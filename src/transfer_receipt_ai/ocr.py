@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from importlib import metadata
 from typing import Any, Protocol
 
 import numpy as np
@@ -115,8 +116,31 @@ def _extract_paddle_lines(payload: Any) -> list[tuple[str, float]]:
 class PaddleOCRReader:
     """Chinese OCR backed by PaddleOCR, imported only when the feature is used."""
 
-    def __init__(self, language: str = "ch", use_angle_cls: bool = True) -> None:
+    def __init__(
+        self,
+        language: str = "ch",
+        use_angle_cls: bool = True,
+        *,
+        device: str = "auto",
+        require_v2: bool = False,
+    ) -> None:
+        if require_v2:
+            try:
+                installed_version = metadata.version("paddleocr")
+            except metadata.PackageNotFoundError as error:
+                raise ImportError(
+                    "PaddleOCR is not installed. Install a PaddlePaddle wheel for this platform, "
+                    "then run `pip install -r requirements-ocr.txt`."
+                ) from error
+            if installed_version != "2.10.0":
+                raise RuntimeError(
+                    f"PaddleOCR 2.10.0 is required for this worker, but found {installed_version}. "
+                    "Install paddleocr==2.10.0."
+                )
         try:
+            # Explicitly initialise Paddle before importing PaddleOCR.  The
+            # split Windows worker never imports Torch in this process.
+            import paddle
             import paddleocr
         except ModuleNotFoundError as error:
             raise ImportError(
@@ -125,6 +149,25 @@ class PaddleOCRReader:
             ) from error
         PaddleOCR = paddleocr.PaddleOCR
         self._use_angle_cls = use_angle_cls
+
+        requested_device = device.lower()
+        if requested_device == "auto":
+            paddle_device = "gpu:0" if paddle.is_compiled_with_cuda() else "cpu"
+        elif requested_device == "cuda":
+            paddle_device = "gpu:0"
+        elif requested_device.startswith("cuda:") and requested_device[5:].isdigit():
+            paddle_device = "gpu:" + requested_device[5:]
+        elif requested_device in {"cpu", "mps"}:
+            # PaddleOCR has no MPS backend.  Keep the public detector CLI's
+            # ``--device mps`` usable by running this separate OCR stage on CPU.
+            paddle_device = "cpu"
+        else:
+            raise ValueError("PaddleOCR device must be auto, cpu, cuda, or cuda:N")
+        if paddle_device.startswith("gpu") and not paddle.is_compiled_with_cuda():
+            raise RuntimeError("Paddle CUDA was requested but this PaddlePaddle build has no CUDA support")
+        paddle.set_device(paddle_device)
+        use_gpu = paddle_device.startswith("gpu")
+        gpu_id = int(paddle_device.split(":", 1)[1]) if use_gpu else 0
 
         # PaddleOCR 3.x replaced ``use_angle_cls``/``show_log`` and the
         # ``ocr`` call with pipeline options plus ``predict``.  Prefer its
@@ -137,7 +180,13 @@ class PaddleOCRReader:
         }
 
         def initialise_v2() -> Any:
-            v2_options = {"lang": language, "use_angle_cls": use_angle_cls, "show_log": False}
+            v2_options = {
+                "lang": language,
+                "use_angle_cls": use_angle_cls,
+                "use_gpu": use_gpu,
+                "gpu_id": gpu_id,
+                "show_log": False,
+            }
             try:
                 return PaddleOCR(**v2_options)
             except (TypeError, ValueError):  # Some late 2.x builds removed show_log.

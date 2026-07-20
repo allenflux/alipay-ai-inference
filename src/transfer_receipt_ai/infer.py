@@ -10,7 +10,7 @@ from typing import Any, Mapping
 
 from tqdm import tqdm
 
-from .geometry import RectificationOptions
+from .geometry import RectificationOptions, save_rgb
 from .labels import DETECTION_CLASSES
 from .model import LRCNNPredictor
 from .ocr import PaddleOCRReader
@@ -66,6 +66,70 @@ def _write_json_atomic(path: Path, payload: object) -> None:
     temporary.replace(path)
 
 
+def ocr_stage_artifact_paths(output_stem: Path) -> tuple[Path, Path]:
+    """Return private, lossless hand-off paths for the split GPU pipeline.
+
+    These files are written only to the coordinator's temporary detector
+    directory.  They deliberately do not appear in the caller's requested
+    output directory or alter the public result JSON schema.
+    """
+    return (
+        output_stem.with_name(output_stem.name + "_ocr_stage.json"),
+        output_stem.with_name(output_stem.name + "_ocr_stage_rectified.png"),
+    )
+
+
+def _write_ocr_stage_artifacts(result: Any, output_stem: Path) -> None:
+    """Persist full-precision detector state for a later Paddle-only process.
+
+    The normal result JSON rounds boxes and homographies for human-readable
+    output.  OCR crop boundaries must instead use the exact detector values,
+    so the staged hand-off keeps a private JSON payload plus a lossless clean
+    rectified image.
+    """
+    artifact_path, rectified_path = ocr_stage_artifact_paths(output_stem)
+    source_path = Path(result.source_path)
+    source_stat = source_path.stat()
+    rectification = result.rectification
+    payload = {
+        "schema_version": 1,
+        "source": result.source_path,
+        "source_fingerprint": {
+            "size": source_stat.st_size,
+            "mtime_ns": source_stat.st_mtime_ns,
+        },
+        "geometry": {
+            "source_size": {
+                "width": int(rectification.source_rgb.shape[1]),
+                "height": int(rectification.source_rgb.shape[0]),
+            },
+            "rectified_size": {
+                "width": int(rectification.rectified_rgb.shape[1]),
+                "height": int(rectification.rectified_rgb.shape[0]),
+            },
+            "rotation_degrees": int(rectification.rotation_degrees),
+            "screen_detected": bool(rectification.screen_detected),
+            "screen_quad_original": rectification.screen_quad_original.tolist(),
+            "H_original_to_rectified": rectification.original_to_rectified.tolist(),
+            "H_rectified_to_original": rectification.rectified_to_original.tolist(),
+        },
+        "detections": [
+            {
+                "label": extracted.detection.label,
+                "score": extracted.detection.score,
+                "bbox_xyxy": list(extracted.detection.bbox_xyxy),
+                "original_polygon": extracted.original_polygon.tolist(),
+            }
+            for extracted in result.detections
+        ],
+        "status_style": result.status_style,
+        "tags": result.tags,
+    }
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    save_rgb(rectified_path, rectification.rectified_rgb)
+    _write_json_atomic(artifact_path, payload)
+
+
 def _validate_output_names(image_paths: list[Path], root: Path) -> None:
     seen: dict[str, Path] = {}
     for image_path in image_paths:
@@ -86,6 +150,7 @@ def _committed_result_exists(
     *,
     status_style_model: Mapping[str, object] | None = None,
     status_style_inference_config: Mapping[str, object] | None = None,
+    require_ocr_for_skip: bool = False,
 ) -> bool:
     result_path = output_stem.with_suffix(".json")
     rectified_path = output_stem.with_name(output_stem.name + "_rectified_annotated.jpg")
@@ -100,6 +165,17 @@ def _committed_result_exists(
         return False
     if not isinstance(payload, dict) or not isinstance(payload.get("fields"), dict):
         return False
+    if payload.get("source") != source_path.resolve().as_posix():
+        return False
+    if require_ocr_for_skip:
+        detections = payload.get("detections")
+        # An empty detector result is deliberately reprocessed.  Without an
+        # extra public-schema marker it is indistinguishable from a prior
+        # ``--ocr none`` run, and retrying is safer than silently skipping OCR.
+        if not isinstance(detections, list) or not detections:
+            return False
+        if not all(isinstance(item, dict) and "ocr" in item for item in detections):
+            return False
     if status_style_model is None:
         return True
     status_style = payload.get("status_style")
@@ -157,6 +233,9 @@ def run_inference(
     status_style_checkpoint: Path | None = None,
     status_confidence_threshold: float = 0.80,
     status_absent_confidence_threshold: float = 0.95,
+    write_ocr_stage_artifacts: bool = False,
+    skip_existing_output_dir: Path | None = None,
+    require_ocr_for_skip: bool = False,
 ) -> list[dict[str, str]]:
     """Process an image or image tree and write one result bundle per raw image."""
     all_image_paths = list(iter_image_paths(input_path))
@@ -185,7 +264,7 @@ def run_inference(
     if limit is not None:
         image_paths = image_paths[:limit]
     corrections = corrections or {}
-    ocr = PaddleOCRReader() if use_ocr else None
+    ocr = PaddleOCRReader(device=device) if use_ocr else None
     predictor = LRCNNPredictor(checkpoint, device=device, score_threshold=score_threshold)
     status_style_predictor: StatusStylePredictor | None = None
     status_style_model: dict[str, object] | None = None
@@ -218,13 +297,19 @@ def run_inference(
             if override.get("skip") is True:
                 continue
             output_stem = (output_dir / relative_path).with_suffix("")
+            existing_output_stem = (
+                (skip_existing_output_dir / relative_path).with_suffix("")
+                if skip_existing_output_dir is not None
+                else output_stem
+            )
             if skip_existing and _committed_result_exists(
                 source_path,
-                output_stem,
+                existing_output_stem,
                 status_style_model=status_style_model,
                 status_style_inference_config=status_style_inference_config,
+                require_ocr_for_skip=require_ocr_for_skip,
             ):
-                record = _written_record(source_path, output_stem, status="skipped_existing")
+                record = _written_record(source_path, existing_output_stem, status="skipped_existing")
                 manifest.append(record)
                 manifest_jsonl.write(json.dumps(record, ensure_ascii=False) + "\n")
                 manifest_jsonl.flush()
@@ -250,7 +335,10 @@ def run_inference(
                 result = pipeline.run(source_path)
                 if require_complete:
                     _require_five_fields(result)
-                write_receipt_result(result, output_stem)
+                if write_ocr_stage_artifacts:
+                    _write_ocr_stage_artifacts(result, output_stem)
+                else:
+                    write_receipt_result(result, output_stem)
                 record = _written_record(source_path, output_stem, status="written")
                 manifest.append(record)
                 manifest_jsonl.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -318,6 +406,10 @@ def build_parser() -> argparse.ArgumentParser:
         default=1600,
         help="Maximum long edge after correction; use 0 to keep original resolution",
     )
+    parser.add_argument("--_write-ocr-stage-artifacts", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--_skip-existing-output", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--_require-ocr-complete-for-skip", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--_quiet", action="store_true", help=argparse.SUPPRESS)
     return parser
 
 
@@ -359,8 +451,12 @@ def main(argv: list[str] | None = None) -> None:
         status_style_checkpoint=args.status_style_checkpoint,
         status_confidence_threshold=args.status_confidence_threshold,
         status_absent_confidence_threshold=args.status_absent_confidence_threshold,
+        write_ocr_stage_artifacts=args._write_ocr_stage_artifacts,
+        skip_existing_output_dir=args._skip_existing_output,
+        require_ocr_for_skip=args._require_ocr_complete_for_skip,
     )
-    print(f"Wrote {len(outputs)} inference result bundle(s) to {args.output}")
+    if not args._quiet:
+        print(f"Wrote {len(outputs)} inference result bundle(s) to {args.output}")
 
 
 if __name__ == "__main__":  # pragma: no cover - CLI entry point

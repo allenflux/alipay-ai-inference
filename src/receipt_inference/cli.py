@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
 from pathlib import Path
 
-from transfer_receipt_ai.infer import run_inference
 from transfer_receipt_ai.prepare import parse_max_side
 
 from .models import MODEL_SPECS, resolve_checkpoint
@@ -39,19 +44,122 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: list[str] | None = None) -> None:
-    args = build_parser().parse_args(argv)
-    if not 0.0 <= args.score_threshold <= 1.0:
-        raise SystemExit("--score-threshold must be between 0 and 1")
-    if args.limit is not None and args.limit <= 0:
-        raise SystemExit("--limit must be positive")
+def _run_child(command: list[str]) -> None:
+    """Run one framework-isolated worker and preserve its exit status."""
+    completed = subprocess.run(command)
+    if completed.returncode:
+        raise SystemExit(completed.returncode)
 
+
+def _detector_command(args: argparse.Namespace, checkpoint: Path, stage_output: Path) -> list[str]:
+    """Build the Torch-only child command using this exact virtualenv."""
+    command = [
+        sys.executable,
+        "-m",
+        "transfer_receipt_ai.infer",
+        "--checkpoint",
+        str(checkpoint),
+        "--input",
+        str(args.input),
+        "--output",
+        str(stage_output),
+        "--device",
+        str(args.device),
+        "--score-threshold",
+        str(args.score_threshold),
+        "--ocr",
+        "none",
+        "--max-side",
+        str(args.max_side),
+        "--_write-ocr-stage-artifacts",
+        "--_quiet",
+    ]
+    if args.require_complete:
+        command.append("--require-complete")
+    if args.continue_on_error:
+        command.append("--continue-on-error")
+    if args.skip_existing:
+        command.extend(
+            (
+                "--skip-existing",
+                "--_skip-existing-output",
+                str(args.output),
+                "--_require-ocr-complete-for-skip",
+            )
+        )
+    if args.limit is not None:
+        command.extend(("--limit", str(args.limit)))
+    return command
+
+
+def _ocr_command(args: argparse.Namespace, stage_output: Path) -> list[str]:
+    """Build the Paddle-only child command using this exact virtualenv."""
+    command = [
+        sys.executable,
+        "-m",
+        "transfer_receipt_ai.ocr_enrich",
+        "--stage-output",
+        str(stage_output),
+        "--output",
+        str(args.output),
+        "--device",
+        str(args.device),
+        "--_quiet",
+    ]
+    if args.continue_on_error:
+        command.append("--continue-on-error")
+    if args.skip_existing:
+        command.append("--skip-existing")
+    return command
+
+
+def _read_final_manifest(output_dir: Path) -> list[dict[str, str]]:
+    manifest_path = output_dir / "inference_manifest.json"
     try:
-        checkpoint = resolve_checkpoint(args.model, args.checkpoint)
-    except (ValueError, FileNotFoundError) as error:
-        raise SystemExit(str(error)) from error
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"OCR worker did not write a readable manifest: {manifest_path}") from error
+    if not isinstance(payload, list):
+        raise RuntimeError(f"OCR worker wrote an invalid manifest: {manifest_path}")
+    return payload
 
-    outputs = run_inference(
+
+def _run_paddle_two_stage(args: argparse.Namespace, checkpoint: Path) -> list[dict[str, str]]:
+    """Run Torch and Paddle sequentially, never in the same Windows process."""
+    # Keep staged PNGs outside the input/output trees.  Otherwise a directory
+    # input that contains its output folder could recursively ingest temporary
+    # detector artifacts on the next scan.
+    stage_output = Path(tempfile.mkdtemp(prefix="receipt_inference_stage_"))
+    completed = False
+    try:
+        print("[1/2] Running Torch detector...")
+        _run_child(_detector_command(args, checkpoint, stage_output))
+        print("[2/2] Running PaddleOCR...")
+        _run_child(_ocr_command(args, stage_output))
+        outputs = _read_final_manifest(args.output)
+        completed = True
+        return outputs
+    finally:
+        if completed:
+            try:
+                shutil.rmtree(stage_output)
+            except OSError as error:
+                print(f"WARNING: Could not remove temporary detector artifacts: {stage_output} ({error})", file=sys.stderr)
+        else:
+            print(f"Temporary detector artifacts retained for debugging: {stage_output}", file=sys.stderr)
+
+
+def _needs_windows_gpu_split(args: argparse.Namespace) -> bool:
+    """Only Windows CUDA needs DLL isolation; retain the existing other paths."""
+    requested = str(args.device).lower()
+    return os.name == "nt" and (requested == "auto" or requested == "cuda" or requested.startswith("cuda:"))
+
+
+def _run_single_process(args: argparse.Namespace, checkpoint: Path) -> list[dict[str, str]]:
+    """Preserve the existing non-Windows/CPU execution path."""
+    from transfer_receipt_ai.infer import run_inference
+
+    return run_inference(
         checkpoint=checkpoint,
         input_path=args.input,
         output_dir=args.output,
@@ -65,9 +173,25 @@ def main(argv: list[str] | None = None) -> None:
         max_side=args.max_side,
         status_style_checkpoint=None,
     )
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = build_parser().parse_args(argv)
+    if not 0.0 <= args.score_threshold <= 1.0:
+        raise SystemExit("--score-threshold must be between 0 and 1")
+    if args.limit is not None and args.limit <= 0:
+        raise SystemExit("--limit must be positive")
+
+    try:
+        checkpoint = resolve_checkpoint(args.model, args.checkpoint)
+    except (ValueError, FileNotFoundError) as error:
+        raise SystemExit(str(error)) from error
+
+    outputs = _run_paddle_two_stage(args, checkpoint) if (
+        args.ocr == "paddle" and _needs_windows_gpu_split(args)
+    ) else _run_single_process(args, checkpoint)
     print(f"Wrote {len(outputs)} inference result bundle(s) to {args.output}")
 
 
 if __name__ == "__main__":  # pragma: no cover
     main()
-

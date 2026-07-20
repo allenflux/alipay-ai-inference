@@ -38,12 +38,32 @@ py -3.10 -m venv .venv
 python -m pip install --upgrade pip
 
 # 示例版本仅适用于对应 CUDA 环境；以 PyTorch 官方安装器给出的命令为准。
-python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
+# 本机 CUDA 12.6 时可使用 cu126 wheel index。
+python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
 python -m pip install -r requirements.txt
 
-# 先按 PaddlePaddle 官方说明安装匹配 CUDA 的 paddlepaddle-gpu，再安装 OCR：
+# 先按 PaddlePaddle 官方说明安装匹配 CUDA 的 paddlepaddle-gpu，再安装 OCR。
+# 示例为 CUDA 12.6；请按实际 CUDA wheel index 调整。
+python -m pip install paddlepaddle-gpu==3.2.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu126/
 python -m pip install -r requirements-ocr.txt
 python -m pip install -e .
+```
+
+Windows 上若 LRCNN 和 PaddleOCR 都使用 GPU，必须使用 `paddleocr==2.10.0`（已由
+`requirements-ocr.txt` 固定）。如果之前安装过 PaddleOCR 3.x，先清理其会隐式导入
+Torch 的依赖链：
+
+```powershell
+python -m pip uninstall -y paddleocr paddlex modelscope
+python -m pip install --no-cache-dir --force-reinstall -r requirements-ocr.txt
+python -m pip check
+python -c "import paddleocr; print(paddleocr.__version__)"
+```
+
+预期版本为 `2.10.0`。然后先单独验证 PaddleOCR GPU（首次会下载 OCR 模型）：
+
+```powershell
+python -c "from transfer_receipt_ai.ocr import PaddleOCRReader; PaddleOCRReader(device='cuda', require_v2=True); print('PaddleOCR 2 GPU OK')"
 ```
 
 开发或运行测试时再安装：
@@ -96,6 +116,26 @@ python -m receipt_inference.cli `
   --require-complete
 ```
 
+在 Windows GPU 环境中，以上 `--ocr paddle` 命令会自动使用**同一个虚拟环境**启动两个
+顺序子进程：第一个只加载 PyTorch GPU 来检测，退出后第二个只加载 PaddleOCR GPU 来识别。
+因此不会在同一 Windows Python 进程中混用两套 cuDNN DLL；输入路径、输出目录、JSON、标注图
+和 manifest 的格式都不变。
+
+`--ocr none` 的命令和行为保持不变：它只运行检测模型，不会启动 PaddleOCR。例如：
+
+```powershell
+python -m receipt_inference.cli `
+  --input "D:\download\TempFakeImages\s3_voucher_GWCZ2071991511234514944_20260701001815.png" `
+  --output "D:\download\TempFakeResults_v1" `
+  --device cuda `
+  --ocr none `
+  --require-complete
+```
+
+要得到 GPU OCR 完整字段，只需将同一条命令中的 `--ocr none` 改为 `--ocr paddle`；其余参数不变。
+不要在 Windows GPU 环境直接运行 `python -m transfer_receipt_ai.infer --ocr paddle`，该底层入口会在
+一个进程中加载两套框架。
+
 如果 checkpoint 缺失，命令会打印必须复制到的完整路径。临时验证另一份权重时，可以用
 `--checkpoint D:\path\other.pt` 覆盖默认位置。
 
@@ -124,4 +164,3 @@ checkpoints\<model_name>\best.pt
 
 如果新模型与 `receipt_lrcnn_v1` 使用相同输入输出协议，只需注册模型并选择对应 predictor；
 如果协议不同，则新增独立 runner，避免把多个模型的条件判断堆进一个推理函数。
-
