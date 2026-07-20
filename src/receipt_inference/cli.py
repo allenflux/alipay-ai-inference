@@ -26,6 +26,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="Optional checkpoint override; normally just copy best.pt into the model directory",
     )
+    parser.add_argument(
+        "--platform-checkpoint",
+        type=Path,
+        help="Optional status-bar device (Android/iOS) classifier checkpoint; adds a 'device' field",
+    )
     parser.add_argument("--input", type=Path, required=True, help="Input image or directory")
     parser.add_argument("--output", type=Path, required=True, help="Result directory")
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda, cuda:0, or mps")
@@ -74,6 +79,8 @@ def _detector_command(args: argparse.Namespace, checkpoint: Path, stage_output: 
         "--_write-ocr-stage-artifacts",
         "--_quiet",
     ]
+    if args.platform_checkpoint is not None:
+        command.extend(("--platform-checkpoint", str(args.platform_checkpoint)))
     if args.require_complete:
         command.append("--require-complete")
     if args.continue_on_error:
@@ -172,6 +179,7 @@ def _run_single_process(args: argparse.Namespace, checkpoint: Path) -> list[dict
         limit=args.limit,
         max_side=args.max_side,
         status_style_checkpoint=None,
+        platform_checkpoint=args.platform_checkpoint,
     )
 
 
