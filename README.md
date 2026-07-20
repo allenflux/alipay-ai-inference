@@ -46,7 +46,7 @@ python -m pip install -r requirements.txt
 # 示例为 CUDA 12.6；请按实际 CUDA wheel index 调整。
 python -m pip install paddlepaddle-gpu==3.2.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu126/
 python -m pip install -r requirements-ocr.txt
-python -m pip install -e .
+python -m pip install -e . --no-deps
 ```
 
 Windows 上若 LRCNN 和 PaddleOCR 都使用 GPU，必须使用 `paddleocr==2.10.0`（已由
@@ -56,7 +56,7 @@ Torch 的依赖链：
 ```powershell
 python -m pip uninstall -y paddleocr paddlex modelscope albumentations albucore numpy opencv-python opencv-contrib-python opencv-python-headless
 python -m pip install --no-cache-dir --force-reinstall -r requirements.txt -r requirements-ocr.txt
-python -m pip install -e .
+python -m pip install -e . --no-deps
 python -m pip check
 python -c "import importlib.metadata as m; print(m.version('paddleocr'), m.version('albumentations'), m.version('albucore'))"
 ```
