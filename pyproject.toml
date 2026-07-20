@@ -9,8 +9,10 @@ description = "Standalone multi-model inference project for transfer receipts"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "numpy>=1.26",
-    "opencv-python>=4.10",
+    "numpy>=1.26; platform_system != 'Windows'",
+    "numpy>=1.26,<2; platform_system == 'Windows'",
+    "opencv-python>=4.10; platform_system != 'Windows'",
+    "opencv-python>=4.10,<4.12; platform_system == 'Windows'",
     "Pillow>=10.3",
     "tqdm>=4.66",
 ]

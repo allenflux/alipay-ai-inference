@@ -54,16 +54,23 @@ Windows 上若 LRCNN 和 PaddleOCR 都使用 GPU，必须使用 `paddleocr==2.10
 Torch 的依赖链：
 
 ```powershell
-python -m pip uninstall -y paddleocr paddlex modelscope
-python -m pip install --no-cache-dir --force-reinstall -r requirements-ocr.txt
+python -m pip uninstall -y paddleocr paddlex modelscope albumentations albucore numpy opencv-python opencv-contrib-python opencv-python-headless
+python -m pip install --no-cache-dir --force-reinstall -r requirements.txt -r requirements-ocr.txt
+python -m pip install -e .
 python -m pip check
-python -c "import paddleocr; print(paddleocr.__version__)"
+python -c "import importlib.metadata as m; print(m.version('paddleocr'), m.version('albumentations'), m.version('albucore'))"
 ```
 
-预期版本为 `2.10.0`。然后先单独验证 PaddleOCR GPU（首次会下载 OCR 模型）：
+预期版本为 `2.10.0 1.4.10 0.0.13`。先确认 Albumentations 没有偷偷导入 Torch：
 
 ```powershell
-python -c "from transfer_receipt_ai.ocr import PaddleOCRReader; PaddleOCRReader(device='cuda', require_v2=True); print('PaddleOCR 2 GPU OK')"
+python -c "import sys, albumentations as A; print(A.__version__, 'torch' in sys.modules); assert A.__version__ == '1.4.10'; assert 'torch' not in sys.modules"
+```
+
+然后单独验证 PaddleOCR GPU（首次会下载 OCR 模型）：
+
+```powershell
+python -c "from transfer_receipt_ai.ocr import PaddleOCRReader; PaddleOCRReader(device='cuda', require_v2=True); import sys; assert 'torch' not in sys.modules; print('PaddleOCR 2 GPU OK')"
 ```
 
 开发或运行测试时再安装：

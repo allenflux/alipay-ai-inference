@@ -135,7 +135,34 @@ class PaddleOCRReader:
             if installed_version != "2.10.0":
                 raise RuntimeError(
                     f"PaddleOCR 2.10.0 is required for this worker, but found {installed_version}. "
-                    "Install paddleocr==2.10.0."
+                    "Run `python -m pip uninstall -y paddleocr paddlex modelscope albumentations albucore` "
+                    "then `python -m pip install --no-cache-dir --force-reinstall -r requirements-ocr.txt`."
+                )
+            try:
+                albumentations_version = metadata.version("albumentations")
+            except metadata.PackageNotFoundError as error:
+                raise ImportError(
+                    "Windows GPU OCR requires albumentations==1.4.10. Run "
+                    "`python -m pip install --no-cache-dir --force-reinstall -r requirements-ocr.txt`."
+                ) from error
+            if albumentations_version != "1.4.10":
+                raise RuntimeError(
+                    "Windows GPU OCR requires albumentations==1.4.10 so PaddleOCR does not import Torch. "
+                    f"Found {albumentations_version}. Run `python -m pip uninstall -y albumentations albucore` "
+                    "then `python -m pip install --no-cache-dir --force-reinstall -r requirements-ocr.txt`."
+                )
+            try:
+                albucore_version = metadata.version("albucore")
+            except metadata.PackageNotFoundError as error:
+                raise ImportError(
+                    "Windows GPU OCR requires albucore==0.0.13. Run "
+                    "`python -m pip install --no-cache-dir --force-reinstall -r requirements-ocr.txt`."
+                ) from error
+            if albucore_version != "0.0.13":
+                raise RuntimeError(
+                    "Windows GPU OCR requires albucore==0.0.13. "
+                    f"Found {albucore_version}. Run `python -m pip uninstall -y albumentations albucore` "
+                    "then `python -m pip install --no-cache-dir --force-reinstall -r requirements-ocr.txt`."
                 )
         try:
             # Explicitly initialise Paddle before importing PaddleOCR.  The

@@ -2,4 +2,14 @@
 # PaddleOCR 3.x imports PaddleX/ModelScope, which imports Torch and conflicts
 # with a GPU Torch process on Windows. The Windows GPU runner uses v2's API.
 paddleocr==2.10.0; platform_system == "Windows"
+# Newer Albumentations imports its PyTorch transforms from package init. This
+# official PaddleOCR 2.x-compatible pair does not load Torch at import time.
+albumentations==1.4.10; platform_system == "Windows"
+albucore==0.0.13; platform_system == "Windows"
+# Keep the old PaddleOCR 2.x augmentation stack on NumPy 1.x. OpenCV 4.12+
+# requires NumPy 2 on Windows and conflicts with this pair.
+numpy>=1.26,<2; platform_system == "Windows"
+opencv-python>=4.10,<4.12; platform_system == "Windows"
+opencv-contrib-python>=4.10,<4.12; platform_system == "Windows"
+opencv-python-headless>=4.10,<4.12; platform_system == "Windows"
 paddleocr>=2.8; platform_system != "Windows"

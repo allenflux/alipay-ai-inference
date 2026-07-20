@@ -1,6 +1,8 @@
 # Install the CUDA build of PyTorch/TorchVision separately first.
-numpy>=1.26
-opencv-python>=4.10
+# PaddleOCR 2.x's Windows GPU dependency set still requires NumPy 1.x.
+numpy>=1.26; platform_system != "Windows"
+numpy>=1.26,<2; platform_system == "Windows"
+opencv-python>=4.10; platform_system != "Windows"
+opencv-python>=4.10,<4.12; platform_system == "Windows"
 Pillow>=10.3
 tqdm>=4.66
-
