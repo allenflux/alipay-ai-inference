@@ -1,0 +1,6 @@
+# Install the CUDA build of PyTorch/TorchVision separately first.
+numpy>=1.26
+opencv-python>=4.10
+Pillow>=10.3
+tqdm>=4.66
+

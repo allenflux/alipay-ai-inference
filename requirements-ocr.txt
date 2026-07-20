@@ -1,0 +1,3 @@
+# Install the OS/CUDA-compatible PaddlePaddle wheel separately first.
+paddleocr>=2.8
+
