@@ -14,6 +14,13 @@ DETECTION_CLASSES: Final[tuple[str, ...]] = (
     "payment_method_field",
 )
 
+# require-complete 判定用的"核心交易字段":这几个必须都检测到才算完整。
+# 刻意排除 time(顶部状态栏时钟)——它不是交易字段,而且设备识别已从状态栏读取,
+# 不应因为少了时钟(常见于安卓右侧时钟漏检、通知横幅遮挡)就把整张回单丢弃。
+REQUIRED_DETECTION_CLASSES: Final[tuple[str, ...]] = tuple(
+    name for name in DETECTION_CLASSES if name != "time"
+)
+
 BACKGROUND_LABEL: Final[int] = 0
 LABEL_TO_ID: Final[dict[str, int]] = {
     name: index for index, name in enumerate(DETECTION_CLASSES, start=1)

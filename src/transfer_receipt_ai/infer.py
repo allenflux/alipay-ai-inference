@@ -11,7 +11,7 @@ from typing import Any, Mapping
 from tqdm import tqdm
 
 from .geometry import RectificationOptions, save_rgb
-from .labels import DETECTION_CLASSES
+from .labels import REQUIRED_DETECTION_CLASSES
 from .model import LRCNNPredictor
 from .ocr import PaddleOCRReader
 from .pipeline import ReceiptPipeline, write_receipt_result
@@ -202,13 +202,19 @@ def _written_record(source_path: Path, output_stem: Path, *, status: str) -> dic
     }
 
 
-def _require_five_fields(result: Any) -> None:
+def _require_core_fields(result: Any) -> None:
+    """require-complete：要求 4 个核心交易字段都检测到；time（状态栏时钟）可选。
+
+    时钟不是交易字段，而且设备识别那边已从状态栏读取它，不应因为少了时钟（常见于
+    安卓右侧时钟漏检、通知横幅遮挡）就把整张回单丢弃。核心字段真缺（金额/状态被遮挡
+    或本就不是转账成功页）才判为不完整。
+    """
     detected = {item.detection.label for item in result.detections}
-    missing = [label for label in DETECTION_CLASSES if label not in detected]
-    if missing or len(result.detections) != len(DETECTION_CLASSES):
+    missing = [label for label in REQUIRED_DETECTION_CLASSES if label not in detected]
+    if missing:
         raise ValueError(
-            "incomplete detection: expected exactly five fields; "
-            f"found={len(result.detections)}, missing={','.join(missing) or 'none'}"
+            "incomplete detection: missing required transfer fields; "
+            f"missing={','.join(missing)} (found={','.join(sorted(detected)) or 'none'})"
         )
 
 
@@ -344,7 +350,7 @@ def run_inference(
                 )
                 result = pipeline.run(source_path)
                 if require_complete:
-                    _require_five_fields(result)
+                    _require_core_fields(result)
                 if write_ocr_stage_artifacts:
                     _write_ocr_stage_artifacts(result, output_stem)
                 else:
