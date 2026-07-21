@@ -201,8 +201,7 @@ class ReceiptPipeline:
             }
         else:
             # The detector normally emits at most one item per class.  When a
-            # custom predictor emits duplicates, classify the strongest box;
-            # --require-complete still rejects the duplicate five-field result.
+            # custom predictor emits duplicates, classify the strongest box.
             status_detection = max(matches, key=lambda detection: detection.score)
             crop = crop_status_region(
                 rectified_rgb,
