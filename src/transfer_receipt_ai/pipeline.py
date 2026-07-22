@@ -31,7 +31,6 @@ from .ocr import (
 from .render import (
     RenderItem,
     StatusStyleRenderItem,
-    draw_device_badge,
     draw_original_circles,
     draw_rectified_circles,
 )
@@ -295,27 +294,21 @@ def write_receipt_result(result: ReceiptResult, output_stem: str | Path) -> dict
     json_path = output_stem.with_suffix(".json")
     save_rgb(
         rectified_path,
-        draw_device_badge(
-            draw_rectified_circles(
-                result.rectification.rectified_rgb,
-                items,
-                status_style=status_style_item,
-            ),
-            result.device,
-            statusbar_box=False,
+        draw_rectified_circles(
+            result.rectification.rectified_rgb,
+            items,
+            status_style=status_style_item,
+            device=result.device,
         ),
     )
     save_rgb(
         original_path,
-        draw_device_badge(
-            draw_original_circles(
-                result.rectification.source_rgb,
-                items,
-                result.rectification.rectified_to_original,
-                status_style=status_style_item,
-            ),
-            result.device,
-            statusbar_box=True,
+        draw_original_circles(
+            result.rectification.source_rgb,
+            items,
+            result.rectification.rectified_to_original,
+            status_style=status_style_item,
+            device=result.device,
         ),
     )
     json_path.write_text(json.dumps(result.as_dict(), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

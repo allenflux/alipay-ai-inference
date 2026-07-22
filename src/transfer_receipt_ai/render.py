@@ -38,6 +38,7 @@ STATUS_STYLE_COLORS = {
     "check_absent": (224, 74, 74),
     "unknown": (225, 145, 35),
 }
+DEVICE_LEGEND_COLOR = (220, 30, 30)  # 红色:设备识别行在“识别结果”面板里高亮(对齐运营交付图 2.jpg)
 
 
 @dataclass(frozen=True)
@@ -98,6 +99,15 @@ def _status_style_caption(item: StatusStyleRenderItem) -> str:
     return f"设备/风险标签 {value} ({item.confidence:.0%})"
 
 
+def _device_caption(device: dict) -> str:
+    """设备识别行文案:如“设备 苹果 (99%)”。"""
+    platform_cn = str(device.get("platform_cn") or device.get("platform") or "未知")
+    confidence = device.get("confidence")
+    if isinstance(confidence, (int, float)):
+        return f"设备 {platform_cn} ({confidence:.0%})"
+    return f"设备 {platform_cn}"
+
+
 def _wrap_caption(draw: ImageDraw.ImageDraw, caption: str, font: ImageFont.ImageFont, max_width: int) -> str:
     """Wrap mixed Chinese/ASCII captions without relying on whitespace."""
     lines: list[str] = []
@@ -119,6 +129,7 @@ def _draw_items(
     item_polygons: Iterable[tuple[RenderItem, np.ndarray]],
     *,
     status_style: StatusStyleRenderItem | None = None,
+    device: dict | None = None,
 ) -> np.ndarray:
     pairs = sorted(
         list(item_polygons),
@@ -133,7 +144,7 @@ def _draw_items(
         points = [tuple(float(value) for value in point) for point in polygon]
         image_draw.line(points, fill=color, width=line_width, joint="curve")
 
-    if not pairs and status_style is None:
+    if not pairs and status_style is None and not device:
         return np.asarray(image)
 
     # Keep OCR text entirely outside the source pixels. The annotated image is
@@ -231,6 +242,46 @@ def _draw_items(
                 font=font,
                 spacing=max(3, font_size // 5),
             )
+            cursor_y += entry_height + max(7, padding // 2)
+
+    # 设备识别行:接在同事的字段卡片下面,红框红字高亮(对齐运营交付图 2.jpg)
+    if device:
+        color = DEVICE_LEGEND_COLOR
+        number = len(pairs) + (2 if status_style is not None else 1)
+        caption = f"{number}. {_device_caption(device)}"
+        try:
+            caption = _wrap_caption(draw, caption, font, max(100, text_width))
+            text_box = draw.multiline_textbbox((0, 0), caption, font=font, spacing=max(3, font_size // 5))
+        except UnicodeEncodeError:
+            platform = str(device.get("platform") or "unknown")
+            conf = device.get("confidence")
+            conf_suffix = f" ({conf:.0%})" if isinstance(conf, (int, float)) else ""
+            caption = f"{number}. Device {platform}{conf_suffix}"
+            text_box = draw.multiline_textbbox((0, 0), caption, font=font, spacing=3)
+        entry_height = max(font_size + padding, text_box[3] - text_box[1] + padding * 2)
+        if cursor_y + entry_height <= height - padding:
+            left = width + padding
+            right = width + panel_width - padding
+            draw.rounded_rectangle(
+                (left, cursor_y, right, cursor_y + entry_height),
+                radius=max(4, padding // 2),
+                fill=(255, 255, 255),
+                outline=color,
+                width=max(2, line_width // 2),
+            )
+            stripe_width = max(5, padding // 2)
+            draw.rounded_rectangle(
+                (left, cursor_y, left + stripe_width, cursor_y + entry_height),
+                radius=max(3, stripe_width // 2),
+                fill=color,
+            )
+            draw.multiline_text(
+                (left + stripe_width + padding, cursor_y + padding),
+                caption,
+                fill=color,
+                font=font,
+                spacing=max(3, font_size // 5),
+            )
     return np.asarray(canvas)
 
 
@@ -239,12 +290,14 @@ def draw_rectified_circles(
     items: Sequence[RenderItem],
     *,
     status_style: StatusStyleRenderItem | None = None,
+    device: dict | None = None,
 ) -> np.ndarray:
     """Draw ellipse outlines in the detector's rectified coordinate system."""
     return _draw_items(
         image_rgb,
         ((item, ellipse_polygon(item.bbox_xyxy)) for item in items),
         status_style=status_style,
+        device=device,
     )
 
 
@@ -254,6 +307,7 @@ def draw_original_circles(
     rectified_to_original: np.ndarray,
     *,
     status_style: StatusStyleRenderItem | None = None,
+    device: dict | None = None,
 ) -> np.ndarray:
     """Project rectified ellipses back into the photo before drawing them.
 
@@ -267,56 +321,5 @@ def draw_original_circles(
             for item in items
         ),
         status_style=status_style,
+        device=device,
     )
-
-
-DEVICE_BADGE_COLOR = (220, 30, 30)  # 红色:设备判定高亮,对齐运营交付图(2.jpg)风格
-
-
-def draw_device_badge(
-    image_rgb: np.ndarray,
-    device: dict | None,
-    *,
-    statusbar_box: bool = False,
-) -> np.ndarray:
-    """把设备识别结果(安卓/苹果)标到图上:左上角红字标签;原图再加顶部状态栏红框(判定依据)。
-
-    device 为空时原样返回——保证不传 --platform-checkpoint(device=None)时,
-    标注图与旧 v1 逐字节一致(逐字节测试因此不受影响)。
-    """
-    if not device:
-        return image_rgb
-    platform_cn = str(device.get("platform_cn") or device.get("platform") or "未知")
-    confidence = device.get("confidence")
-    label = f"设备 {platform_cn}"
-    if isinstance(confidence, (int, float)):
-        label += f" ({confidence:.0%})"
-
-    image = Image.fromarray(image_rgb.copy())
-    draw = ImageDraw.Draw(image)
-    height, width = image_rgb.shape[:2]
-    line_width = max(3, min(8, int(round(max(height, width) * 0.0025))))
-    font_size = max(16, int(round(height * 0.018)))
-    font = _find_font(font_size)
-
-    top = line_width
-    if statusbar_box:
-        # 顶部状态栏红框——设备判定的依据(与 2.jpg 的“判定依据”框一致)
-        bar_bottom = max(int(height * 0.058), font_size + 8)
-        draw.rectangle(
-            [line_width, line_width, width - line_width, bar_bottom],
-            outline=DEVICE_BADGE_COLOR,
-            width=line_width,
-        )
-        draw.text((line_width + 6, bar_bottom + 4), "状态栏(判定依据)", fill=DEVICE_BADGE_COLOR, font=font)
-        top = bar_bottom + 4 + font_size + 8
-
-    # 设备标签:白底红字画在左上,任意底色上都可读
-    pad = 6
-    text_width = int(draw.textlength(label, font=font))
-    draw.rectangle(
-        [line_width, top, line_width + text_width + 2 * pad, top + font_size + 2 * pad],
-        fill=(255, 255, 255),
-    )
-    draw.text((line_width + pad, top + pad), label, fill=DEVICE_BADGE_COLOR, font=font)
-    return np.asarray(image)
