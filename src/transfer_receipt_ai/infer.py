@@ -245,6 +245,7 @@ def run_inference(
     skip_existing_output_dir: Path | None = None,
     require_ocr_for_skip: bool = False,
     platform_checkpoint: Path | None = None,
+    annotate: str = "all",
 ) -> list[dict[str, str]]:
     """Process an image or image tree and write one result bundle per raw image."""
     all_image_paths = list(iter_image_paths(input_path))
@@ -354,7 +355,7 @@ def run_inference(
                 if write_ocr_stage_artifacts:
                     _write_ocr_stage_artifacts(result, output_stem)
                 else:
-                    write_receipt_result(result, output_stem)
+                    write_receipt_result(result, output_stem, annotate_mode=annotate)
                 record = _written_record(source_path, output_stem, status="written")
                 manifest.append(record)
                 manifest_jsonl.write(json.dumps(record, ensure_ascii=False) + "\n")

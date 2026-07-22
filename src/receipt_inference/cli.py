@@ -36,6 +36,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda, cuda:0, or mps")
     parser.add_argument("--score-threshold", type=float, default=0.50)
     parser.add_argument("--ocr", choices=("paddle", "none"), default="paddle")
+    parser.add_argument(
+        "--annotate",
+        choices=("flagged", "all", "none"),
+        default="all",
+        help="标注哪些图:all=每张(默认,兼容旧行为) / flagged=只标缺核心字段、需复核的(更快、省盘) / none=都不标",
+    )
     parser.add_argument("--require-complete", action="store_true")
     parser.add_argument("--continue-on-error", action="store_true")
     parser.add_argument("--skip-existing", action="store_true")
@@ -113,6 +119,7 @@ def _ocr_command(args: argparse.Namespace, stage_output: Path) -> list[str]:
         str(args.device),
         "--_quiet",
     ]
+    command.extend(("--annotate", str(args.annotate)))
     if args.continue_on_error:
         command.append("--continue-on-error")
     if args.skip_existing:
@@ -180,6 +187,7 @@ def _run_single_process(args: argparse.Namespace, checkpoint: Path) -> list[dict
         max_side=args.max_side,
         status_style_checkpoint=None,
         platform_checkpoint=args.platform_checkpoint,
+        annotate=args.annotate,
     )
 
 

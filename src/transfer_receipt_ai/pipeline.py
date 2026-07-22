@@ -28,6 +28,7 @@ from .ocr import (
     normalize_status,
     normalize_time,
 )
+from .labels import REQUIRED_DETECTION_CLASSES
 from .render import (
     RenderItem,
     StatusStyleRenderItem,
@@ -266,10 +267,37 @@ class ReceiptPipeline:
         )
 
 
-def write_receipt_result(result: ReceiptResult, output_stem: str | Path) -> dict[str, Path]:
-    """Write JSON, rectified image, and perspective-correct original annotation."""
+def _should_annotate(result: ReceiptResult, mode: str) -> bool:
+    """按 mode 决定是否给这张图画标注。
+
+    "all" 每张都标;"none" 都不标;"flagged" 只标缺核心字段(需人工复核)的。
+    完整回单(核心字段齐全)在 flagged 模式下跳过标注,省下绘制+编码开销。
+    """
+    if mode == "none":
+        return False
+    if mode != "flagged":
+        return True  # "all" 或未知值一律画,保持向后兼容
+    detected = {item.detection.label for item in result.detections}
+    return not all(label in detected for label in REQUIRED_DETECTION_CLASSES)
+
+
+def write_receipt_result(
+    result: ReceiptResult, output_stem: str | Path, *, annotate_mode: str = "all"
+) -> dict[str, Path]:
+    """写 JSON;按 annotate_mode 决定是否画+存标注图。
+
+    annotate_mode:"all"(每张都标)/"flagged"(只标缺核心字段、需复核的)/"none"(都不标)。
+    标注(画两张 CJK 面板 + 编码两张 JPEG)约占检测阶段 31%;完整回单跳过它可大幅提速,
+    JSON 始终照写、内容不受影响。默认 "all",不传即与原行为逐字节一致。
+    """
     output_stem = Path(output_stem)
     output_stem.parent.mkdir(parents=True, exist_ok=True)
+    json_path = output_stem.with_suffix(".json")
+    json_path.write_text(json.dumps(result.as_dict(), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    written: dict[str, Path] = {"json": json_path}
+    if not _should_annotate(result, annotate_mode):
+        return written
+
     structured_text = {
         "time": result.fields.get("time", {}).get("value"),
         "amount": result.fields.get("amount", {}).get("normalized"),
@@ -291,7 +319,6 @@ def write_receipt_result(result: ReceiptResult, output_stem: str | Path) -> dict
             status_style_item = StatusStyleRenderItem(label, float(confidence))
     rectified_path = output_stem.with_name(output_stem.name + "_rectified_annotated.jpg")
     original_path = output_stem.with_name(output_stem.name + "_original_annotated.jpg")
-    json_path = output_stem.with_suffix(".json")
     save_rgb(
         rectified_path,
         draw_rectified_circles(
@@ -311,5 +338,6 @@ def write_receipt_result(result: ReceiptResult, output_stem: str | Path) -> dict
             device=result.device,
         ),
     )
-    json_path.write_text(json.dumps(result.as_dict(), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    return {"json": json_path, "rectified_annotation": rectified_path, "original_annotation": original_path}
+    written["rectified_annotation"] = rectified_path
+    written["original_annotation"] = original_path
+    return written

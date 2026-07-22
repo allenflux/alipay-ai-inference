@@ -24,6 +24,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="auto", help="Paddle device: auto, cpu, cuda, or cuda:N")
     parser.add_argument("--continue-on-error", action="store_true")
     parser.add_argument("--skip-existing", action="store_true")
+    parser.add_argument(
+        "--annotate", choices=("flagged", "all", "none"), default="all",
+        help="标注哪些图:all=每张 / flagged=只标缺核心字段的 / none=都不标",
+    )
     parser.add_argument("--_quiet", action="store_true", help=argparse.SUPPRESS)
     return parser
 
@@ -330,6 +334,7 @@ def run_ocr_enrichment(
     reader: Any,
     skip_existing: bool = False,
     continue_on_error: bool = False,
+    annotate: str = "all",
 ) -> list[dict[str, str]]:
     """Complete one detector batch without importing or instantiating Torch."""
     # These imports occur only after PaddleOCR has been initialised by ``main``.
@@ -383,7 +388,7 @@ def run_ocr_enrichment(
                     record = _written_record(source_path, output_stem, status="skipped_existing")
                 else:
                     result, source_path = _rehydrate_result(payload, rectified_path, reader)
-                    write_receipt_result(result, output_stem)
+                    write_receipt_result(result, output_stem, annotate_mode=annotate)
                     record = _written_record(source_path, output_stem, status="written")
                 final_manifest.append(record)
                 manifest_jsonl.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -422,6 +427,7 @@ def main(argv: list[str] | None = None) -> None:
         reader=reader,
         skip_existing=args.skip_existing,
         continue_on_error=args.continue_on_error,
+        annotate=args.annotate,
     )
     if not args._quiet:
         print(f"Wrote {len(outputs)} inference result bundle(s) to {args.output}")
