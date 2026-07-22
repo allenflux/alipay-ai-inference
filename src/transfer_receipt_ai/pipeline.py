@@ -293,51 +293,51 @@ def write_receipt_result(
     output_stem = Path(output_stem)
     output_stem.parent.mkdir(parents=True, exist_ok=True)
     json_path = output_stem.with_suffix(".json")
-    json_path.write_text(json.dumps(result.as_dict(), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     written: dict[str, Path] = {"json": json_path}
-    if not _should_annotate(result, annotate_mode):
-        return written
-
-    structured_text = {
-        "time": result.fields.get("time", {}).get("value"),
-        "amount": result.fields.get("amount", {}).get("normalized"),
-        "recipient_field": result.fields.get("recipient", {}).get("value"),
-        "payment_method_field": result.fields.get("payment_method", {}).get("value"),
-    }
-    items: list[RenderItem] = []
-    for extracted in result.detections:
-        item = extracted.render_item()
-        replacement = structured_text.get(item.label)
-        if isinstance(replacement, str) and replacement:
-            item = RenderItem(item.label, item.score, item.bbox_xyxy, replacement)
-        items.append(item)
-    status_style_item: StatusStyleRenderItem | None = None
-    if result.status_style is not None:
-        label = result.status_style.get("label")
-        confidence = result.status_style.get("confidence")
-        if isinstance(label, str) and isinstance(confidence, (int, float)):
-            status_style_item = StatusStyleRenderItem(label, float(confidence))
-    rectified_path = output_stem.with_name(output_stem.name + "_rectified_annotated.jpg")
-    original_path = output_stem.with_name(output_stem.name + "_original_annotated.jpg")
-    save_rgb(
-        rectified_path,
-        draw_rectified_circles(
-            result.rectification.rectified_rgb,
-            items,
-            status_style=status_style_item,
-            device=result.device,
-        ),
-    )
-    save_rgb(
-        original_path,
-        draw_original_circles(
-            result.rectification.source_rgb,
-            items,
-            result.rectification.rectified_to_original,
-            status_style=status_style_item,
-            device=result.device,
-        ),
-    )
-    written["rectified_annotation"] = rectified_path
-    written["original_annotation"] = original_path
+    if _should_annotate(result, annotate_mode):
+        structured_text = {
+            "time": result.fields.get("time", {}).get("value"),
+            "amount": result.fields.get("amount", {}).get("normalized"),
+            "recipient_field": result.fields.get("recipient", {}).get("value"),
+            "payment_method_field": result.fields.get("payment_method", {}).get("value"),
+        }
+        items: list[RenderItem] = []
+        for extracted in result.detections:
+            item = extracted.render_item()
+            replacement = structured_text.get(item.label)
+            if isinstance(replacement, str) and replacement:
+                item = RenderItem(item.label, item.score, item.bbox_xyxy, replacement)
+            items.append(item)
+        status_style_item: StatusStyleRenderItem | None = None
+        if result.status_style is not None:
+            label = result.status_style.get("label")
+            confidence = result.status_style.get("confidence")
+            if isinstance(label, str) and isinstance(confidence, (int, float)):
+                status_style_item = StatusStyleRenderItem(label, float(confidence))
+        rectified_path = output_stem.with_name(output_stem.name + "_rectified_annotated.jpg")
+        original_path = output_stem.with_name(output_stem.name + "_original_annotated.jpg")
+        save_rgb(
+            rectified_path,
+            draw_rectified_circles(
+                result.rectification.rectified_rgb,
+                items,
+                status_style=status_style_item,
+                device=result.device,
+            ),
+        )
+        save_rgb(
+            original_path,
+            draw_original_circles(
+                result.rectification.source_rgb,
+                items,
+                result.rectification.rectified_to_original,
+                status_style=status_style_item,
+                device=result.device,
+            ),
+        )
+        written["rectified_annotation"] = rectified_path
+        written["original_annotation"] = original_path
+    # JSON 最后写:它是"这张图已处理完成"的权威标记(标注图是派生产物)。skip-existing 续跑
+    # 只认 JSON 在不在,不再依赖标注图,因此 --annotate flagged/none 跳过标注也能被正确识别为已完成。
+    json_path.write_text(json.dumps(result.as_dict(), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return written

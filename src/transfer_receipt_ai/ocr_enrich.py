@@ -115,9 +115,8 @@ def _written_record(source_path: Path, output_stem: Path, *, status: str) -> dic
 def _ocr_committed_result_exists(source_path: Path, output_stem: Path) -> bool:
     """Return whether a final result bundle was completed by the OCR stage."""
     result_path = output_stem.with_suffix(".json")
-    rectified_path = output_stem.with_name(output_stem.name + "_rectified_annotated.jpg")
-    original_path = output_stem.with_name(output_stem.name + "_original_annotated.jpg")
-    if not all(path.is_file() for path in (result_path, rectified_path, original_path)):
+    # 只看 JSON(写在标注图之后的完成标记);标注图在 flagged/none 下可能缺,不作为续跑依据。
+    if not result_path.is_file():
         return False
     if result_path.stat().st_mtime_ns < source_path.stat().st_mtime_ns:
         return False

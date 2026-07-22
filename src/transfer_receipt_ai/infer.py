@@ -155,9 +155,9 @@ def _committed_result_exists(
     require_ocr_for_skip: bool = False,
 ) -> bool:
     result_path = output_stem.with_suffix(".json")
-    rectified_path = output_stem.with_name(output_stem.name + "_rectified_annotated.jpg")
-    original_path = output_stem.with_name(output_stem.name + "_original_annotated.jpg")
-    if not all(path.is_file() for path in (result_path, rectified_path, original_path)):
+    # JSON 写在标注图之后,是"已处理完成"的权威标记;标注图在 --annotate flagged/none 下可能
+    # 不写,故续跑判定只看 JSON 是否存在,不再要求标注图。
+    if not result_path.is_file():
         return False
     if result_path.stat().st_mtime_ns < source_path.stat().st_mtime_ns:
         return False
