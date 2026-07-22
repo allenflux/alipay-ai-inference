@@ -75,6 +75,7 @@ class ReceiptResult:
     fields: dict[str, Any]
     status_style: dict[str, Any] | None = None
     tags: dict[str, Any] | None = None
+    device: dict[str, Any] | None = None
 
     def as_dict(self) -> dict[str, object]:
         output: dict[str, object] = {
@@ -89,6 +90,9 @@ class ReceiptResult:
             output["status_style"] = self.status_style
         if self.tags is not None:
             output["tags"] = self.tags
+        # 设备识别(安卓/苹果):看原图状态栏 + 分辨率,替代对号那套。可选字段,不影响原 v1 schema。
+        if self.device is not None:
+            output["device"] = self.device
         return output
 
 
@@ -161,6 +165,7 @@ class ReceiptPipeline:
         status_style_model: dict[str, object] | None = None,
         status_style_inference_config: dict[str, object] | None = None,
         status_style_margin_ratio: float = 0.30,
+        device_predictor: Any | None = None,
     ) -> None:
         if status_style_margin_ratio < 0:
             raise ValueError("status_style_margin_ratio cannot be negative")
@@ -168,6 +173,7 @@ class ReceiptPipeline:
         self.ocr = ocr
         self.rectification_options = rectification_options or RectificationOptions()
         self.status_style_predictor = status_style_predictor
+        self.device_predictor = device_predictor
         self.status_style_model = dict(status_style_model) if status_style_model is not None else None
         self.status_style_inference_config = (
             dict(status_style_inference_config)
@@ -195,8 +201,7 @@ class ReceiptPipeline:
             }
         else:
             # The detector normally emits at most one item per class.  When a
-            # custom predictor emits duplicates, classify the strongest box;
-            # --require-complete still rejects the duplicate five-field result.
+            # custom predictor emits duplicates, classify the strongest box.
             status_detection = max(matches, key=lambda detection: detection.score)
             crop = crop_status_region(
                 rectified_rgb,
@@ -228,6 +233,10 @@ class ReceiptPipeline:
     def run(self, source_path: str | Path) -> ReceiptResult:
         source_path = Path(source_path)
         source_rgb = load_upright_rgb(source_path)
+        # 设备识别看的是原图状态栏(最顶上),不是矫正后的裁剪;复用已解码的 source_rgb,零额外解码。
+        device: dict[str, Any] | None = None
+        if self.device_predictor is not None:
+            device = self.device_predictor.classify(source_rgb)
         rectification = rectify_receipt(source_rgb, self.rectification_options)
         raw_detections = self.predictor.predict(rectification.rectified_rgb)
         status_style: dict[str, Any] | None = None
@@ -253,6 +262,7 @@ class ReceiptPipeline:
             fields=_build_fields(detections),
             status_style=status_style,
             tags=tags,
+            device=device,
         )
 
 
@@ -288,6 +298,7 @@ def write_receipt_result(result: ReceiptResult, output_stem: str | Path) -> dict
             result.rectification.rectified_rgb,
             items,
             status_style=status_style_item,
+            device=result.device,
         ),
     )
     save_rgb(
@@ -297,6 +308,7 @@ def write_receipt_result(result: ReceiptResult, output_stem: str | Path) -> dict
             items,
             result.rectification.rectified_to_original,
             status_style=status_style_item,
+            device=result.device,
         ),
     )
     json_path.write_text(json.dumps(result.as_dict(), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

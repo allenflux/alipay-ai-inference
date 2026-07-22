@@ -38,6 +38,7 @@ STATUS_STYLE_COLORS = {
     "check_absent": (224, 74, 74),
     "unknown": (225, 145, 35),
 }
+DEVICE_LEGEND_COLOR = (220, 30, 30)  # 红色:设备识别行在“识别结果”面板里高亮(对齐运营交付图 2.jpg)
 
 
 @dataclass(frozen=True)
@@ -98,6 +99,15 @@ def _status_style_caption(item: StatusStyleRenderItem) -> str:
     return f"设备/风险标签 {value} ({item.confidence:.0%})"
 
 
+def _device_caption(device: dict) -> str:
+    """设备识别行文案:如“设备 苹果 (99%)”。"""
+    platform_cn = str(device.get("platform_cn") or device.get("platform") or "未知")
+    confidence = device.get("confidence")
+    if isinstance(confidence, (int, float)):
+        return f"设备 {platform_cn} ({confidence:.0%})"
+    return f"设备 {platform_cn}"
+
+
 def _wrap_caption(draw: ImageDraw.ImageDraw, caption: str, font: ImageFont.ImageFont, max_width: int) -> str:
     """Wrap mixed Chinese/ASCII captions without relying on whitespace."""
     lines: list[str] = []
@@ -119,6 +129,7 @@ def _draw_items(
     item_polygons: Iterable[tuple[RenderItem, np.ndarray]],
     *,
     status_style: StatusStyleRenderItem | None = None,
+    device: dict | None = None,
 ) -> np.ndarray:
     pairs = sorted(
         list(item_polygons),
@@ -133,7 +144,7 @@ def _draw_items(
         points = [tuple(float(value) for value in point) for point in polygon]
         image_draw.line(points, fill=color, width=line_width, joint="curve")
 
-    if not pairs and status_style is None:
+    if not pairs and status_style is None and not device:
         return np.asarray(image)
 
     # Keep OCR text entirely outside the source pixels. The annotated image is
@@ -231,6 +242,46 @@ def _draw_items(
                 font=font,
                 spacing=max(3, font_size // 5),
             )
+            cursor_y += entry_height + max(7, padding // 2)
+
+    # 设备识别行:接在同事的字段卡片下面,红框红字高亮(对齐运营交付图 2.jpg)
+    if device:
+        color = DEVICE_LEGEND_COLOR
+        number = len(pairs) + (2 if status_style is not None else 1)
+        caption = f"{number}. {_device_caption(device)}"
+        try:
+            caption = _wrap_caption(draw, caption, font, max(100, text_width))
+            text_box = draw.multiline_textbbox((0, 0), caption, font=font, spacing=max(3, font_size // 5))
+        except UnicodeEncodeError:
+            platform = str(device.get("platform") or "unknown")
+            conf = device.get("confidence")
+            conf_suffix = f" ({conf:.0%})" if isinstance(conf, (int, float)) else ""
+            caption = f"{number}. Device {platform}{conf_suffix}"
+            text_box = draw.multiline_textbbox((0, 0), caption, font=font, spacing=3)
+        entry_height = max(font_size + padding, text_box[3] - text_box[1] + padding * 2)
+        if cursor_y + entry_height <= height - padding:
+            left = width + padding
+            right = width + panel_width - padding
+            draw.rounded_rectangle(
+                (left, cursor_y, right, cursor_y + entry_height),
+                radius=max(4, padding // 2),
+                fill=(255, 255, 255),
+                outline=color,
+                width=max(2, line_width // 2),
+            )
+            stripe_width = max(5, padding // 2)
+            draw.rounded_rectangle(
+                (left, cursor_y, left + stripe_width, cursor_y + entry_height),
+                radius=max(3, stripe_width // 2),
+                fill=color,
+            )
+            draw.multiline_text(
+                (left + stripe_width + padding, cursor_y + padding),
+                caption,
+                fill=color,
+                font=font,
+                spacing=max(3, font_size // 5),
+            )
     return np.asarray(canvas)
 
 
@@ -239,12 +290,14 @@ def draw_rectified_circles(
     items: Sequence[RenderItem],
     *,
     status_style: StatusStyleRenderItem | None = None,
+    device: dict | None = None,
 ) -> np.ndarray:
     """Draw ellipse outlines in the detector's rectified coordinate system."""
     return _draw_items(
         image_rgb,
         ((item, ellipse_polygon(item.bbox_xyxy)) for item in items),
         status_style=status_style,
+        device=device,
     )
 
 
@@ -254,6 +307,7 @@ def draw_original_circles(
     rectified_to_original: np.ndarray,
     *,
     status_style: StatusStyleRenderItem | None = None,
+    device: dict | None = None,
 ) -> np.ndarray:
     """Project rectified ellipses back into the photo before drawing them.
 
@@ -267,4 +321,5 @@ def draw_original_circles(
             for item in items
         ),
         status_style=status_style,
+        device=device,
     )

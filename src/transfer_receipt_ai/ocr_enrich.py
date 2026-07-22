@@ -302,10 +302,13 @@ def _rehydrate_result(payload: dict[str, Any], rectified_path: Path, reader: Any
 
     status_style = payload.get("status_style")
     tags = payload.get("tags")
+    device = payload.get("device")
     if status_style is not None and not isinstance(status_style, dict):
         raise ValueError("Detector-stage artifact has invalid status_style")
     if tags is not None and not isinstance(tags, dict):
         raise ValueError("Detector-stage artifact has invalid tags")
+    if device is not None and not isinstance(device, dict):
+        raise ValueError("Detector-stage artifact has invalid device")
     return (
         ReceiptResult(
             source_path=source_path.resolve().as_posix(),
@@ -314,6 +317,7 @@ def _rehydrate_result(payload: dict[str, Any], rectified_path: Path, reader: Any
             fields=_build_fields(detections),
             status_style=status_style,
             tags=tags,
+            device=device,
         ),
         source_path,
     )

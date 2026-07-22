@@ -11,7 +11,7 @@ from typing import Any, Mapping
 from tqdm import tqdm
 
 from .geometry import RectificationOptions, save_rgb
-from .labels import DETECTION_CLASSES
+from .labels import REQUIRED_DETECTION_CLASSES
 from .model import LRCNNPredictor
 from .ocr import PaddleOCRReader
 from .pipeline import ReceiptPipeline, write_receipt_result
@@ -22,6 +22,7 @@ from .status_style import (
     status_style_checkpoint_signature,
     status_style_tags,
 )
+from .device_statusbar import StatusBarDeviceClassifier
 
 
 STATUS_STYLE_MARGIN_RATIO = 0.30
@@ -124,6 +125,7 @@ def _write_ocr_stage_artifacts(result: Any, output_stem: Path) -> None:
         ],
         "status_style": result.status_style,
         "tags": result.tags,
+        "device": result.device,
     }
     artifact_path.parent.mkdir(parents=True, exist_ok=True)
     save_rgb(rectified_path, rectification.rectified_rgb)
@@ -200,13 +202,19 @@ def _written_record(source_path: Path, output_stem: Path, *, status: str) -> dic
     }
 
 
-def _require_five_fields(result: Any) -> None:
+def _require_core_fields(result: Any) -> None:
+    """require-complete：要求 4 个核心交易字段都检测到；time（状态栏时钟）可选。
+
+    时钟不是交易字段，而且设备识别那边已从状态栏读取它，不应因为少了时钟（常见于
+    安卓右侧时钟漏检、通知横幅遮挡）就把整张回单丢弃。核心字段真缺（金额/状态被遮挡
+    或本就不是转账成功页）才判为不完整。
+    """
     detected = {item.detection.label for item in result.detections}
-    missing = [label for label in DETECTION_CLASSES if label not in detected]
-    if missing or len(result.detections) != len(DETECTION_CLASSES):
+    missing = [label for label in REQUIRED_DETECTION_CLASSES if label not in detected]
+    if missing:
         raise ValueError(
-            "incomplete detection: expected exactly five fields; "
-            f"found={len(result.detections)}, missing={','.join(missing) or 'none'}"
+            "incomplete detection: missing required transfer fields; "
+            f"missing={','.join(missing)} (found={','.join(sorted(detected)) or 'none'})"
         )
 
 
@@ -236,6 +244,7 @@ def run_inference(
     write_ocr_stage_artifacts: bool = False,
     skip_existing_output_dir: Path | None = None,
     require_ocr_for_skip: bool = False,
+    platform_checkpoint: Path | None = None,
 ) -> list[dict[str, str]]:
     """Process an image or image tree and write one result bundle per raw image."""
     all_image_paths = list(iter_image_paths(input_path))
@@ -284,6 +293,12 @@ def run_inference(
             confidence_threshold=status_confidence_threshold,
             absent_confidence_threshold=status_absent_confidence_threshold,
         )
+    # 设备识别(状态栏 CNN + 分辨率)。Torch 模型,只在检测阶段构建,不进 Paddle 阶段。
+    device_predictor = (
+        StatusBarDeviceClassifier(platform_checkpoint, device=device)
+        if platform_checkpoint is not None
+        else None
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
     manifest_path, manifest_jsonl_path, errors_jsonl_path = _manifest_paths(output_dir, shard_index, shard_count)
     manifest: list[dict[str, str]] = []
@@ -331,10 +346,11 @@ def run_inference(
                     status_style_model=status_style_model,
                     status_style_inference_config=status_style_inference_config,
                     status_style_margin_ratio=STATUS_STYLE_MARGIN_RATIO,
+                    device_predictor=device_predictor,
                 )
                 result = pipeline.run(source_path)
                 if require_complete:
-                    _require_five_fields(result)
+                    _require_core_fields(result)
                 if write_ocr_stage_artifacts:
                     _write_ocr_stage_artifacts(result, output_stem)
                 else:
@@ -367,6 +383,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--status-style-checkpoint",
         type=Path,
         help="Optional status-style classifier checkpoint; omit to keep the original five-field v1 output",
+    )
+    parser.add_argument(
+        "--platform-checkpoint",
+        type=Path,
+        help="Optional status-bar device (Android/iOS) classifier checkpoint; adds a 'device' field",
     )
     parser.add_argument("--input", type=Path, required=True, help="Raw image or raw-image directory")
     parser.add_argument("--output", type=Path, required=True)
@@ -454,6 +475,7 @@ def main(argv: list[str] | None = None) -> None:
         write_ocr_stage_artifacts=args._write_ocr_stage_artifacts,
         skip_existing_output_dir=args._skip_existing_output,
         require_ocr_for_skip=args._require_ocr_complete_for_skip,
+        platform_checkpoint=args.platform_checkpoint,
     )
     if not args._quiet:
         print(f"Wrote {len(outputs)} inference result bundle(s) to {args.output}")
