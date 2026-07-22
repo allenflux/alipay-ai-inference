@@ -268,3 +268,55 @@ def draw_original_circles(
         ),
         status_style=status_style,
     )
+
+
+DEVICE_BADGE_COLOR = (220, 30, 30)  # 红色:设备判定高亮,对齐运营交付图(2.jpg)风格
+
+
+def draw_device_badge(
+    image_rgb: np.ndarray,
+    device: dict | None,
+    *,
+    statusbar_box: bool = False,
+) -> np.ndarray:
+    """把设备识别结果(安卓/苹果)标到图上:左上角红字标签;原图再加顶部状态栏红框(判定依据)。
+
+    device 为空时原样返回——保证不传 --platform-checkpoint(device=None)时,
+    标注图与旧 v1 逐字节一致(逐字节测试因此不受影响)。
+    """
+    if not device:
+        return image_rgb
+    platform_cn = str(device.get("platform_cn") or device.get("platform") or "未知")
+    confidence = device.get("confidence")
+    label = f"设备 {platform_cn}"
+    if isinstance(confidence, (int, float)):
+        label += f" ({confidence:.0%})"
+
+    image = Image.fromarray(image_rgb.copy())
+    draw = ImageDraw.Draw(image)
+    height, width = image_rgb.shape[:2]
+    line_width = max(3, min(8, int(round(max(height, width) * 0.0025))))
+    font_size = max(16, int(round(height * 0.018)))
+    font = _find_font(font_size)
+
+    top = line_width
+    if statusbar_box:
+        # 顶部状态栏红框——设备判定的依据(与 2.jpg 的“判定依据”框一致)
+        bar_bottom = max(int(height * 0.058), font_size + 8)
+        draw.rectangle(
+            [line_width, line_width, width - line_width, bar_bottom],
+            outline=DEVICE_BADGE_COLOR,
+            width=line_width,
+        )
+        draw.text((line_width + 6, bar_bottom + 4), "状态栏(判定依据)", fill=DEVICE_BADGE_COLOR, font=font)
+        top = bar_bottom + 4 + font_size + 8
+
+    # 设备标签:白底红字画在左上,任意底色上都可读
+    pad = 6
+    text_width = int(draw.textlength(label, font=font))
+    draw.rectangle(
+        [line_width, top, line_width + text_width + 2 * pad, top + font_size + 2 * pad],
+        fill=(255, 255, 255),
+    )
+    draw.text((line_width + pad, top + pad), label, fill=DEVICE_BADGE_COLOR, font=font)
+    return np.asarray(image)
