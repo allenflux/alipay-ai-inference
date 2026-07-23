@@ -383,7 +383,8 @@ internal static class ImagePipeline
         var resizedHeight = Math.Clamp((int)Math.Round(source.Height * scale, MidpointRounding.ToEven), 1, DetectorHeight);
         var left = (DetectorWidth - resizedWidth) / 2;
         var top = (DetectorHeight - resizedHeight) / 2;
-        using var resized = source.Clone(context => context.Resize(resizedWidth, resizedHeight, KnownResamplers.Bilinear));
+        // ImageSharp calls the bilinear kernel "Triangle".
+        using var resized = source.Clone(context => context.Resize(resizedWidth, resizedHeight, KnownResamplers.Triangle));
         using var canvas = new Image<Rgb24>(DetectorWidth, DetectorHeight);
         canvas.Mutate(context => context.DrawImage(resized, new Point(left, top), 1.0f));
 
