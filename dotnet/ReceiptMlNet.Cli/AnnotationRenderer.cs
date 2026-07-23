@@ -5,17 +5,18 @@ using SixLabors.ImageSharp.Drawing.Processing;
 using SixLabors.ImageSharp.Formats.Jpeg;
 using SixLabors.ImageSharp.PixelFormats;
 using SixLabors.ImageSharp.Processing;
+using IOPath = System.IO.Path;
 
 internal sealed record AnnotationPaths(string Rectified, string Original)
 {
     public static AnnotationPaths ForResultJson(string resultJsonPath)
     {
-        var fullResultPath = Path.GetFullPath(resultJsonPath);
-        var directory = Path.GetDirectoryName(fullResultPath)!;
-        var stem = Path.GetFileNameWithoutExtension(fullResultPath);
+        var fullResultPath = IOPath.GetFullPath(resultJsonPath);
+        var directory = IOPath.GetDirectoryName(fullResultPath)!;
+        var stem = IOPath.GetFileNameWithoutExtension(fullResultPath);
         return new AnnotationPaths(
-            Path.Combine(directory, stem + "_rectified_annotated.jpg"),
-            Path.Combine(directory, stem + "_original_annotated.jpg"));
+            IOPath.Combine(directory, stem + "_rectified_annotated.jpg"),
+            IOPath.Combine(directory, stem + "_original_annotated.jpg"));
     }
 }
 
@@ -47,7 +48,7 @@ internal static class AnnotationRenderer
         DeviceResult? device,
         AnnotationPaths paths)
     {
-        Directory.CreateDirectory(Path.GetDirectoryName(paths.Rectified)!);
+        Directory.CreateDirectory(IOPath.GetDirectoryName(paths.Rectified)!);
         using var source = ImagePipeline.LoadUprightRgb(inputFile);
         using var canvas = Render(source, detections, device);
         var encoder = new JpegEncoder { Quality = 95 };
