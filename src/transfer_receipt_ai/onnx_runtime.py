@@ -147,6 +147,24 @@ def onnx_providers(device: str, ort: Any) -> list[Any]:
     raise ValueError("ONNX device must be auto, cpu, cuda, or cuda:<non-negative integer>")
 
 
+def _preload_cuda_dlls(ort: Any, providers: list[Any]) -> None:
+    """Load CUDA/cuDNN DLLs before creating a Windows CUDA session when supported.
+
+    Recent ``onnxruntime-gpu`` wheels provide ``preload_dlls``.  It discovers
+    the DLLs bundled with PyTorch as well as NVIDIA pip packages, avoiding a
+    fragile requirement for users to edit their system PATH.  Older ORT builds
+    do not expose the helper and retain their native loader behaviour.
+    """
+
+    uses_cuda = any(
+        (provider[0] if isinstance(provider, tuple) else provider) == "CUDAExecutionProvider"
+        for provider in providers
+    )
+    preload_dlls = getattr(ort, "preload_dlls", None)
+    if uses_cuda and callable(preload_dlls):
+        preload_dlls()
+
+
 def _static_image_shape(session: Any, input_name: str) -> tuple[bool, int, int]:
     """Return ``(has_batch_axis, height, width)`` for an exported image input."""
 
@@ -197,6 +215,7 @@ class OnnxLRCNNPredictor:
             raise FileNotFoundError(f"ONNX model not found: {self.model_path}")
         ort = _import_onnxruntime()
         self.providers = onnx_providers(device, ort)
+        _preload_cuda_dlls(ort, self.providers)
         self.session = ort.InferenceSession(str(self.model_path), providers=self.providers)
         self.input_name = input_name
         self.has_batch_axis, self.input_height, self.input_width = _static_image_shape(self.session, input_name)
@@ -298,6 +317,7 @@ class OnnxStatusBarDeviceClassifier:
             raise FileNotFoundError(f"ONNX model not found: {self.model_path}")
         ort = _import_onnxruntime()
         self.providers = onnx_providers(device, ort)
+        _preload_cuda_dlls(ort, self.providers)
         self.session = ort.InferenceSession(str(self.model_path), providers=self.providers)
         self.input_name = input_name
         input_meta = next((item for item in self.session.get_inputs() if item.name == input_name), None)

@@ -117,25 +117,51 @@ checkpoints\statusbar_device_v1\best.pt
 
 ## 单图验证
 
+以下命令已在 Windows CUDA 环境验证通过；项目目录是
+`D:\alipay-ai-data\alipay-ai-inference`：
+
 ```powershell
-receipt-model-infer `
+python -m receipt_inference.cli `
   --input "D:\download\TempFakeImages\s3_voucher_GWCZ2071991511234514944_20260701001815.png" `
   --output "D:\download\TempFakeResults_v1" `
-  --platform-checkpoint "D:\path\alipay-ai-inference\checkpoints\statusbar_device_v1\best.pt" `
+  --platform-checkpoint "D:\alipay-ai-data\alipay-ai-inference\checkpoints\statusbar_device_v1\best.pt" `
   --device cuda `
   --ocr paddle `
   --require-complete
 ```
 
-也可以使用模块入口：
+## 批量推理
+
+将 `--input` 指向图片目录即可递归处理目录下的所有受支持图片。先用 `--limit 100` 做
+100 张试跑；输出目录应放在输入目录之外。`--continue-on-error` 会把坏图或缺少核心字段的
+图片记录到 `inference_errors.jsonl`，但不阻断其他图片：
 
 ```powershell
 python -m receipt_inference.cli `
-  --input "D:\path\receipt.png" `
-  --output "D:\path\results" `
+  --input "D:\download\TempFakeImages" `
+  --output "D:\download\TempFakeResults_batch100" `
+  --platform-checkpoint "D:\alipay-ai-data\alipay-ai-inference\checkpoints\statusbar_device_v1\best.pt" `
   --device cuda `
   --ocr paddle `
-  --require-complete
+  --require-complete `
+  --continue-on-error `
+  --limit 100
+```
+
+任务中断后，以相同的输入、输出和模型参数重新运行，并追加 `--skip-existing`，即可跳过已经
+完成 OCR 的结果：
+
+```powershell
+python -m receipt_inference.cli `
+  --input "D:\download\TempFakeImages" `
+  --output "D:\download\TempFakeResults_batch100" `
+  --platform-checkpoint "D:\alipay-ai-data\alipay-ai-inference\checkpoints\statusbar_device_v1\best.pt" `
+  --device cuda `
+  --ocr paddle `
+  --require-complete `
+  --continue-on-error `
+  --limit 100 `
+  --skip-existing
 ```
 
 在 Windows GPU 环境中，以上 `--ocr paddle` 命令会自动使用**同一个虚拟环境**启动两个
@@ -175,15 +201,29 @@ ONNX 是标准交付物，不是 ML.NET 专属格式。当前项目可导出并�
 - `receipt_lrcnn_v1` 主检测器；
 - `statusbar_device_v1` 可选设备识别 CNN。
 
-先在能够加载原始 `.pt` 的服务器安装导出验证依赖。CPU 验证使用 `onnxruntime`；若最终
-服务器需要 CUDA ONNX 推理，请安装与 CUDA 匹配的 `onnxruntime-gpu`，不要同时保留两个
-ONNX Runtime 包。
+先在能够加载原始 `.pt` 的服务器安装导出验证依赖。`requirements-export.txt` 安装的是用于
+导出校验的 CPU 版 `onnxruntime`。最终服务器若需要 CUDA ONNX 推理，必须将它替换为与 CUDA
+匹配的 `onnxruntime-gpu`，不要同时保留两个 ONNX Runtime 包。
 
 ```powershell
 python -m pip install -r requirements-export.txt
 # Pull 到包含 ONNX 命令的代码后，刷新 editable console script。
 python -m pip install -e . --no-deps
 ```
+
+### Windows CUDA 12 ONNX 推理
+
+当前部署环境若使用 CUDA 12.x（例如 `venv-cu126`），安装 CUDA 12 构建的 ONNX Runtime GPU
+包。先移除 CPU/GPU 两种旧包，再限定到 1.26.x；这样不会误装从 1.27 起默认 CUDA 13 的 wheel：
+
+```powershell
+python -m pip uninstall -y onnxruntime onnxruntime-gpu
+python -m pip install "onnxruntime-gpu>=1.21,<1.27"
+python -c "import onnxruntime as ort; print(ort.__version__); print(ort.get_available_providers())"
+```
+
+最后一条必须显示 `CUDAExecutionProvider`。运行时会自动预加载 PyTorch 或 NVIDIA pip 包中的
+CUDA/cuDNN DLL；如果未显示该 provider，不要传 `--device cuda`，先解决环境安装问题。
 
 主检测器是 TorchVision Faster R-CNN。为保证 ONNX Runtime / .NET 的稳定性，导出固定的
 单图输入画布，默认协议为 `image: float32 [3, 1536, 864]`（CHW、RGB、像素 `0..1`）。

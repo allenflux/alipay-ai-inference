@@ -9,7 +9,7 @@ from receipt_inference import cli, models
 from transfer_receipt_ai.geometry import RectificationOptions, RectificationResult
 from transfer_receipt_ai.infer import _write_ocr_stage_artifacts
 from transfer_receipt_ai.model import Detection
-from transfer_receipt_ai.onnx_runtime import prepare_detector_input
+from transfer_receipt_ai.onnx_runtime import _preload_cuda_dlls, prepare_detector_input
 from transfer_receipt_ai.ocr import OCRResult
 from transfer_receipt_ai.ocr_enrich import run_ocr_enrichment
 from transfer_receipt_ai.pipeline import ExtractedDetection, ReceiptPipeline, ReceiptResult, write_receipt_result
@@ -106,6 +106,22 @@ def test_onnx_letterbox_preprocessing_restores_source_coordinates() -> None:
     # 200×100 scales to 300×150 and is vertically centred at y=75.
     restored = mapping.restore_boxes(np.array([[0, 75, 300, 225]], dtype=np.float32))
     np.testing.assert_allclose(restored, [[0, 0, 200, 100]], atol=1e-5)
+
+
+def test_onnx_cuda_provider_preloads_dlls_when_supported() -> None:
+    calls: list[bool] = []
+
+    class FakeOrt:
+        @staticmethod
+        def preload_dlls() -> None:
+            calls.append(True)
+
+    _preload_cuda_dlls(
+        FakeOrt(),
+        [("CUDAExecutionProvider", {"device_id": "0"}), "CPUExecutionProvider"],
+    )
+
+    assert calls == [True]
 
 
 def test_paddle_cli_uses_two_sequential_workers_in_the_same_venv(monkeypatch, tmp_path) -> None:
