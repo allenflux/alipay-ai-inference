@@ -108,7 +108,7 @@ internal static class ReceiptMlNetProgram
         }
 
         WriteJsonAtomic(Path.Combine(options.OutputDirectory, "inference_manifest.json"), manifest);
-        Console.WriteLine($"Wrote {manifest.Count(record => record.Status == \"written\")} ML.NET result bundle(s) to {options.OutputDirectory}");
+        Console.WriteLine($"Wrote {manifest.Count(record => record.Status == "written")} ML.NET result bundle(s) to {options.OutputDirectory}");
     }
 
     private static ReceiptResult InferImage(
@@ -524,7 +524,7 @@ internal sealed record ModelContract(string FileName)
         var kind = root.GetProperty("kind").GetString();
         if (!string.Equals(kind, expectedKind, StringComparison.Ordinal))
         {
-            throw new UsageException($"Contract {contractPath} has kind {kind ?? \"(missing)\"}; expected {expectedKind}");
+            throw new UsageException($"Contract {contractPath} has kind {kind ?? "(missing)"}; expected {expectedKind}");
         }
         var expectedHash = root.GetProperty("onnx").GetProperty("sha256").GetString();
         var actualHash = Sha256(fullModelPath);
