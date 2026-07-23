@@ -5,6 +5,8 @@
 
 第一阶段只注册 `receipt_lrcnn_v1`，并且不加载 `status_style_v1`。后续增加其他模型时，
 在 `src/receipt_inference/models.py` 注册模型目录，再按模型输入输出差异增加 runner。
+可选的状态栏设备识别模型不在注册表中；通过 `--platform-checkpoint` 或
+`--platform-onnx-model` 显式启用。
 
 ## 目录结构
 
@@ -13,6 +15,9 @@ alipay-ai-inference/
   checkpoints/
     receipt_lrcnn_v1/
       best.pt                 # 部署时复制进来，不提交 Git
+    statusbar_device_v1/
+      best.pt                 # 可选：Android/iOS 状态栏设备识别
+  artifacts/                  # 建议放导出的 ONNX 与 contract JSON
   src/
     receipt_inference/        # 多模型入口与模型注册表
     transfer_receipt_ai/      # 当前回执模型运行时代码
@@ -20,6 +25,7 @@ alipay-ai-inference/
   pyproject.toml
   requirements.txt
   requirements-ocr.txt
+  requirements-export.txt
   requirements-dev.txt
 ```
 
@@ -91,7 +97,7 @@ PaddlePaddle/PaddleOCR 的 GPU wheel 必须和 Windows、Python、CUDA 版本匹
 
 ## 放置模型
 
-只复制训练阶段选出的 `best.pt`：
+主检测器复制训练阶段选出的 `best.pt`：
 
 ```text
 checkpoints\receipt_lrcnn_v1\best.pt
@@ -101,12 +107,21 @@ checkpoints\receipt_lrcnn_v1\best.pt
 固定类别顺序和模型权重。程序从项目安装位置解析默认 checkpoint，因此无需在命令里传
 `--checkpoint`。
 
+如果要输出 Android/iOS 设备识别字段，再额外复制：
+
+```text
+checkpoints\statusbar_device_v1\best.pt
+```
+
+它不是默认模型；运行时必须明确传入 `--platform-checkpoint`。
+
 ## 单图验证
 
 ```powershell
 receipt-model-infer `
   --input "D:\download\TempFakeImages\s3_voucher_GWCZ2071991511234514944_20260701001815.png" `
   --output "D:\download\TempFakeResults_v1" `
+  --platform-checkpoint "D:\path\alipay-ai-inference\checkpoints\statusbar_device_v1\best.pt" `
   --device cuda `
   --ocr paddle `
   --require-complete
@@ -146,9 +161,83 @@ python -m receipt_inference.cli `
 如果 checkpoint 缺失，命令会打印必须复制到的完整路径。临时验证另一份权重时，可以用
 `--checkpoint D:\path\other.pt` 覆盖默认位置。
 
+若没有部署设备识别模型，删除整段 `--platform-checkpoint ...` 即可。设备识别使用原图
+顶部状态栏和分辨率规则，结果会写到每张结果 JSON 的 `device` 字段。
+
 每张成功输入会生成结构化 JSON、纠正图圈选结果、原图透视回投圈选结果，以及批量
-`inference_manifest.json`。启用 `--require-complete` 后，未检测齐五个字段的图片会失败，
-不会写成完整结果。
+`inference_manifest.json`。启用 `--require-complete` 后，未检测齐金额、转账状态、收款方和
+付款方式这四个核心字段的图片会失败；顶部 `time` 字段允许缺失。
+
+## ONNX 交付与推理
+
+ONNX 是标准交付物，不是 ML.NET 专属格式。当前项目可导出并运行：
+
+- `receipt_lrcnn_v1` 主检测器；
+- `statusbar_device_v1` 可选设备识别 CNN。
+
+先在能够加载原始 `.pt` 的服务器安装导出验证依赖。CPU 验证使用 `onnxruntime`；若最终
+服务器需要 CUDA ONNX 推理，请安装与 CUDA 匹配的 `onnxruntime-gpu`，不要同时保留两个
+ONNX Runtime 包。
+
+```powershell
+python -m pip install -r requirements-export.txt
+# Pull 到包含 ONNX 命令的代码后，刷新 editable console script。
+python -m pip install -e . --no-deps
+```
+
+主检测器是 TorchVision Faster R-CNN。为保证 ONNX Runtime / .NET 的稳定性，导出固定的
+单图输入画布，默认协议为 `image: float32 [3, 1536, 864]`（CHW、RGB、像素 `0..1`）。
+ONNX 图内部保留 Faster R-CNN 的归一化；调用方不要再次做 ImageNet normalize。运行时将
+透视纠正后的图片等比缩放并黑边 letterbox 到该画布，然后把检测框映射回纠正图坐标。
+
+导出主检测器时需要一张真实回执图片用于跟踪检测图，并在相同固定输入上做 PyTorch
+wrapper 与 ONNX Runtime CPU 对齐验证：
+
+```powershell
+receipt-model-export-onnx `
+  --kind detector `
+  --checkpoint "D:\path\alipay-ai-inference\checkpoints\receipt_lrcnn_v1\best.pt" `
+  --sample-image "D:\input\one-receipt.png" `
+  --output "D:\path\alipay-ai-inference\artifacts\receipt_lrcnn_v1.onnx" `
+  --input-width 864 `
+  --input-height 1536 `
+  --resize-mode letterbox
+```
+
+导出设备识别模型：
+
+```powershell
+receipt-model-export-onnx `
+  --kind statusbar `
+  --checkpoint "D:\path\alipay-ai-inference\checkpoints\statusbar_device_v1\best.pt" `
+  --output "D:\path\alipay-ai-inference\artifacts\statusbar_device_v1.onnx"
+```
+
+每个 ONNX 旁边都会生成 `.contract.json`，其中固定记录了来源 checkpoint SHA-256、输入输出
+节点、类别顺序、画布大小、预处理、阈值、opset 与导出运行时版本；交付时两个文件必须成对
+交付。
+
+导出后，仍用同一个公共入口运行完整的 OpenCV / ONNX / PaddleOCR 流水线：
+
+```powershell
+python -m receipt_inference.cli `
+  --onnx-model "D:\path\alipay-ai-inference\artifacts\receipt_lrcnn_v1.onnx" `
+  --platform-onnx-model "D:\path\alipay-ai-inference\artifacts\statusbar_device_v1.onnx" `
+  --input "D:\input\one-receipt.png" `
+  --output "D:\output\receipt-onnx-test" `
+  --device cuda:0 `
+  --ocr paddle `
+  --score-threshold 0.50 `
+  --max-side 1600 `
+  --require-complete
+```
+
+若不需要设备识别，删除 `--platform-onnx-model ...`。若运行的 ONNX 与 contract 中的
+`resize_mode` 不同，必须显式传入 `--onnx-resize-mode stretch`；默认是 `letterbox`。
+建议先用同一批图片分别跑 PyTorch 与 ONNX，比较每类最佳框、类别与分数，再把 ONNX 和
+contract JSON 交付给 .NET。对于 Faster R-CNN 的变长 `boxes / labels / scores` 输出，C# 使用
+ONNX Runtime 直接 API 通常比强行套 ML.NET 的 `IDataView` 更直接；如交付方明确要求 ML.NET，
+则以同一份 ONNX contract 中的节点名和 tensor shape 接入 `ApplyOnnxModel`。
 
 ## CPU / macOS 开发环境
 

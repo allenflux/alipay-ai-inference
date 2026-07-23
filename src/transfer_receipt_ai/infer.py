@@ -22,7 +22,6 @@ from .status_style import (
     status_style_checkpoint_signature,
     status_style_tags,
 )
-from .device_statusbar import StatusBarDeviceClassifier
 
 
 STATUS_STYLE_MARGIN_RATIO = 0.30
@@ -220,7 +219,8 @@ def _require_core_fields(result: Any) -> None:
 
 def run_inference(
     *,
-    checkpoint: Path,
+    checkpoint: Path | None = None,
+    onnx_model: Path | None = None,
     input_path: Path,
     output_dir: Path,
     score_threshold: float = 0.50,
@@ -245,8 +245,14 @@ def run_inference(
     skip_existing_output_dir: Path | None = None,
     require_ocr_for_skip: bool = False,
     platform_checkpoint: Path | None = None,
+    platform_onnx_model: Path | None = None,
+    onnx_resize_mode: str = "letterbox",
 ) -> list[dict[str, str]]:
     """Process an image or image tree and write one result bundle per raw image."""
+    if (checkpoint is None) == (onnx_model is None):
+        raise ValueError("Specify exactly one of checkpoint or onnx_model")
+    if platform_checkpoint is not None and platform_onnx_model is not None:
+        raise ValueError("Specify at most one of platform_checkpoint or platform_onnx_model")
     all_image_paths = list(iter_image_paths(input_path))
     if not all_image_paths:
         raise ValueError(f"No supported images found under {input_path}")
@@ -274,7 +280,17 @@ def run_inference(
         image_paths = image_paths[:limit]
     corrections = corrections or {}
     ocr = PaddleOCRReader(device=device) if use_ocr else None
-    predictor = LRCNNPredictor(checkpoint, device=device, score_threshold=score_threshold)
+    if onnx_model is None:
+        predictor = LRCNNPredictor(checkpoint, device=device, score_threshold=score_threshold)
+    else:
+        from .onnx_runtime import OnnxLRCNNPredictor
+
+        predictor = OnnxLRCNNPredictor(
+            onnx_model,
+            device=device,
+            score_threshold=score_threshold,
+            resize_mode=onnx_resize_mode,
+        )
     status_style_predictor: StatusStylePredictor | None = None
     status_style_model: dict[str, object] | None = None
     status_style_inference_config: dict[str, object] | None = None
@@ -293,12 +309,18 @@ def run_inference(
             confidence_threshold=status_confidence_threshold,
             absent_confidence_threshold=status_absent_confidence_threshold,
         )
-    # 设备识别(状态栏 CNN + 分辨率)。Torch 模型,只在检测阶段构建,不进 Paddle 阶段。
-    device_predictor = (
-        StatusBarDeviceClassifier(platform_checkpoint, device=device)
-        if platform_checkpoint is not None
-        else None
-    )
+    # 设备识别(状态栏 CNN + 分辨率)。它和主检测器一样，只在检测阶段构建，
+    # 不进入 Paddle 阶段；ONNX 交付时可完全避免导入 PyTorch。
+    if platform_checkpoint is not None:
+        from .device_statusbar import StatusBarDeviceClassifier
+
+        device_predictor = StatusBarDeviceClassifier(platform_checkpoint, device=device)
+    elif platform_onnx_model is not None:
+        from .onnx_runtime import OnnxStatusBarDeviceClassifier
+
+        device_predictor = OnnxStatusBarDeviceClassifier(platform_onnx_model, device=device)
+    else:
+        device_predictor = None
     output_dir.mkdir(parents=True, exist_ok=True)
     manifest_path, manifest_jsonl_path, errors_jsonl_path = _manifest_paths(output_dir, shard_index, shard_count)
     manifest: list[dict[str, str]] = []
@@ -378,21 +400,35 @@ def run_inference(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Detect, OCR and circle transfer receipt fields")
-    parser.add_argument("--checkpoint", type=Path, required=True)
+    model_group = parser.add_mutually_exclusive_group(required=True)
+    model_group.add_argument("--checkpoint", type=Path, help="PyTorch detector checkpoint")
+    model_group.add_argument("--onnx-model", type=Path, help="Fixed-shape ONNX detector model")
     parser.add_argument(
         "--status-style-checkpoint",
         type=Path,
         help="Optional status-style classifier checkpoint; omit to keep the original five-field v1 output",
     )
-    parser.add_argument(
+    platform_group = parser.add_mutually_exclusive_group()
+    platform_group.add_argument(
         "--platform-checkpoint",
         type=Path,
         help="Optional status-bar device (Android/iOS) classifier checkpoint; adds a 'device' field",
+    )
+    platform_group.add_argument(
+        "--platform-onnx-model",
+        type=Path,
+        help="Optional ONNX status-bar device classifier; adds a 'device' field",
     )
     parser.add_argument("--input", type=Path, required=True, help="Raw image or raw-image directory")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--score-threshold", type=float, default=0.50)
+    parser.add_argument(
+        "--onnx-resize-mode",
+        choices=("letterbox", "stretch"),
+        default="letterbox",
+        help="Fixed-canvas preprocessing for --onnx-model; must match its .contract.json",
+    )
     parser.add_argument(
         "--status-confidence-threshold",
         type=float,
@@ -418,7 +454,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--require-complete",
         action="store_true",
-        help="Only write result bundles when all five required fields are detected",
+        help="Only write result bundles when the four core transfer fields are detected",
     )
     parser.add_argument("--limit", type=int, help="Process at most this many images from the selected shard")
     parser.add_argument(
@@ -452,6 +488,7 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit("--limit must be positive")
     outputs = run_inference(
         checkpoint=args.checkpoint,
+        onnx_model=args.onnx_model,
         input_path=args.input,
         output_dir=args.output,
         device=args.device,
@@ -476,6 +513,8 @@ def main(argv: list[str] | None = None) -> None:
         skip_existing_output_dir=args._skip_existing_output,
         require_ocr_for_skip=args._require_ocr_complete_for_skip,
         platform_checkpoint=args.platform_checkpoint,
+        platform_onnx_model=args.platform_onnx_model,
+        onnx_resize_mode=args.onnx_resize_mode,
     )
     if not args._quiet:
         print(f"Wrote {len(outputs)} inference result bundle(s) to {args.output}")
