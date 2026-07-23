@@ -76,9 +76,15 @@ internal static class ReceiptMlNetProgram
         foreach (var inputFile in inputFiles)
         {
             var outputFile = OutputPathFor(options.OutputDirectory, sourceRoot, inputFile);
+            var annotationPaths = AnnotationPaths.ForResultJson(outputFile);
             if (options.SkipExisting && File.Exists(outputFile))
             {
-                manifest.Add(new ManifestRecord(Path.GetFullPath(inputFile), outputFile, "skipped_existing"));
+                manifest.Add(new ManifestRecord(
+                    Path.GetFullPath(inputFile),
+                    outputFile,
+                    "skipped_existing",
+                    annotationPaths.Rectified,
+                    annotationPaths.Original));
                 continue;
             }
 
@@ -93,8 +99,17 @@ internal static class ReceiptMlNetProgram
                 {
                     ModelContracts = new ContractReferences(detectorContract.FileName, deviceContract?.FileName),
                 };
+                if (ShouldAnnotate(result.Detections, options.AnnotationMode))
+                {
+                    AnnotationRenderer.RenderAndSave(inputFile, result.Detections, result.Device, annotationPaths);
+                }
                 WriteJsonAtomic(outputFile, result);
-                manifest.Add(new ManifestRecord(Path.GetFullPath(inputFile), outputFile, "written"));
+                manifest.Add(new ManifestRecord(
+                    Path.GetFullPath(inputFile),
+                    outputFile,
+                    "written",
+                    annotationPaths.Rectified,
+                    annotationPaths.Original));
             }
             catch (Exception exception)
             {
@@ -139,6 +154,7 @@ internal static class ReceiptMlNetProgram
             {
                 "This .NET CLI performs ONNX model inference only.",
                 "Input must already be an upright, rectified receipt image when perspective correction is needed.",
+                "Annotated JPGs use upright source coordinates. Their original/rectified pair is identical until perspective rectification is ported to .NET.",
                 "PaddleOCR and Python receipt field extraction are not included in this ML.NET CLI.",
             });
     }
@@ -181,6 +197,16 @@ internal static class ReceiptMlNetProgram
         {
             throw new InvalidOperationException($"incomplete detection: missing required transfer fields; missing={string.Join(',', missing)}");
         }
+    }
+
+    private static bool ShouldAnnotate(IEnumerable<DetectionResult> detections, string mode)
+    {
+        return mode switch
+        {
+            "none" => false,
+            "flagged" => RequiredLabels.Except(detections.Select(item => item.Label), StringComparer.Ordinal).Any(),
+            _ => true,
+        };
     }
 
     private static IEnumerable<string> EnumerateInputFiles(string inputPath)
@@ -551,6 +577,7 @@ internal sealed record CliOptions(
     string OutputDirectory,
     string Device,
     float ScoreThreshold,
+    string AnnotationMode,
     bool RequireComplete,
     bool ContinueOnError,
     bool SkipExisting,
@@ -562,11 +589,12 @@ Usage:
     --detector <receipt_lrcnn_v1.onnx> \
     [--device-model <statusbar_device_v1.onnx>] \
     --input <image-or-directory> --output <directory> \
-    [--device auto|cpu|cuda:0] [--score-threshold 0.50] \
+    [--device auto|cpu|cuda:0] [--score-threshold 0.50] [--annotate all|flagged|none] \
     [--require-complete] [--continue-on-error] [--skip-existing] [--limit 100]
 
-This ML.NET CLI runs the two ONNX neural models. It does not include OpenCV
-perspective rectification or PaddleOCR; use an already rectified image when needed.
+This ML.NET CLI runs the two ONNX neural models. It writes JSON and, by default,
+two annotated JPGs. It does not include OpenCV perspective rectification or
+PaddleOCR; use an already rectified image when needed.
 """;
 
     public static CliOptions Parse(string[] args)
@@ -577,6 +605,7 @@ perspective rectification or PaddleOCR; use an already rectified image when need
         string? output = null;
         var device = "auto";
         var scoreThreshold = 0.50f;
+        var annotationMode = "all";
         var requireComplete = false;
         var continueOnError = false;
         var skipExisting = false;
@@ -591,6 +620,7 @@ perspective rectification or PaddleOCR; use an already rectified image when need
                 case "--input": input = NextValue(args, ref index); break;
                 case "--output": output = NextValue(args, ref index); break;
                 case "--device": device = NextValue(args, ref index); break;
+                case "--annotate": annotationMode = ParseAnnotationMode(NextValue(args, ref index)); break;
                 case "--score-threshold":
                     if (!float.TryParse(NextValue(args, ref index), NumberStyles.Float, CultureInfo.InvariantCulture, out scoreThreshold) || scoreThreshold is < 0.0f or > 1.0f)
                     {
@@ -616,7 +646,17 @@ perspective rectification or PaddleOCR; use an already rectified image when need
             throw new UsageException("--detector, --input and --output are required");
         }
         _ = DeviceSetting.Parse(device);
-        return new CliOptions(detector, deviceModel, input, output, device, scoreThreshold, requireComplete, continueOnError, skipExisting, limit);
+        return new CliOptions(detector, deviceModel, input, output, device, scoreThreshold, annotationMode, requireComplete, continueOnError, skipExisting, limit);
+    }
+
+    private static string ParseAnnotationMode(string value)
+    {
+        var mode = value.ToLowerInvariant();
+        if (mode is "all" or "flagged" or "none")
+        {
+            return mode;
+        }
+        throw new UsageException("--annotate must be all, flagged, or none");
     }
 
     private static string NextValue(string[] args, ref int index)
@@ -653,5 +693,10 @@ internal sealed record DeviceResult(
     string? CnnPlatform,
     string? ConflictDetail);
 internal sealed record ContractReferences(string Detector, string? Device);
-internal sealed record ManifestRecord(string Source, string Result, string Status);
+internal sealed record ManifestRecord(
+    string Source,
+    string Result,
+    string Status,
+    string? AnnotatedRectified = null,
+    string? AnnotatedOriginal = null);
 internal sealed record ErrorRecord(string Source, string ErrorType, string Message);

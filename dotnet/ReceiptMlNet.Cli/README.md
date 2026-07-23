@@ -10,10 +10,31 @@ Python pipeline:
 
 - Included: EXIF orientation, RGB letterbox to detector tensor `image`
   `[3,1536,864]`, model execution, box restoration, score filtering, per-class
-  best selection, device status-bar classification, JSON and batch manifests.
+  best selection, device status-bar classification, inspection JPGs, JSON and
+  batch manifests.
 - Not included: receipt screen/quad detection and perspective correction,
-  annotated images, PaddleOCR, and field-value normalization. Use already
-  rectified images when perspective correction is needed.
+  PaddleOCR, and field-value normalization. Use already rectified images when
+  perspective correction is needed.
+
+## Annotated output
+
+`--annotate all` is the default and writes the same compatibility names used by
+the Python pipeline beside each result JSON:
+
+- `<stem>_rectified_annotated.jpg`
+- `<stem>_original_annotated.jpg`
+
+The image uses the same field colors, expanded ellipse outlines, fixed label
+order, score legend, and red device row. `--annotate flagged` writes JPGs only
+when one of the four core transfer fields is missing; `--annotate none` writes
+JSON only. The JSON is written after the derived JPGs, and `--skip-existing`
+still treats JSON as the completion marker.
+
+This runner has not ported Python's OpenCV perspective rectification or
+homography projection. Therefore, for now both compatibility-named JPGs show
+the same EXIF-upright source-coordinate annotation. They visually match the
+Python rectified annotation when the input is already rectified, but are not a
+pixel-for-pixel substitute for Python's original-photo projection.
 
 ## CPU
 
@@ -25,6 +46,7 @@ dotnet run --project .\dotnet\ReceiptMlNet.Cli\ReceiptMlNet.Cli.csproj -- `
   --input D:\input\one-receipt.png `
   --output D:\output\mlnet-cpu `
   --device cpu `
+  --annotate all `
   --require-complete
 ```
 

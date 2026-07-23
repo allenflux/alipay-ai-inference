@@ -284,10 +284,15 @@ contract JSON 交付给 .NET。
 `boxes / labels / scores`，设备模型输出 Android/iOS 概率。它会校验两个 `.contract.json` 的
 模型 SHA-256，防止模型和交付说明混用。
 
-该项目的第一版只覆盖**模型层**：EXIF 摆正、letterbox、检测框坐标还原、阈值/每类最佳框和
-设备识别规则，并写出 JSON / manifest。它没有移植 OpenCV 透视矫正、标注图，或 PaddleOCR
-字段提取；需要透视矫正时，输入必须是已纠正的图片。不要把它的 JSON 当作 Python 完整 OCR
-流水线的等价替代品。
+该项目覆盖**模型层**：EXIF 摆正、letterbox、检测框坐标还原、阈值/每类最佳框、设备识别规则，
+并写出 JSON / manifest / 标注 JPG。默认 `--annotate all`，每张会输出与 Python 相同命名的
+`*_rectified_annotated.jpg` 和 `*_original_annotated.jpg`，使用同一套字段颜色、椭圆框、分数侧栏
+与设备识别红色行；还可传 `--annotate flagged`（只标缺核心字段的图）或 `--annotate none`。
+
+它尚未移植 OpenCV 透视矫正、单应矩阵回投或 PaddleOCR 字段提取；需要透视矫正时，输入必须是
+已纠正的图片。因此当前两张兼容命名的 JPG 都是基于 EXIF 摆正后的输入坐标绘制，内容相同；对于
+已纠正输入，它们视觉上等同于 Python 的 rectified 标注图，但不是 Python 原图投影图的逐像素替代。
+不要把它的 JSON 当作 Python 完整 OCR 流水线的等价替代品。
 
 安装 [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0) 后，CPU 单图验证：
 
@@ -301,6 +306,7 @@ dotnet run --project .\dotnet\ReceiptMlNet.Cli\ReceiptMlNet.Cli.csproj -- `
   --input "D:\download\TempFakeImages\s3_voucher_GWCZ2071991511234514944_20260701001815.png" `
   --output "D:\download\TempFakeResults_mlnet_cpu" `
   --device cpu `
+  --annotate all `
   --require-complete
 ```
 
@@ -329,6 +335,7 @@ dotnet run --project .\dotnet\ReceiptMlNet.Cli\ReceiptMlNet.Cli.csproj -p:OnnxRu
   --input "D:\download\TempFakeImages\s3_voucher_GWCZ2071991511234514944_20260701001815.png" `
   --output "D:\download\TempFakeResults_mlnet_gpu" `
   --device cuda:0 `
+  --annotate all `
   --require-complete
 ```
 
