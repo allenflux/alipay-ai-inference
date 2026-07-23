@@ -3,4 +3,5 @@ __pycache__/
 *.egg-info/
 checkpoints/**/*.pt
 runs/
-
+dotnet/**/bin/
+dotnet/**/obj/

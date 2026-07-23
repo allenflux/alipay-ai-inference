@@ -275,9 +275,64 @@ python -m receipt_inference.cli `
 若不需要设备识别，删除 `--platform-onnx-model ...`。若运行的 ONNX 与 contract 中的
 `resize_mode` 不同，必须显式传入 `--onnx-resize-mode stretch`；默认是 `letterbox`。
 建议先用同一批图片分别跑 PyTorch 与 ONNX，比较每类最佳框、类别与分数，再把 ONNX 和
-contract JSON 交付给 .NET。对于 Faster R-CNN 的变长 `boxes / labels / scores` 输出，C# 使用
-ONNX Runtime 直接 API 通常比强行套 ML.NET 的 `IDataView` 更直接；如交付方明确要求 ML.NET，
-则以同一份 ONNX contract 中的节点名和 tensor shape 接入 `ApplyOnnxModel`。
+contract JSON 交付给 .NET。
+
+## .NET / ML.NET ONNX 命令
+
+[`dotnet/ReceiptMlNet.Cli`](dotnet/ReceiptMlNet.Cli) 是独立于 Python 的 .NET 8 控制台项目。
+它实际使用 ML.NET 的 `ApplyOnnxModel` 加载当前 ONNX：主检测模型输出动态长度的
+`boxes / labels / scores`，设备模型输出 Android/iOS 概率。它会校验两个 `.contract.json` 的
+模型 SHA-256，防止模型和交付说明混用。
+
+该项目的第一版只覆盖**模型层**：EXIF 摆正、letterbox、检测框坐标还原、阈值/每类最佳框和
+设备识别规则，并写出 JSON / manifest。它没有移植 OpenCV 透视矫正、标注图，或 PaddleOCR
+字段提取；需要透视矫正时，输入必须是已纠正的图片。不要把它的 JSON 当作 Python 完整 OCR
+流水线的等价替代品。
+
+安装 [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0) 后，CPU 单图验证：
+
+```powershell
+cd D:\alipay-ai-data\alipay-ai-inference
+dotnet restore .\dotnet\ReceiptMlNet.Cli\ReceiptMlNet.Cli.csproj
+
+dotnet run --project .\dotnet\ReceiptMlNet.Cli\ReceiptMlNet.Cli.csproj -- `
+  --detector ".\artifacts\receipt_lrcnn_v1.onnx" `
+  --device-model ".\artifacts\statusbar_device_v1.onnx" `
+  --input "D:\download\TempFakeImages\s3_voucher_GWCZ2071991511234514944_20260701001815.png" `
+  --output "D:\download\TempFakeResults_mlnet_cpu" `
+  --device cpu `
+  --require-complete
+```
+
+CUDA 机器构建 GPU Runtime 并强制 GPU 验证：
+
+```powershell
+dotnet run --project .\dotnet\ReceiptMlNet.Cli\ReceiptMlNet.Cli.csproj -p:OnnxRuntimeFlavor=gpu -- `
+  --detector ".\artifacts\receipt_lrcnn_v1.onnx" `
+  --device-model ".\artifacts\statusbar_device_v1.onnx" `
+  --input "D:\download\TempFakeImages\s3_voucher_GWCZ2071991511234514944_20260701001815.png" `
+  --output "D:\download\TempFakeResults_mlnet_gpu" `
+  --device cuda:0 `
+  --require-complete
+```
+
+`--device auto` 会请求 GPU 并允许回退 CPU；GPU 是否真的可用时应先以 `--device cuda:0` 做单图
+验收。批量 100 张：
+
+```powershell
+dotnet run --project .\dotnet\ReceiptMlNet.Cli\ReceiptMlNet.Cli.csproj -p:OnnxRuntimeFlavor=gpu -- `
+  --detector ".\artifacts\receipt_lrcnn_v1.onnx" `
+  --device-model ".\artifacts\statusbar_device_v1.onnx" `
+  --input "D:\download\TempFakeImages" `
+  --output "D:\download\TempFakeResults_mlnet_batch100" `
+  --device auto `
+  --require-complete `
+  --continue-on-error `
+  --limit 100
+```
+
+中断续跑时，添加 `--skip-existing`。交付给这个命令的文件仍是同一组四个：两个 `.onnx` 和
+各自的 `.contract.json`；无需重新导出 ML.NET 专属模型。
 
 ## CPU / macOS 开发环境
 
