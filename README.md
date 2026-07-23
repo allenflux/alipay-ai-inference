@@ -306,6 +306,22 @@ dotnet run --project .\dotnet\ReceiptMlNet.Cli\ReceiptMlNet.Cli.csproj -- `
 
 CUDA 机器构建 GPU Runtime 并强制 GPU 验证：
 
+`Microsoft.ML.OnnxRuntime.Gpu` 自带 ONNX Runtime CUDA Provider，但不自带 NVIDIA
+CUDA/cuDNN 的运行时 DLL。运行 .NET 命令前，Windows 需要在 `PATH` 中提供兼容的
+CUDA 12.x 与 cuDNN 9.x。若当前 Python 虚拟环境使用 CUDA 12 的 PyTorch，可先在**同一个
+PowerShell** 中执行下列命令，让 `dotnet` 子进程复用 PyTorch 的 DLL：
+
+```powershell
+$torchLib = python -c "import os, torch; print(os.path.join(os.path.dirname(torch.__file__), 'lib'))"
+Test-Path "$torchLib\cublasLt64_12.dll"
+Test-Path "$torchLib\cudnn64_9.dll"
+$env:Path = "$torchLib;$env:Path"
+```
+
+前两个检查都应为 `True`；该 PATH 设置只对当前终端有效。正式的纯 .NET 交付应安装 Windows
+x64 的 CUDA 12.x 与 cuDNN 9.x，并把两者的 `bin` 目录写入系统 PATH，不能只复制零散 DLL
+到项目目录。
+
 ```powershell
 dotnet run --project .\dotnet\ReceiptMlNet.Cli\ReceiptMlNet.Cli.csproj -p:OnnxRuntimeFlavor=gpu -- `
   --detector ".\artifacts\receipt_lrcnn_v1.onnx" `
