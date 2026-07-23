@@ -9,6 +9,7 @@ from receipt_inference import cli, models
 from transfer_receipt_ai.geometry import RectificationOptions, RectificationResult
 from transfer_receipt_ai.infer import _write_ocr_stage_artifacts
 from transfer_receipt_ai.model import Detection
+from transfer_receipt_ai.onnx_runtime import prepare_detector_input
 from transfer_receipt_ai.ocr import OCRResult
 from transfer_receipt_ai.ocr_enrich import run_ocr_enrichment
 from transfer_receipt_ai.pipeline import ExtractedDetection, ReceiptPipeline, ReceiptResult, write_receipt_result
@@ -60,6 +61,51 @@ def test_cli_runs_only_receipt_model(monkeypatch, tmp_path) -> None:
     assert captured["status_style_checkpoint"] is None
     assert captured["use_ocr"] is False
     assert captured["require_complete"] is True
+
+
+def test_cli_can_run_an_onnx_detector_without_resolving_a_pt_checkpoint(monkeypatch, tmp_path) -> None:
+    onnx_model = tmp_path / "receipt_lrcnn_v1.onnx"
+    onnx_model.write_bytes(b"onnx")
+    captured = {}
+
+    def fake_run_inference(**kwargs):
+        captured.update(kwargs)
+        return [{"status": "written"}]
+
+    import transfer_receipt_ai.infer as inference
+
+    monkeypatch.setattr(inference, "run_inference", fake_run_inference)
+    cli.main(
+        [
+            "--onnx-model",
+            str(onnx_model),
+            "--platform-onnx-model",
+            str(onnx_model),
+            "--input",
+            str(tmp_path / "receipt.png"),
+            "--output",
+            str(tmp_path / "results"),
+            "--ocr",
+            "none",
+        ]
+    )
+
+    assert captured["checkpoint"] is None
+    assert captured["onnx_model"] == onnx_model.resolve()
+    assert captured["platform_checkpoint"] is None
+    assert captured["platform_onnx_model"] == onnx_model
+    assert captured["onnx_resize_mode"] == "letterbox"
+
+
+def test_onnx_letterbox_preprocessing_restores_source_coordinates() -> None:
+    source = np.zeros((100, 200, 3), dtype=np.uint8)
+    tensor, mapping = prepare_detector_input(source, input_width=300, input_height=300, resize_mode="letterbox")
+
+    assert tensor.shape == (3, 300, 300)
+    assert tensor.dtype == np.float32
+    # 200×100 scales to 300×150 and is vertically centred at y=75.
+    restored = mapping.restore_boxes(np.array([[0, 75, 300, 225]], dtype=np.float32))
+    np.testing.assert_allclose(restored, [[0, 0, 200, 100]], atol=1e-5)
 
 
 def test_paddle_cli_uses_two_sequential_workers_in_the_same_venv(monkeypatch, tmp_path) -> None:

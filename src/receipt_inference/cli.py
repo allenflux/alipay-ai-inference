@@ -27,14 +27,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional checkpoint override; normally just copy best.pt into the model directory",
     )
     parser.add_argument(
+        "--onnx-model",
+        type=Path,
+        help="Use a fixed-shape ONNX detector instead of the registered PyTorch checkpoint",
+    )
+    platform_group = parser.add_mutually_exclusive_group()
+    platform_group.add_argument(
         "--platform-checkpoint",
         type=Path,
         help="Optional status-bar device (Android/iOS) classifier checkpoint; adds a 'device' field",
+    )
+    platform_group.add_argument(
+        "--platform-onnx-model",
+        type=Path,
+        help="Optional ONNX status-bar device classifier; adds a 'device' field",
     )
     parser.add_argument("--input", type=Path, required=True, help="Input image or directory")
     parser.add_argument("--output", type=Path, required=True, help="Result directory")
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda, cuda:0, or mps")
     parser.add_argument("--score-threshold", type=float, default=0.50)
+    parser.add_argument(
+        "--onnx-resize-mode",
+        choices=("letterbox", "stretch"),
+        default="letterbox",
+        help="Fixed-canvas preprocessing for --onnx-model; must match its .contract.json",
+    )
     parser.add_argument("--ocr", choices=("paddle", "none"), default="paddle")
     parser.add_argument(
         "--annotate",
@@ -62,14 +79,15 @@ def _run_child(command: list[str]) -> None:
         raise SystemExit(completed.returncode)
 
 
-def _detector_command(args: argparse.Namespace, checkpoint: Path, stage_output: Path) -> list[str]:
-    """Build the Torch-only child command using this exact virtualenv."""
+def _detector_command(args: argparse.Namespace, model_path: Path, stage_output: Path) -> list[str]:
+    """Build the detector-only child command using this exact virtualenv."""
+    model_argument = "--onnx-model" if args.onnx_model is not None else "--checkpoint"
     command = [
         sys.executable,
         "-m",
         "transfer_receipt_ai.infer",
-        "--checkpoint",
-        str(checkpoint),
+        model_argument,
+        str(model_path),
         "--input",
         str(args.input),
         "--output",
@@ -78,6 +96,8 @@ def _detector_command(args: argparse.Namespace, checkpoint: Path, stage_output: 
         str(args.device),
         "--score-threshold",
         str(args.score_threshold),
+        "--onnx-resize-mode",
+        str(args.onnx_resize_mode),
         "--ocr",
         "none",
         "--max-side",
@@ -87,6 +107,8 @@ def _detector_command(args: argparse.Namespace, checkpoint: Path, stage_output: 
     ]
     if args.platform_checkpoint is not None:
         command.extend(("--platform-checkpoint", str(args.platform_checkpoint)))
+    if args.platform_onnx_model is not None:
+        command.extend(("--platform-onnx-model", str(args.platform_onnx_model)))
     if args.require_complete:
         command.append("--require-complete")
     if args.continue_on_error:
@@ -138,16 +160,17 @@ def _read_final_manifest(output_dir: Path) -> list[dict[str, str]]:
     return payload
 
 
-def _run_paddle_two_stage(args: argparse.Namespace, checkpoint: Path) -> list[dict[str, str]]:
-    """Run Torch and Paddle sequentially, never in the same Windows process."""
+def _run_paddle_two_stage(args: argparse.Namespace, model_path: Path) -> list[dict[str, str]]:
+    """Run detector and Paddle sequentially, never in the same Windows GPU process."""
     # Keep staged PNGs outside the input/output trees.  Otherwise a directory
     # input that contains its output folder could recursively ingest temporary
     # detector artifacts on the next scan.
     stage_output = Path(tempfile.mkdtemp(prefix="receipt_inference_stage_"))
     completed = False
     try:
-        print("[1/2] Running Torch detector...")
-        _run_child(_detector_command(args, checkpoint, stage_output))
+        detector_name = "ONNX" if args.onnx_model is not None else "Torch"
+        print(f"[1/2] Running {detector_name} detector...")
+        _run_child(_detector_command(args, model_path, stage_output))
         print("[2/2] Running PaddleOCR...")
         _run_child(_ocr_command(args, stage_output))
         outputs = _read_final_manifest(args.output)
@@ -169,12 +192,13 @@ def _needs_windows_gpu_split(args: argparse.Namespace) -> bool:
     return os.name == "nt" and (requested == "auto" or requested == "cuda" or requested.startswith("cuda:"))
 
 
-def _run_single_process(args: argparse.Namespace, checkpoint: Path) -> list[dict[str, str]]:
+def _run_single_process(args: argparse.Namespace, model_path: Path) -> list[dict[str, str]]:
     """Preserve the existing non-Windows/CPU execution path."""
     from transfer_receipt_ai.infer import run_inference
 
     return run_inference(
-        checkpoint=checkpoint,
+        checkpoint=None if args.onnx_model is not None else model_path,
+        onnx_model=model_path if args.onnx_model is not None else None,
         input_path=args.input,
         output_dir=args.output,
         device=args.device,
@@ -187,8 +211,23 @@ def _run_single_process(args: argparse.Namespace, checkpoint: Path) -> list[dict
         max_side=args.max_side,
         status_style_checkpoint=None,
         platform_checkpoint=args.platform_checkpoint,
+        platform_onnx_model=args.platform_onnx_model,
+        onnx_resize_mode=args.onnx_resize_mode,
         annotate=args.annotate,
     )
+
+
+def _resolve_model_path(args: argparse.Namespace) -> Path:
+    """Resolve exactly one detector artifact selected by the public CLI."""
+
+    if args.onnx_model is None:
+        return resolve_checkpoint(args.model, args.checkpoint)
+    if args.checkpoint is not None:
+        raise ValueError("--checkpoint and --onnx-model cannot be used together")
+    model_path = args.onnx_model.expanduser()
+    if not model_path.is_file():
+        raise FileNotFoundError(f"ONNX model not found: {model_path}")
+    return model_path.resolve()
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -199,13 +238,13 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit("--limit must be positive")
 
     try:
-        checkpoint = resolve_checkpoint(args.model, args.checkpoint)
+        model_path = _resolve_model_path(args)
     except (ValueError, FileNotFoundError) as error:
         raise SystemExit(str(error)) from error
 
-    outputs = _run_paddle_two_stage(args, checkpoint) if (
+    outputs = _run_paddle_two_stage(args, model_path) if (
         args.ocr == "paddle" and _needs_windows_gpu_split(args)
-    ) else _run_single_process(args, checkpoint)
+    ) else _run_single_process(args, model_path)
     print(f"Wrote {len(outputs)} inference result bundle(s) to {args.output}")
 
 

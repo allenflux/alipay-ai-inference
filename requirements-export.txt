@@ -1,0 +1,5 @@
+# ONNX export validation uses the CPU runtime. For CUDA inference on the
+# deployment server, install the matching onnxruntime-gpu build instead of
+# onnxruntime (and keep the server's compatible torch/torchvision install).
+onnx>=1.16,<2
+onnxruntime>=1.18,<2
