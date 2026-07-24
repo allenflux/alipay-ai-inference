@@ -159,6 +159,10 @@ def _parse_record(line: str, *, records_path: Path, line_number: int, dataset_ro
         "split": split,
         "id": str(value.get("id", image_value)),
         "group_id": group_id,
+        "paddle_text": value.get("paddle_text") if isinstance(value.get("paddle_text"), str) else text,
+        "source": value.get("source") if isinstance(value.get("source"), str) else None,
+        "result_json": value.get("result_json") if isinstance(value.get("result_json"), str) else None,
+        "crop_sha256": value.get("crop_sha256") if isinstance(value.get("crop_sha256"), str) else None,
     }
 
 
@@ -298,8 +302,8 @@ def _resolve_device(torch: Any, requested: str) -> str:
     raise ValueError("device must be auto, cpu, cuda, cuda:N, or mps")
 
 
-def _resize_to_tensor(image_path: Path, *, config: RecognizerConfig, torch: Any) -> Any:
-    """Gray-scale, aspect-preserving white letterbox used by train and ONNX contract."""
+def preprocess_image(image_path: Path, *, config: RecognizerConfig) -> np.ndarray:
+    """Return the fixed NCHW float32 preprocessing declared in the ONNX contract."""
     with Image.open(image_path) as image:
         gray = image.convert("L")
         scale = min(config.image_width / gray.width, config.image_height / gray.height)
@@ -311,7 +315,12 @@ def _resize_to_tensor(image_path: Path, *, config: RecognizerConfig, torch: Any)
         top = (config.image_height - height) // 2
         left = (config.image_width - width) // 2
         canvas[top : top + height, left : left + width] = np.asarray(gray, dtype=np.uint8)
-    return torch.from_numpy(canvas.astype(np.float32) / 255.0).unsqueeze(0)
+    return (canvas.astype(np.float32) / 255.0)[np.newaxis, np.newaxis, :, :]
+
+
+def _resize_to_tensor(image_path: Path, *, config: RecognizerConfig, torch: Any) -> Any:
+    """Torch wrapper for the shared train/ONNX image preprocessing."""
+    return torch.from_numpy(preprocess_image(image_path, config=config)[0])
 
 
 def _make_dataset(records: Sequence[Mapping[str, object]], *, character_to_id: Mapping[str, int], config: RecognizerConfig, torch: Any) -> Any:
@@ -319,32 +328,41 @@ def _make_dataset(records: Sequence[Mapping[str, object]], *, character_to_id: M
         def __len__(self) -> int:
             return len(records)
 
-        def __getitem__(self, index: int) -> tuple[Any, Any, str]:
+        def __getitem__(self, index: int) -> tuple[Any, Any, str, str]:
             record = records[index]
             text = str(record["text"])
             targets = torch.tensor([character_to_id[character] for character in text], dtype=torch.long)
             image = _resize_to_tensor(Path(record["image_path"]), config=config, torch=torch)
-            return image, targets, text
+            return image, targets, text, str(record["field"])
 
     return ReceiptOcrDataset()
 
 
-def _collate_batch(batch: Sequence[tuple[Any, Any, str]], *, torch: Any) -> tuple[Any, Any, Any, list[str]]:
+def _collate_batch(
+    batch: Sequence[tuple[Any, Any, str, str]], *, torch: Any
+) -> tuple[Any, Any, Any, list[str], list[str]]:
     images = torch.stack([item[0] for item in batch])
     target_lengths = torch.tensor([item[1].numel() for item in batch], dtype=torch.long)
     targets = torch.cat([item[1] for item in batch])
-    return images, targets, target_lengths, [item[2] for item in batch]
+    return images, targets, target_lengths, [item[2] for item in batch], [item[3] for item in batch]
 
 
-def _decode_logits(logits: Any, *, characters: Sequence[str]) -> list[str]:
-    """CTC greedy decode; class 0 is blank and class N maps to characters[N-1]."""
-    indices = logits.argmax(dim=2).detach().cpu().tolist()
+def decode_ctc_logits(logits: np.ndarray, *, characters: Sequence[str]) -> list[str]:
+    """Greedily decode `[time, batch, class]` CTC logits without PyTorch."""
+    values = np.asarray(logits)
+    if values.ndim != 3:
+        raise ValueError("CTC logits must have shape [time,batch,class]")
+    if values.shape[2] != len(characters) + 1:
+        raise ValueError(
+            f"CTC logits class count {values.shape[2]} does not match blank plus {len(characters)} characters"
+        )
+    indices = values.argmax(axis=2)
     decoded: list[str] = []
-    for batch_index in range(len(indices[0]) if indices else 0):
+    for batch_index in range(indices.shape[1]):
         previous = -1
         output: list[str] = []
-        for timestep in indices:
-            current = int(timestep[batch_index])
+        for current_value in indices[:, batch_index]:
+            current = int(current_value)
             if current != 0 and current != previous:
                 output.append(characters[current - 1])
             previous = current
@@ -352,13 +370,27 @@ def _decode_logits(logits: Any, *, characters: Sequence[str]) -> list[str]:
     return decoded
 
 
-def _evaluate(model: Any, loader: Any, *, criterion: Any, device: str, characters: Sequence[str], torch: Any) -> dict[str, float]:
+def _decode_logits(logits: Any, *, characters: Sequence[str]) -> list[str]:
+    """CTC greedy decode; class 0 is blank and class N maps to characters[N-1]."""
+    return decode_ctc_logits(logits.detach().cpu().numpy(), characters=characters)
+
+
+def _evaluate(
+    model: Any,
+    loader: Any,
+    *,
+    criterion: Any,
+    device: str,
+    characters: Sequence[str],
+    torch: Any,
+) -> dict[str, object]:
     model.eval()
     total_loss = 0.0
     total_items = 0
     exact_matches = 0
+    per_field: dict[str, Counter[str]] = {}
     with torch.no_grad():
-        for images, targets, target_lengths, texts in loader:
+        for images, targets, target_lengths, texts, fields in loader:
             images = images.to(device)
             targets = targets.to(device)
             logits = model(images)
@@ -370,10 +402,26 @@ def _evaluate(model: Any, loader: Any, *, criterion: Any, device: str, character
             loss = criterion(log_probs, targets, input_lengths, target_lengths)
             total_loss += float(loss.detach().cpu()) * len(texts)
             total_items += len(texts)
-            exact_matches += sum(predicted == expected for predicted, expected in zip(_decode_logits(logits, characters=characters), texts))
+            predictions = _decode_logits(logits, characters=characters)
+            for field, predicted, expected in zip(fields, predictions, texts):
+                counters = per_field.setdefault(field, Counter())
+                counters["records"] += 1
+                counters["exact_matches"] += int(predicted == expected)
+                exact_matches += int(predicted == expected)
     if total_items == 0:
         raise ValueError("Validation set is empty")
-    return {"loss": total_loss / total_items, "exact_match": exact_matches / total_items}
+    return {
+        "loss": total_loss / total_items,
+        "exact_match": exact_matches / total_items,
+        "by_field": {
+            field: {
+                "records": int(counters["records"]),
+                "exact_matches": int(counters["exact_matches"]),
+                "exact_match": counters["exact_matches"] / counters["records"],
+            }
+            for field, counters in sorted(per_field.items())
+        },
+    }
 
 
 def _write_checkpoint(path: Path, payload: Mapping[str, object], *, torch: Any) -> None:
@@ -422,10 +470,10 @@ def train_recognizer(
     # val/test makes an OOV metric look better than it really is.
     characters = _charset(train_records)
     _validate_non_train_characters(
-        (record for record in records if record["split"] != "train"),
+        validation_records,
         train_characters=set(characters),
     )
-    _validate_ctc_capacity(records, config=config)
+    _validate_ctc_capacity((*train_records, *validation_records), config=config)
     character_to_id = {character: index for index, character in enumerate(characters, start=1)}
     torch, _ = _require_torch()
     target_device = _resolve_device(torch, device)
@@ -477,7 +525,7 @@ def train_recognizer(
         model.train()
         total_loss = 0.0
         total_items = 0
-        for images, targets, target_lengths, texts in train_loader:
+        for images, targets, target_lengths, texts, _fields in train_loader:
             images = images.to(target_device)
             targets = targets.to(target_device)
             optimizer.zero_grad(set_to_none=True)
@@ -504,6 +552,7 @@ def train_recognizer(
             "train_loss": train_loss,
             "val_loss": validation["loss"],
             "val_exact_match": validation["exact_match"],
+            "val_by_field": validation["by_field"],
         }
         history.append(epoch_record)
         checkpoint_payload = {

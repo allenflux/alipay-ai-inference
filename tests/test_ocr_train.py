@@ -11,7 +11,9 @@ torch = pytest.importorskip("torch")
 
 from transfer_receipt_ai.ocr_train import (
     RecognizerConfig,
+    build_train_parser,
     build_ctc_recognizer,
+    decode_ctc_logits,
     export_onnx,
     train_recognizer,
 )
@@ -58,6 +60,19 @@ def test_tiny_ctc_training_writes_a_checkpoint(tmp_path: Path) -> None:
     assert (checkpoint.parent / "charset.json").is_file()
 
 
+def test_training_defaults_include_recipient_field() -> None:
+    args = build_train_parser().parse_args(["--records", "records.jsonl", "--output", "out"])
+    assert "recipient_field" in args.fields
+
+
+def test_ctc_decoder_collapses_repeats_and_blanks() -> None:
+    # CTC classes: blank=0, A=1, B=2.  The index sequence is A,A,blank,B,B,A.
+    logits = np.zeros((6, 1, 3), dtype=np.float32)
+    for time, index in enumerate((1, 1, 0, 2, 2, 1)):
+        logits[time, 0, index] = 1.0
+    assert decode_ctc_logits(logits, characters=["A", "B"]) == ["ABA"]
+
+
 def test_training_rejects_validation_characters_not_seen_in_train(tmp_path: Path) -> None:
     dataset = tmp_path / "dataset"
     images = dataset / "images"
@@ -86,6 +101,38 @@ def test_training_rejects_validation_characters_not_seen_in_train(tmp_path: Path
             epochs=1,
             batch_size=1,
         )
+
+
+def test_training_keeps_test_characters_out_of_the_training_charset(tmp_path: Path) -> None:
+    dataset = tmp_path / "dataset"
+    images = dataset / "images"
+    images.mkdir(parents=True)
+    for index in range(3):
+        Image.fromarray(np.full((20, 50, 3), 255, dtype=np.uint8)).save(images / f"{index}.png")
+    records_path = dataset / "pseudo_labels.jsonl"
+    records_path.write_text(
+        "".join(
+            json.dumps(record) + "\n"
+            for record in (
+                _record("images/0.png", "1", "train"),
+                _record("images/1.png", "1", "val"),
+                _record("images/2.png", "不在训练集", "test"),
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    checkpoint = train_recognizer(
+        records_path=records_path,
+        output_dir=tmp_path / "run",
+        fields=("amount",),
+        config=RecognizerConfig(image_height=32, image_width=64, hidden_size=16, lstm_layers=1),
+        device="cpu",
+        epochs=1,
+        batch_size=1,
+    )
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
+    assert payload["characters"] == ["1"]
 
 
 def test_training_rejects_ctc_targets_that_cannot_fit_time_axis(tmp_path: Path) -> None:

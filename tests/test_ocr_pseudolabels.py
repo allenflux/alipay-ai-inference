@@ -10,6 +10,7 @@ from PIL import Image
 
 from transfer_receipt_ai.ocr_pseudolabels import (
     UnsafeOcrDatasetOutputError,
+    _ensure_validation_charset_coverage,
     build_pseudo_label_dataset,
 )
 from transfer_receipt_ai.ocr_train import load_records
@@ -154,3 +155,20 @@ def test_rejects_source_image_modified_after_paddle_result(tmp_path: Path) -> No
 
     with pytest.raises(ValueError, match="source image is newer"):
         build_pseudo_label_dataset(results_dir=results, output_dir=tmp_path / "pseudo")
+
+
+def test_validation_groups_with_new_characters_move_to_train_but_test_stays_held_out() -> None:
+    records: list[dict[str, object]] = [
+        {"group_id": "train", "split": "train", "text": "收款方 张三"},
+        {"group_id": "validation", "split": "val", "text": "收款方 李四"},
+        {"group_id": "test", "split": "test", "text": "收款方 王五"},
+    ]
+
+    adjustments = _ensure_validation_charset_coverage(records)
+
+    assert adjustments == {
+        "groups_moved_val_to_train_for_charset": 1,
+        "records_moved_val_to_train_for_charset": 1,
+    }
+    assert records[1]["split"] == "train"
+    assert records[2]["split"] == "test"

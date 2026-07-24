@@ -144,6 +144,48 @@ def _review_selected(sample_id: str, ratio: float) -> bool:
     return bucket < ratio
 
 
+def _ensure_validation_charset_coverage(records: Sequence[dict[str, object]]) -> dict[str, int]:
+    """Keep validation CTC targets inside the training character vocabulary.
+
+    The split stays group-safe: when a validation group has a character absent
+    from all current training groups, the *whole group* moves to train.  Test
+    groups are never moved, because their OOV count is valuable deployment
+    evidence and must not shape training/validation selection.
+    """
+    grouped: dict[str, list[dict[str, object]]] = {}
+    group_split: dict[str, str] = {}
+    for record in records:
+        group_id = str(record["group_id"])
+        split = str(record["split"])
+        prior = group_split.setdefault(group_id, split)
+        if prior != split:
+            raise ValueError(f"group {group_id!r} has inconsistent initial split assignments")
+        grouped.setdefault(group_id, []).append(record)
+    train_characters = {
+        character
+        for group_id, group_records in grouped.items()
+        if group_split[group_id] == "train"
+        for record in group_records
+        for character in str(record["text"])
+    }
+    moved_groups = 0
+    moved_records = 0
+    for group_id in sorted(grouped):
+        if group_split[group_id] != "val":
+            continue
+        group_characters = {character for record in grouped[group_id] for character in str(record["text"])}
+        if group_characters <= train_characters:
+            continue
+        group_split[group_id] = "train"
+        moved_groups += 1
+        moved_records += len(grouped[group_id])
+        train_characters.update(group_characters)
+    for group_id, group_records in grouped.items():
+        for record in group_records:
+            record["split"] = group_split[group_id]
+    return {"groups_moved_val_to_train_for_charset": moved_groups, "records_moved_val_to_train_for_charset": moved_records}
+
+
 def _character_coverage(records: Iterable[Mapping[str, object]], *, labels: Sequence[str]) -> dict[str, object]:
     """Count characters by field and split so free-text coverage is inspectable."""
     grouped: dict[str, dict[str, list[Mapping[str, object]]]] = {
@@ -480,6 +522,7 @@ def build_pseudo_label_dataset(
                 raise
 
     accepted.sort(key=lambda record: str(record["id"]))
+    validation_charset_adjustments = _ensure_validation_charset_coverage(accepted)
     review = [record for record in accepted if _review_selected(str(record["id"]), review_ratio)]
     split_records = {
         split: [record for record in accepted if record["split"] == split]
@@ -514,6 +557,7 @@ def build_pseudo_label_dataset(
             "charset_size": len(characters),
         },
         "character_coverage_file": "character_coverage.json",
+        "validation_charset_adjustments": validation_charset_adjustments,
         "warning": (
             "Records are PaddleOCR pseudo labels. Review a stratified sample and keep an independent "
             "human-labelled evaluation set before making accuracy claims. Source images must remain unchanged "

@@ -222,6 +222,7 @@ python -m transfer_receipt_ai.ocr_pseudolabels `
   --output "D:\download\ReceiptOcrPseudoV1" `
   --min-detector-score 0.90 `
   --min-ocr-confidence 0.98 `
+  --test-ratio 0.10 `
   --review-ratio 0.10 `
   --continue-on-error
 ```
@@ -237,7 +238,8 @@ python -m transfer_receipt_ai.ocr_pseudolabels `
 
 先抽查 `review_candidates.jsonl` 指向的图片和文字。Paddle 伪标签适合扩大训练样本，**不能**作为
 最终准确率证明；应另留人工修正、且不参与训练的验证/测试样本。1000 张回单适合先跑通流程，
-但收款方包含自由中文姓名/商户名，字符覆盖不足时不能期待泛化到未见汉字。
+本版本的训练、ONNX contract 和验收都包含收款方。收款方包含自由中文姓名/商户名，因此 1000 张
+只能先产生候选模型；是否可替代当前 Paddle，必须由下面的逐字段保留集评估决定。
 
 构建完成后，先确认没有读取错误、并且每个准备训练的字段都有足够样本；命令会把相同统计也打印出来：
 
@@ -259,7 +261,10 @@ $coverage.recipient_field.train.characters.psobject.Properties |
 
 训练会强制要求每个 `--fields` 字段都至少有一条 train 和 val 样本；否则不会生成一个“实际上没学过
 某字段”的 ONNX。为了防止验证集字符泄漏，字符表只从 train 生成；若报出验证集有未见字符，不要忽略。
-请用一个新的空输出目录、换一个 `--split-seed` 重建伪标签切分，或增加该字符的人工确认训练样本。
+这通常只会发生在你手工编辑 JSONL 后；请用一个新的空输出目录重建伪标签切分，或增加该字符的
+人工确认训练样本。
+构建器默认会将包含这类字符的**整笔验证回单**移入 train，保持同组不泄漏；test 回单绝不因此移动，
+其 OOV 统计会在 ONNX 验收中如实报告。
 
 训练机器需先安装对应 CPU/CUDA 的 PyTorch wheel（不要让普通 PyPI 覆盖已验证的 CUDA wheel），然后：
 
@@ -269,7 +274,7 @@ python -m pip install -r requirements-train-ocr.txt
 python -m transfer_receipt_ai.ocr_train `
   --records "D:\download\ReceiptOcrPseudoV1\pseudo_labels.jsonl" `
   --output "D:\download\ReceiptOcrCtcV1" `
-  --fields "amount,time,transfer_status,payment_method_field" `
+  --fields "amount,time,transfer_status,recipient_field,payment_method_field" `
   --device cuda:0 `
   --epochs 30 `
   --batch-size 32 `
@@ -291,6 +296,28 @@ artifacts\receipt_ocr_ctc_v1.contract.json
 模型固定输入为灰度白底 letterbox 的 `[1, 1, 48, 768]`，输出为 CTC logits；字符表和 contract
 必须与 ONNX 一起交付。当前 ML.NET CLI 尚未接入该 OCR ONNX，因此训练成功后还需把 CTC 解码和
 字段清洗接入 C#，再替换 Python/Paddle OCR 阶段。
+
+训练命令只会用 train/val；`--test-ratio 0.10` 留出的 test 不参与训练或调参。导出后必须运行
+ONNX 实际推理，与同一张字段裁图的 Paddle OCR 结果逐项对比：
+
+```powershell
+python -m transfer_receipt_ai.ocr_evaluate `
+  --model ".\artifacts\receipt_ocr_ctc_v1.onnx" `
+  --records "D:\download\ReceiptOcrPseudoV1\pseudo_labels.jsonl" `
+  --split test `
+  --output "D:\download\ReceiptOcrEvalV1" `
+  --fields "amount,time,transfer_status,recipient_field,payment_method_field" `
+  --device cuda:0 `
+  --min-raw-exact-match 0.99 `
+  --min-semantic-exact-match 0.99 `
+  --max-micro-cer 0.005 `
+  --max-oov-reference-rate 0
+```
+
+该命令会对每个字段（包括 `recipient_field`）分别执行验收；任一字段没有达到门槛则返回失败，但仍写出
+`summary.json`、`comparisons.jsonl` 和 `disagreements.jsonl` 供查看。它会同时报告模型字符表外的
+测试字符、训练中见过/未见过的文本，以及 ONNX 实际 provider 和延迟。这个比较证明的是“对保留的
+Paddle 输出的一致性”；要证明真实业务准确率仍需一批人工标注的独立回单。
 
 ## ONNX 交付与推理
 
