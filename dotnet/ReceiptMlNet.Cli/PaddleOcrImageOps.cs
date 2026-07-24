@@ -93,7 +93,7 @@ internal static class PaddleOcrImageOps
         try
         {
             var resized = new Mat();
-            Cv2.Resize(working, resized, new Size(resizedWidth, resizedHeight), 0, 0, InterpolationFlags.Linear);
+            Cv2.Resize(working, resized, new OpenCvSharp.Size(resizedWidth, resizedHeight), 0, 0, InterpolationFlags.Linear);
             return resized;
         }
         finally
@@ -151,7 +151,7 @@ internal static class PaddleOcrImageOps
         };
         using var transform = Cv2.GetPerspectiveTransform(points, destination);
         var crop = new Mat();
-        Cv2.WarpPerspective(rgb, crop, transform, new Size(cropWidth, cropHeight), InterpolationFlags.Cubic, BorderTypes.Replicate);
+        Cv2.WarpPerspective(rgb, crop, transform, new OpenCvSharp.Size(cropWidth, cropHeight), InterpolationFlags.Cubic, BorderTypes.Replicate);
         if (crop.Cols > 0 && crop.Rows / (float)crop.Cols >= 1.5f)
         {
             var rotated = new Mat();
@@ -171,7 +171,7 @@ internal static class PaddleOcrImageOps
         var ratio = rgb.Cols / (float)Math.Max(1, rgb.Rows);
         var resizedWidth = Math.Min(targetWidth, Math.Max(1, (int)Math.Ceiling(targetHeight * ratio)));
         using var resized = new Mat();
-        Cv2.Resize(rgb, resized, new Size(resizedWidth, targetHeight), 0, 0, InterpolationFlags.Linear);
+        Cv2.Resize(rgb, resized, new OpenCvSharp.Size(resizedWidth, targetHeight), 0, 0, InterpolationFlags.Linear);
         if (!padRight || resizedWidth == targetWidth)
         {
             return resized.Clone();

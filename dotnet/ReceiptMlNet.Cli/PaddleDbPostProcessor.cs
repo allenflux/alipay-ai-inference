@@ -343,4 +343,11 @@ internal static class PaddleDbPostProcessor
         }
         return length;
     }
+
+    private static float Distance(Point2f first, Point2f second)
+    {
+        var dx = first.X - second.X;
+        var dy = first.Y - second.Y;
+        return MathF.Sqrt(dx * dx + dy * dy);
+    }
 }
