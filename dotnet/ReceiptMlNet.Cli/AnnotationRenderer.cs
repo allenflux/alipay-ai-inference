@@ -77,8 +77,8 @@ internal static class AnnotationRenderer
             7);
         var panelWidth = Math.Clamp(
             (int)Math.Round(source.Width * 0.52, MidpointRounding.ToEven),
-            300,
-            680);
+            360,
+            800);
         var fontSize = Math.Max(
             16,
             Math.Min(30, Math.Min(source.Height / 40, (int)Math.Round(Math.Max(source.Width, source.Height) * 0.012, MidpointRounding.ToEven))));
@@ -86,8 +86,49 @@ internal static class AnnotationRenderer
         var fonts = SelectFontFamily();
         var font = fonts.Family.CreateFont(fontSize);
         var titleFont = fonts.Family.CreateFont(Math.Min(34, fontSize + 3));
+        var stripeWidth = Math.Max(5, padding / 2);
+        // Keep every OCR character visible.  The conservative character width
+        // leaves enough room for the widest CJK glyphs, while still making a
+        // compact legend for normal one-line values.
+        var captionWidth = Math.Max(100, panelWidth - stripeWidth - padding * 3);
+        var maximumCharactersPerLine = Math.Max(8, (int)Math.Floor(captionWidth / (fontSize * 1.15f)));
+        var textLineHeight = Math.Max(fontSize + 2, (int)Math.Ceiling(fontSize * 1.35f));
+        var cards = new List<AnnotationCard>();
+        for (var index = 0; index < ordered.Length; index++)
+        {
+            var detection = ordered[index];
+            var presentation = PresentationFor(detection.Label);
+            var captionLabel = fonts.SupportsChinese ? presentation.DisplayName : detection.Label;
+            var ocrText = detection.Ocr is { Text.Length: > 0 }
+                ? $": {detection.Ocr.Text}"
+                : string.Empty;
+            var caption = WrapCaption(
+                $"{index + 1}. {captionLabel}{ocrText} ({Percent(detection.Score)})",
+                maximumCharactersPerLine);
+            cards.Add(new AnnotationCard(
+                presentation.Color,
+                TextColor,
+                caption,
+                CardHeight(caption, fontSize, textLineHeight, padding)));
+        }
+        if (device is not null)
+        {
+            var deviceCaption = fonts.SupportsChinese
+                ? $"{ordered.Length + 1}. 设备 {device.PlatformCn} ({Percent(device.Confidence)})"
+                : $"{ordered.Length + 1}. Device {device.Platform} ({Percent(device.Confidence)})";
+            deviceCaption = WrapCaption(deviceCaption, maximumCharactersPerLine);
+            cards.Add(new AnnotationCard(
+                DeviceColor,
+                DeviceColor,
+                deviceCaption,
+                CardHeight(deviceCaption, fontSize, textLineHeight, padding)));
+        }
 
-        var canvas = new Image<Rgb24>(source.Width + panelWidth, source.Height, new Rgb24(247, 248, 250));
+        var cardGap = Math.Max(7, padding / 2);
+        var firstCardTop = padding + fontSize + padding;
+        var requiredPanelHeight = firstCardTop + cards.Sum(card => card.Height + cardGap) + padding;
+        var canvasHeight = Math.Max(source.Height, requiredPanelHeight);
+        var canvas = new Image<Rgb24>(source.Width + panelWidth, canvasHeight, new Rgb24(247, 248, 250));
         canvas.Mutate(context =>
         {
             context.DrawImage(source, new Point(0, 0), 1.0f);
@@ -103,42 +144,35 @@ internal static class AnnotationRenderer
                     new EllipsePolygon(centerX, centerY, ellipseWidth, ellipseHeight));
             }
 
-            context.Fill(PanelSeparator, new RectangleF(source.Width, 0, Math.Max(2, lineWidth / 2), source.Height));
+            context.Fill(PanelSeparator, new RectangleF(source.Width, 0, Math.Max(2, lineWidth / 2), canvasHeight));
             var panelLeft = source.Width + padding;
             var panelRight = source.Width + panelWidth - padding;
             var title = fonts.SupportsChinese ? "识别结果" : "Detection results";
             context.DrawText(title, titleFont, TextColor, new PointF(panelLeft, padding));
 
-            var cursorY = padding + fontSize + padding;
-            var entryHeight = fontSize + padding * 2;
-            for (var index = 0; index < ordered.Length; index++)
+            var cursorY = firstCardTop;
+            foreach (var card in cards)
             {
-                var detection = ordered[index];
-                var presentation = PresentationFor(detection.Label);
-                var captionLabel = fonts.SupportsChinese ? presentation.DisplayName : detection.Label;
-                var ocrText = detection.Ocr is { Text.Length: > 0 }
-                    ? $": {Truncate(detection.Ocr.Text, 28)}"
-                    : string.Empty;
-                var caption = $"{index + 1}. {captionLabel}{ocrText} ({Percent(detection.Score)})";
-                if (!DrawCard(context, panelLeft, panelRight, cursorY, entryHeight, padding, lineWidth, presentation.Color, caption, font, TextColor, source.Height))
-                {
-                    return;
-                }
-                cursorY += entryHeight + Math.Max(7, padding / 2);
-            }
-
-            if (device is not null)
-            {
-                var deviceCaption = fonts.SupportsChinese
-                    ? $"{ordered.Length + 1}. 设备 {device.PlatformCn} ({Percent(device.Confidence)})"
-                    : $"{ordered.Length + 1}. Device {device.Platform} ({Percent(device.Confidence)})";
-                _ = DrawCard(context, panelLeft, panelRight, cursorY, entryHeight, padding, lineWidth, DeviceColor, deviceCaption, font, DeviceColor, source.Height);
+                DrawCard(
+                    context,
+                    panelLeft,
+                    panelRight,
+                    cursorY,
+                    card.Height,
+                    padding,
+                    lineWidth,
+                    stripeWidth,
+                    card.Color,
+                    card.Caption,
+                    font,
+                    card.TextColor);
+                cursorY += card.Height + cardGap;
             }
         });
         return canvas;
     }
 
-    private static bool DrawCard(
+    private static void DrawCard(
         IImageProcessingContext context,
         float left,
         float right,
@@ -146,23 +180,17 @@ internal static class AnnotationRenderer
         float height,
         int padding,
         int lineWidth,
+        int stripeWidth,
         Color color,
         string caption,
         Font font,
-        Color textColor,
-        int imageHeight)
+        Color textColor)
     {
-        if (top + height > imageHeight - padding)
-        {
-            return false;
-        }
         var rectangle = new RectangleF(left, top, right - left, height);
         context.Fill(Color.White, rectangle);
         context.Draw(Pens.Solid(color, Math.Max(2, lineWidth / 2)), rectangle);
-        var stripeWidth = Math.Max(5, padding / 2);
         context.Fill(color, new RectangleF(left, top, stripeWidth, height));
         context.DrawText(caption, font, textColor, new PointF(left + stripeWidth + padding, top + padding));
-        return true;
     }
 
     private static LabelPresentation PresentationFor(string label)
@@ -201,11 +229,48 @@ internal static class AnnotationRenderer
         return $"{percent}%";
     }
 
-    private static string Truncate(string value, int maximumLength)
+    private static string WrapCaption(string value, int maximumCharactersPerLine)
     {
-        return value.Length <= maximumLength ? value : value[..Math.Max(0, maximumLength - 1)] + "…";
+        if (maximumCharactersPerLine <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(maximumCharactersPerLine));
+        }
+
+        var lines = new List<string>();
+        var current = new System.Text.StringBuilder(maximumCharactersPerLine);
+        foreach (var character in value)
+        {
+            if (character == '\r')
+            {
+                continue;
+            }
+            if (character == '\n')
+            {
+                lines.Add(current.ToString());
+                current.Clear();
+                continue;
+            }
+            current.Append(character);
+            if (current.Length >= maximumCharactersPerLine)
+            {
+                lines.Add(current.ToString());
+                current.Clear();
+            }
+        }
+        if (current.Length > 0 || lines.Count == 0)
+        {
+            lines.Add(current.ToString());
+        }
+        return string.Join('\n', lines);
+    }
+
+    private static int CardHeight(string caption, int fontSize, int textLineHeight, int padding)
+    {
+        var lineCount = Math.Max(1, caption.Count(character => character == '\n') + 1);
+        return Math.Max(fontSize + padding * 2, lineCount * textLineHeight + padding * 2);
     }
 
     private sealed record LabelPresentation(string DisplayName, Color Color, int Order);
     private sealed record FontSelection(FontFamily Family, bool SupportsChinese);
+    private sealed record AnnotationCard(Color Color, Color TextColor, string Caption, int Height);
 }
