@@ -116,7 +116,10 @@ internal static class AnnotationRenderer
                 var detection = ordered[index];
                 var presentation = PresentationFor(detection.Label);
                 var captionLabel = fonts.SupportsChinese ? presentation.DisplayName : detection.Label;
-                var caption = $"{index + 1}. {captionLabel} ({Percent(detection.Score)})";
+                var ocrText = detection.Ocr is { Text.Length: > 0 }
+                    ? $": {Truncate(detection.Ocr.Text, 28)}"
+                    : string.Empty;
+                var caption = $"{index + 1}. {captionLabel}{ocrText} ({Percent(detection.Score)})";
                 if (!DrawCard(context, panelLeft, panelRight, cursorY, entryHeight, padding, lineWidth, presentation.Color, caption, font, TextColor, source.Height))
                 {
                     return;
@@ -196,6 +199,11 @@ internal static class AnnotationRenderer
     {
         var percent = Math.Clamp((int)Math.Round(value * 100.0f, MidpointRounding.ToEven), 0, 100);
         return $"{percent}%";
+    }
+
+    private static string Truncate(string value, int maximumLength)
+    {
+        return value.Length <= maximumLength ? value : value[..Math.Max(0, maximumLength - 1)] + "…";
     }
 
     private sealed record LabelPresentation(string DisplayName, Color Color, int Order);

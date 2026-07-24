@@ -305,8 +305,8 @@ CPU 不是 GPU 不可用时的隐式降级，而是独立验收目标：`export-
 因此上面的 100 张和全量命令成功，才说明这三个 OCR ONNX 在 CPU 可运行且保持转换前效果；它不需要 CUDA、cuDNN 或
 Paddle GPU。
 
-后续 .NET OCR CLI 会把 `--device cpu` 固定映射到 CPU Execution Provider，并在全量回归中单独输出 CPU p50/p95、
-吞吐、峰值内存和字段一致性；CUDA 只是同一套 ONNX 的可选加速路径，不改变 CPU 的结果契约。
+`.NET OCR CLI` 的 `--device cpu` 会固定创建 CPU ONNX Runtime Session；CUDA 只是同一套 ONNX 的可选
+加速路径，不改变 CPU 的结果契约。C# 侧仍须用下面的 CPU / GPU 命令对同一批回单做字段、JSON 和性能回归。
 
 ### 速度与轻量化策略
 
@@ -317,8 +317,9 @@ Paddle GPU。
 | 后续回退 | 快路径低置信、旋转、多行或字段规则异常时回到 det + cls + rec | 不用速度换取错误结果 |
 | 压缩 | 只在一致性回归通过后测试 CPU INT8 | 量化一旦影响中文/金额/时间任一门槛即不采用 |
 
-三个 ONNX Session 会在进程启动时只加载一次；同尺寸字段会批处理；GPU 使用 CUDA Execution Provider，CPU 使用
-CPU Execution Provider。OCR 的 det/rec 有动态 shape、文本框后处理和 CTC 解码，因此 .NET 端会直接用
+三个 OCR ONNX Session 会在进程启动时只加载一次；基线按字段顺序处理，并在识别 ONNX 的 batch 轴可变时按
+Paddle 的文本框宽高比分组批量识别，否则安全地逐条识别。GPU 使用 CUDA Execution Provider，CPU 使用 CPU
+Execution Provider。OCR 的 det/rec 有动态 shape、文本框后处理和 CTC 解码，因此 .NET 端会直接用
 `Microsoft.ML.OnnxRuntime.InferenceSession`，不强行塞进固定张量的 `ApplyOnnxModel`；这仍然是纯 ONNX/.NET 交付。
 验收同时记录全量 1000 张的逐字段文本/归一化值、p50/p95 单图耗时、总吞吐、显存/内存和最终包体积。
 
@@ -425,8 +426,8 @@ artifacts\receipt_ocr_ctc_v1.contract.json
 ```
 
 模型固定输入为灰度白底 letterbox 的 `[1, 1, 48, 768]`，输出为 CTC logits；字符表和 contract
-必须与 ONNX 一起交付。当前 ML.NET CLI 尚未接入该 OCR ONNX，因此训练成功后还需把 CTC 解码和
-字段清洗接入 C#，再替换 Python/Paddle OCR 阶段。
+必须与 ONNX 一起交付。当前 .NET CLI 接入的是冻结的 PP-OCR `det + cls + rec` 交付包，**尚未接入这一份
+自训练 CTC ONNX**；只有当该候选通过下方严格验收后，才应单独接入并替换 Paddle OCR 阶段。
 
 训练命令只会用 train/val；`--test-ratio 0.10` 留出的 test 不参与训练或调参。导出后必须运行
 ONNX 实际推理，与同一张字段裁图的 Paddle OCR 结果逐项对比：
@@ -535,32 +536,44 @@ contract JSON 交付给 .NET。
 
 ## .NET / ML.NET ONNX 命令
 
-[`dotnet/ReceiptMlNet.Cli`](dotnet/ReceiptMlNet.Cli) 是独立于 Python 的 .NET 8 控制台项目。
+[`dotnet/ReceiptMlNet.Cli`](dotnet/ReceiptMlNet.Cli) 是独立于 Python 的 .NET 8 控制台项目，当前 OCR
+运行时交付目标是 **Windows x64**（OpenCvSharp Windows 原生库）。
 它实际使用 ML.NET 的 `ApplyOnnxModel` 加载当前 ONNX：主检测模型输出动态长度的
 `boxes / labels / scores`，设备模型输出 Android/iOS 概率。它会校验两个 `.contract.json` 的
-模型 SHA-256，防止模型和交付说明混用。
+模型 SHA-256，防止模型和交付说明混用。传入 `--ocr onnx --ocr-bundle <交付目录>` 后，它还会
+直接用 ONNX Runtime 加载冻结的 PP-OCR `det + cls + rec` 三个模型；OCR 不依赖 Python、Paddle
+或网络下载。OCR 交付目录必须是前文 `package-delivery` 产生的目录，CLI 会校验三份 ONNX、字符表和
+`paddle_ocr_delivery.contract.json` 的 SHA-256。
 
 该项目覆盖**模型层**：EXIF 摆正、letterbox、检测框坐标还原、阈值/每类最佳框、设备识别规则，
 并写出 JSON / manifest / 标注 JPG。默认 `--annotate all`，每张会输出与 Python 相同命名的
 `*_rectified_annotated.jpg` 和 `*_original_annotated.jpg`，使用同一套字段颜色、椭圆框、分数侧栏
 与设备识别红色行；还可传 `--annotate flagged`（只标缺核心字段的图）或 `--annotate none`。
 
-它尚未移植 OpenCV 透视矫正、单应矩阵回投或 PaddleOCR 字段提取；需要透视矫正时，输入必须是
-已纠正的图片。因此当前两张兼容命名的 JPG 都是基于 EXIF 摆正后的输入坐标绘制，内容相同；对于
-已纠正输入，它们视觉上等同于 Python 的 rectified 标注图，但不是 Python 原图投影图的逐像素替代。
-不要把它的 JSON 当作 Python 完整 OCR 流水线的等价替代品。
+启用 OCR 时，每个检测字段会按 Python 相同的 8% 边距裁图，执行完整 DB 文本检测、方向分类、CTC
+识别，并写入 `detections[].ocr` 与 `fields.time/amount/transfer_status/recipient/payment_method`；标注图侧栏
+也会显示 OCR 文本。OCR 的 `det/cls/rec` Session 每批只创建一次。
+
+目前仍未移植 OpenCV 透视矫正、单应矩阵回投。因此输入需要是已纠正的回单图/截图；两张兼容命名的 JPG
+仍基于 EXIF 摆正后的输入坐标绘制，内容相同。照片类原图要获得与 Python 完全相同的几何结果，需要后续
+移植矫正模块。
 
 安装 [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0) 后，CPU 单图验证：
 
 ```powershell
 cd D:\alipay-ai-data\alipay-ai-inference
 dotnet restore .\dotnet\ReceiptMlNet.Cli\ReceiptMlNet.Cli.csproj
+$ocrBundle = ".\artifacts\paddle_ocr_ppocrv4_v1_delivery"
 
-dotnet run --project .\dotnet\ReceiptMlNet.Cli\ReceiptMlNet.Cli.csproj -- `
+dotnet build .\dotnet\ReceiptMlNet.Cli\ReceiptMlNet.Cli.csproj -p:OnnxRuntimeFlavor=cpu
+
+dotnet run --no-build --project .\dotnet\ReceiptMlNet.Cli\ReceiptMlNet.Cli.csproj -- `
   --detector ".\artifacts\receipt_lrcnn_v1.onnx" `
   --device-model ".\artifacts\statusbar_device_v1.onnx" `
+  --ocr onnx `
+  --ocr-bundle $ocrBundle `
   --input "D:\download\TempFakeImages\s3_voucher_GWCZ2071991511234514944_20260701001815.png" `
-  --output "D:\download\TempFakeResults_mlnet_cpu" `
+  --output "D:\download\TempFakeResults_mlnet_onnx_ocr_cpu_1" `
   --device cpu `
   --annotate all `
   --require-complete
@@ -585,33 +598,109 @@ x64 的 CUDA 12.x 与 cuDNN 9.x，并把两者的 `bin` 目录写入系统 PATH�
 到项目目录。
 
 ```powershell
-dotnet run --project .\dotnet\ReceiptMlNet.Cli\ReceiptMlNet.Cli.csproj -p:OnnxRuntimeFlavor=gpu -- `
+dotnet build .\dotnet\ReceiptMlNet.Cli\ReceiptMlNet.Cli.csproj -p:OnnxRuntimeFlavor=gpu
+
+dotnet run --no-build --project .\dotnet\ReceiptMlNet.Cli\ReceiptMlNet.Cli.csproj -p:OnnxRuntimeFlavor=gpu -- `
   --detector ".\artifacts\receipt_lrcnn_v1.onnx" `
   --device-model ".\artifacts\statusbar_device_v1.onnx" `
+  --ocr onnx `
+  --ocr-bundle $ocrBundle `
   --input "D:\download\TempFakeImages\s3_voucher_GWCZ2071991511234514944_20260701001815.png" `
-  --output "D:\download\TempFakeResults_mlnet_gpu" `
+  --output "D:\download\TempFakeResults_mlnet_onnx_ocr_gpu_1" `
   --device cuda:0 `
   --annotate all `
   --require-complete
 ```
 
-`--device auto` 会请求 GPU 并允许回退 CPU；GPU 是否真的可用时应先以 `--device cuda:0` 做单图
-验收。批量 100 张：
+`--device cuda:0` 是严格 GPU 验证：回单检测、设备识别和 OCR 的 det/cls/rec 三个 Session 都会请求
+同一块 CUDA 设备；任一个 CUDA Session 不能创建时，该命令会失败。ONNX Runtime 可能将少量 shape/metadata
+节点保留在 CPU，这是正常的，不影响神经网络计算优先走 GPU。`--device auto` 则允许整套 OCR 回退 CPU，不应用作
+GPU 验收。
+
+不要混用 CPU/GPU 的输出目录。下面命名中的最后一段是本次验证上限：`_1`、`_100`、`_10000`。
+
+批量 100 张 CPU 验证：
 
 ```powershell
-dotnet run --project .\dotnet\ReceiptMlNet.Cli\ReceiptMlNet.Cli.csproj -p:OnnxRuntimeFlavor=gpu -- `
+$batchInput = "D:\download\TempFakeImages"
+$batchOutputCpu = "D:\download\TempFakeResults_mlnet_onnx_ocr_cpu_100"
+
+dotnet build .\dotnet\ReceiptMlNet.Cli\ReceiptMlNet.Cli.csproj -p:OnnxRuntimeFlavor=cpu
+
+dotnet run --no-build --project .\dotnet\ReceiptMlNet.Cli\ReceiptMlNet.Cli.csproj -p:OnnxRuntimeFlavor=cpu -- `
   --detector ".\artifacts\receipt_lrcnn_v1.onnx" `
   --device-model ".\artifacts\statusbar_device_v1.onnx" `
-  --input "D:\download\TempFakeImages" `
-  --output "D:\download\TempFakeResults_mlnet_batch100" `
-  --device auto `
+  --ocr onnx `
+  --ocr-bundle $ocrBundle `
+  --input $batchInput `
+  --output $batchOutputCpu `
+  --device cpu `
+  --annotate all `
   --require-complete `
   --continue-on-error `
   --limit 100
 ```
 
-中断续跑时，添加 `--skip-existing`。交付给这个命令的文件仍是同一组四个：两个 `.onnx` 和
-各自的 `.contract.json`；无需重新导出 ML.NET 专属模型。
+批量 100 张 GPU 验证：
+
+```powershell
+dotnet run --no-build --project .\dotnet\ReceiptMlNet.Cli\ReceiptMlNet.Cli.csproj -p:OnnxRuntimeFlavor=gpu -- `
+  --detector ".\artifacts\receipt_lrcnn_v1.onnx" `
+  --device-model ".\artifacts\statusbar_device_v1.onnx" `
+  --ocr onnx `
+  --ocr-bundle $ocrBundle `
+  --input "D:\download\TempFakeImages" `
+  --output "D:\download\TempFakeResults_mlnet_onnx_ocr_gpu_100" `
+  --device cuda:0 `
+  --annotate all `
+  --require-complete `
+  --continue-on-error `
+  --limit 100
+```
+
+10,000 张正式 CPU / GPU 回归只改输出目录与执行设备；每次先构建匹配的 Runtime flavor：
+
+```powershell
+$batchInput = "D:\download\TempFakeImages"
+$batchOutputCpu = "D:\download\TempFakeResults_mlnet_onnx_ocr_cpu_10000"
+
+dotnet build .\dotnet\ReceiptMlNet.Cli\ReceiptMlNet.Cli.csproj -p:OnnxRuntimeFlavor=cpu
+dotnet run --no-build --project .\dotnet\ReceiptMlNet.Cli\ReceiptMlNet.Cli.csproj -p:OnnxRuntimeFlavor=cpu -- `
+  --detector ".\artifacts\receipt_lrcnn_v1.onnx" `
+  --device-model ".\artifacts\statusbar_device_v1.onnx" `
+  --ocr onnx `
+  --ocr-bundle $ocrBundle `
+  --input $batchInput `
+  --output $batchOutputCpu `
+  --device cpu `
+  --annotate all `
+  --require-complete `
+  --continue-on-error `
+  --limit 10000
+```
+
+```powershell
+$batchInput = "D:\download\TempFakeImages"
+$batchOutputGpu = "D:\download\TempFakeResults_mlnet_onnx_ocr_gpu_10000"
+
+dotnet build .\dotnet\ReceiptMlNet.Cli\ReceiptMlNet.Cli.csproj -p:OnnxRuntimeFlavor=gpu
+dotnet run --no-build --project .\dotnet\ReceiptMlNet.Cli\ReceiptMlNet.Cli.csproj -p:OnnxRuntimeFlavor=gpu -- `
+  --detector ".\artifacts\receipt_lrcnn_v1.onnx" `
+  --device-model ".\artifacts\statusbar_device_v1.onnx" `
+  --ocr onnx `
+  --ocr-bundle $ocrBundle `
+  --input $batchInput `
+  --output $batchOutputGpu `
+  --device cuda:0 `
+  --annotate all `
+  --require-complete `
+  --continue-on-error `
+  --limit 10000
+```
+
+中断续跑时，在对应命令末尾添加 `--skip-existing`；如果旧 JSON 没有 `fields`，在 `--ocr onnx` 模式下会
+自动重跑而不会误跳过。CPU 与 GPU 输出的 `inference_manifest.json` / `inference_errors.jsonl` 可分别用于
+统计两套验证的成功数、错误数和耗时。
 
 ## CPU / macOS 开发环境
 

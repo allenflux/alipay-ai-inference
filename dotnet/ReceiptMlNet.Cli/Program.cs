@@ -48,6 +48,9 @@ internal static class ReceiptMlNetProgram
         ModelContract? deviceContract = options.DeviceModelPath is null
             ? null
             : ModelContract.LoadAndVerify(options.DeviceModelPath, "statusbar_device_v1");
+        var ocrBundle = options.OcrMode == "onnx"
+            ? PaddleOcrDeliveryBundle.LoadAndVerify(options.OcrBundlePath!)
+            : null;
 
         var inputFiles = EnumerateInputFiles(options.InputPath).ToList();
         if (inputFiles.Count == 0)
@@ -72,12 +75,18 @@ internal static class ReceiptMlNetProgram
         var deviceClassifier = options.DeviceModelPath is null
             ? null
             : new DeviceModel(options.DeviceModelPath, device);
+        Console.WriteLine($"Requested ONNX device: {device.Requested} (receipt detector{(deviceClassifier is null ? string.Empty : "/device model")})");
+        using var ocrEngine = ocrBundle is null ? null : new PaddleOcrEngine(ocrBundle, device);
+        if (ocrEngine is not null)
+        {
+            Console.WriteLine($"OCR ONNX execution provider: {ocrEngine.ExecutionProvider} (det/cls/rec)");
+        }
 
         foreach (var inputFile in inputFiles)
         {
             var outputFile = OutputPathFor(options.OutputDirectory, sourceRoot, inputFile);
             var annotationPaths = AnnotationPaths.ForResultJson(outputFile);
-            if (options.SkipExisting && File.Exists(outputFile))
+            if (options.SkipExisting && ExistingResultSatisfiesRequestedMode(outputFile, options.OcrMode))
             {
                 manifest.Add(new ManifestRecord(
                     Path.GetFullPath(inputFile),
@@ -90,14 +99,17 @@ internal static class ReceiptMlNetProgram
 
             try
             {
-                var result = InferImage(inputFile, detector, deviceClassifier, options.ScoreThreshold);
+                var result = InferImage(inputFile, detector, deviceClassifier, ocrEngine, options.ScoreThreshold);
                 if (options.RequireComplete)
                 {
                     EnsureCoreFields(result.Detections);
                 }
                 result = result with
                 {
-                    ModelContracts = new ContractReferences(detectorContract.FileName, deviceContract?.FileName),
+                    ModelContracts = new ContractReferences(
+                        detectorContract.FileName,
+                        deviceContract?.FileName,
+                        ocrBundle is null ? null : Path.GetFileName(ocrBundle.ContractPath)),
                 };
                 if (ShouldAnnotate(result.Detections, options.AnnotationMode))
                 {
@@ -130,6 +142,7 @@ internal static class ReceiptMlNetProgram
         string inputFile,
         DetectorModel detector,
         DeviceModel? deviceClassifier,
+        PaddleOcrEngine? ocrEngine,
         float scoreThreshold)
     {
         using var source = ImagePipeline.LoadUprightRgb(inputFile);
@@ -138,6 +151,11 @@ internal static class ReceiptMlNetProgram
         var prepared = ImagePipeline.PrepareDetectorInput(source);
         var predictions = detector.Predict(prepared.Tensor);
         var detections = PostProcessDetections(predictions, prepared, scoreThreshold);
+        if (ocrEngine is not null)
+        {
+            detections = EnrichWithOcr(source, detections, ocrEngine);
+        }
+        var fields = ocrEngine is null ? null : BuildFields(detections);
 
         return new ReceiptResult(
             Path.GetFullPath(inputFile),
@@ -148,14 +166,17 @@ internal static class ReceiptMlNetProgram
                 "letterbox",
                 "not_applied"),
             detections,
+            fields,
             device,
             null,
             new[]
             {
-                "This .NET CLI performs ONNX model inference only.",
+                "This .NET CLI performs ONNX model inference.",
                 "Input must already be an upright, rectified receipt image when perspective correction is needed.",
                 "Annotated JPGs use upright source coordinates. Their original/rectified pair is identical until perspective rectification is ported to .NET.",
-                "PaddleOCR and Python receipt field extraction are not included in this ML.NET CLI.",
+                ocrEngine is null
+                    ? "PaddleOCR ONNX field extraction is disabled; pass --ocr onnx --ocr-bundle <delivery-directory> to enable it."
+                    : "OCR uses the verified PP-OCR ONNX delivery bundle; source-image perspective rectification is not yet ported to .NET.",
             });
     }
 
@@ -187,6 +208,136 @@ internal static class ReceiptMlNetProgram
             }
         }
         return bestByLabel.Values.OrderBy(item => item.Label, StringComparer.Ordinal).ToList();
+    }
+
+    private static List<DetectionResult> EnrichWithOcr(
+        Image<Rgb24> source,
+        IReadOnlyList<DetectionResult> detections,
+        PaddleOcrEngine ocrEngine)
+    {
+        var enriched = new List<DetectionResult>(detections.Count);
+        foreach (var detection in detections)
+        {
+            var crop = CropFieldWithMargin(source, detection.BboxImage);
+            if (crop is null)
+            {
+                enriched.Add(detection with { Ocr = new OcrResult(string.Empty, null) });
+                continue;
+            }
+            using (crop)
+            {
+                var result = ocrEngine.Recognize(crop);
+                enriched.Add(detection with { Ocr = new OcrResult(result.Text, result.Confidence) });
+            }
+        }
+        return enriched;
+    }
+
+    private static Image<Rgb24>? CropFieldWithMargin(Image<Rgb24> source, float[] box)
+    {
+        if (box.Length < 4)
+        {
+            return null;
+        }
+        var marginX = Math.Max(2.0f, (box[2] - box[0]) * 0.08f);
+        var marginY = Math.Max(2.0f, (box[3] - box[1]) * 0.08f);
+        var left = Math.Clamp((int)MathF.Floor(box[0] - marginX), 0, source.Width);
+        var top = Math.Clamp((int)MathF.Floor(box[1] - marginY), 0, source.Height);
+        var right = Math.Clamp((int)MathF.Ceiling(box[2] + marginX), 0, source.Width);
+        var bottom = Math.Clamp((int)MathF.Ceiling(box[3] + marginY), 0, source.Height);
+        if (right <= left || bottom <= top)
+        {
+            return null;
+        }
+        return source.Clone(context => context.Crop(new Rectangle(left, top, right - left, bottom - top)));
+    }
+
+    private static ReceiptFields BuildFields(IReadOnlyList<DetectionResult> detections)
+    {
+        var byLabel = detections.ToDictionary(item => item.Label, StringComparer.Ordinal);
+        var time = FieldFromOcr(byLabel.GetValueOrDefault("time"));
+        if (time.Raw is not null)
+        {
+            time = time with { Value = ReceiptFieldNormalizer.NormalizeTime(time.Raw) };
+        }
+
+        var amount = FieldFromOcr(byLabel.GetValueOrDefault("amount"));
+        if (amount.Raw is not null && ReceiptFieldNormalizer.NormalizeAmount(amount.Raw) is { } normalizedAmount)
+        {
+            amount = amount with
+            {
+                Normalized = normalizedAmount.Normalized,
+                AmountFen = normalizedAmount.AmountFen,
+                Currency = normalizedAmount.Currency,
+            };
+        }
+
+        var recipient = FieldFromOcr(byLabel.GetValueOrDefault("recipient_field"));
+        if (recipient.Raw is not null)
+        {
+            recipient = recipient with { Value = ReceiptFieldNormalizer.ExtractFieldValue(recipient.Raw, "recipient") };
+        }
+
+        var paymentMethod = FieldFromOcr(byLabel.GetValueOrDefault("payment_method_field"));
+        if (paymentMethod.Raw is not null)
+        {
+            var value = ReceiptFieldNormalizer.ExtractFieldValue(paymentMethod.Raw, "payment_method");
+            paymentMethod = paymentMethod with
+            {
+                Value = value,
+                Normalized = ReceiptFieldNormalizer.NormalizePaymentMethod(value).Normalized,
+            };
+        }
+
+        var transferStatus = FieldFromOcr(byLabel.GetValueOrDefault("transfer_status"));
+        if (transferStatus.Raw is not null)
+        {
+            transferStatus = transferStatus with { Normalized = ReceiptFieldNormalizer.NormalizeStatus(transferStatus.Raw) };
+        }
+
+        return new ReceiptFields(time, amount, transferStatus, recipient, paymentMethod);
+    }
+
+    private static ReceiptFieldResult FieldFromOcr(DetectionResult? detection)
+    {
+        if (detection is null)
+        {
+            return new ReceiptFieldResult("absent", null, null, null, null, null, null, null, null);
+        }
+        if (detection.Ocr is null || string.IsNullOrWhiteSpace(detection.Ocr.Text))
+        {
+            // Python's unreadable-field shape exposes the detector value as
+            // `score`, while successful OCR uses `detector_score`.
+            return new ReceiptFieldResult("unreadable", null, null, null, MathF.Round(detection.Score, 6), null, null, null, null);
+        }
+        return new ReceiptFieldResult(
+            "read",
+            detection.Ocr.Text,
+            detection.Ocr.Confidence is null ? null : MathF.Round(detection.Ocr.Confidence.Value, 6),
+            MathF.Round(detection.Score, 6),
+            null,
+            null,
+            null,
+            null,
+            null);
+    }
+
+    private static bool ExistingResultSatisfiesRequestedMode(string outputPath, string ocrMode)
+    {
+        if (!File.Exists(outputPath) || ocrMode == "none")
+        {
+            return File.Exists(outputPath);
+        }
+        try
+        {
+            using var document = JsonDocument.Parse(File.ReadAllBytes(outputPath));
+            return document.RootElement.TryGetProperty("fields", out var fields)
+                && fields.ValueKind == JsonValueKind.Object;
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
     }
 
     private static void EnsureCoreFields(IEnumerable<DetectionResult> detections)
@@ -573,6 +724,8 @@ internal sealed record ModelContract(string FileName)
 internal sealed record CliOptions(
     string DetectorPath,
     string? DeviceModelPath,
+    string OcrMode,
+    string? OcrBundlePath,
     string InputPath,
     string OutputDirectory,
     string Device,
@@ -588,19 +741,23 @@ Usage:
   dotnet run --project dotnet/ReceiptMlNet.Cli/ReceiptMlNet.Cli.csproj -- \
     --detector <receipt_lrcnn_v1.onnx> \
     [--device-model <statusbar_device_v1.onnx>] \
+    [--ocr none|onnx] [--ocr-bundle <paddle-ocr-delivery-directory>] \
     --input <image-or-directory> --output <directory> \
     [--device auto|cpu|cuda:0] [--score-threshold 0.50] [--annotate all|flagged|none] \
     [--require-complete] [--continue-on-error] [--skip-existing] [--limit 100]
 
-This ML.NET CLI runs the two ONNX neural models. It writes JSON and, by default,
-two annotated JPGs. It does not include OpenCV perspective rectification or
-PaddleOCR; use an already rectified image when needed.
+This .NET CLI runs the receipt/device ONNX models and can optionally run a
+verified PP-OCR ONNX delivery bundle. It writes JSON and, by default, two
+annotated JPGs. It does not yet include perspective rectification; use an
+already rectified image when needed.
 """;
 
     public static CliOptions Parse(string[] args)
     {
         string? detector = null;
         string? deviceModel = null;
+        var ocrMode = "none";
+        string? ocrBundle = null;
         string? input = null;
         string? output = null;
         var device = "auto";
@@ -617,6 +774,8 @@ PaddleOCR; use an already rectified image when needed.
             {
                 case "--detector": detector = NextValue(args, ref index); break;
                 case "--device-model": deviceModel = NextValue(args, ref index); break;
+                case "--ocr": ocrMode = ParseOcrMode(NextValue(args, ref index)); break;
+                case "--ocr-bundle": ocrBundle = NextValue(args, ref index); break;
                 case "--input": input = NextValue(args, ref index); break;
                 case "--output": output = NextValue(args, ref index); break;
                 case "--device": device = NextValue(args, ref index); break;
@@ -645,8 +804,26 @@ PaddleOCR; use an already rectified image when needed.
         {
             throw new UsageException("--detector, --input and --output are required");
         }
+        if (ocrMode == "onnx" && string.IsNullOrWhiteSpace(ocrBundle))
+        {
+            throw new UsageException("--ocr-bundle is required when --ocr onnx");
+        }
+        if (ocrMode == "none" && !string.IsNullOrWhiteSpace(ocrBundle))
+        {
+            throw new UsageException("--ocr-bundle requires --ocr onnx");
+        }
         _ = DeviceSetting.Parse(device);
-        return new CliOptions(detector, deviceModel, input, output, device, scoreThreshold, annotationMode, requireComplete, continueOnError, skipExisting, limit);
+        return new CliOptions(detector, deviceModel, ocrMode, ocrBundle, input, output, device, scoreThreshold, annotationMode, requireComplete, continueOnError, skipExisting, limit);
+    }
+
+    private static string ParseOcrMode(string value)
+    {
+        var mode = value.ToLowerInvariant();
+        if (mode is "none" or "onnx")
+        {
+            return mode;
+        }
+        throw new UsageException("--ocr must be none or onnx");
     }
 
     private static string ParseAnnotationMode(string value)
@@ -676,13 +853,36 @@ internal sealed record ReceiptResult(
     string InferenceEngine,
     DetectorGeometry Geometry,
     List<DetectionResult> Detections,
+    ReceiptFields? Fields,
     DeviceResult? Device,
     ContractReferences? ModelContracts,
     string[] Limitations);
 
 internal sealed record DetectorGeometry(ImageSize SourceSize, ImageSize DetectorCanvas, string ResizeMode, string Rectification);
 internal sealed record ImageSize(int Width, int Height);
-internal sealed record DetectionResult(string Label, float Score, float[] BboxImage);
+internal sealed record DetectionResult(string Label, float Score, float[] BboxImage, OcrResult? Ocr = null);
+internal sealed record OcrResult(
+    string Text,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.Never)] float? Confidence);
+
+internal sealed record ReceiptFields(
+    ReceiptFieldResult Time,
+    ReceiptFieldResult Amount,
+    ReceiptFieldResult TransferStatus,
+    ReceiptFieldResult Recipient,
+    ReceiptFieldResult PaymentMethod);
+
+/// <summary>JSON-compatible structured field state mirroring the Python pipeline.</summary>
+internal sealed record ReceiptFieldResult(
+    string State,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? Raw,
+    float? OcrConfidence,
+    float? DetectorScore,
+    float? Score,
+    string? Value,
+    string? Normalized,
+    long? AmountFen,
+    string? Currency);
 internal sealed record DeviceResult(
     string Platform,
     string PlatformCn,
@@ -692,7 +892,7 @@ internal sealed record DeviceResult(
     float? PIos,
     string? CnnPlatform,
     string? ConflictDetail);
-internal sealed record ContractReferences(string Detector, string? Device);
+internal sealed record ContractReferences(string Detector, string? Device, string? OcrBundle);
 internal sealed record ManifestRecord(
     string Source,
     string Result,
