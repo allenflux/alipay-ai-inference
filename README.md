@@ -298,6 +298,16 @@ python -m transfer_receipt_ai.paddle_ocr_bundle verify-delivery `
 
 该目录只带 `onnx/`、`charset/` 和 `paddle_ocr_delivery.contract.json`，不带 `.pdmodel`、Paddle 或 Python。
 
+### CPU 是正式交付目标
+
+CPU 不是 GPU 不可用时的隐式降级，而是独立验收目标：`export-onnx` 对每份 ONNX 强制用
+`CPUExecutionProvider` 做一次加载检查；`validate-onnx` 也固定在 CPU 上运行原生 Paddle 与 ONNX 的文本对比。
+因此上面的 100 张和全量命令成功，才说明这三个 OCR ONNX 在 CPU 可运行且保持转换前效果；它不需要 CUDA、cuDNN 或
+Paddle GPU。
+
+后续 .NET OCR CLI 会把 `--device cpu` 固定映射到 CPU Execution Provider，并在全量回归中单独输出 CPU p50/p95、
+吞吐、峰值内存和字段一致性；CUDA 只是同一套 ONNX 的可选加速路径，不改变 CPU 的结果契约。
+
 ### 速度与轻量化策略
 
 | 阶段 | 运行内容 | 目的 |

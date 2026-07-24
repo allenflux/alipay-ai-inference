@@ -10,6 +10,7 @@ from transfer_receipt_ai.paddle_ocr_bundle import (
     CONTRACT_FILENAME,
     DELIVERY_CONTRACT_FILENAME,
     PaddleOcrBundleError,
+    _paddle_onnx_options,
     _require_dynamic_ocr_shapes,
     build_parser,
     package_delivery_bundle,
@@ -140,3 +141,22 @@ def test_bundle_cli_exposes_conversion_and_delivery_stages() -> None:
 
     assert args.min_text_exact_match == 1.0
     assert args.max_confidence_delta == 0.01
+
+
+def test_conversion_parity_reader_is_forced_to_cpu_even_if_snapshot_used_gpu(tmp_path: Path) -> None:
+    bundle = tmp_path / "bundle"
+    contract = {
+        "effective_paddleocr_args": {"lang": "ch", "use_gpu": True, "gpu_id": 7},
+        "onnx": {
+            role: {"path": f"onnx/paddle_ocr_{role}.onnx"}
+            for role in ("det", "rec", "cls")
+        },
+        "dictionary": {"path": "charset/ppocr_keys_v1.txt"},
+    }
+
+    options = _paddle_onnx_options(bundle, contract)
+
+    assert options["use_onnx"] is True
+    assert options["use_gpu"] is False
+    assert options["onnx_providers"] == ["CPUExecutionProvider"]
+    assert options["det_model_dir"] == str(bundle / "onnx" / "paddle_ocr_det.onnx")
