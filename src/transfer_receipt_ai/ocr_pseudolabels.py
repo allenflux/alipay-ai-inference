@@ -262,6 +262,47 @@ def _parse_labels(value: str) -> tuple[str, ...]:
     return labels
 
 
+def _parse_confidence_override(value: str) -> tuple[str, float]:
+    """Parse a CLI ``field=confidence`` override without accepting unknown fields."""
+    label, separator, raw_score = value.partition("=")
+    label = label.strip()
+    if not separator or not label or not raw_score.strip():
+        raise argparse.ArgumentTypeError("expected LABEL=SCORE, for example amount=0.90")
+    if label not in DETECTION_CLASSES:
+        raise argparse.ArgumentTypeError(
+            f"unknown field {label!r}; expected one of: {','.join(DETECTION_CLASSES)}"
+        )
+    try:
+        score = float(raw_score)
+    except ValueError:
+        raise argparse.ArgumentTypeError("confidence override score must be numeric") from None
+    if not math.isfinite(score) or not 0.0 <= score <= 1.0:
+        raise argparse.ArgumentTypeError("confidence override score must be between 0 and 1")
+    return label, score
+
+
+def _normalise_confidence_overrides(
+    value: Mapping[str, float] | None,
+) -> dict[str, float]:
+    overrides: dict[str, float] = {}
+    if value is None:
+        return overrides
+    invalid = sorted(set(value) - set(DETECTION_CLASSES))
+    if invalid:
+        raise ValueError(f"unknown OCR confidence override field(s): {','.join(invalid)}")
+    for label, raw_score in value.items():
+        if isinstance(raw_score, bool):
+            raise ValueError(f"OCR confidence override for {label} must be numeric")
+        try:
+            score = float(raw_score)
+        except (TypeError, ValueError):
+            raise ValueError(f"OCR confidence override for {label} must be numeric") from None
+        if not math.isfinite(score) or not 0.0 <= score <= 1.0:
+            raise ValueError(f"OCR confidence override for {label} must be between 0 and 1")
+        overrides[label] = score
+    return overrides
+
+
 def _validate_build_options(
     *,
     min_detector_score: float,
@@ -328,6 +369,7 @@ def build_pseudo_label_dataset(
     labels: Sequence[str] = DETECTION_CLASSES,
     min_detector_score: float = DEFAULT_MIN_DETECTOR_SCORE,
     min_ocr_confidence: float = DEFAULT_MIN_OCR_CONFIDENCE,
+    min_ocr_confidence_by_label: Mapping[str, float] | None = None,
     max_text_length: int = DEFAULT_MAX_TEXT_LENGTH,
     max_per_label_text: int = DEFAULT_MAX_PER_LABEL_TEXT,
     validation_ratio: float = 0.10,
@@ -348,6 +390,7 @@ def build_pseudo_label_dataset(
     invalid_labels = sorted(set(labels) - set(DETECTION_CLASSES))
     if not labels or invalid_labels:
         raise ValueError(f"labels must be a non-empty subset of: {','.join(DETECTION_CLASSES)}")
+    min_ocr_confidence_by_label = _normalise_confidence_overrides(min_ocr_confidence_by_label)
     _validate_build_options(
         min_detector_score=min_detector_score,
         min_ocr_confidence=min_ocr_confidence,
@@ -437,9 +480,15 @@ def build_pseudo_label_dataset(
                         rejected.append(_rejection(result_json, label=label, reason="non_printable_text"))
                         continue
                     ocr_confidence = _finite_score(ocr.get("confidence"), "OCR confidence")
-                    if ocr_confidence < min_ocr_confidence:
+                    required_ocr_confidence = min_ocr_confidence_by_label.get(label, min_ocr_confidence)
+                    if ocr_confidence < required_ocr_confidence:
                         rejected.append(
-                            _rejection(result_json, label=label, reason="low_ocr_confidence", detail=str(ocr_confidence))
+                            _rejection(
+                                result_json,
+                                label=label,
+                                reason="low_ocr_confidence",
+                                detail=f"score={ocr_confidence}, required={required_ocr_confidence}",
+                            )
                         )
                         continue
                     semantic_value = _semantic_value(label, text)
@@ -539,6 +588,7 @@ def build_pseudo_label_dataset(
         "selection": {
             "min_detector_score": min_detector_score,
             "min_ocr_confidence": min_ocr_confidence,
+            "min_ocr_confidence_by_label": dict(sorted(min_ocr_confidence_by_label.items())),
             "max_text_length": max_text_length,
             "max_per_label_text": max_per_label_text,
             "validation_ratio": validation_ratio,
@@ -590,6 +640,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--min-detector-score", type=float, default=DEFAULT_MIN_DETECTOR_SCORE)
     parser.add_argument("--min-ocr-confidence", type=float, default=DEFAULT_MIN_OCR_CONFIDENCE)
+    parser.add_argument(
+        "--min-ocr-confidence-override",
+        action="append",
+        type=_parse_confidence_override,
+        default=[],
+        metavar="LABEL=SCORE",
+        help="Override OCR confidence for one field; repeat as needed, e.g. amount=0.90",
+    )
     parser.add_argument("--max-text-length", type=int, default=DEFAULT_MAX_TEXT_LENGTH)
     parser.add_argument("--max-per-label-text", type=int, default=DEFAULT_MAX_PER_LABEL_TEXT)
     parser.add_argument("--validation-ratio", type=float, default=0.10)
@@ -608,6 +666,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
+    override_labels = [label for label, _score in args.min_ocr_confidence_override]
+    if len(set(override_labels)) != len(override_labels):
+        raise SystemExit("OCR pseudo-label export failed:\nduplicate --min-ocr-confidence-override field")
     try:
         records = build_pseudo_label_dataset(
             results_dir=args.results,
@@ -615,6 +676,7 @@ def main(argv: list[str] | None = None) -> None:
             labels=args.labels,
             min_detector_score=args.min_detector_score,
             min_ocr_confidence=args.min_ocr_confidence,
+            min_ocr_confidence_by_label=dict(args.min_ocr_confidence_override),
             max_text_length=args.max_text_length,
             max_per_label_text=args.max_per_label_text,
             validation_ratio=args.validation_ratio,

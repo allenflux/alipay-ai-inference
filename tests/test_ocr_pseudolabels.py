@@ -133,6 +133,33 @@ def test_low_confidence_and_invalid_semantics_are_rejected(tmp_path: Path) -> No
     assert {record["reason"] for record in rejected} == {"low_ocr_confidence", "field_semantic_validation_failed"}
 
 
+def test_per_field_ocr_confidence_override_keeps_low_confidence_amount_only(tmp_path: Path) -> None:
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    source = raw_dir / "receipt.png"
+    image = np.full((40, 60, 3), 200, dtype=np.uint8)
+    image[8:24, 8:45] = [20, 40, 60]
+    Image.fromarray(image).save(source)
+    results = tmp_path / "results"
+    _write_result(
+        results_dir=results,
+        source=source,
+        detections=[
+            _detection("amount", "¥12.30", confidence=0.91),
+            _detection("time", "09:30", confidence=0.91, x_offset=5),
+        ],
+    )
+
+    records = build_pseudo_label_dataset(
+        results_dir=results,
+        output_dir=tmp_path / "pseudo",
+        min_ocr_confidence_by_label={"amount": 0.90},
+        review_ratio=0.0,
+    )
+
+    assert [record["field"] for record in records] == ["amount"]
+
+
 def test_refuses_dataset_output_inside_results_tree(tmp_path: Path) -> None:
     source = tmp_path / "raw.png"
     Image.fromarray(np.zeros((20, 20, 3), dtype=np.uint8)).save(source)

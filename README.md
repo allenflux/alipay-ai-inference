@@ -222,10 +222,14 @@ python -m transfer_receipt_ai.ocr_pseudolabels `
   --output "D:\download\ReceiptOcrPseudoV1" `
   --min-detector-score 0.90 `
   --min-ocr-confidence 0.98 `
+  --min-ocr-confidence-override "amount=0.90" `
   --test-ratio 0.10 `
   --review-ratio 0.10 `
   --continue-on-error
 ```
+
+如果某字段因全局 `0.98` 门槛而几乎没有样本，可以只降低该字段，例如上面的 `amount=0.90`；其余字段
+仍保持 `0.98`。不要为了补金额而降低全部字段的阈值。
 
 输出目录包含：
 
