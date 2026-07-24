@@ -195,6 +195,123 @@ python -m receipt_inference.cli `
 `inference_manifest.json`。启用 `--require-complete` 后，未检测齐金额、转账状态、收款方和
 付款方式这四个核心字段的图片会失败；顶部 `time` 字段允许缺失。
 
+## 纯 ONNX OCR 交付（保持当前 PaddleOCR 效果的路线）
+
+前面的自训练 CTC 是一个实验候选，不应直接替换当前 PaddleOCR：本次 1000 张伪标签的保留集验收只得到
+`raw_exact_match=52.65%`、`micro_cer=0.1302`，且收款方有大量未覆盖中文字符。因此交付版本应冻结**当前
+实际运行成功**的 PaddleOCR 资产并导出 ONNX，而不是继续加大自训练模型。
+
+当前 Windows 服务器已确认模型类型是 PP-OCRv4 det/rec + mobile v2.0 cls。默认缓存通常是以下布局（最终以
+冻结出的 contract 中 `source_directory` 和 `rec_char_dict_path` 为准；不要硬编码 Windows 用户名）：
+
+```text
+%USERPROFILE%\.paddleocr\whl\det\ch\ch_PP-OCRv4_det_infer
+%USERPROFILE%\.paddleocr\whl\rec\ch\ch_PP-OCRv4_rec_infer
+%USERPROFILE%\.paddleocr\whl\cls\ch_ppocr_mobile_v2.0_cls_infer
+%VIRTUAL_ENV%\Lib\site-packages\paddleocr\ppocr\utils\ppocr_keys_v1.txt
+```
+
+前三项分别是文字检测、中文识别、方向分类；最后一项是与识别模型严格匹配的字符表。不要改用列表中其他
+`*_dict.txt`，尤其不要用 `chinese_cht_dict.txt`。也不要只导出识别模型：当前生产逻辑是
+`PaddleOCR(..., use_angle_cls=True).ocr(crop, cls=True)`，需要完整的 det + cls + rec 三段。
+
+先从**已成功运行当前 PaddleOCR 的同一个虚拟环境**冻结资产。此命令以 CPU 初始化，只读取相同缓存，不会影响
+现有 GPU 推理；默认若缓存缺失会报错而不会暗中下载新模型：
+
+```powershell
+$project = "D:\alipay-ai-data\alipay-ai-inference"
+$bundle = "$project\artifacts\paddle_ocr_ppocrv4_v1"
+
+python -m transfer_receipt_ai.paddle_ocr_bundle snapshot `
+  --output $bundle `
+  --device cpu
+
+Get-Content "$bundle\paddle_ocr_bundle.contract.json" -Encoding UTF8
+```
+
+输出是不可覆盖的审计快照，内含三个 Paddle 静态模型、字符表、有效 PaddleOCR 参数、版本、文件大小和 SHA-256。
+冻结命令也会记录当前 Python 流水线的关键兼容规则：输入是直接传给 Paddle v2 的 RGB crop；多行文本清洗后以单个
+空格连接，置信度取行级置信度均值。C# 端必须照此实现，不能自行加 RGB/BGR 交换。
+
+然后在当前 Windows venv 中安装适用于 Windows/Python 3.10 的转换器。使用 `--no-deps`，避免它改动已经能运行的
+Paddle/PaddleOCR/CUDA 依赖；不要使用 Paddle2ONNX 2.1.x：它针对 Paddle 3 依赖链，不是本项目的锁定转换环境。
+
+```powershell
+python -m pip install --no-deps paddle2onnx==1.3.0
+$converter = "$env:VIRTUAL_ENV\Scripts\paddle2onnx.exe"
+& $converter --version
+
+python -m transfer_receipt_ai.paddle_ocr_bundle export-onnx `
+  --bundle $bundle `
+  --paddle2onnx $converter
+
+python -m transfer_receipt_ai.paddle_ocr_bundle verify `
+  --bundle $bundle `
+  --require-onnx
+```
+
+它会从冻结副本而不是 live cache 导出，并对每个 ONNX 再运行 ONNX checker 和 CPU ONNX Runtime 加载检查；输出为：
+
+```text
+artifacts\paddle_ocr_ppocrv4_v1\
+  onnx\paddle_ocr_det.onnx
+  onnx\paddle_ocr_rec.onnx
+  onnx\paddle_ocr_cls.onnx
+  charset\ppocr_keys_v1.txt
+  paddle_ocr_bundle.contract.json
+  paddle\...                    # 只用于审计/可复现转换，不放最终交付包
+```
+
+转换成功后，先在**同一批字段裁图**上验证“Paddle 原生推理 vs PaddleOCR 2.10 的 `use_onnx=True` 推理”。两侧复用
+官方完全相同的 det/cls/rec 前后处理，只替换底层推理图，因此这是转换是否保持效果的第一道门槛。先抽 100 张，再跑全部：
+
+```powershell
+$crops = "D:\download\ReceiptOcrPseudoV3\images"
+
+python -m transfer_receipt_ai.paddle_ocr_bundle validate-onnx `
+  --bundle $bundle `
+  --input $crops `
+  --output "D:\download\PaddleOcrOnnxParity100" `
+  --limit 100 `
+  --min-text-exact-match 1.0 `
+  --max-confidence-delta 0.01
+```
+
+成功后将输出目录换成 `D:\download\PaddleOcrOnnxParityAll`、删除 `--limit 100` 再跑全量。输出的
+`comparisons.jsonl` 包含逐 crop 文本、行序列、置信度和耗时，`summary.json` 包含精确匹配率与 p50/p95。它只验证
+Paddle → ONNX 的转换一致性；通过后才进入 Python ONNX → C# ONNX 的逐字段、JSON 和性能回归。
+
+不要传 `--input_shape_dict` 或进行静态 shape / INT8 量化；OCR 检测模型的高宽和识别模型的宽度必须先保持动态，才能做
+当前效果的一致性基线。审计 bundle 必须保留 `paddle/`，不要从它手动删除源模型；完成逐字段回归后，用以下命令创建
+单独的、轻量的纯 ONNX 交付目录：
+
+```powershell
+$delivery = "$project\artifacts\paddle_ocr_ppocrv4_v1_delivery"
+
+python -m transfer_receipt_ai.paddle_ocr_bundle package-delivery `
+  --bundle $bundle `
+  --output $delivery
+
+python -m transfer_receipt_ai.paddle_ocr_bundle verify-delivery `
+  --delivery $delivery
+```
+
+该目录只带 `onnx/`、`charset/` 和 `paddle_ocr_delivery.contract.json`，不带 `.pdmodel`、Paddle 或 Python。
+
+### 速度与轻量化策略
+
+| 阶段 | 运行内容 | 目的 |
+| --- | --- | --- |
+| 基线 | 每个字段执行 OCR det + cls + rec | 先证明文字和字段值与当前 Paddle 一致 |
+| 后续快路径 | 对正常横向、单行且高置信字段直接 cls + rec | 仅在完整基线回归通过后实施，跳过文字检测以降低多数回单耗时 |
+| 后续回退 | 快路径低置信、旋转、多行或字段规则异常时回到 det + cls + rec | 不用速度换取错误结果 |
+| 压缩 | 只在一致性回归通过后测试 CPU INT8 | 量化一旦影响中文/金额/时间任一门槛即不采用 |
+
+三个 ONNX Session 会在进程启动时只加载一次；同尺寸字段会批处理；GPU 使用 CUDA Execution Provider，CPU 使用
+CPU Execution Provider。OCR 的 det/rec 有动态 shape、文本框后处理和 CTC 解码，因此 .NET 端会直接用
+`Microsoft.ML.OnnxRuntime.InferenceSession`，不强行塞进固定张量的 `ApplyOnnxModel`；这仍然是纯 ONNX/.NET 交付。
+验收同时记录全量 1000 张的逐字段文本/归一化值、p50/p95 单图耗时、总吞吐、显存/内存和最终包体积。
+
 ## 自训练 OCR（不在交付时依赖 Paddle）
 
 已有的 Python `--ocr paddle` 结果可以作为**伪标签**，用来训练独立的 PyTorch CTC 文字识别器。
