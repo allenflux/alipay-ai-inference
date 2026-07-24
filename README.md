@@ -26,6 +26,7 @@ alipay-ai-inference/
   requirements.txt
   requirements-ocr.txt
   requirements-export.txt
+  requirements-train-ocr.txt
   requirements-dev.txt
 ```
 
@@ -193,6 +194,103 @@ python -m receipt_inference.cli `
 每张成功输入会生成结构化 JSON、纠正图圈选结果、原图透视回投圈选结果，以及批量
 `inference_manifest.json`。启用 `--require-complete` 后，未检测齐金额、转账状态、收款方和
 付款方式这四个核心字段的图片会失败；顶部 `time` 字段允许缺失。
+
+## 自训练 OCR（不在交付时依赖 Paddle）
+
+已有的 Python `--ocr paddle` 结果可以作为**伪标签**，用来训练独立的 PyTorch CTC 文字识别器。
+训练和导出过程不会导入 Paddle；最终产物是 ONNX、字符表和 contract，供后续 C# / ONNX Runtime
+OCR 接入使用。
+
+不要直接拿带红圈的 `*_annotated.jpg` 训练。下面的脚本读取结果 JSON 中的 `source`、几何和
+`detections[].ocr`，重建干净的矫正图，并用与当前 OCR 相同的 8% 边距规则裁出字段图。最终 JSON 的
+几何坐标经过序列化取整，因此裁图是可复现的近似重建；它不使用带红圈预览图，也不是私有全精度
+Paddle 阶段裁图的逐像素副本。默认只接受
+检测置信度 `>= 0.90`、Paddle OCR 置信度 `>= 0.98` 且能通过字段语义检查的样本；低质量样本会进入
+`rejected.jsonl`，不会混入训练集。
+
+原始图片在生成这批 Paddle 结果后不要再覆盖或编辑；导出器会检查修改时间并拒绝明显已变更的图片，
+但旧结果 JSON 没有保存原图内容哈希，因此最稳妥的做法仍是保持原始图片目录只读。
+只有在迁移文件后已人工确认内容完全相同、仅修改时间改变时，才可以显式加
+`--allow-source-newer` 跳过这一层保护。
+
+例如，已在服务器生成的结果目录为
+`D:\download\TempFakeResults_onnx_cpu_ocr_10000` 时：
+
+```powershell
+python -m transfer_receipt_ai.ocr_pseudolabels `
+  --results "D:\download\TempFakeResults_onnx_cpu_ocr_10000" `
+  --output "D:\download\ReceiptOcrPseudoV1" `
+  --min-detector-score 0.90 `
+  --min-ocr-confidence 0.98 `
+  --review-ratio 0.10 `
+  --continue-on-error
+```
+
+输出目录包含：
+
+- `images/<field>/*.png`：没有标注框的干净字段裁图；
+- `pseudo_labels.jsonl`：通过筛选的训练记录；
+- `review_candidates.jsonl`：稳定抽取的人工复核样本；
+- `rejected.jsonl` / `build_errors.jsonl`：被拒绝或无法读取的原因；
+- `splits/train.jsonl`、`val.jsonl`、`test.jsonl`：按同一回单分组的无泄漏切分；
+- `charset.txt`、`character_coverage.json`、`dataset_config.json`：构建期字符覆盖与筛选条件。
+
+先抽查 `review_candidates.jsonl` 指向的图片和文字。Paddle 伪标签适合扩大训练样本，**不能**作为
+最终准确率证明；应另留人工修正、且不参与训练的验证/测试样本。1000 张回单适合先跑通流程，
+但收款方包含自由中文姓名/商户名，字符覆盖不足时不能期待泛化到未见汉字。
+
+构建完成后，先确认没有读取错误、并且每个准备训练的字段都有足够样本；命令会把相同统计也打印出来：
+
+```powershell
+$summary = Get-Content "D:\download\ReceiptOcrPseudoV1\dataset_config.json" | ConvertFrom-Json
+$summary.counts
+```
+
+要决定能否加入收款方，先查看 train 中最少出现的收款方字符；`Count=1` 的字通常还需要补更多样本，
+完全没出现的目标字则无法由当前模型输出：
+
+```powershell
+$coverage = Get-Content "D:\download\ReceiptOcrPseudoV1\character_coverage.json" | ConvertFrom-Json
+$coverage.recipient_field.train.characters.psobject.Properties |
+  ForEach-Object { [PSCustomObject]@{ Character = $_.Name; Count = [int]$_.Value } } |
+  Sort-Object Count, Character |
+  Select-Object -First 50
+```
+
+训练会强制要求每个 `--fields` 字段都至少有一条 train 和 val 样本；否则不会生成一个“实际上没学过
+某字段”的 ONNX。为了防止验证集字符泄漏，字符表只从 train 生成；若报出验证集有未见字符，不要忽略。
+请用一个新的空输出目录、换一个 `--split-seed` 重建伪标签切分，或增加该字符的人工确认训练样本。
+
+训练机器需先安装对应 CPU/CUDA 的 PyTorch wheel（不要让普通 PyPI 覆盖已验证的 CUDA wheel），然后：
+
+```powershell
+python -m pip install -r requirements-train-ocr.txt
+
+python -m transfer_receipt_ai.ocr_train `
+  --records "D:\download\ReceiptOcrPseudoV1\pseudo_labels.jsonl" `
+  --output "D:\download\ReceiptOcrCtcV1" `
+  --fields "amount,time,transfer_status,payment_method_field" `
+  --device cuda:0 `
+  --epochs 30 `
+  --batch-size 32 `
+  --onnx-output ".\artifacts\receipt_ocr_ctc_v1.onnx"
+```
+
+`requirements-train-ocr.txt` 只安装 ONNX 导出所需的 `onnx`，不会触碰运行环境已有的
+`onnxruntime-gpu`。若要在单独的 CPU 环境执行 ONNX Runtime 对齐检查，再额外安装
+`onnxruntime`；CUDA 环境只保留与 CUDA 版本匹配的 `onnxruntime-gpu`，不要同时安装两者。
+
+这会写出 `best.pt`、`last.pt`、训练历史，以及：
+
+```text
+artifacts\receipt_ocr_ctc_v1.onnx
+artifacts\receipt_ocr_ctc_v1.charset.json
+artifacts\receipt_ocr_ctc_v1.contract.json
+```
+
+模型固定输入为灰度白底 letterbox 的 `[1, 1, 48, 768]`，输出为 CTC logits；字符表和 contract
+必须与 ONNX 一起交付。当前 ML.NET CLI 尚未接入该 OCR ONNX，因此训练成功后还需把 CTC 解码和
+字段清洗接入 C#，再替换 Python/Paddle OCR 阶段。
 
 ## ONNX 交付与推理
 

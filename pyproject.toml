@@ -20,6 +20,9 @@ dependencies = [
 [project.scripts]
 receipt-model-infer = "receipt_inference.cli:main"
 receipt-model-export-onnx = "transfer_receipt_ai.onnx_export:main"
+receipt-ocr-build-pseudolabels = "transfer_receipt_ai.ocr_pseudolabels:main"
+receipt-ocr-train = "transfer_receipt_ai.ocr_train:train_main"
+receipt-ocr-export-onnx = "transfer_receipt_ai.ocr_train:export_main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

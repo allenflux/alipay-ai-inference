@@ -1,0 +1,11 @@
+# Install the CPU/CUDA-specific PyTorch wheel separately, following the official
+# PyTorch selector for the training machine.  Do not add a generic ``torch``
+# requirement here: it can replace a working CUDA build with a CPU wheel.
+#
+# The base project requirements supply NumPy, OpenCV and Pillow.  ONNX is only
+# needed when exporting the trained recognizer for the .NET delivery.
+onnx>=1.16,<2
+# Do not add ``onnxruntime`` here.  A CUDA deployment should keep its matching
+# ``onnxruntime-gpu`` package; installing both packages in one environment is
+# unsupported.  For an optional CPU-only ONNX parity check, install
+# ``onnxruntime`` in a separate CPU environment.
