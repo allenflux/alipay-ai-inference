@@ -135,6 +135,7 @@ def _load_artifacts(model_path: Path) -> tuple[RecognizerConfig, list[str], Mapp
         config = RecognizerConfig(
             image_height=int(raw_model["image_height"]),
             image_width=int(raw_model["image_width"]),
+            base_channels=int(raw_model.get("base_channels", 64)),
             hidden_size=int(raw_model["hidden_size"]),
             lstm_layers=int(raw_model["lstm_layers"]),
         )
@@ -289,6 +290,7 @@ def evaluate_onnx(
     model_path: Path,
     records_path: Path,
     output_dir: Path,
+    dataset_root: Path | None = None,
     split: str = "test",
     fields: Sequence[str] = DETECTION_CLASSES,
     training_splits: Sequence[str] = ("train", "val"),
@@ -323,7 +325,7 @@ def evaluate_onnx(
     unsupported = sorted(set(fields) - set(contract_fields))
     if unsupported:
         raise ValueError(f"OCR ONNX contract does not declare requested fields: {','.join(unsupported)}")
-    records = load_records(records_path, fields=fields)
+    records = load_records(records_path, fields=fields, dataset_root=dataset_root)
     evaluation_records = [record for record in records if record["split"] == split]
     development_records = [record for record in records if record["split"] in training_splits]
     model_train_records = [record for record in records if record["split"] == "train"]
@@ -376,6 +378,9 @@ def evaluate_onnx(
                 "result_json": record.get("result_json"),
                 "crop_sha256": record.get("crop_sha256"),
                 "paddle_text": str(record["paddle_text"]),
+                "source_text": record.get("source_text"),
+                "semantic_value": record.get("semantic_value"),
+                "label_source": record.get("label_source"),
                 "reference_text": reference_text,
                 "candidate_text": candidate_text,
                 "raw_exact": candidate_text == reference_text,
@@ -401,15 +406,18 @@ def evaluate_onnx(
         max_micro_cer=max_micro_cer,
         max_oov_reference_rate=max_oov_reference_rate,
     )
+    label_sources = sorted({str(record.get("label_source", "unspecified")) for record in evaluation_records})
+    transaction_truth = label_sources == ["transaction_truth"]
     summary: dict[str, object] = {
         "schema_version": EVALUATION_SCHEMA_VERSION,
-        "kind": "receipt_ocr_ctc_paddle_parity_v1",
+        "kind": "receipt_ocr_ctc_truth_evaluation_v1" if transaction_truth else "receipt_ocr_ctc_pseudo_label_evaluation_v1",
         "model": model_path.as_posix(),
         "model_sha256": _sha256(model_path),
         "records": records_path.resolve().as_posix(),
         "evaluation_split": split,
         "training_splits": list(training_splits),
         "fields": list(fields),
+        "label_sources": label_sources,
         "providers": active_providers,
         "overall": overall,
         "by_field": by_field,
@@ -422,8 +430,11 @@ def evaluate_onnx(
             "failures": failures,
         },
         "warning": (
-            "This compares ONNX output to held-out PaddleOCR pseudo labels, not to human ground truth. "
-            "Use an independently human-reviewed holdout before making production-accuracy claims."
+            "This evaluates against local transaction truth. Validate the receipt-key association and keep a separate "
+            "audit set before treating it as production accuracy."
+            if transaction_truth
+            else "This compares ONNX output to held-out pseudo labels, not to independent business truth. "
+            "Use an independently reviewed holdout before making production-accuracy claims."
         ),
     }
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -440,6 +451,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Compare a receipt OCR ONNX candidate with held-out PaddleOCR labels")
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--records", type=Path, required=True, help="Top-level pseudo_labels.jsonl")
+    parser.add_argument(
+        "--dataset-root",
+        type=Path,
+        help="Root that owns image paths in --records; defaults to the records file directory",
+    )
     parser.add_argument("--output", type=Path, required=True, help="New empty evaluation output directory")
     parser.add_argument("--split", choices=("val", "test"), default="test")
     parser.add_argument("--fields", type=_parse_fields, default=DETECTION_CLASSES)
@@ -459,6 +475,7 @@ def main(argv: list[str] | None = None) -> None:
             model_path=args.model,
             records_path=args.records,
             output_dir=args.output,
+            dataset_root=args.dataset_root,
             split=args.split,
             fields=args.fields,
             training_splits=args.training_splits,

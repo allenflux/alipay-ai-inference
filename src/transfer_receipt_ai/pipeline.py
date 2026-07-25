@@ -97,7 +97,10 @@ class ReceiptResult:
         return output
 
 
-def _crop_with_margin(image_rgb: np.ndarray, bbox_xyxy: tuple[float, float, float, float], margin_ratio: float = 0.08) -> np.ndarray:
+def crop_field_with_margin(
+    image_rgb: np.ndarray, bbox_xyxy: tuple[float, float, float, float], margin_ratio: float = 0.08
+) -> np.ndarray:
+    """Crop a detector field plus the deployment's standard proportional margin."""
     x1, y1, x2, y2 = bbox_xyxy
     height, width = image_rgb.shape[:2]
     margin_x = max(2.0, (x2 - x1) * margin_ratio)
@@ -107,6 +110,12 @@ def _crop_with_margin(image_rgb: np.ndarray, bbox_xyxy: tuple[float, float, floa
     right = min(width, int(np.ceil(x2 + margin_x)))
     bottom = min(height, int(np.ceil(y2 + margin_y)))
     return image_rgb[top:bottom, left:right]
+
+
+# v1 pseudo-label exports imported this private name.  Retain it while new
+# training paths use the public function above, so crop geometry stays exactly
+# compatible with deployed detector/OCR behaviour.
+_crop_with_margin = crop_field_with_margin
 
 
 def _field_from_ocr(detection: ExtractedDetection | None) -> dict[str, object]:

@@ -34,12 +34,15 @@ DEFAULT_IMAGE_WIDTH = 768
 class RecognizerConfig:
     image_height: int = DEFAULT_IMAGE_HEIGHT
     image_width: int = DEFAULT_IMAGE_WIDTH
+    base_channels: int = 64
     hidden_size: int = 128
     lstm_layers: int = 2
 
     def validate(self) -> None:
         if self.image_height < 16 or self.image_width < 64:
             raise ValueError("image_height must be at least 16 and image_width must be at least 64")
+        if self.base_channels < 8:
+            raise ValueError("base_channels must be at least 8")
         if self.hidden_size < 16:
             raise ValueError("hidden_size must be at least 16")
         if self.lstm_layers < 1:
@@ -83,29 +86,32 @@ def build_ctc_recognizer(*, vocab_size: int, config: RecognizerConfig) -> Any:
     class ReceiptOcrCtc(nn.Module):
         def __init__(self) -> None:
             super().__init__()
+            base = config.base_channels
+            middle = base * 2
+            high = base * 4
             self.encoder = nn.Sequential(
-                nn.Conv2d(1, 64, kernel_size=3, padding=1),
-                nn.BatchNorm2d(64),
+                nn.Conv2d(1, base, kernel_size=3, padding=1),
+                nn.BatchNorm2d(base),
                 nn.ReLU(inplace=True),
                 nn.MaxPool2d(kernel_size=2, stride=2),
-                nn.Conv2d(64, 128, kernel_size=3, padding=1),
-                nn.BatchNorm2d(128),
+                nn.Conv2d(base, middle, kernel_size=3, padding=1),
+                nn.BatchNorm2d(middle),
                 nn.ReLU(inplace=True),
                 nn.MaxPool2d(kernel_size=2, stride=2),
-                nn.Conv2d(128, 256, kernel_size=3, padding=1),
-                nn.BatchNorm2d(256),
+                nn.Conv2d(middle, high, kernel_size=3, padding=1),
+                nn.BatchNorm2d(high),
                 nn.ReLU(inplace=True),
                 nn.MaxPool2d(kernel_size=(2, 1), stride=(2, 1)),
-                nn.Conv2d(256, 256, kernel_size=3, padding=1),
-                nn.BatchNorm2d(256),
+                nn.Conv2d(high, high, kernel_size=3, padding=1),
+                nn.BatchNorm2d(high),
                 nn.ReLU(inplace=True),
                 nn.MaxPool2d(kernel_size=(2, 1), stride=(2, 1)),
-                nn.Conv2d(256, 256, kernel_size=3, padding=1),
-                nn.BatchNorm2d(256),
+                nn.Conv2d(high, high, kernel_size=3, padding=1),
+                nn.BatchNorm2d(high),
                 nn.ReLU(inplace=True),
             )
             self.sequence = nn.LSTM(
-                input_size=256,
+                input_size=high,
                 hidden_size=config.hidden_size,
                 num_layers=config.lstm_layers,
                 bidirectional=True,
@@ -160,13 +166,21 @@ def _parse_record(line: str, *, records_path: Path, line_number: int, dataset_ro
         "id": str(value.get("id", image_value)),
         "group_id": group_id,
         "paddle_text": value.get("paddle_text") if isinstance(value.get("paddle_text"), str) else text,
+        "source_text": value.get("source_text") if isinstance(value.get("source_text"), str) else None,
+        "semantic_value": value.get("semantic_value") if isinstance(value.get("semantic_value"), str) else None,
+        "label_source": value.get("label_source") if isinstance(value.get("label_source"), str) else "unspecified",
         "source": value.get("source") if isinstance(value.get("source"), str) else None,
         "result_json": value.get("result_json") if isinstance(value.get("result_json"), str) else None,
         "crop_sha256": value.get("crop_sha256") if isinstance(value.get("crop_sha256"), str) else None,
     }
 
 
-def load_records(records_path: Path, *, fields: Sequence[str] = DETECTION_CLASSES) -> list[dict[str, object]]:
+def load_records(
+    records_path: Path,
+    *,
+    fields: Sequence[str] = DETECTION_CLASSES,
+    dataset_root: Path | None = None,
+) -> list[dict[str, object]]:
     """Read pseudo-label records without importing PyTorch."""
     fields = tuple(fields)
     invalid = sorted(set(fields) - set(DETECTION_CLASSES))
@@ -175,7 +189,9 @@ def load_records(records_path: Path, *, fields: Sequence[str] = DETECTION_CLASSE
     records_path = records_path.resolve()
     if not records_path.is_file():
         raise FileNotFoundError(records_path)
-    dataset_root = records_path.parent.resolve()
+    dataset_root = (dataset_root if dataset_root is not None else records_path.parent).resolve()
+    if not dataset_root.is_dir():
+        raise NotADirectoryError(dataset_root)
     records: list[dict[str, object]] = []
     ids: set[str] = set()
     images: set[str] = set()
@@ -436,6 +452,7 @@ def train_recognizer(
     records_path: Path,
     output_dir: Path,
     fields: Sequence[str] = DETECTION_CLASSES,
+    dataset_root: Path | None = None,
     config: RecognizerConfig = RecognizerConfig(),
     device: str = "auto",
     epochs: int = 30,
@@ -457,7 +474,7 @@ def train_recognizer(
     output_dir = output_dir.resolve()
     if output_dir.exists() and any(output_dir.iterdir()):
         raise ValueError(f"training output already contains files: {output_dir}. Choose a new empty directory.")
-    records = load_records(records_path, fields=selected_fields)
+    records = load_records(records_path, fields=selected_fields, dataset_root=dataset_root)
     train_records = [record for record in records if record["split"] == "train"]
     validation_records = [record for record in records if record["split"] == "val"]
     if not train_records:
@@ -648,6 +665,7 @@ def export_onnx(
         config = RecognizerConfig(
             image_height=int(raw_config["image_height"]),
             image_width=int(raw_config["image_width"]),
+            base_channels=int(raw_config.get("base_channels", 64)),
             hidden_size=int(raw_config["hidden_size"]),
             lstm_layers=int(raw_config["lstm_layers"]),
         )
@@ -734,6 +752,11 @@ def _parse_fields(value: str) -> tuple[str, ...]:
 def build_train_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train a Paddle-free CTC receipt OCR recognizer")
     parser.add_argument("--records", type=Path, required=True, help="pseudo_labels.jsonl or reviewed JSONL")
+    parser.add_argument(
+        "--dataset-root",
+        type=Path,
+        help="Root that owns image paths in --records; defaults to the records file directory",
+    )
     parser.add_argument("--output", type=Path, required=True, help="New empty checkpoint output directory")
     parser.add_argument("--fields", type=_parse_fields, default=DETECTION_CLASSES)
     parser.add_argument("--device", default="auto")
@@ -743,6 +766,7 @@ def build_train_parser() -> argparse.ArgumentParser:
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--image-height", type=int, default=DEFAULT_IMAGE_HEIGHT)
     parser.add_argument("--image-width", type=int, default=DEFAULT_IMAGE_WIDTH)
+    parser.add_argument("--base-channels", type=int, default=64)
     parser.add_argument("--hidden-size", type=int, default=128)
     parser.add_argument("--lstm-layers", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
@@ -761,6 +785,7 @@ def train_main(argv: list[str] | None = None) -> None:
     config = RecognizerConfig(
         image_height=args.image_height,
         image_width=args.image_width,
+        base_channels=args.base_channels,
         hidden_size=args.hidden_size,
         lstm_layers=args.lstm_layers,
     )
@@ -769,6 +794,7 @@ def train_main(argv: list[str] | None = None) -> None:
             records_path=args.records,
             output_dir=args.output,
             fields=args.fields,
+            dataset_root=args.dataset_root,
             config=config,
             device=args.device,
             epochs=args.epochs,

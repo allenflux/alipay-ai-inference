@@ -34,7 +34,7 @@ from .ocr import (
     normalize_status,
     normalize_time,
 )
-from .pipeline import _crop_with_margin
+from .pipeline import crop_field_with_margin
 from .status_crops import (
     _group_id,
     _load_json_document,
@@ -496,7 +496,7 @@ def build_pseudo_label_dataset(
                         rejected.append(_rejection(result_json, label=label, reason="field_semantic_validation_failed"))
                         continue
                     bbox = _bbox(detection.get("bbox_rectified"))
-                    crop_rgb = _crop_with_margin(rectified_rgb, bbox)
+                    crop_rgb = crop_field_with_margin(rectified_rgb, bbox)
                     if crop_rgb.size == 0 or min(crop_rgb.shape[:2]) < 8:
                         rejected.append(_rejection(result_json, label=label, reason="empty_or_tiny_crop"))
                         continue

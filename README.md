@@ -451,6 +451,226 @@ python -m transfer_receipt_ai.ocr_evaluate `
 测试字符、训练中见过/未见过的文本，以及 ONNX 实际 provider 和延迟。这个比较证明的是“对保留的
 Paddle 输出的一致性”；要证明真实业务准确率仍需一批人工标注的独立回单。
 
+## 轻量字段识别 v2（不带 Paddle、离线交付）
+
+旧版 `receipt_ocr_ctc_v1` 把金额、时间、状态、付款方式和自由中文收款方放进同一个 CTC 字符表，
+不能作为小模型交付路线。本节的 v2 改成按字段建模：
+
+| 字段 | v2 模型 | 输出策略 |
+| --- | --- | --- |
+| `amount` | 数字 CTC | 仅输出合法金额；无效或低置信进入 `review` |
+| `time` | 数字/冒号 CTC | 仅输出合法时钟时间 |
+| `transfer_status` | 三分类 | `success` / `pending` / `failed`；不确定进入 `review` |
+| `payment_method_field` | 五分类 | `bank_card` / `balance` / `yuebao` / `huabei` / `other` |
+| `recipient_field` | 本地交易索引优先；可选已知对象分类 | 未命中统一为 `unknown/review`，首版不伪造任意中文原文 |
+
+它的训练、导出和运行都不导入 Paddle、不访问网络。最推荐的标签来源是本地交易真值表，而不是历史
+OCR 伪标签：12 万原图只有在能关联真实交易字段时，才是高质量监督数据。
+
+### 1. 只跑检测，生成本地训练所需的几何 JSON
+
+下面的命令使用既有收据/设备 ONNX，不执行 OCR，也不写标注图片。第一轮只跑 **1000 张**；确认
+`receipt_key` 关联率、字段漏检率和裁图无误后，再移除 `--limit 1000` 跑全量。`--continue-on-error`
+会把坏图保留在错误报告中而不中断批次。
+
+```powershell
+$project = "D:\alipay-ai-data\alipay-ai-inference"
+$rawImages = "D:\download\OriginalImages120K"
+$detectorResults = "D:\download\ReceiptDetectorNoOcr120K"
+
+python -m receipt_inference.cli `
+  --onnx-model "$project\artifacts\receipt_lrcnn_v1.onnx" `
+  --platform-onnx-model "$project\artifacts\statusbar_device_v1.onnx" `
+  --input $rawImages `
+  --output $detectorResults `
+  --device cpu `
+  --ocr none `
+  --annotate none `
+  --require-complete `
+  --continue-on-error `
+  --limit 1000
+```
+
+这里必须使用 Python `receipt_inference.cli` 的结果目录：其中保存了透视矫正几何，后续才能从原图重建
+同样的字段裁图。当前 ML.NET CLI 的 JSON 不含这套几何，不能直接作为这一步的 `--results`。
+
+### 2. 准备离线交易真值 JSONL
+
+真值文件每行一个 JSON，对应的 `receipt_key` 必须能由原图文件名抽出。当前 `s3_voucher_GWCZ...png`
+可使用默认正则；金额可提供 `amount`（如 `100.00`）或整数分 `amount_fen`。类别可使用中文原文，也可
+直接使用规范值。
+
+```json
+{"receipt_key":"GWCZ2071991511234514944","amount_fen":10000,"time":"12:06","transfer_status":"success","payment_method":"bank_card","recipient":"交易商家"}
+```
+
+请保留一部分完整回单作为独立 test；不要把同一 `receipt_key` 或同一张回单的多次截图分到不同 split。
+构建器会按照收据组稳定切分 train / val / test：
+
+```powershell
+$truth = "D:\secure-data\receipt_truth_120k.jsonl"
+$truthDataset = "D:\download\ReceiptTruthDataset120K"
+
+python -m transfer_receipt_ai.ocr_truth_dataset `
+  --results $detectorResults `
+  --truth $truth `
+  --output $truthDataset `
+  --source-key-regex '(?P<key>GWCZ[0-9A-Za-z]+)' `
+  --fields amount,time,transfer_status,payment_method_field `
+  --min-detector-score 0.80 `
+  --validation-ratio 0.10 `
+  --test-ratio 0.10 `
+  --continue-on-error
+```
+
+输出的 `$truthDataset\pseudo_labels.jsonl` 名称为兼容旧工具而保留；其中每条记录的
+`label_source` 是 `transaction_truth`，并不是 Paddle 标签。`rejected.jsonl` 会记录缺少真值键、
+漏检字段或坏裁图；先检查它再训练。构建器默认拒绝“原图修改时间晚于检测 JSON”的情况，以免拿旧框裁
+新图；只有审计过变化时才加 `--allow-source-newer`。构建过程会先写入临时同级目录，全部完成后才原子发布
+`$truthDataset`，因此中断不会留下看似可用的半成品。
+
+### 3. 从真值裁图创建轻量任务
+
+该步骤不复制 12 万张裁图，只在 `$truthDataset` 上生成轻量 manifest。收款方只保留训练集出现次数
+达到门槛的前 N 个已知对象；其余一律映射到 `unknown`，避免长尾中文把模型和字符表重新做大。
+
+```powershell
+$lite = "D:\download\ReceiptLiteV2"
+
+python -m transfer_receipt_ai.ocr_lite_dataset `
+  --records "$truthDataset\pseudo_labels.jsonl" `
+  --output $lite `
+  --recipient-top-k 200 `
+  --recipient-min-train-count 25 `
+  --recipient-unknown-to-known-ratio 2.0
+```
+
+会生成 `amount_ctc.jsonl`、`time_ctc.jsonl`、状态/付款方式/收款方分类 manifest、
+`recipient_catalog.json` 和 `dataset.contract.json`。初版建议只训练前四项；收款方优先由本地交易索引
+返回，未命中即 `unknown/review`。
+
+### 4. 训练并导出小 ONNX
+
+先安装与训练机 CUDA 匹配的 PyTorch，再安装导出依赖。以下是 GPU 示例；将 `--device cuda:0` 改成
+`--device cpu` 即可用 CPU 训练（会慢很多）。
+
+```powershell
+python -m pip install -r requirements-train-ocr.txt
+
+python -m transfer_receipt_ai.ocr_train `
+  --records "$lite\amount_ctc.jsonl" `
+  --dataset-root $truthDataset `
+  --fields amount `
+  --output "D:\download\ReceiptLiteAmountRun" `
+  --device cuda:0 `
+  --image-height 32 `
+  --image-width 256 `
+  --base-channels 16 `
+  --hidden-size 64 `
+  --lstm-layers 1 `
+  --epochs 30 `
+  --batch-size 128 `
+  --onnx-output "$project\artifacts\receipt_lite_amount_v2.onnx"
+
+python -m transfer_receipt_ai.ocr_train `
+  --records "$lite\time_ctc.jsonl" `
+  --dataset-root $truthDataset `
+  --fields time `
+  --output "D:\download\ReceiptLiteTimeRun" `
+  --device cuda:0 `
+  --image-height 32 `
+  --image-width 192 `
+  --base-channels 16 `
+  --hidden-size 64 `
+  --lstm-layers 1 `
+  --epochs 30 `
+  --batch-size 128 `
+  --onnx-output "$project\artifacts\receipt_lite_time_v2.onnx"
+
+python -m transfer_receipt_ai.ocr_lite_classifier train `
+  --records "$lite\transfer_status_classifier.jsonl" `
+  --dataset-root $truthDataset `
+  --output "D:\download\ReceiptLiteStatusRun" `
+  --device cuda:0 `
+  --epochs 20 `
+  --batch-size 128 `
+  --onnx-output "$project\artifacts\receipt_lite_status_v2.onnx"
+
+python -m transfer_receipt_ai.ocr_lite_classifier train `
+  --records "$lite\payment_method_classifier.jsonl" `
+  --dataset-root $truthDataset `
+  --output "D:\download\ReceiptLitePaymentRun" `
+  --device cuda:0 `
+  --epochs 20 `
+  --batch-size 128 `
+  --onnx-output "$project\artifacts\receipt_lite_payment_v2.onnx"
+```
+
+上面的 `pip install` 只发生在训练/导出准备阶段；最终 ONNX 推理包不含 Paddle，也不需要网络。若训练机本身
+也不允许联网，请由受批准的机器预先准备 wheel 目录，再离线安装，例如
+`python -m pip install --no-index --find-links D:\offline-wheels -r requirements-train-ocr.txt`；PyTorch/TorchVision
+同样应从对应 CUDA 的离线 wheel 安装，而不是在线临时换版本。
+
+每个分类器会输出 `.onnx`、`.labels.json` 与 `.contract.json`；数值 CTC 会输出 `.onnx`、
+`.charset.json` 与 `.contract.json`。三份文件都必须一起交付。
+
+### 5. 先用独立 test 验收，再接入 .NET
+
+以下命令的 reference 是本地交易真值，不是 Paddle。金额和时间必须先达到验收门槛；状态重点检查
+`failed/pending -> success` 的混淆记录，低置信度在运行时应进入 `review`，而不是猜成成功。
+
+```powershell
+python -m transfer_receipt_ai.ocr_evaluate `
+  --model "$project\artifacts\receipt_lite_amount_v2.onnx" `
+  --records "$lite\amount_ctc.jsonl" `
+  --dataset-root $truthDataset `
+  --split test `
+  --output "D:\download\ReceiptLiteAmountEval" `
+  --fields amount `
+  --device cpu `
+  --min-semantic-exact-match 0.995 `
+  --max-micro-cer 0.005 `
+  --max-oov-reference-rate 0
+
+python -m transfer_receipt_ai.ocr_evaluate `
+  --model "$project\artifacts\receipt_lite_time_v2.onnx" `
+  --records "$lite\time_ctc.jsonl" `
+  --dataset-root $truthDataset `
+  --split test `
+  --output "D:\download\ReceiptLiteTimeEval" `
+  --fields time `
+  --device cpu `
+  --min-semantic-exact-match 0.995 `
+  --max-micro-cer 0.005 `
+  --max-oov-reference-rate 0
+
+python -m transfer_receipt_ai.ocr_lite_classifier evaluate `
+  --model "$project\artifacts\receipt_lite_status_v2.onnx" `
+  --records "$lite\transfer_status_classifier.jsonl" `
+  --dataset-root $truthDataset `
+  --split test `
+  --output "D:\download\ReceiptLiteStatusEval" `
+  --device cpu `
+  --min-accuracy 0.99 `
+  --min-macro-recall 0.98 `
+  --min-confidence 0.99 `
+  --max-non-success-to-success 0
+
+python -m transfer_receipt_ai.ocr_lite_classifier evaluate `
+  --model "$project\artifacts\receipt_lite_payment_v2.onnx" `
+  --records "$lite\payment_method_classifier.jsonl" `
+  --dataset-root $truthDataset `
+  --split test `
+  --output "D:\download\ReceiptLitePaymentEval" `
+  --device cpu `
+  --min-accuracy 0.99 `
+  --min-macro-recall 0.98 `
+  --min-confidence 0.99
+```
+
+当前 .NET CLI 尚未加载这些 v2 小模型；先以以上 CPU test 的真实精度、p50/p95、ONNX 文件大小为准。
+通过后再新增 `--ocr lite`，不会改坏既有 `--ocr onnx` 的 PP-OCR 命令。
+
 ## ONNX 交付与推理
 
 ONNX 是标准交付物，不是 ML.NET 专属格式。当前项目可导出并运行：
