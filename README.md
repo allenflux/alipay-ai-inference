@@ -451,10 +451,107 @@ python -m transfer_receipt_ai.ocr_evaluate `
 测试字符、训练中见过/未见过的文本，以及 ONNX 实际 provider 和延迟。这个比较证明的是“对保留的
 Paddle 输出的一致性”；要证明真实业务准确率仍需一批人工标注的独立回单。
 
-## 轻量字段识别 v2（不带 Paddle、离线交付）
+## 单模型轻量字段识别 v3（当前推荐，不带 Paddle）
+
+最终交付目标不是四个小模型，而是 **一个 ONNX、一个 ONNX Runtime Session、每张回单一次推理**。
+检测器 `receipt_lrcnn_v1.onnx` 和设备识别器仍是独立模型；本节只替代字段 OCR。
+
+```text
+field_images [4,1,48,384]
+  0=amount / 1=time / 2=transfer_status / 3=payment_method_field
+        ↓
+共享轻量 CNN 主干
+  ├─ amount + time 数字 CTC
+  ├─ payment_method 原文 CTC（保留银行名、卡类型、尾号）
+  └─ transfer_status 三分类
+```
+
+所以它是一个模型文件，虽然有四个输出节点：`amount_logits`、`time_logits`、`payment_logits`、
+`status_logits`。这避免让中文付款方式字符与金额/时间数字竞争同一个大字符表，也不会把
+`建设银行储蓄卡(3667)` 降成只有 `bank_card` 的分类。
+
+当前 v3 有意不包含自由中文 `recipient_field`：此前小识别器的收款方精度不合格；要接近 Paddle 的
+任意中文原文，需要单独的宽字符模型和更多人工真值。缺失或低置信的字段必须返回 `review`，不能猜测。
+如果改用交易真值训练付款方式，真值必须提供画面可见的原文（例如 `建设银行储蓄卡(3667)`）；只有
+`bank_card` / `balance` 这类归一化类别不能作为付款方式 CTC 标签，会被 v3 manifest 拒绝。
+
+### 1. 将已经生成的 Paddle 教师标签聚合为“一张回单一行” manifest
+
+这一步不训练、不复制图片、也不再调用 Paddle。它只把平铺的四类字段裁图按同一张回单组合，并隔离
+train/val/test；同一字段出现相互矛盾的教师文本时，会移出训练而不是凭置信度强行选一个。
+
+```powershell
+$outputRoot = "D:\alipay-ai-data\receipt-lite-pilot-v1"
+$teacherLabels = "$outputRoot\paddle-teacher-labels"
+$unifiedManifest = "$outputRoot\unified-manifest"
+
+python -m transfer_receipt_ai.ocr_unified_dataset `
+  --records "$teacherLabels\pseudo_labels.jsonl" `
+  --output $unifiedManifest
+```
+
+成功后查看 `$unifiedManifest\dataset.contract.json`。它会列出四个 slot 在 train/val/test 的数量、完整回单数、
+冲突裁图数。当前 1000 张只是连通性 pilot；不应把它的结果当作“接近 Paddle”的结论。
+
+### 2. 训练并直接导出一个 ONNX
+
+训练阶段可以使用 PyTorch/CUDA；运行交付物只包含 ONNX 和两个 JSON sidecar，不包含 Paddle、Python 或网络依赖。
+`--dataset-root` 必须指向教师标签目录，因为 manifest 不复制 `images/`。
+若训练环境尚未有 ONNX 导出依赖，先执行 `python -m pip install -r requirements-train-ocr.txt`；保持已有的
+`onnxruntime-gpu`，不要再额外安装 CPU 版 `onnxruntime`。导出会用已安装的 ONNX Runtime 做一次 CPU 图加载和
+Torch/ORT 输出对齐验证。
+
+```powershell
+$unifiedRun = "$outputRoot\unified-run-v1"
+$unifiedModel = "$outputRoot\models\receipt_unified_field_reader_v3_pilot.onnx"
+
+python -m transfer_receipt_ai.ocr_unified train `
+  --records "$unifiedManifest\unified_fields.jsonl" `
+  --dataset-root $teacherLabels `
+  --output $unifiedRun `
+  --device cuda:0 `
+  --image-height 48 `
+  --image-width 384 `
+  --base-channels 24 `
+  --numeric-hidden-size 64 `
+  --payment-hidden-size 96 `
+  --epochs 40 `
+  --batch-size 32 `
+  --onnx-output $unifiedModel
+```
+
+输出包括：
+
+- `$unifiedRun\best.pt`：只用于后续再导出；不是交付物；
+- `$unifiedModel`：一个固定输入 `[4,1,48,384]` 的 ONNX；
+- `$unifiedModel` 同名的 `.labels.json` 和 `.contract.json`：字符表、slot 顺序、SHA-256、预处理和输出协议，必须与 ONNX 一起交付。
+
+`training_summary.json` 若显示 `status_classes_missing_from_train` 含 `pending` 或 `failed`，这个 pilot 的状态头
+**不能上线**；它没有见过该状态，不能用“全是成功”的数据假装通过安全验收。
+
+### 3. 用 ONNX 实际运行做保留集 teacher-parity 验收
+
+这是 CPU 验证命令，确保最终没有 GPU 时也能跑；若只验证 GPU，将 `--device cpu` 改成 `cuda:0`。每张回单
+只调用一次 ONNX Session，然后分别统计金额、时间、付款方式原文、状态以及 `pending/failed -> success` 的危险混淆。
+
+```powershell
+python -m transfer_receipt_ai.ocr_unified evaluate `
+  --model $unifiedModel `
+  --records "$unifiedManifest\unified_fields.jsonl" `
+  --dataset-root $teacherLabels `
+  --split test `
+  --output "$outputRoot\unified-eval-v1-cpu" `
+  --device cpu
+```
+
+先阅读 `summary.json`、`disagreements.jsonl` 和付款方式的 `oov_reference_rate`。1000 张 pilot 验证通过后，
+再把教师数据扩大到至少 1 万张；只有分组隔离的 Paddle 保留集和人工真值保留集都达到门槛，才接入 .NET。
+教师一致性并不等于真实业务准确率。
+
+### 历史分模型 v2（仅保留为对照，不是本次交付路线）
 
 旧版 `receipt_ocr_ctc_v1` 把金额、时间、状态、付款方式和自由中文收款方放进同一个 CTC 字符表，
-不能作为小模型交付路线。本节的 v2 改成按字段建模：
+不能作为小模型交付路线。早期 v2 改成分别建模：
 
 | 字段 | v2 模型 | 输出策略 |
 | --- | --- | --- |
@@ -764,6 +861,10 @@ contract JSON 交付给 .NET。
 直接用 ONNX Runtime 加载冻结的 PP-OCR `det + cls + rec` 三个模型；OCR 不依赖 Python、Paddle
 或网络下载。OCR 交付目录必须是前文 `package-delivery` 产生的目录，CLI 会校验三份 ONNX、字符表和
 `paddle_ocr_delivery.contract.json` 的 SHA-256。
+
+上面的 `--ocr onnx --ocr-bundle` 仅适用于冻结的 PP-OCR bundle，**不能**把单模型
+`receipt_unified_field_reader_v3` 传给它。统一 reader 需要先通过 Python 的保留集验收；随后会以独立的
+`--ocr unified` 路径接入 .NET，并复用同一份 `[4,1,H,W]` 预处理与 slot 顺序。
 
 该项目覆盖**模型层**：EXIF 摆正、letterbox、检测框坐标还原、阈值/每类最佳框、设备识别规则，
 并写出 JSON / manifest / 标注 JPG。默认 `--annotate all`，每张会输出与 Python 相同命名的

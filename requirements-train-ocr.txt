@@ -7,5 +7,6 @@
 onnx>=1.16,<2
 # Do not add ``onnxruntime`` here.  A CUDA deployment should keep its matching
 # ``onnxruntime-gpu`` package; installing both packages in one environment is
-# unsupported.  For an optional CPU-only ONNX parity check, install
-# ``onnxruntime`` in a separate CPU environment.
+# unsupported.  Unified-reader export validates the generated graph with the
+# ONNX Runtime already installed in that environment; for CPU-only training,
+# install ``onnxruntime`` in a separate CPU environment.
