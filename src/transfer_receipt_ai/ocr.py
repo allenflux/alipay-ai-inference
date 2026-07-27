@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import date
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from importlib import metadata
 from typing import Any, Protocol
@@ -264,14 +265,45 @@ class PaddleOCRReader:
 
 
 _AMOUNT_PATTERN = re.compile(r"(?:[¥￥]\s*)?([0-9OoIl]{1,3}(?:,[0-9OoIl]{3})*(?:\.\d{1,2})?)")
+# Strict v6 display candidates are intentionally kept separate from the
+# historical forgiving pattern above.  The latter preserves old pseudo-label
+# behavior; the former is used whenever a visible CNY format can be verified
+# exactly, including minus signs and conventional thousands grouping.
+_STRICT_AMOUNT_TOKEN_PATTERN = re.compile(
+    r"(?<![0-9A-Za-z,.\-¥￥])(?P<token>-?[¥￥]?-? ?[0-9][0-9,]*\.[0-9]{2})(?![0-9A-Za-z,.])"
+)
 _TIME_PATTERN = re.compile(r"(?<!\d)(\d{1,2}:\d{2}(?::\d{2})?)(?!\d)")
+_DATETIME_PATTERN = re.compile(
+    r"(?<!\d)(?P<year>\d{4})-(?P<month>\d{2})-(?P<day>\d{2}) "
+    r"(?P<hour>\d{2}):(?P<minute>\d{2})(?::(?P<second>\d{2}))?(?!\d)"
+)
 
 
 def normalize_time(raw_text: str) -> str | None:
     """Extract the visible status-bar time without inventing a transaction time."""
     # OCR commonly returns a full-width Chinese colon. Do not use ``\b`` here:
     # Chinese characters next to the time count as Unicode word characters.
-    candidates = _TIME_PATTERN.findall(clean_text(raw_text).replace("：", ":"))
+    text = clean_text(raw_text).replace("：", ":")
+    # A complete dashed date-time must win over the embedded ``HH:MM`` tail.
+    # Treat ``-`` and the space as grammar, not as generic CTC noise, and
+    # validate the real calendar date before returning it.
+    for candidate in _DATETIME_PATTERN.finditer(text):
+        year = int(candidate.group("year"))
+        month = int(candidate.group("month"))
+        day = int(candidate.group("day"))
+        hour = int(candidate.group("hour"))
+        minute = int(candidate.group("minute"))
+        second_text = candidate.group("second")
+        second = int(second_text) if second_text is not None else None
+        try:
+            date(year, month, day)
+        except ValueError:
+            continue
+        if hour <= 23 and minute <= 59 and (second is None or second <= 59):
+            suffix = f":{second:02d}" if second is not None else ""
+            return f"{year:04d}-{month:02d}-{day:02d} {hour:02d}:{minute:02d}{suffix}"
+
+    candidates = _TIME_PATTERN.findall(text)
 
     def valid_status_time(candidate: str) -> bool:
         values = [int(value) for value in candidate.split(":")]
@@ -297,6 +329,49 @@ def normalize_time(raw_text: str) -> str | None:
 def normalize_amount(raw_text: str) -> dict[str, object] | None:
     """Normalise a CNY amount while retaining the raw OCR text separately."""
     raw_text = clean_text(raw_text)
+    # Use the same strict display grammar that v6 trains/validates against.
+    # Import lazily to keep the base OCR module independent during ordinary
+    # detector-only use and to avoid changing v1-v5 accepted labels.
+    from .ocr_unified_targets import parse_amount_display_target
+
+    strict_candidates = []
+    for match in _STRICT_AMOUNT_TOKEN_PATTERN.finditer(raw_text):
+        parsed = parse_amount_display_target(match.group("token"))
+        if parsed is not None:
+            strict_candidates.append((match, parsed))
+    if strict_candidates:
+        match, parsed = max(
+            strict_candidates,
+            key=lambda item: (
+                1 if item[1]["currency"] in {"¥", "￥"} else 0,
+                1 if item[1]["grouped_thousands"] else 0,
+                len(str(item[1]["integer_digits"])),
+            ),
+        )
+        canonical = str(parsed["canonical_decimal"])
+        try:
+            value = Decimal(canonical)
+        except InvalidOperation:  # Defensive: the strict helper already checked digits.
+            return None
+        fen = int(value * 100)
+        normalized = ("-¥" if value < 0 else "¥") + f"{abs(value):.2f}"
+        return {
+            "raw": raw_text,
+            "visible": str(parsed["visible_text"]),
+            "normalized": normalized,
+            "amount_fen": fen,
+            "currency": "CNY",
+            "strict_display": True,
+        }
+
+    # Once a visible CNY sign, grouping comma, or minus appears, accepting a
+    # smaller legacy substring would silently convert e.g. ``¥12,34.56`` into
+    # a different amount.  Treat that as invalid/review rather than repairing
+    # teacher text behind the user's back.  Bare legacy numeric values remain
+    # supported for compatibility with old result bundles.
+    if any(marker in raw_text for marker in ("¥", "￥", ",", "-")):
+        return None
+
     matches = list(_AMOUNT_PATTERN.finditer(raw_text))
     if not matches:
         return None

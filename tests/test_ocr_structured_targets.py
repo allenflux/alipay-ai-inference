@@ -9,17 +9,95 @@ from PIL import Image
 
 from transfer_receipt_ai.ocr_unified_targets import (
     AMOUNT_AUX_FORMAT,
+    AMOUNT_DISPLAY_AUX_FORMAT,
+    AMOUNT_SIGN_CLASSES,
     PAYMENT_CARD_TAIL_FORMAT,
+    PAYMENT_BANK_PREFIX_FORMAT,
     PARENTHESIS_STYLE_ASCII,
     PARENTHESIS_STYLE_FULLWIDTH,
     TIME_AUX_FORMAT,
+    TIME_DISPLAY_AUX_FORMAT,
+    TIME_DISPLAY_FORMAT_CLASSES,
     is_structured_target,
     parse_amount_aux_target,
+    parse_amount_display_target,
+    parse_payment_bank_prefix_target,
     parse_payment_card_tail_target,
     parse_time_aux_target,
+    parse_time_display_target,
     recompose_payment_card_tail_target,
     structured_target_config,
 )
+
+
+@pytest.mark.parametrize(
+    ("value", "canonical", "sign", "currency", "grouped"),
+    (
+        ("¥1,234.56", "1234.56", "positive", "¥", True),
+        ("￥1,234.56", "1234.56", "positive", "￥", True),
+        ("-¥1,234.56", "-1234.56", "negative", "¥", True),
+        ("¥-1,234.56", "-1234.56", "negative", "¥", True),
+        ("99.99", "99.99", "positive", None, False),
+    ),
+)
+def test_v6_amount_display_target_keeps_visible_symbols_but_has_a_strict_canonical_value(
+    value: str, canonical: str, sign: str, currency: str | None, grouped: bool
+) -> None:
+    target = parse_amount_display_target(value)
+
+    assert target is not None
+    assert target["format"] == AMOUNT_DISPLAY_AUX_FORMAT
+    assert target["visible_text"] == value
+    assert target["canonical_decimal"] == canonical
+    assert target["sign"] == sign
+    assert target["currency"] == currency
+    assert target["grouped_thousands"] is grouped
+    assert target["sign"] in AMOUNT_SIGN_CLASSES
+
+
+@pytest.mark.parametrize(
+    "value",
+    (
+        "12,34.56",
+        "1,,234.56",
+        "¥1.2",
+        "¥1O0.00",
+        "--¥1.00",
+        "-0.00",
+        "¥-0.00",
+        " 1.00",
+        "1.00 ",
+    ),
+)
+def test_v6_amount_display_target_refuses_ambiguous_or_noncanonical_visible_formats(value: str) -> None:
+    assert parse_amount_display_target(value) is None
+
+
+@pytest.mark.parametrize(
+    ("value", "format_name", "digits"),
+    (
+        ("1:44", "clock_h_mm", "0144"),
+        ("01:44", "clock_hh_mm", "0144"),
+        ("01:44:05", "clock_hh_mm_ss", "014405"),
+        ("2026-07-27 12:34", "date_ymd_hh_mm", "202607271234"),
+        ("2026-07-27 12:34:56", "date_ymd_hh_mm_ss", "20260727123456"),
+    ),
+)
+def test_v6_time_display_target_accepts_only_explicit_clock_or_datetime_grammar(
+    value: str, format_name: str, digits: str
+) -> None:
+    target = parse_time_display_target(value)
+
+    assert target is not None
+    assert target["format"] == TIME_DISPLAY_AUX_FORMAT
+    assert target["format_name"] == format_name
+    assert "".join(target["canonical_digits"]) == digits
+    assert target["format_name"] in TIME_DISPLAY_FORMAT_CLASSES
+
+
+@pytest.mark.parametrize("value", ("12-34", "2026-19-27 12:34", "2026-02-30 12:34", "28:99", "2026-07-27T12:34"))
+def test_v6_time_display_target_refuses_invalid_or_unlisted_templates(value: str) -> None:
+    assert parse_time_display_target(value) is None
 from transfer_receipt_ai.ocr_unified_dataset import build_unified_dataset
 
 
@@ -70,6 +148,15 @@ def test_payment_card_tail_parser_preserves_visible_prefix_tail_and_parentheses(
 )
 def test_payment_card_tail_parser_rejects_ambiguous_or_non_four_digit_values(visible_text: str) -> None:
     assert parse_payment_card_tail_target(visible_text) is None
+
+
+def test_v6_payment_bank_prefix_target_uses_only_an_exact_visible_card_prefix() -> None:
+    assert parse_payment_bank_prefix_target("建设银行储蓄卡（3667）") == {
+        "schema_version": 1,
+        "format": PAYMENT_BANK_PREFIX_FORMAT,
+        "visible_prefix": "建设银行储蓄卡",
+    }
+    assert parse_payment_bank_prefix_target("建设银行储蓄卡（366）") is None
 
 
 @pytest.mark.parametrize(
@@ -278,11 +365,16 @@ def test_unified_dataset_attaches_only_safe_structured_targets_without_replacing
 
     assert amount["text"] == "99.99"
     assert amount["amount_aux"]["canonical_decimal"] == "99.99"
+    assert amount["visible_text"] == "¥99.99"
+    assert amount["amount_display"]["canonical_decimal"] == "99.99"
     assert time["text"] == "1:44"
     assert time["time_aux"]["hour_width"] == 1
+    assert time["visible_text"] == "1:44"
+    assert time["time_display"]["format_name"] == "clock_h_mm"
     assert payment["text"] == "建设银行储蓄卡（3667）"
     assert payment["payment_card_tail"]["prefix_text"] == "建设银行储蓄卡"
     assert payment["payment_card_tail"]["card_tail"] == "3667"
+    assert payment["payment_bank_prefix"]["visible_prefix"] == "建设银行储蓄卡"
 
     second = next(row for row in rows if row["group_id"] == "receipt-two")
     assert second["slots"]["payment_method_field"]["text"] == "余额"
@@ -294,4 +386,10 @@ def test_unified_dataset_attaches_only_safe_structured_targets_without_replacing
         "time_aux_unparsed": 0,
         "payment_card_tail": 1,
         "payment_card_tail_unparsed": 1,
+        "amount_display": 1,
+        "amount_display_unparsed": 0,
+        "time_display": 1,
+        "time_display_unparsed": 0,
+        "payment_bank_prefix": 1,
+        "payment_bank_prefix_unparsed": 1,
     }

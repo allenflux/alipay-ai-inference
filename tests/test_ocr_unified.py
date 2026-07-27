@@ -12,15 +12,25 @@ torch = pytest.importorskip("torch")
 from transfer_receipt_ai.ocr_unified import (
     KIND_V3,
     KIND_V5,
+    KIND_V6,
+    PAYMENT_BANK_OTHER_CLASS,
+    V6_AMOUNT_CHARACTERS,
+    V6_ONNX_OUTPUT_NAMES,
+    V6_TIME_CHARACTERS,
     V5_ONNX_OUTPUT_NAMES,
     UnifiedReaderConfig,
     _checkpoint_config,
     _delivery_text,
     _format_exact_match,
     _load_onnx_artifacts,
+    _amount_v6_structured_target,
     _structured_amount_predictions,
+    _structured_amount_v6_predictions,
     _structured_payment_predictions,
+    _structured_payment_v6_predictions,
     _structured_time_predictions,
+    _structured_time_v6_predictions,
+    _time_v6_structured_target,
     build_unified_reader,
     decode_ctc_logits,
     evaluate_unified_onnx,
@@ -30,8 +40,11 @@ from transfer_receipt_ai.ocr_unified import (
 )
 from transfer_receipt_ai.ocr_unified_targets import (
     parse_amount_aux_target,
+    parse_amount_display_target,
+    parse_payment_bank_prefix_target,
     parse_payment_card_tail_target,
     parse_time_aux_target,
+    parse_time_display_target,
 )
 
 
@@ -127,6 +140,50 @@ def _write_v5_dataset(tmp_path: Path) -> Path:
     return records_path
 
 
+def _v6_structured_receipt(index: int, split: str, status: str) -> dict[str, object]:
+    """A minimal v6 row with exact visible-format and bank verifier targets."""
+    record = _structured_receipt(index, split, status)
+    slots = dict(record["slots"])
+
+    amount = dict(slots["amount"])
+    amount["visible_text"] = "¥199.00"
+    amount["amount_display"] = parse_amount_display_target("¥199.00")
+
+    time = dict(slots["time"])
+    time["visible_text"] = "1:44"
+    time["time_display"] = parse_time_display_target("1:44")
+
+    payment = dict(slots["payment_method_field"])
+    payment["payment_bank_prefix"] = parse_payment_bank_prefix_target(str(payment["text"]))
+
+    slots.update(
+        {
+            "amount": amount,
+            "time": time,
+            "payment_method_field": payment,
+        }
+    )
+    record["slots"] = slots
+    return record
+
+
+def _write_v6_dataset(tmp_path: Path) -> Path:
+    dataset = tmp_path / "dataset-v6"
+    records = [
+        _v6_structured_receipt(21, "train", "success"),
+        _v6_structured_receipt(22, "train", "pending"),
+        _v6_structured_receipt(23, "val", "success"),
+        _v6_structured_receipt(24, "val", "pending"),
+        _v6_structured_receipt(25, "test", "failed"),
+    ]
+    for receipt_index, record in enumerate(records):
+        for slot_index, slot in enumerate(dict(record["slots"]).values()):
+            _write_image(dataset / str(dict(slot)["image"]), 20 + receipt_index * 25 + slot_index)
+    records_path = dataset / "unified_fields.jsonl"
+    records_path.write_text("".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records), encoding="utf-8")
+    return records_path
+
+
 def _tiny_config(*, architecture_version: int) -> UnifiedReaderConfig:
     return UnifiedReaderConfig(
         architecture_version=architecture_version,
@@ -182,6 +239,51 @@ def test_unified_v5_model_keeps_one_input_and_emits_structured_heads() -> None:
     assert list(payment_parentheses.shape) == [2, 2]
     assert hasattr(model, "amount_vertical_reducer")
     assert hasattr(model, "payment_prefix_sequence")
+
+
+def test_unified_v6_model_keeps_one_input_but_separates_visible_ctc_and_verifier_paths() -> None:
+    config = _tiny_config(architecture_version=6)
+    model = build_unified_reader(
+        payment_vocab_size=6,
+        payment_bank_prefix_vocab_size=2,
+        config=config,
+    )
+    outputs = model(torch.zeros((2, 4, 1, 32, 64), dtype=torch.float32))
+
+    assert len(outputs) == len(V6_ONNX_OUTPUT_NAMES)
+    (
+        amount,
+        time,
+        payment,
+        status,
+        amount_sign,
+        amount_length,
+        amount_digits,
+        time_format,
+        time_digits,
+        payment_prefix,
+        payment_bank,
+        payment_tail,
+        payment_structure,
+        payment_parentheses,
+    ) = outputs
+    assert list(amount.shape) == [16, 2, len(V6_AMOUNT_CHARACTERS) + 1]
+    assert list(time.shape) == [16, 2, len(V6_TIME_CHARACTERS) + 1]
+    assert list(payment.shape) == [16, 2, 6]
+    assert list(status.shape) == [2, 3]
+    assert list(amount_sign.shape) == [2, 2]
+    assert list(amount_length.shape) == [2, 7]
+    assert list(amount_digits.shape) == [2, 9, 10]
+    assert list(time_format.shape) == [2, 6]
+    assert list(time_digits.shape) == [2, 14, 10]
+    assert list(payment_prefix.shape) == [16, 2, 6]
+    assert list(payment_bank.shape) == [2, 2]
+    assert list(payment_tail.shape) == [2, 4, 10]
+    assert list(payment_structure.shape) == [2, 2]
+    assert list(payment_parentheses.shape) == [2, 2]
+    assert model.amount_ctc_sequence is not model.amount_verifier_sequence
+    assert model.time_ctc_sequence is not model.time_verifier_sequence
+    assert model.payment_ctc_sequence is not model.payment_prefix_sequence
 
 
 def test_unified_v3_config_keeps_the_existing_output_protocol() -> None:
@@ -275,6 +377,46 @@ def test_v5_structured_decoders_keep_valid_forms_and_reject_invalid_financial_fo
     ) == [(None, 0.0)]
 
 
+def test_v6_verifier_decoders_require_valid_signed_time_and_known_bank_forms() -> None:
+    amount_length = np.full((1, 7), -6.0, dtype=np.float32)
+    amount_length[0, 1] = 6.0  # two integer digits
+    amount_digits = np.full((1, 9, 10), -6.0, dtype=np.float32)
+    for column, value in zip(range(5, 9), (1, 9, 0, 0)):
+        amount_digits[0, column, value] = 6.0
+    amount_sign = np.asarray([[-6.0, 6.0]], dtype=np.float32)
+    assert _structured_amount_v6_predictions(amount_sign, amount_length, amount_digits)[0][0] == "-19.00"
+
+    time_format = np.full((1, 6), -6.0, dtype=np.float32)
+    time_format[0, 4] = 6.0  # date_ymd_hh_mm
+    time_digits = np.full((1, 14, 10), -6.0, dtype=np.float32)
+    for column, value in enumerate((2, 0, 2, 6, 0, 7, 2, 7, 1, 2, 3, 4, 0, 0)):
+        time_digits[0, column, value] = 6.0
+    assert _structured_time_v6_predictions(time_format, time_digits)[0][0] == "2026-07-27 12:34"
+
+    bank_classes = [PAYMENT_BANK_OTHER_CLASS, "建设银行储蓄卡"]
+    bank_logits = np.asarray([[-6.0, 6.0]], dtype=np.float32)
+    tail_logits = np.full((1, 4, 10), -6.0, dtype=np.float32)
+    for column, value in enumerate((3, 6, 6, 7)):
+        tail_logits[0, column, value] = 6.0
+    structure = np.asarray([[-6.0, 6.0]], dtype=np.float32)
+    parentheses = np.asarray([[-6.0, 6.0]], dtype=np.float32)
+    prediction = _structured_payment_v6_predictions(
+        bank_logits,
+        tail_logits,
+        structure,
+        parentheses,
+        payment_bank_prefix_classes=bank_classes,
+    )
+    assert prediction[0][0] == "建设银行储蓄卡（3667）"
+    assert _structured_payment_v6_predictions(
+        np.asarray([[6.0, -6.0]], dtype=np.float32),
+        tail_logits,
+        structure,
+        parentheses,
+        payment_bank_prefix_classes=bank_classes,
+    ) == [(None, 0.0)]
+
+
 def test_v5_right_aligned_preprocess_has_a_distinct_fixed_position_from_legacy_center(tmp_path: Path) -> None:
     image_path = tmp_path / "narrow.png"
     Image.fromarray(np.zeros((20, 20), dtype=np.uint8)).save(image_path)
@@ -295,6 +437,42 @@ def test_v5_refuses_a_legacy_manifest_without_strict_auxiliary_targets(tmp_path:
             epochs=1,
             batch_size=2,
         )
+
+
+def test_v6_refuses_a_legacy_manifest_without_visible_format_and_bank_targets(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="strict visible amount/time and exact payment bank-prefix"):
+        train_unified_reader(
+            records_path=_write_v5_dataset(tmp_path),
+            output_dir=tmp_path / "run-v6-without-visible-aux",
+            config=_tiny_config(architecture_version=6),
+            device="cpu",
+            epochs=1,
+            batch_size=2,
+            payment_bank_prefix_min_support=1,
+        )
+
+
+def test_v6_verifier_targets_reparse_visible_text_before_trusting_auxiliary_json() -> None:
+    """A stale auxiliary object must not contradict the v6 CTC label."""
+    amount_record = _v6_structured_receipt(31, "train", "success")
+    amount_slot = dict(dict(amount_record["slots"])["amount"])
+    amount_aux = dict(amount_slot["amount_display"])
+    amount_aux["integer_digits"] = "999"
+    amount_slot["amount_display"] = amount_aux
+    amount_slots = dict(amount_record["slots"])
+    amount_slots["amount"] = amount_slot
+    amount_record["slots"] = amount_slots
+    assert _amount_v6_structured_target(amount_record) is None
+
+    time_record = _v6_structured_receipt(32, "train", "success")
+    time_slot = dict(dict(time_record["slots"])["time"])
+    time_aux = dict(time_slot["time_display"])
+    time_aux["format_name"] = "clock_hh_mm"
+    time_slot["time_display"] = time_aux
+    time_slots = dict(time_record["slots"])
+    time_slots["time"] = time_slot
+    time_record["slots"] = time_slots
+    assert _time_v6_structured_target(time_record) is None
 
 
 def test_v5_delivery_is_review_only_until_independent_calibration_exists() -> None:
@@ -318,6 +496,13 @@ def test_v5_delivery_is_review_only_until_independent_calibration_exists() -> No
         candidate_text="1:44",
         ctc_text="1:44",
         structured_text="1:44",
+    ) == "review"
+    assert _delivery_text(
+        architecture_version=6,
+        field="amount",
+        candidate_text="¥99.99",
+        ctc_text="¥99.99",
+        structured_text="99.99",
     ) == "review"
     assert _delivery_text(
         architecture_version=4,
@@ -345,6 +530,32 @@ def test_tiny_unified_training_writes_checkpoint(tmp_path: Path) -> None:
     assert summary["kind"] == "receipt_unified_field_reader_v4"
     assert summary["status_head_policy"]["runtime_policy"] == "review_only"
     assert summary["status_head_policy"]["training_enabled"] is False
+
+
+def test_tiny_v6_training_writes_train_only_bank_classes_and_visible_charsets(tmp_path: Path) -> None:
+    checkpoint = train_unified_reader(
+        records_path=_write_v6_dataset(tmp_path),
+        output_dir=tmp_path / "run-v6",
+        config=_tiny_config(architecture_version=6),
+        device="cpu",
+        epochs=1,
+        batch_size=2,
+        payment_bank_prefix_min_support=1,
+    )
+    assert checkpoint.is_file()
+    labels = json.loads((checkpoint.parent / "labels.json").read_text(encoding="utf-8"))
+    summary = json.loads((checkpoint.parent / "training_summary.json").read_text(encoding="utf-8"))
+    assert summary["kind"] == KIND_V6
+    assert labels["amount_characters"] == list(V6_AMOUNT_CHARACTERS)
+    assert labels["time_characters"] == list(V6_TIME_CHARACTERS)
+    assert labels["payment_bank_prefix_classes"] == [PAYMENT_BANK_OTHER_CLASS, "建设银行储蓄卡"]
+    assert labels["payment_bank_prefix_oov_by_split"]["test"] == {"records": 1, "other": 0}
+    assert summary["records"][0]["val_verifier_macro_exact_match"] is not None
+    assert set(summary["records"][0]["val_verifier_by_field"]) == {
+        "amount",
+        "time",
+        "payment_method_field",
+    }
 
 
 def test_unified_export_has_one_fixed_receipt_input_when_onnx_is_available(tmp_path: Path) -> None:
@@ -427,3 +638,54 @@ def test_unified_v5_export_loads_and_evaluates_one_receipt_when_onnx_is_availabl
         "transfer_status",
     }
     assert all("delivery_text" in row and "decoder_agrees" in row for row in comparisons)
+
+
+def test_unified_v6_export_loads_and_evaluates_one_receipt_when_onnx_is_available(tmp_path: Path) -> None:
+    onnx = pytest.importorskip("onnx")
+    ort = pytest.importorskip("onnxruntime")
+    records_path = _write_v6_dataset(tmp_path)
+    config = _tiny_config(architecture_version=6)
+    checkpoint = train_unified_reader(
+        records_path=records_path,
+        output_dir=tmp_path / "run-v6",
+        config=config,
+        device="cpu",
+        epochs=1,
+        batch_size=2,
+        payment_bank_prefix_min_support=1,
+    )
+    model_path, labels_path, contract_path = export_unified_onnx(
+        checkpoint_path=checkpoint,
+        output_path=tmp_path / "reader-v6.onnx",
+    )
+    onnx.checker.check_model(onnx.load_model(model_path))
+    session = ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])
+    assert [item.name for item in session.get_outputs()] == list(V6_ONNX_OUTPUT_NAMES)
+    outputs = session.run(None, {"field_images": np.zeros((4, 1, 32, 64), dtype=np.float32)})
+    contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    assert [list(value.shape) for value in outputs] == [
+        contract["outputs"][name]["shape"] for name in V6_ONNX_OUTPUT_NAMES
+    ]
+    config_from_contract, _, loaded_contract = _load_onnx_artifacts(model_path)
+    assert config_from_contract.architecture_version == 6
+    assert loaded_contract["kind"] == KIND_V6
+    assert loaded_contract["text_delivery_policy"]["runtime_policy"].startswith("review_only")
+    assert labels_path.is_file()
+
+    summary, failures = evaluate_unified_onnx(
+        model_path=model_path,
+        records_path=records_path,
+        output_dir=tmp_path / "eval-v6",
+        split="test",
+        device="cpu",
+    )
+    assert failures == []
+    assert summary["by_field"]["amount"]["records"] == 1
+    comparisons = [
+        json.loads(line)
+        for line in (tmp_path / "eval-v6" / "comparisons.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    amount = next(row for row in comparisons if row["field"] == "amount")
+    assert amount["reference_text"] == "¥199.00"
+    assert amount["runtime_policy"].startswith("review_only")
+    assert amount["delivery_text"] == "review"

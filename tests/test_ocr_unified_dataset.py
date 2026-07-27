@@ -110,6 +110,8 @@ def test_build_unified_dataset_groups_slots_and_keeps_payment_text(tmp_path: Pat
     assert first["slots"]["amount"]["text"] == "100.00"
     assert first["slots"]["amount"]["amount_aux"]["canonical_decimal"] == "100.00"
     assert first["slots"]["amount"]["amount_aux"]["right_aligned_digit_count"] == 5
+    assert first["slots"]["amount"]["visible_text"] == "¥100.00"
+    assert first["slots"]["amount"]["amount_display"]["canonical_decimal"] == "100.00"
     assert first["slots"]["time"]["text"] == "12:06"
     assert first["slots"]["time"]["time_aux"] == {
         "schema_version": 1,
@@ -129,6 +131,11 @@ def test_build_unified_dataset_groups_slots_and_keeps_payment_text(tmp_path: Pat
         "card_tail": "3667",
         "parentheses": "ascii",
     }
+    assert first["slots"]["payment_method_field"]["payment_bank_prefix"] == {
+        "schema_version": 1,
+        "format": "visible_payment_bank_prefix_v6",
+        "visible_prefix": "建设银行储蓄卡",
+    }
     assert summary["structured_target_counts"] == {
         "amount_aux": 2,
         "amount_aux_unparsed": 0,
@@ -136,6 +143,12 @@ def test_build_unified_dataset_groups_slots_and_keeps_payment_text(tmp_path: Pat
         "time_aux_unparsed": 0,
         "payment_card_tail": 1,
         "payment_card_tail_unparsed": 0,
+        "amount_display": 2,
+        "amount_display_unparsed": 0,
+        "time_display": 1,
+        "time_display_unparsed": 0,
+        "payment_bank_prefix": 1,
+        "payment_bank_prefix_unparsed": 0,
     }
     assert summary["structured_target_counts_by_split"]["payment_card_tail"] == {
         "train": 1,

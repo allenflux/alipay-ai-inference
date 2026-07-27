@@ -29,8 +29,11 @@ from typing import Any
 from .ocr import clean_text, extract_field_value
 from .ocr_unified_targets import (
     parse_amount_aux_target,
+    parse_amount_display_target,
+    parse_payment_bank_prefix_target,
     parse_payment_card_tail_target,
     parse_time_aux_target,
+    parse_time_display_target,
     structured_target_config,
 )
 
@@ -72,15 +75,26 @@ def _selection_key(value: Mapping[str, object]) -> tuple[float, float, str]:
 
 def _numeric_target(field: str, semantic_value: str) -> str | None:
     if field == "amount":
-        target = semantic_value.removeprefix("¥").removeprefix("￥")
-        if target and all(character in "0123456789." for character in target) and target.count(".") <= 1:
+        target = semantic_value
+        sign = ""
+        if target.startswith("-"):
+            sign, target = "-", target[1:]
+        target = target.removeprefix("¥").removeprefix("￥")
+        target = sign + target
+        if (
+            target
+            and all(character in "0123456789.-" for character in target)
+            and target.count(".") == 1
+            and target.count("-") <= 1
+            and ("-" not in target or target.startswith("-"))
+        ):
             return target
         return None
     if field == "time":
         target = semantic_value.replace("：", ":")
         if (
             target
-            and all(character in "0123456789:" for character in target)
+            and all(character in "0123456789:- " for character in target)
             and target.count(":") in {1, 2}
         ):
             return target
@@ -189,14 +203,19 @@ def _slot_payload(record: Mapping[str, object]) -> dict[str, object] | None:
             "detector_score": record.get("detector_score"),
             "crop_sha256": record.get("crop_sha256"),
         }
-        # Keep the pre-existing CTC text exactly as before, while adding an
-        # optional structured target only where it is mathematically safe.
-        # A future v5 reader can train a compact fixed-position digit head
-        # without pretending that a malformed decimal is a valid amount.
+        # Keep the v5-compatible canonical CTC target while adding an optional
+        # *visible* v6 target.  The latter is never silently repaired: CTC can
+        # learn ``¥``, commas, a minus, hyphens, and the date-time space only
+        # when that exact display grammar has been validated.
+        source_text = clean_text(str(record["text"]))
         if field == "amount":
             amount_aux = parse_amount_aux_target(target)
             if amount_aux is not None:
                 payload["amount_aux"] = amount_aux
+            amount_display = parse_amount_display_target(source_text)
+            if amount_display is not None:
+                payload["visible_text"] = amount_display["visible_text"]
+                payload["amount_display"] = amount_display
         else:
             # The legacy CTC slot may still contain a seconds-bearing value,
             # but v5's time-specific target deliberately excludes it.  Do not
@@ -205,6 +224,10 @@ def _slot_payload(record: Mapping[str, object]) -> dict[str, object] | None:
             time_aux = parse_time_aux_target(target)
             if time_aux is not None:
                 payload["time_aux"] = time_aux
+            time_display = parse_time_display_target(source_text)
+            if time_display is not None:
+                payload["visible_text"] = time_display["visible_text"]
+                payload["time_display"] = time_display
         return payload
     if field == "transfer_status":
         if semantic_value not in STATUS_CLASSES:
@@ -254,6 +277,9 @@ def _slot_payload(record: Mapping[str, object]) -> dict[str, object] | None:
         payment_card_tail = parse_payment_card_tail_target(text)
         if payment_card_tail is not None:
             payload["payment_card_tail"] = payment_card_tail
+        payment_bank_prefix = parse_payment_bank_prefix_target(text)
+        if payment_bank_prefix is not None:
+            payload["payment_bank_prefix"] = payment_bank_prefix
         return payload
     raise AssertionError(field)
 
@@ -408,43 +434,44 @@ def build_unified_dataset(*, records_path: Path, output_dir: Path) -> dict[str, 
         field for record in unified_records for field in list(record.get("ambiguous_slots", []))
     )
     aux_name_by_slot = {
-        "amount": "amount_aux",
-        "time": "time_aux",
-        "payment_method_field": "payment_card_tail",
+        "amount": ("amount_aux", "amount_display"),
+        "time": ("time_aux", "time_display"),
+        "payment_method_field": ("payment_card_tail", "payment_bank_prefix"),
     }
     structured_target_counts: dict[str, int] = {}
     structured_target_counts_by_split: dict[str, dict[str, int]] = {}
-    for slot_name, aux_name in aux_name_by_slot.items():
-        structured_target_counts[aux_name] = sum(
-            1
-            for record in unified_records
-            for slot in [dict(record["slots"]).get(slot_name)]
-            if isinstance(slot, Mapping) and aux_name in slot
-        )
-        structured_target_counts_by_split[aux_name] = {
-            split: sum(
+    for slot_name, aux_names in aux_name_by_slot.items():
+        for aux_name in aux_names:
+            structured_target_counts[aux_name] = sum(
                 1
                 for record in unified_records
-                if str(record["split"]) == split
                 for slot in [dict(record["slots"]).get(slot_name)]
                 if isinstance(slot, Mapping) and aux_name in slot
             )
-            for split in ("train", "val", "test")
-        }
-        unparsed_name = f"{aux_name}_unparsed"
-        structured_target_counts[unparsed_name] = int(slot_counts[slot_name]) - structured_target_counts[aux_name]
-        structured_target_counts_by_split[unparsed_name] = {
-            split: int(
-                sum(
+            structured_target_counts_by_split[aux_name] = {
+                split: sum(
                     1
                     for record in unified_records
                     if str(record["split"]) == split
                     for slot in [dict(record["slots"]).get(slot_name)]
-                    if isinstance(slot, Mapping) and aux_name not in slot
+                    if isinstance(slot, Mapping) and aux_name in slot
                 )
-            )
-            for split in ("train", "val", "test")
-        }
+                for split in ("train", "val", "test")
+            }
+            unparsed_name = f"{aux_name}_unparsed"
+            structured_target_counts[unparsed_name] = int(slot_counts[slot_name]) - structured_target_counts[aux_name]
+            structured_target_counts_by_split[unparsed_name] = {
+                split: int(
+                    sum(
+                        1
+                        for record in unified_records
+                        if str(record["split"]) == split
+                        for slot in [dict(record["slots"]).get(slot_name)]
+                        if isinstance(slot, Mapping) and aux_name not in slot
+                    )
+                )
+                for split in ("train", "val", "test")
+            }
     summary: dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
         "kind": KIND,
