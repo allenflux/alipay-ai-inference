@@ -1089,12 +1089,37 @@ def _validate_exported_onnx(
     actual_outputs = session.run(output_names, {"field_images": dummy.detach().cpu().numpy()})
     for name, actual, expected in zip(output_names, actual_outputs, expected_outputs):
         expected_array = expected.detach().cpu().numpy()
-        if list(np.asarray(actual).shape) != list(expected_array.shape):
+        actual_array = np.asarray(actual)
+        if list(actual_array.shape) != list(expected_array.shape):
             raise ValueError(
-                f"Exported unified OCR ONNX output {name!r} has shape {list(np.asarray(actual).shape)}, "
+                f"Exported unified OCR ONNX output {name!r} has shape {list(actual_array.shape)}, "
                 f"expected {list(expected_array.shape)}"
             )
-        np.testing.assert_allclose(actual, expected_array, rtol=1e-4, atol=1e-5)
+        if not np.isfinite(actual_array).all() or not np.isfinite(expected_array).all():
+            raise ValueError(f"Exported unified OCR ONNX output {name!r} contains a non-finite value")
+        # Keep the initial export check intentionally strict.  If ORT and
+        # Torch differ, include actionable diagnostics instead of surfacing
+        # NumPy's truncated assertion alone.  We must see the actual drift
+        # before deciding whether it is ordinary cross-runtime FP rounding or
+        # a graph-conversion issue (notably around GRU/normalisation ops).
+        if not np.allclose(actual_array, expected_array, rtol=1e-4, atol=1e-5):
+            expected64 = expected_array.astype(np.float64, copy=False)
+            actual64 = actual_array.astype(np.float64, copy=False)
+            absolute_error = np.abs(actual64 - expected64)
+            relative_error = absolute_error / np.maximum(np.abs(expected64), 1e-6)
+            decision_positions = int(np.prod(actual_array.shape[:-1])) if actual_array.ndim > 1 else 1
+            argmax_mismatches = int(
+                np.count_nonzero(np.argmax(actual_array, axis=-1) != np.argmax(expected_array, axis=-1))
+            )
+            raise ValueError(
+                f"Exported unified OCR ONNX output {name!r} differs from Torch beyond "
+                "rtol=1e-4, atol=1e-5: "
+                f"max_abs={float(absolute_error.max()):.8g}, "
+                f"mean_abs={float(absolute_error.mean()):.8g}, "
+                f"max_rel={float(relative_error.max()):.8g}, "
+                f"argmax_mismatches={argmax_mismatches}/{decision_positions}. "
+                "Keep the checkpoint and report these values; do not retrain before resolving export parity."
+            )
 
 
 def export_unified_onnx(*, checkpoint_path: Path, output_path: Path) -> tuple[Path, Path, Path]:
