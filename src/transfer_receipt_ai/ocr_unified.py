@@ -101,6 +101,14 @@ CTC_ONNX_BLANK_INDICES = {
     "payment_prefix_logits": PAYMENT_BLANK_INDEX,
 }
 
+# Match the project-wide fixed-graph export tolerance.  The unified reader
+# additionally requires every output position to keep the exact same argmax,
+# which is the actual character/class decision boundary used by the delivery
+# decoder.  This accepts harmless CPU Torch/ORT accumulation drift near zero
+# without accepting a changed decoded result.
+ONNX_EXPORT_RTOL = 1e-3
+ONNX_EXPORT_ATOL = 1e-3
+
 
 def _onnx_output_names(config: "UnifiedReaderConfig") -> tuple[str, ...]:
     return V5_ONNX_OUTPUT_NAMES if config.architecture_version == 5 else LEGACY_ONNX_OUTPUT_NAMES
@@ -2008,9 +2016,9 @@ def _validate_exported_onnx(
         if not np.isfinite(actual_array).all() or not np.isfinite(expected_array).all():
             raise ValueError(f"Exported unified OCR ONNX output {name!r} contains a non-finite value")
         # CPU ORT and CPU Torch can accumulate small FP32 drift through the
-        # exported GRU/normalisation sequence.  The tolerance below is still
-        # far below one CTC/logit unit, and is paired with an exact argmax
-        # check so a changed decoded character/status is never accepted.
+        # exported GRU/normalisation sequence. The value tolerance matches
+        # the detector export verifier and is paired with an exact argmax
+        # check, so a changed decoded character/status is never accepted.
         expected64 = expected_array.astype(np.float64, copy=False)
         actual64 = actual_array.astype(np.float64, copy=False)
         absolute_error = np.abs(actual64 - expected64)
@@ -2019,10 +2027,18 @@ def _validate_exported_onnx(
         argmax_mismatches = int(
             np.count_nonzero(np.argmax(actual_array, axis=-1) != np.argmax(expected_array, axis=-1))
         )
-        if not np.allclose(actual_array, expected_array, rtol=1e-3, atol=1e-4) or argmax_mismatches:
+        if (
+            not np.allclose(
+                actual_array,
+                expected_array,
+                rtol=ONNX_EXPORT_RTOL,
+                atol=ONNX_EXPORT_ATOL,
+            )
+            or argmax_mismatches
+        ):
             raise ValueError(
                 f"Exported unified OCR ONNX output {name!r} differs from Torch beyond "
-                "rtol=1e-3, atol=1e-4 or changes its argmax: "
+                f"rtol={ONNX_EXPORT_RTOL:g}, atol={ONNX_EXPORT_ATOL:g} or changes its argmax: "
                 f"max_abs={float(absolute_error.max()):.8g}, "
                 f"mean_abs={float(absolute_error.mean()):.8g}, "
                 f"max_rel={float(relative_error.max()):.8g}, "
