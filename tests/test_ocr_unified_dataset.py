@@ -108,9 +108,41 @@ def test_build_unified_dataset_groups_slots_and_keeps_payment_text(tmp_path: Pat
     assert first["slot_order"] == list(SLOT_ORDER)
     assert first["complete"] is True
     assert first["slots"]["amount"]["text"] == "100.00"
+    assert first["slots"]["amount"]["amount_aux"]["canonical_decimal"] == "100.00"
+    assert first["slots"]["amount"]["amount_aux"]["right_aligned_digit_count"] == 5
     assert first["slots"]["time"]["text"] == "12:06"
+    assert first["slots"]["time"]["time_aux"] == {
+        "schema_version": 1,
+        "format": "clock_h_mm_or_hh_mm_no_seconds_v1",
+        "text": "12:06",
+        "hour_text": "12",
+        "minute_text": "06",
+        "hour_width": 2,
+    }
     assert first["slots"]["transfer_status"]["class_name"] == "success"
     assert first["slots"]["payment_method_field"]["text"] == "建设银行储蓄卡(3667)"
+    assert first["slots"]["payment_method_field"]["payment_card_tail"] == {
+        "schema_version": 1,
+        "format": "visible_prefix_exact_ascii_4_digit_card_tail_v1",
+        "visible_text": "建设银行储蓄卡(3667)",
+        "prefix_text": "建设银行储蓄卡",
+        "card_tail": "3667",
+        "parentheses": "ascii",
+    }
+    assert summary["structured_target_counts"] == {
+        "amount_aux": 2,
+        "amount_aux_unparsed": 0,
+        "time_aux": 1,
+        "time_aux_unparsed": 0,
+        "payment_card_tail": 1,
+        "payment_card_tail_unparsed": 0,
+    }
+    assert summary["structured_target_counts_by_split"]["payment_card_tail"] == {
+        "train": 1,
+        "val": 0,
+        "test": 0,
+    }
+    assert summary["structured_target_config"]["payment_card_tail"]["tail_character_set"] == "ASCII 0-9"
 
 
 def test_build_unified_dataset_quarantines_conflicting_duplicate_slot(tmp_path: Path) -> None:

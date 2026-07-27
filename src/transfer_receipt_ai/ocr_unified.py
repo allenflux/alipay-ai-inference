@@ -3,9 +3,11 @@
 The model intentionally has one shared visual encoder and one ONNX artifact,
 while retaining specialised heads where the output spaces differ:
 
-* amount/time: independent, small numeric CTC heads in the current v4
-  architecture (v3's shared head remains loadable for compatibility);
-* payment method: a separate CTC head which preserves bank/card text; and
+* amount/time: independent numeric readers.  v5 adds fixed-position digit
+  heads beside the CTC readers so a financial decimal or status-bar time is
+  not accepted merely because a greedy CTC string looks plausible;
+* payment method: a raw CTC fallback plus v5's separate visible prefix and
+  exact four-digit card-tail readers; and
 * transfer status: a finite three-class head.
 
 That is materially different from putting all Chinese payment characters and
@@ -35,19 +37,73 @@ from .onnx_runtime import _preload_cuda_dlls, onnx_providers
 from .ocr import normalize_payment_method
 from .ocr_unified_dataset import KIND as DATASET_KIND
 from .ocr_unified_dataset import SLOT_ORDER, STATUS_CLASSES
+from .ocr_unified_targets import (
+    AMOUNT_AUX_FORMAT,
+    AMOUNT_MAX_INTEGER_DIGITS as TARGET_AMOUNT_MAX_INTEGER_DIGITS,
+    PAYMENT_CARD_TAIL_FORMAT,
+    PARENTHESIS_STYLE_ASCII,
+    PARENTHESIS_STYLE_FULLWIDTH,
+    TIME_AUX_FORMAT,
+    is_structured_target,
+    recompose_payment_card_tail_target,
+)
 
 
 SCHEMA_VERSION = 1
 KIND_V3 = "receipt_unified_field_reader_v3"
 KIND_V4 = "receipt_unified_field_reader_v4"
+KIND_V5 = "receipt_unified_field_reader_v5"
 # Keep the public alias for callers that only need the current training
 # format.  Loading/export code must use SUPPORTED_KINDS instead so that the
 # already-produced v3 checkpoint and ONNX bundle remain usable.
-KIND = KIND_V4
-SUPPORTED_KINDS = frozenset((KIND_V3, KIND_V4))
+KIND = KIND_V5
+SUPPORTED_KINDS = frozenset((KIND_V3, KIND_V4, KIND_V5))
 NUMERIC_CHARACTERS = tuple("0123456789.:")
 NUMERIC_BLANK_INDEX = 0
 PAYMENT_BLANK_INDEX = 0
+
+# v5 keeps these structural pieces deliberately small and fixed.  They are
+# auxiliary outputs of the *same* ONNX graph, not extra OCR models/sessions.
+# Covers values through 9,999,999.99 while keeping the student head compact.
+# The dataset contract rejects larger values from structural supervision rather
+# than silently truncating them; their legacy CTC label remains available.
+AMOUNT_MAX_INTEGER_DIGITS = TARGET_AMOUNT_MAX_INTEGER_DIGITS
+AMOUNT_DIGIT_SLOTS = AMOUNT_MAX_INTEGER_DIGITS + 2  # right-aligned integer + cents
+TIME_DIGIT_SLOTS = 4  # canonical HHMM; hour display width is a separate head
+PAYMENT_TAIL_DIGIT_SLOTS = 4
+PAYMENT_STRUCTURE_CLASSES = ("unstructured", "card_tail4")
+PAYMENT_PARENTHESIS_CLASSES = (PARENTHESIS_STYLE_ASCII, PARENTHESIS_STYLE_FULLWIDTH)
+STRUCTURED_IGNORE_INDEX = -100
+
+LEGACY_ONNX_OUTPUT_NAMES = ("amount_logits", "time_logits", "payment_logits", "status_logits")
+V5_ONNX_OUTPUT_NAMES = (
+    "amount_logits",
+    "time_logits",
+    "payment_logits",
+    "status_logits",
+    "amount_length_logits",
+    "amount_digit_logits",
+    "time_digit_logits",
+    "time_hour_width_logits",
+    "payment_prefix_logits",
+    "payment_tail_digit_logits",
+    "payment_structure_logits",
+    "payment_parentheses_logits",
+)
+# Only these output tensors use CTC.  The remaining v5 tensors are ordinary
+# fixed-position / classification logits and deliberately have no blank index.
+# Keeping this distinction in one place prevents the delivery contract loader
+# from treating a structured digit head as a CTC sequence.
+CTC_ONNX_BLANK_INDICES = {
+    "amount_logits": NUMERIC_BLANK_INDEX,
+    "time_logits": NUMERIC_BLANK_INDEX,
+    "payment_logits": PAYMENT_BLANK_INDEX,
+    "payment_prefix_logits": PAYMENT_BLANK_INDEX,
+}
+
+
+def _onnx_output_names(config: "UnifiedReaderConfig") -> tuple[str, ...]:
+    return V5_ONNX_OUTPUT_NAMES if config.architecture_version == 5 else LEGACY_ONNX_OUTPUT_NAMES
 
 
 def _kind_for_architecture(architecture_version: int) -> str:
@@ -55,6 +111,8 @@ def _kind_for_architecture(architecture_version: int) -> str:
         return KIND_V3
     if architecture_version == 4:
         return KIND_V4
+    if architecture_version == 5:
+        return KIND_V5
     raise ValueError(f"Unsupported unified reader architecture v{architecture_version}")
 
 
@@ -67,25 +125,26 @@ def _architecture_for_kind(kind: object) -> int:
         return 3
     if kind == KIND_V4:
         return 4
+    if kind == KIND_V5:
+        return 5
     raise ValueError(f"Unsupported unified OCR artifact kind: {kind!r}")
 
 
 @dataclass(frozen=True)
 class UnifiedReaderConfig:
-    # v4 retains more vertical detail (64px input, /8 vertical reduction)
-    # and gives amount/time independent decoders.  v3 stays loadable when a
-    # legacy checkpoint/contract has no architecture_version field.
-    architecture_version: int = 4
-    image_height: int = 64
-    image_width: int = 384
-    base_channels: int = 24
-    numeric_hidden_size: int = 64
-    payment_hidden_size: int = 96
+    # v5 uses a still-small 80x512 view so financial glyphs retain enough
+    # detail for the structural heads. v3/v4 stay loadable for compatibility.
+    architecture_version: int = 5
+    image_height: int = 80
+    image_width: int = 512
+    base_channels: int = 32
+    numeric_hidden_size: int = 96
+    payment_hidden_size: int = 128
     pooled_width: int = 8
 
     def validate(self) -> None:
-        if self.architecture_version not in {3, 4}:
-            raise ValueError("architecture_version must be 3 or 4")
+        if self.architecture_version not in {3, 4, 5}:
+            raise ValueError("architecture_version must be 3, 4, or 5")
         if self.image_height < 16 or self.image_width < 64 or self.image_width % 4:
             raise ValueError("image_height must be >=16 and image_width must be a multiple of 4 >=64")
         if self.base_channels < 8:
@@ -172,8 +231,10 @@ def build_unified_reader(*, payment_vocab_size: int, config: UnifiedReaderConfig
     Architecture v3 deliberately preserves the original module names and
     topology.  That is necessary for strict loading of existing v3 checkpoints.
     Architecture v4 uses a less destructive vertical downsampling path and
-    independent amount/time decoders, without changing the one-input/four-output
-    ONNX protocol.
+    independent amount/time decoders.  v5 retains that compact shared trunk,
+    but replaces the destructive ``mean(height)`` text reduction with learned
+    per-field vertical reducers and emits structural financial-digit heads in
+    the same graph.  v3/v4 output tuples are intentionally unchanged.
     """
     if payment_vocab_size < 2:
         raise ValueError("payment_vocab_size must include CTC blank plus at least one character")
@@ -194,6 +255,35 @@ def build_unified_reader(*, payment_vocab_size: int, config: UnifiedReaderConfig
 
         def forward(self, value: Any) -> Any:
             return self.layers(value)
+
+    class VerticalTextReducer(nn.Module):
+        """Collapse a fixed feature height without averaging away digit strokes.
+
+        The reader has a static ONNX input shape, so v5 knows the encoder's
+        post-stride height.  A depthwise full-height convolution lets each
+        channel learn which vertical evidence matters before a cheap pointwise
+        projection mixes channels for the recurrent decoder.
+        """
+
+        def __init__(self, channels: int, feature_height: int) -> None:
+            super().__init__()
+            self.depthwise = nn.Conv2d(
+                channels,
+                channels,
+                kernel_size=(feature_height, 1),
+                groups=channels,
+                bias=False,
+            )
+            self.norm = nn.GroupNorm(_group_count(channels), channels)
+            self.activation = nn.SiLU(inplace=True)
+            self.pointwise = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
+
+        def forward(self, value: Any) -> Any:
+            value = self.depthwise(value)
+            value = self.norm(value)
+            value = self.activation(value)
+            value = self.pointwise(value)
+            return value.squeeze(2)
 
     class UnifiedFieldReader(nn.Module):
         def __init__(self) -> None:
@@ -230,10 +320,36 @@ def build_unified_reader(*, payment_vocab_size: int, config: UnifiedReaderConfig
                 self.time_classifier = nn.Linear(config.numeric_hidden_size * 2, len(NUMERIC_CHARACTERS) + 1)
             self.payment_sequence = nn.GRU(fourth, config.payment_hidden_size, bidirectional=True)
             self.payment_classifier = nn.Linear(config.payment_hidden_size * 2, payment_vocab_size)
+            if config.architecture_version == 5:
+                feature_height = (config.image_height + 7) // 8
+                self.amount_vertical_reducer = VerticalTextReducer(fourth, feature_height)
+                self.time_vertical_reducer = VerticalTextReducer(fourth, feature_height)
+                self.payment_vertical_reducer = VerticalTextReducer(fourth, feature_height)
+                self.payment_prefix_sequence = nn.GRU(fourth, config.payment_hidden_size, bidirectional=True)
+                self.payment_prefix_classifier = nn.Linear(config.payment_hidden_size * 2, payment_vocab_size)
+                self.amount_length_classifier = nn.Linear(
+                    config.numeric_hidden_size * 2, AMOUNT_MAX_INTEGER_DIGITS
+                )
+                self.amount_digit_classifier = nn.Linear(
+                    config.numeric_hidden_size * 2, AMOUNT_DIGIT_SLOTS * 10
+                )
+                self.time_digit_classifier = nn.Linear(
+                    config.numeric_hidden_size * 2, TIME_DIGIT_SLOTS * 10
+                )
+                self.time_hour_width_classifier = nn.Linear(config.numeric_hidden_size * 2, 2)
+                self.payment_tail_digit_classifier = nn.Linear(
+                    config.payment_hidden_size * 2, PAYMENT_TAIL_DIGIT_SLOTS * 10
+                )
+                self.payment_structure_classifier = nn.Linear(
+                    config.payment_hidden_size * 2, len(PAYMENT_STRUCTURE_CLASSES)
+                )
+                self.payment_parentheses_classifier = nn.Linear(
+                    config.payment_hidden_size * 2, len(PAYMENT_PARENTHESIS_CLASSES)
+                )
             self.status_pool = nn.AdaptiveAvgPool2d((1, config.pooled_width))
             self.status_classifier = nn.Linear(fourth * config.pooled_width, len(STATUS_CLASSES))
 
-        def forward(self, field_images: Any) -> tuple[Any, Any, Any]:
+        def forward(self, field_images: Any) -> tuple[Any, ...]:
             # Training input: [batch, slot=4, channel=1, height, width].
             if field_images.ndim != 5 or field_images.shape[1] != len(SLOT_ORDER) or field_images.shape[2] != 1:
                 raise ValueError("field_images must have shape [batch,4,1,height,width]")
@@ -258,28 +374,78 @@ def build_unified_reader(*, payment_vocab_size: int, config: UnifiedReaderConfig
             else:
                 # v4 keeps a common visual trunk but lets amount and time
                 # specialize their recurrent decoder and final character logits.
-                amount_features = encoded[:, 0].mean(dim=2).permute(2, 0, 1)
-                amount_sequence, _ = self.amount_sequence(amount_features)
+                if self.architecture_version == 5:
+                    amount_features = self.amount_vertical_reducer(encoded[:, 0]).permute(2, 0, 1)
+                    time_features = self.time_vertical_reducer(encoded[:, 1]).permute(2, 0, 1)
+                else:
+                    amount_features = encoded[:, 0].mean(dim=2).permute(2, 0, 1)
+                    time_features = encoded[:, 1].mean(dim=2).permute(2, 0, 1)
+                amount_sequence, amount_hidden = self.amount_sequence(amount_features)
                 amount_logits = self.amount_classifier(amount_sequence)
-                time_features = encoded[:, 1].mean(dim=2).permute(2, 0, 1)
-                time_sequence, _ = self.time_sequence(time_features)
+                time_sequence, time_hidden = self.time_sequence(time_features)
                 time_logits = self.time_classifier(time_sequence)
                 numeric_logits = torch.stack((amount_logits, time_logits), dim=2)
 
-            payment_features = encoded[:, 3].mean(dim=2)  # [batch,C,T]
+            if self.architecture_version == 5:
+                payment_features = self.payment_vertical_reducer(encoded[:, 3])  # [batch,C,T]
+            else:
+                payment_features = encoded[:, 3].mean(dim=2)  # [batch,C,T]
             payment_sequence = payment_features.permute(2, 0, 1)
-            payment_sequence, _ = self.payment_sequence(payment_sequence)
+            payment_sequence, payment_hidden = self.payment_sequence(payment_sequence)
             payment_logits = self.payment_classifier(payment_sequence)  # [T,batch,class]
 
             status_features = self.status_pool(encoded[:, 2]).flatten(1)
             status_logits = self.status_classifier(status_features)
+            if self.architecture_version == 5:
+                amount_summary = torch.cat((amount_hidden[0], amount_hidden[1]), dim=1)
+                time_summary = torch.cat((time_hidden[0], time_hidden[1]), dim=1)
+                payment_prefix_sequence, payment_prefix_hidden = self.payment_prefix_sequence(payment_features.permute(2, 0, 1))
+                payment_prefix_logits = self.payment_prefix_classifier(payment_prefix_sequence)
+                payment_summary = torch.cat((payment_prefix_hidden[0], payment_prefix_hidden[1]), dim=1)
+                amount_length_logits = self.amount_length_classifier(amount_summary)
+                amount_digit_logits = self.amount_digit_classifier(amount_summary).reshape(
+                    batch, AMOUNT_DIGIT_SLOTS, 10
+                )
+                time_digit_logits = self.time_digit_classifier(time_summary).reshape(batch, TIME_DIGIT_SLOTS, 10)
+                time_hour_width_logits = self.time_hour_width_classifier(time_summary)
+                payment_tail_digit_logits = self.payment_tail_digit_classifier(payment_summary).reshape(
+                    batch, PAYMENT_TAIL_DIGIT_SLOTS, 10
+                )
+                payment_structure_logits = self.payment_structure_classifier(payment_summary)
+                payment_parentheses_logits = self.payment_parentheses_classifier(payment_summary)
+                return (
+                    numeric_logits,
+                    payment_logits,
+                    status_logits,
+                    amount_length_logits,
+                    amount_digit_logits,
+                    time_digit_logits,
+                    time_hour_width_logits,
+                    payment_prefix_logits,
+                    payment_tail_digit_logits,
+                    payment_structure_logits,
+                    payment_parentheses_logits,
+                )
             return numeric_logits, payment_logits, status_logits
 
     return UnifiedFieldReader()
 
 
-def preprocess_image(image_path: Path, *, config: UnifiedReaderConfig) -> np.ndarray:
-    """Return one grayscale crop as ``[1,H,W]`` float32 with white letterbox."""
+def preprocess_image(
+    image_path: Path,
+    *,
+    config: UnifiedReaderConfig,
+    horizontal_alignment: str = "center",
+) -> np.ndarray:
+    """Return one grayscale crop as ``[1,H,W]`` float32 with white letterbox.
+
+    v5 places text fields against the right edge.  That makes fixed-position
+    decimal, time and card-tail auxiliary heads deterministic without adding a
+    second input image or a second ONNX session.  v3/v4 keep the historical
+    centred letterbox exactly.
+    """
+    if horizontal_alignment not in {"center", "right"}:
+        raise ValueError("horizontal_alignment must be center or right")
     with Image.open(image_path) as image:
         gray = image.convert("L")
         scale = min(config.image_width / gray.width, config.image_height / gray.height)
@@ -289,7 +455,7 @@ def preprocess_image(image_path: Path, *, config: UnifiedReaderConfig) -> np.nda
         gray = gray.resize((width, height), resampling)
         canvas = np.full((config.image_height, config.image_width), 255, dtype=np.uint8)
         top = (config.image_height - height) // 2
-        left = (config.image_width - width) // 2
+        left = config.image_width - width if horizontal_alignment == "right" else (config.image_width - width) // 2
         canvas[top : top + height, left : left + width] = np.asarray(gray, dtype=np.uint8)
     return (canvas.astype(np.float32) / 255.0)[np.newaxis, :, :]
 
@@ -484,7 +650,16 @@ def _input_tensor(record: Mapping[str, object], *, config: UnifiedReaderConfig) 
     for index, field in enumerate(SLOT_ORDER):
         slot = slots.get(field)
         if isinstance(slot, Mapping):
-            field_images[index] = preprocess_image(Path(slot["image_path"]), config=config)
+            right_align = config.architecture_version == 5 and field in {
+                "amount",
+                "time",
+                "payment_method_field",
+            }
+            field_images[index] = preprocess_image(
+                Path(slot["image_path"]),
+                config=config,
+                horizontal_alignment="right" if right_align else "center",
+            )
     return field_images
 
 
@@ -513,6 +688,49 @@ def _collate_receipts(samples: Sequence[tuple[Any, Mapping[str, object]]]) -> tu
 def _make_dataset(records: Sequence[Mapping[str, object]], *, config: UnifiedReaderConfig, torch: Any) -> Any:
     del torch  # Kept in the signature so callers make the dependency explicit.
     return _UnifiedReceiptDataset(records, config=config)
+
+
+def _unpack_reader_outputs(outputs: object, *, config: UnifiedReaderConfig) -> dict[str, Any]:
+    """Give training/evaluation named tensors while preserving v3/v4 tuples."""
+    if not isinstance(outputs, tuple):
+        raise ValueError("Unified reader must return a tuple of tensors")
+    if config.architecture_version == 5:
+        if len(outputs) != 11:
+            raise ValueError("Unified v5 reader must return eleven output tensors")
+        (
+            numeric_logits,
+            payment_logits,
+            status_logits,
+            amount_length_logits,
+            amount_digit_logits,
+            time_digit_logits,
+            time_hour_width_logits,
+            payment_prefix_logits,
+            payment_tail_digit_logits,
+            payment_structure_logits,
+            payment_parentheses_logits,
+        ) = outputs
+        return {
+            "numeric_logits": numeric_logits,
+            "payment_logits": payment_logits,
+            "status_logits": status_logits,
+            "amount_length_logits": amount_length_logits,
+            "amount_digit_logits": amount_digit_logits,
+            "time_digit_logits": time_digit_logits,
+            "time_hour_width_logits": time_hour_width_logits,
+            "payment_prefix_logits": payment_prefix_logits,
+            "payment_tail_digit_logits": payment_tail_digit_logits,
+            "payment_structure_logits": payment_structure_logits,
+            "payment_parentheses_logits": payment_parentheses_logits,
+        }
+    if len(outputs) != 3:
+        raise ValueError("Unified v3/v4 reader must return three output tensors")
+    numeric_logits, payment_logits, status_logits = outputs
+    return {
+        "numeric_logits": numeric_logits,
+        "payment_logits": payment_logits,
+        "status_logits": status_logits,
+    }
 
 
 def decode_ctc_logits(logits: np.ndarray, *, characters: Sequence[str]) -> list[str]:
@@ -564,6 +782,122 @@ def decode_ctc_logits_with_confidence(logits: np.ndarray, *, characters: Sequenc
     return output
 
 
+def _argmax_with_confidence(logits: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Return final-axis argmax values and their softmax probabilities."""
+    values = np.asarray(logits, dtype=np.float64)
+    shifted = values - values.max(axis=-1, keepdims=True)
+    probabilities = np.exp(shifted)
+    probabilities /= probabilities.sum(axis=-1, keepdims=True)
+    indices = probabilities.argmax(axis=-1)
+    confidence = np.take_along_axis(probabilities, indices[..., np.newaxis], axis=-1).squeeze(-1)
+    return indices.astype(np.int64), confidence.astype(np.float64)
+
+
+def _structured_amount_predictions(
+    amount_length_logits: np.ndarray,
+    amount_digit_logits: np.ndarray,
+) -> list[tuple[str | None, float]]:
+    lengths, length_confidence = _argmax_with_confidence(amount_length_logits)
+    digits, digit_confidence = _argmax_with_confidence(amount_digit_logits)
+    if digits.ndim != 2 or digits.shape[1] != AMOUNT_DIGIT_SLOTS:
+        raise ValueError("amount structured digit output has an invalid shape")
+    output: list[tuple[str | None, float]] = []
+    for index, raw_length in enumerate(lengths.tolist()):
+        integer_length = int(raw_length) + 1
+        if not 1 <= integer_length <= AMOUNT_MAX_INTEGER_DIGITS:
+            output.append((None, 0.0))
+            continue
+        first = AMOUNT_MAX_INTEGER_DIGITS - integer_length
+        integer = "".join(str(value) for value in digits[index, first:AMOUNT_MAX_INTEGER_DIGITS])
+        cents = "".join(str(value) for value in digits[index, AMOUNT_MAX_INTEGER_DIGITS:])
+        # The dataset parser deliberately rejects non-canonical values such as
+        # 00.99.  Do the same at decode time: a structural head that produces
+        # an impossible amount must lead to review/CTC diagnostics, never to a
+        # silently reformatted financial value.
+        if integer_length > 1 and integer.startswith("0"):
+            output.append((None, 0.0))
+            continue
+        confidence = float(
+            np.mean(
+                np.concatenate(
+                    (
+                        np.asarray([length_confidence[index]]),
+                        digit_confidence[index, first:AMOUNT_DIGIT_SLOTS],
+                    )
+                )
+            )
+        )
+        output.append((f"{integer}.{cents}", confidence))
+    return output
+
+
+def _structured_time_predictions(
+    time_digit_logits: np.ndarray,
+    time_hour_width_logits: np.ndarray,
+) -> list[tuple[str | None, float]]:
+    digits, digit_confidence = _argmax_with_confidence(time_digit_logits)
+    widths, width_confidence = _argmax_with_confidence(time_hour_width_logits)
+    if digits.ndim != 2 or digits.shape[1] != TIME_DIGIT_SLOTS:
+        raise ValueError("time structured digit output has an invalid shape")
+    output: list[tuple[str | None, float]] = []
+    for index, values in enumerate(digits):
+        hour = int(values[0]) * 10 + int(values[1])
+        minute = int(values[2]) * 10 + int(values[3])
+        width = int(widths[index]) + 1
+        if not (0 <= hour <= 23 and 0 <= minute <= 59) or width not in {1, 2} or (width == 1 and hour >= 10):
+            output.append((None, 0.0))
+            continue
+        rendered_hour = str(hour) if width == 1 else f"{hour:02d}"
+        confidence = float(np.mean(np.concatenate((digit_confidence[index], [width_confidence[index]]))))
+        output.append((f"{rendered_hour}:{minute:02d}", confidence))
+    return output
+
+
+def _structured_payment_predictions(
+    payment_prefix_logits: np.ndarray,
+    payment_tail_digit_logits: np.ndarray,
+    payment_structure_logits: np.ndarray,
+    payment_parentheses_logits: np.ndarray,
+    *,
+    payment_characters: Sequence[str],
+) -> list[tuple[str | None, float]]:
+    prefix_predictions = decode_ctc_logits_with_confidence(
+        np.asarray(payment_prefix_logits), characters=payment_characters
+    )
+    tail_digits, tail_confidence = _argmax_with_confidence(payment_tail_digit_logits)
+    structure, structure_confidence = _argmax_with_confidence(payment_structure_logits)
+    parentheses, parentheses_confidence = _argmax_with_confidence(payment_parentheses_logits)
+    if tail_digits.ndim != 2 or tail_digits.shape[1] != PAYMENT_TAIL_DIGIT_SLOTS:
+        raise ValueError("payment structured tail output has an invalid shape")
+    output: list[tuple[str | None, float]] = []
+    for index, (prefix, prefix_confidence) in enumerate(prefix_predictions):
+        if int(structure[index]) != 1 or not prefix or any(character in "()（）" for character in prefix):
+            output.append((None, 0.0))
+            continue
+        tail = "".join(str(value) for value in tail_digits[index])
+        style = PAYMENT_PARENTHESIS_CLASSES[int(parentheses[index])]
+        candidate = recompose_payment_card_tail_target(
+            prefix_text=prefix,
+            card_tail=tail,
+            parentheses=style,
+        )
+        if candidate is None:
+            output.append((None, 0.0))
+            continue
+        confidence = float(
+            np.mean(
+                np.concatenate(
+                    (
+                        np.asarray([prefix_confidence, structure_confidence[index], parentheses_confidence[index]]),
+                        tail_confidence[index],
+                    )
+                )
+            )
+        )
+        output.append((candidate, confidence))
+    return output
+
+
 def _slot_text(record: Mapping[str, object], field: str) -> str | None:
     slot = dict(record["slots"]).get(field)
     if not isinstance(slot, Mapping):
@@ -578,6 +912,159 @@ def _status_name(record: Mapping[str, object]) -> str | None:
         return None
     class_name = slot.get("class_name")
     return class_name if class_name in STATUS_CLASSES else None
+
+
+def _amount_structured_target(record: Mapping[str, object]) -> tuple[int, list[int]] | None:
+    """Return integer length and fixed right-aligned decimal digits for v5.
+
+    The unified manifest's amount target is already semantic-normalised by the
+    teacher pipeline.  We nevertheless validate it here rather than letting a
+    malformed pseudo-label become a confident financial prediction.
+    """
+    slot = dict(record["slots"]).get("amount")
+    if not isinstance(slot, Mapping):
+        return None
+    aux = slot.get("amount_aux")
+    if not is_structured_target(aux, expected_format=AMOUNT_AUX_FORMAT):
+        return None
+    integer = aux.get("integer_digits")
+    cents = aux.get("cents_digits")
+    digits = aux.get("right_aligned_digits")
+    mask = aux.get("right_aligned_mask")
+    if (
+        not isinstance(integer, str)
+        or not isinstance(cents, str)
+        or not isinstance(digits, list)
+        or not isinstance(mask, list)
+        or len(integer) not in range(1, AMOUNT_MAX_INTEGER_DIGITS + 1)
+        or len(cents) != 2
+        or len(digits) != AMOUNT_DIGIT_SLOTS
+        or len(mask) != AMOUNT_DIGIT_SLOTS
+        or not integer.isascii()
+        or not cents.isascii()
+        or not integer.isdigit()
+        or not cents.isdigit()
+    ):
+        return None
+    visible_text = slot.get("text")
+    if visible_text != f"{integer}.{cents}":
+        return None
+    expected_digits: list[str | None] = [None] * (AMOUNT_MAX_INTEGER_DIGITS - len(integer))
+    expected_digits.extend((*integer, *cents))
+    expected_mask = [value is not None for value in expected_digits]
+    if digits != expected_digits or mask != expected_mask:
+        return None
+    targets: list[int] = []
+    for value, active in zip(digits, mask):
+        if active is False and value is None:
+            targets.append(STRUCTURED_IGNORE_INDEX)
+        elif active is True and isinstance(value, str) and len(value) == 1 and value.isascii() and value.isdigit():
+            targets.append(int(value))
+        else:
+            return None
+    if "".join(str(value) for value in targets if value != STRUCTURED_IGNORE_INDEX) != integer + cents:
+        return None
+    return len(integer) - 1, targets
+
+
+def _time_structured_target(record: Mapping[str, object]) -> tuple[list[int], int] | None:
+    """Return canonical HHMM digits plus visible one/two-digit hour width.
+
+    We intentionally do not fabricate a leading zero in the *display* value:
+    ``1:44`` and ``01:44`` remain separate raw labels.  The numeric head uses
+    a zero-padded internal representation and the hour-width head restores the
+    visible form.  Times with seconds remain CTC-only/review candidates.
+    """
+    slot = dict(record["slots"]).get("time")
+    if not isinstance(slot, Mapping):
+        return None
+    aux = slot.get("time_aux")
+    if not is_structured_target(aux, expected_format=TIME_AUX_FORMAT):
+        return None
+    hour_text = aux.get("hour_text")
+    minute_text = aux.get("minute_text")
+    if (
+        not isinstance(hour_text, str)
+        or not isinstance(minute_text, str)
+        or len(hour_text) not in {1, 2}
+        or len(minute_text) != 2
+        or not hour_text.isascii()
+        or not minute_text.isascii()
+        or not hour_text.isdigit()
+        or not minute_text.isdigit()
+    ):
+        return None
+    hour, minute = int(hour_text), int(minute_text)
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    if slot.get("text") != f"{hour_text}:{minute_text}":
+        return None
+    canonical = f"{hour:02d}{minute:02d}"
+    return [int(character) for character in canonical], len(hour_text) - 1
+
+
+def _payment_card_tail_target(record: Mapping[str, object]) -> tuple[str, list[int], int] | None:
+    """Use the manifest's audited parser result when it is a complete card tail.
+
+    The parser never guesses an incomplete/invalid tail.  Older v3/v4
+    manifests have no structured payload and therefore train the raw CTC path
+    only, which is safer than inferring financial digits from arbitrary text.
+    """
+    slot = dict(record["slots"]).get("payment_method_field")
+    if not isinstance(slot, Mapping):
+        return None
+    aux = slot.get("payment_card_tail")
+    if not is_structured_target(aux, expected_format=PAYMENT_CARD_TAIL_FORMAT):
+        return None
+    prefix = aux.get("prefix_text")
+    tail = aux.get("card_tail")
+    parentheses = aux.get("parentheses")
+    if (
+        not isinstance(prefix, str)
+        or not prefix
+        or not isinstance(tail, str)
+        or len(tail) != PAYMENT_TAIL_DIGIT_SLOTS
+        or not tail.isascii()
+        or not tail.isdigit()
+        or parentheses not in PAYMENT_PARENTHESIS_CLASSES
+    ):
+        return None
+    if recompose_payment_card_tail_target(
+        prefix_text=prefix,
+        card_tail=tail,
+        parentheses=str(parentheses),
+    ) != slot.get("text"):
+        return None
+    return prefix, [int(character) for character in tail], PAYMENT_PARENTHESIS_CLASSES.index(str(parentheses))
+
+
+def _structured_cross_entropy_loss(
+    logits: Any,
+    *,
+    labels: Sequence[int | Sequence[int] | None],
+    torch: Any,
+) -> tuple[Any | None, int]:
+    """CE for optional fixed-position targets, excluding absent slots safely."""
+    selected = [(index, label) for index, label in enumerate(labels) if label is not None]
+    if not selected:
+        return None, 0
+    indices = torch.tensor([index for index, _ in selected], dtype=torch.long, device=logits.device)
+    selected_logits = logits.index_select(0, indices)
+    first_label = selected[0][1]
+    if isinstance(first_label, int):
+        targets = torch.tensor([int(label) for _, label in selected], dtype=torch.long, device=logits.device)
+        return torch.nn.functional.cross_entropy(selected_logits, targets), len(selected)
+    targets = torch.tensor([list(label) for _, label in selected], dtype=torch.long, device=logits.device)
+    if selected_logits.ndim != 3 or list(selected_logits.shape[:2]) != list(targets.shape):
+        raise ValueError("Structured digit logits/targets have incompatible shapes")
+    return (
+        torch.nn.functional.cross_entropy(
+            selected_logits.reshape(-1, selected_logits.shape[-1]),
+            targets.reshape(-1),
+            ignore_index=STRUCTURED_IGNORE_INDEX,
+        ),
+        len(selected),
+    )
 
 
 def _field_split_counts(records: Iterable[Mapping[str, object]]) -> dict[str, dict[str, int]]:
@@ -595,6 +1082,43 @@ def _field_split_counts(records: Iterable[Mapping[str, object]]) -> dict[str, di
         field: {split: int(counts[field][split]) for split in ("train", "val", "test")}
         for field in SLOT_ORDER
     }
+
+
+def _structured_split_counts(records: Iterable[Mapping[str, object]]) -> dict[str, dict[str, int]]:
+    """Audit the labels that actually supervise v5's fixed-position heads."""
+    targets = {
+        "amount_aux": _amount_structured_target,
+        "time_aux": _time_structured_target,
+        "payment_card_tail": _payment_card_tail_target,
+    }
+    counts: dict[str, Counter[str]] = {name: Counter() for name in (*targets, "payment_unstructured")}
+    for record in records:
+        split = str(record["split"])
+        for name, parser in targets.items():
+            if parser(record) is not None:
+                counts[name][split] += 1
+        if _slot_text(record, "payment_method_field") is not None and _payment_card_tail_target(record) is None:
+            counts["payment_unstructured"][split] += 1
+    return {
+        name: {split: int(counts[name][split]) for split in ("train", "val", "test")}
+        for name in counts
+    }
+
+
+def _require_v5_structured_coverage(counts: Mapping[str, Mapping[str, int]]) -> None:
+    missing = [
+        f"{name}:{split}"
+        for name in ("amount_aux", "time_aux", "payment_card_tail", "payment_unstructured")
+        for split in ("train", "val")
+        if int(counts[name][split]) <= 0
+    ]
+    if missing:
+        raise ValueError(
+            "Unified v5 needs structured train/val labels for amount, time, exact payment card tails, and "
+            "unstructured payment values; missing "
+            + ", ".join(missing)
+            + ". Rebuild the manifest with ocr_unified_dataset and inspect dataset.contract.json."
+        )
 
 
 def _status_split_counts(records: Iterable[Mapping[str, object]]) -> dict[str, dict[str, int]]:
@@ -768,6 +1292,10 @@ def _batch_loss(
     status_criterion: Any | None,
     status_enabled: bool,
     payment_loss_weight: float,
+    config: UnifiedReaderConfig,
+    structured_outputs: Mapping[str, Any] | None,
+    ctc_loss_weight: float,
+    structured_loss_weight: float,
     torch: Any,
     allow_empty: bool = False,
 ) -> tuple[Any | None, dict[str, dict[str, float | int]]]:
@@ -801,13 +1329,99 @@ def _batch_loss(
         )
     else:
         status_loss, status_used = None, 0
+
+    amount_length_loss: Any | None = None
+    amount_digits_loss: Any | None = None
+    time_digits_loss: Any | None = None
+    time_hour_width_loss: Any | None = None
+    payment_prefix_loss: Any | None = None
+    payment_tail_loss: Any | None = None
+    payment_structure_loss: Any | None = None
+    payment_parentheses_loss: Any | None = None
+    amount_structured_used = 0
+    time_structured_used = 0
+    payment_card_tail_used = 0
+    payment_structure_used = 0
+    if config.architecture_version == 5:
+        if structured_outputs is None:
+            raise ValueError("Unified v5 loss requires structured output tensors")
+        amount_targets = [_amount_structured_target(record) for record in records]
+        amount_length_loss, amount_structured_used = _structured_cross_entropy_loss(
+            structured_outputs["amount_length_logits"],
+            labels=[target[0] if target is not None else None for target in amount_targets],
+            torch=torch,
+        )
+        amount_digits_loss, _ = _structured_cross_entropy_loss(
+            structured_outputs["amount_digit_logits"],
+            labels=[target[1] if target is not None else None for target in amount_targets],
+            torch=torch,
+        )
+        time_targets = [_time_structured_target(record) for record in records]
+        time_digits_loss, time_structured_used = _structured_cross_entropy_loss(
+            structured_outputs["time_digit_logits"],
+            labels=[target[0] if target is not None else None for target in time_targets],
+            torch=torch,
+        )
+        time_hour_width_loss, _ = _structured_cross_entropy_loss(
+            structured_outputs["time_hour_width_logits"],
+            labels=[target[1] if target is not None else None for target in time_targets],
+            torch=torch,
+        )
+        payment_targets = [_payment_card_tail_target(record) for record in records]
+        payment_prefix_loss, payment_card_tail_used, _ = _ctc_loss(
+            structured_outputs["payment_prefix_logits"],
+            labels=[target[0] if target is not None else None for target in payment_targets],
+            character_to_id=payment_to_id,
+            torch=torch,
+        )
+        payment_tail_loss, _ = _structured_cross_entropy_loss(
+            structured_outputs["payment_tail_digit_logits"],
+            labels=[target[1] if target is not None else None for target in payment_targets],
+            torch=torch,
+        )
+        payment_parentheses_loss, _ = _structured_cross_entropy_loss(
+            structured_outputs["payment_parentheses_logits"],
+            labels=[target[2] if target is not None else None for target in payment_targets],
+            torch=torch,
+        )
+        payment_structure_loss, payment_structure_used = _structured_cross_entropy_loss(
+            structured_outputs["payment_structure_logits"],
+            labels=[1 if target is not None else 0 if _slot_text(record, "payment_method_field") is not None else None for record, target in zip(records, payment_targets)],
+            torch=torch,
+        )
     pieces: list[Any] = []
-    if amount_loss is not None:
-        pieces.append(amount_loss)
-    if time_loss is not None:
-        pieces.append(time_loss)
-    if payment_loss is not None:
-        pieces.append(payment_loss * payment_loss_weight)
+    if config.architecture_version == 5:
+        if amount_loss is not None:
+            pieces.append(amount_loss * ctc_loss_weight)
+        if time_loss is not None:
+            pieces.append(time_loss * ctc_loss_weight)
+        if payment_loss is not None:
+            pieces.append(payment_loss * payment_loss_weight * ctc_loss_weight)
+        if amount_length_loss is not None:
+            pieces.append(amount_length_loss * structured_loss_weight)
+        if amount_digits_loss is not None:
+            pieces.append(amount_digits_loss * structured_loss_weight)
+        if time_digits_loss is not None:
+            pieces.append(time_digits_loss * structured_loss_weight)
+        if time_hour_width_loss is not None:
+            pieces.append(time_hour_width_loss * structured_loss_weight)
+        if payment_prefix_loss is not None:
+            pieces.append(payment_prefix_loss * payment_loss_weight * structured_loss_weight)
+        if payment_tail_loss is not None:
+            # The exact four digits are the demonstrated v4 failure mode;
+            # give their compact, directly supervised head a modest priority.
+            pieces.append(payment_tail_loss * payment_loss_weight * structured_loss_weight * 1.5)
+        if payment_structure_loss is not None:
+            pieces.append(payment_structure_loss * payment_loss_weight * structured_loss_weight)
+        if payment_parentheses_loss is not None:
+            pieces.append(payment_parentheses_loss * payment_loss_weight * structured_loss_weight * 0.25)
+    else:
+        if amount_loss is not None:
+            pieces.append(amount_loss)
+        if time_loss is not None:
+            pieces.append(time_loss)
+        if payment_loss is not None:
+            pieces.append(payment_loss * payment_loss_weight)
     if status_loss is not None:
         pieces.append(status_loss)
     if not pieces:
@@ -825,6 +1439,26 @@ def _batch_loss(
             "oov": payment_oov,
         },
         "transfer_status": {"loss": float(status_loss.detach().cpu()) if status_loss is not None else math.nan, "used": status_used, "oov": 0},
+        "amount_structured": {
+            "length_loss": float(amount_length_loss.detach().cpu()) if amount_length_loss is not None else math.nan,
+            "digits_loss": float(amount_digits_loss.detach().cpu()) if amount_digits_loss is not None else math.nan,
+            "used": amount_structured_used,
+        },
+        "time_structured": {
+            "digits_loss": float(time_digits_loss.detach().cpu()) if time_digits_loss is not None else math.nan,
+            "hour_width_loss": float(time_hour_width_loss.detach().cpu()) if time_hour_width_loss is not None else math.nan,
+            "used": time_structured_used,
+        },
+        "payment_structured": {
+            "prefix_loss": float(payment_prefix_loss.detach().cpu()) if payment_prefix_loss is not None else math.nan,
+            "tail_loss": float(payment_tail_loss.detach().cpu()) if payment_tail_loss is not None else math.nan,
+            "structure_loss": float(payment_structure_loss.detach().cpu()) if payment_structure_loss is not None else math.nan,
+            "parentheses_loss": float(payment_parentheses_loss.detach().cpu())
+            if payment_parentheses_loss is not None
+            else math.nan,
+            "card_tail_used": payment_card_tail_used,
+            "structure_used": payment_structure_used,
+        },
     }
 
 
@@ -832,6 +1466,7 @@ def _evaluate_model(
     model: Any,
     loader: Any,
     *,
+    config: UnifiedReaderConfig,
     device: str,
     numeric_characters: Sequence[str],
     numeric_to_id: Mapping[str, int],
@@ -841,6 +1476,8 @@ def _evaluate_model(
     status_criterion: Any | None,
     status_enabled: bool,
     payment_loss_weight: float,
+    ctc_loss_weight: float,
+    structured_loss_weight: float,
     torch: Any,
 ) -> dict[str, object]:
     """Evaluate all four heads without discarding OOV held-out labels."""
@@ -853,7 +1490,10 @@ def _evaluate_model(
     with torch.no_grad():
         for field_images, records in loader:
             field_images = field_images.to(device)
-            numeric_logits, payment_logits, status_logits = model(field_images)
+            outputs = _unpack_reader_outputs(model(field_images), config=config)
+            numeric_logits = outputs["numeric_logits"]
+            payment_logits = outputs["payment_logits"]
+            status_logits = outputs["status_logits"]
             loss, _ = _batch_loss(
                 numeric_logits,
                 payment_logits,
@@ -865,37 +1505,105 @@ def _evaluate_model(
                 status_criterion=status_criterion,
                 status_enabled=status_enabled,
                 payment_loss_weight=payment_loss_weight,
+                config=config,
+                structured_outputs=outputs if config.architecture_version == 5 else None,
+                ctc_loss_weight=ctc_loss_weight,
+                structured_loss_weight=structured_loss_weight,
                 torch=torch,
                 allow_empty=True,
             )
             if loss is not None:
                 total_loss += float(loss.detach().cpu()) * len(records)
                 loss_receipts += len(records)
-            amount_predictions = decode_ctc_logits(
+            amount_ctc_predictions = decode_ctc_logits(
                 numeric_logits[:, :, 0, :].detach().cpu().numpy(), characters=numeric_characters
             )
-            time_predictions = decode_ctc_logits(
+            time_ctc_predictions = decode_ctc_logits(
                 numeric_logits[:, :, 1, :].detach().cpu().numpy(), characters=numeric_characters
             )
-            payment_predictions = decode_ctc_logits(
+            payment_ctc_predictions = decode_ctc_logits(
                 payment_logits.detach().cpu().numpy(), characters=payment_characters
             )
+            amount_predictions = list(amount_ctc_predictions)
+            time_predictions = list(time_ctc_predictions)
+            payment_predictions = list(payment_ctc_predictions)
+            delivery_predictions: dict[str, list[str | None]] = {
+                "amount": list(amount_ctc_predictions),
+                "time": list(time_ctc_predictions),
+                "payment_method_field": list(payment_ctc_predictions),
+            }
+            if config.architecture_version == 5:
+                structured_amount = _structured_amount_predictions(
+                    outputs["amount_length_logits"].detach().cpu().numpy(),
+                    outputs["amount_digit_logits"].detach().cpu().numpy(),
+                )
+                structured_time = _structured_time_predictions(
+                    outputs["time_digit_logits"].detach().cpu().numpy(),
+                    outputs["time_hour_width_logits"].detach().cpu().numpy(),
+                )
+                structured_payment = _structured_payment_predictions(
+                    outputs["payment_prefix_logits"].detach().cpu().numpy(),
+                    outputs["payment_tail_digit_logits"].detach().cpu().numpy(),
+                    outputs["payment_structure_logits"].detach().cpu().numpy(),
+                    outputs["payment_parentheses_logits"].detach().cpu().numpy(),
+                    payment_characters=payment_characters,
+                )
+                amount_predictions = [
+                    structured if structured is not None else ctc
+                    for ctc, (structured, _) in zip(amount_ctc_predictions, structured_amount)
+                ]
+                time_predictions = [
+                    structured if structured is not None else ctc
+                    for ctc, (structured, _) in zip(time_ctc_predictions, structured_time)
+                ]
+                payment_predictions = [
+                    structured if structured is not None else ctc
+                    for ctc, (structured, _) in zip(payment_ctc_predictions, structured_payment)
+                ]
+                # Structural digits/prefixes are the delivery path.  A CTC
+                # fallback is still recorded for diagnostics, but until it has
+                # a separately calibrated safe policy it cannot be emitted.
+                # A disagreement is therefore review, never a tie-breaker.
+                delivery_predictions = {
+                    "amount": [
+                        structured if structured is not None and structured == ctc else None
+                        for ctc, (structured, _) in zip(amount_ctc_predictions, structured_amount)
+                    ],
+                    "time": [
+                        structured if structured is not None and structured == ctc else None
+                        for ctc, (structured, _) in zip(time_ctc_predictions, structured_time)
+                    ],
+                    "payment_method_field": [
+                        structured if structured is not None and structured == ctc else None
+                        for ctc, (structured, _) in zip(payment_ctc_predictions, structured_payment)
+                    ],
+                }
             status_predictions = status_logits.argmax(dim=1).detach().cpu().tolist()
             for index, record in enumerate(records):
                 values = {
-                    "amount": (_slot_text(record, "amount"), amount_predictions[index]),
-                    "time": (_slot_text(record, "time"), time_predictions[index]),
+                    "amount": (
+                        _slot_text(record, "amount"),
+                        amount_predictions[index],
+                        delivery_predictions["amount"][index],
+                    ),
+                    "time": (
+                        _slot_text(record, "time"),
+                        time_predictions[index],
+                        delivery_predictions["time"][index],
+                    ),
                     "payment_method_field": (
                         _slot_text(record, "payment_method_field"),
                         payment_predictions[index],
+                        delivery_predictions["payment_method_field"][index],
                     ),
                 }
                 if status_enabled:
                     values["transfer_status"] = (
                         _status_name(record),
                         STATUS_CLASSES[int(status_predictions[index])],
+                        STATUS_CLASSES[int(status_predictions[index])],
                     )
-                for field, (expected, predicted) in values.items():
+                for field, (expected, predicted, delivery_predicted) in values.items():
                     if expected is None:
                         continue
                     field_counter = counters[field]
@@ -906,15 +1614,28 @@ def _evaluate_model(
                         field_counter["oov_reference"] += 1
                     matched = str(expected) == str(predicted)
                     field_counter["exact_matches"] += int(matched)
+                    if delivery_predicted is not None:
+                        delivery_matched = str(expected) == str(delivery_predicted)
+                        field_counter["delivery_records"] += 1
+                        field_counter["delivery_exact_matches"] += int(delivery_matched)
+                        field_counter["delivery_false_accepts"] += int(not delivery_matched)
                     exact_total += int(matched)
                     label_total += 1
                     if field == "transfer_status" and expected != "success" and predicted == "success":
                         field_counter["non_success_to_success"] += 1
     if not loss_receipts or not label_total:
         raise ValueError("Validation set has no CTC/classification labels covered by the training charset")
+    delivery_records = sum(counter["delivery_records"] for counter in counters.values())
+    delivery_exact_matches = sum(counter["delivery_exact_matches"] for counter in counters.values())
     return {
         "loss": total_loss / loss_receipts,
         "exact_match": exact_total / label_total,
+        "delivery_coverage": delivery_records / label_total,
+        "delivery_exact_match": delivery_exact_matches / max(1, delivery_records),
+        "delivery_exact_overall": delivery_exact_matches / label_total,
+        "delivery_false_accepts": int(
+            sum(counter["delivery_false_accepts"] for counter in counters.values())
+        ),
         "by_field": {
             field: {
                 "records": int(counter["records"]),
@@ -922,6 +1643,9 @@ def _evaluate_model(
                 "exact_match": counter["exact_matches"] / max(1, counter["records"]),
                 "oov_reference_records": int(counter["oov_reference"]),
                 "non_success_to_success": int(counter["non_success_to_success"]),
+                "delivery_coverage": counter["delivery_records"] / max(1, counter["records"]),
+                "delivery_exact_match": counter["delivery_exact_matches"] / max(1, counter["delivery_records"]),
+                "delivery_false_accepts": int(counter["delivery_false_accepts"]),
             }
             for field, counter in counters.items()
         },
@@ -949,6 +1673,8 @@ def train_unified_reader(
     learning_rate: float = 1e-3,
     weight_decay: float = 1e-4,
     payment_loss_weight: float = 1.0,
+    ctc_loss_weight: float = 0.35,
+    structured_loss_weight: float = 1.0,
     seed: int = 42,
     num_workers: int = 0,
 ) -> Path:
@@ -963,8 +1689,17 @@ def train_unified_reader(
     config.validate()
     if epochs <= 0 or batch_size <= 0:
         raise ValueError("epochs and batch_size must be positive")
-    if learning_rate <= 0 or weight_decay < 0 or payment_loss_weight <= 0:
-        raise ValueError("learning_rate and payment_loss_weight must be positive; weight_decay cannot be negative")
+    if (
+        learning_rate <= 0
+        or weight_decay < 0
+        or payment_loss_weight <= 0
+        or ctc_loss_weight <= 0
+        or structured_loss_weight <= 0
+    ):
+        raise ValueError(
+            "learning_rate, payment_loss_weight, ctc_loss_weight, and structured_loss_weight must be positive; "
+            "weight_decay cannot be negative"
+        )
     if num_workers < 0:
         raise ValueError("num_workers cannot be negative")
     output_dir = output_dir.resolve()
@@ -976,12 +1711,15 @@ def train_unified_reader(
     if not train_records or not validation_records:
         raise ValueError("The unified manifest must contain non-empty train and val receipt splits")
     field_counts = _field_split_counts(records)
+    structured_counts = _structured_split_counts(records)
     status_counts = _status_split_counts(records)
     status_policy = _status_head_policy(status_counts)
     required_fields = ["amount", "time", "payment_method_field"]
     if bool(status_policy["training_enabled"]):
         required_fields.append("transfer_status")
     _require_train_and_validation_coverage(field_counts, required_fields=required_fields)
+    if config.architecture_version == 5:
+        _require_v5_structured_coverage(structured_counts)
     _validate_ctc_capacity(records, config=config)
     payment_characters = _payment_charset(train_records)
     payment_to_id = {character: index for index, character in enumerate(payment_characters, start=1)}
@@ -1044,6 +1782,7 @@ def train_unified_reader(
             "payment_blank_index": PAYMENT_BLANK_INDEX,
             "payment_characters": payment_characters,
             "status_classes": list(STATUS_CLASSES),
+            "structured_target_counts": structured_counts,
             "payment_charset_sha256": hashlib.sha256("".join(payment_characters).encode("utf-8")).hexdigest(),
         },
     )
@@ -1052,7 +1791,7 @@ def train_unified_reader(
     # When the status head has full validation coverage, prefer a checkpoint
     # that never maps pending/failed to success.  In review-only mode that
     # metric is deliberately excluded and the three text heads choose best.
-    best_score = (float("-inf"), -1.0, float("-inf"))
+    best_score = (float("-inf"), -1.0, -1.0, float("-inf"))
     best_path = output_dir / "best.pt"
     for epoch in range(1, epochs + 1):
         model.train()
@@ -1061,7 +1800,10 @@ def train_unified_reader(
         for field_images, batch_records in train_loader:
             field_images = field_images.to(target_device)
             optimizer.zero_grad(set_to_none=True)
-            numeric_logits, payment_logits, status_logits = model(field_images)
+            outputs = _unpack_reader_outputs(model(field_images), config=config)
+            numeric_logits = outputs["numeric_logits"]
+            payment_logits = outputs["payment_logits"]
+            status_logits = outputs["status_logits"]
             loss, _ = _batch_loss(
                 numeric_logits,
                 payment_logits,
@@ -1073,6 +1815,10 @@ def train_unified_reader(
                 status_criterion=status_train_criterion,
                 status_enabled=bool(status_policy["training_enabled"]),
                 payment_loss_weight=payment_loss_weight,
+                config=config,
+                structured_outputs=outputs if config.architecture_version == 5 else None,
+                ctc_loss_weight=ctc_loss_weight,
+                structured_loss_weight=structured_loss_weight,
                 torch=torch,
             )
             loss.backward()
@@ -1083,6 +1829,7 @@ def train_unified_reader(
         validation = _evaluate_model(
             model,
             validation_loader,
+            config=config,
             device=target_device,
             numeric_characters=numeric_characters,
             numeric_to_id=numeric_to_id,
@@ -1092,6 +1839,8 @@ def train_unified_reader(
             status_criterion=status_validation_criterion,
             status_enabled=bool(status_policy["training_enabled"]),
             payment_loss_weight=payment_loss_weight,
+            ctc_loss_weight=ctc_loss_weight,
+            structured_loss_weight=structured_loss_weight,
             torch=torch,
         )
         epoch_record: dict[str, object] = {
@@ -1099,6 +1848,10 @@ def train_unified_reader(
             "train_loss": total_loss / max(total_receipts, 1),
             "val_loss": validation["loss"],
             "val_exact_match": validation["exact_match"],
+            "val_delivery_coverage": validation["delivery_coverage"],
+            "val_delivery_exact_match": validation["delivery_exact_match"],
+            "val_delivery_exact_overall": validation["delivery_exact_overall"],
+            "val_delivery_false_accepts": validation["delivery_false_accepts"],
             "val_by_field": validation["by_field"],
             "val_status_non_success_to_success": validation["status_non_success_to_success"],
         }
@@ -1113,9 +1866,12 @@ def train_unified_reader(
             "status_classes": list(STATUS_CLASSES),
             "field_counts": field_counts,
             "status_class_counts": status_counts,
+            "structured_target_counts": structured_counts,
             "status_head_policy": status_policy,
             "payment_oov_by_split": payment_oov,
             "payment_loss_weight": payment_loss_weight,
+            "ctc_loss_weight": ctc_loss_weight,
+            "structured_loss_weight": structured_loss_weight,
             "epoch": epoch,
             "metrics": epoch_record,
         }
@@ -1124,6 +1880,7 @@ def train_unified_reader(
             -float(validation["status_non_success_to_success"])
             if bool(status_policy["training_enabled"])
             else 0.0,
+            float(validation["delivery_exact_overall"]),
             float(validation["exact_match"]),
             -float(validation["loss"]),
         )
@@ -1137,6 +1894,7 @@ def train_unified_reader(
                 "kind": _kind_for_config(config),
                 "field_counts": field_counts,
                 "status_class_counts": status_counts,
+                "structured_target_counts": structured_counts,
                 "status_head_policy": status_policy,
                 "payment_oov_by_split": payment_oov,
                 "records": history,
@@ -1148,7 +1906,9 @@ def train_unified_reader(
         )
         print(
             f"epoch {epoch}/{epochs}: train_loss={float(epoch_record['train_loss']):.4f} "
-            f"val_loss={float(validation['loss']):.4f} val_exact_match={float(validation['exact_match']):.2%}"
+            f"val_loss={float(validation['loss']):.4f} val_exact_match={float(validation['exact_match']):.2%} "
+            f"val_delivery={float(validation['delivery_exact_overall']):.2%} "
+            f"coverage={float(validation['delivery_coverage']):.2%}"
         )
     return best_path
 
@@ -1225,6 +1985,7 @@ def _validate_exported_onnx(
     onnx_path: Path,
     *,
     dummy: Any,
+    output_names: Sequence[str],
     expected_outputs: Sequence[Any],
 ) -> None:
     """Require the exported graph to load and match Torch on a fixed input."""
@@ -1232,11 +1993,11 @@ def _validate_exported_onnx(
     session = onnxruntime.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
     if [item.name for item in session.get_inputs()] != ["field_images"]:
         raise ValueError("Exported unified OCR ONNX has an unexpected input name")
-    output_names = ["amount_logits", "time_logits", "payment_logits", "status_logits"]
-    if [item.name for item in session.get_outputs()] != output_names:
+    expected_names = list(output_names)
+    if [item.name for item in session.get_outputs()] != expected_names:
         raise ValueError("Exported unified OCR ONNX has unexpected output names")
-    actual_outputs = session.run(output_names, {"field_images": dummy.detach().cpu().numpy()})
-    for name, actual, expected in zip(output_names, actual_outputs, expected_outputs):
+    actual_outputs = session.run(expected_names, {"field_images": dummy.detach().cpu().numpy()})
+    for name, actual, expected in zip(expected_names, actual_outputs, expected_outputs):
         expected_array = expected.detach().cpu().numpy()
         actual_array = np.asarray(actual)
         if list(actual_array.shape) != list(expected_array.shape):
@@ -1303,14 +2064,30 @@ def export_unified_onnx(*, checkpoint_path: Path, output_path: Path) -> tuple[Pa
             super().__init__()
             self.reader = reader
 
-        def forward(self, field_images: Any) -> tuple[Any, Any, Any, Any]:
+        def forward(self, field_images: Any) -> tuple[Any, ...]:
             # ONNX input is one receipt in fixed field order: [4,1,H,W].
-            numeric, payment, status = self.reader(field_images.unsqueeze(0))
+            outputs = _unpack_reader_outputs(self.reader(field_images.unsqueeze(0)), config=config)
+            numeric = outputs["numeric_logits"]
+            payment = outputs["payment_logits"]
+            status = outputs["status_logits"]
             # Separate amount/time outputs keep the .NET decoder simple while
             # still invoking only one model/session/run.
-            return numeric[:, 0, 0, :], numeric[:, 0, 1, :], payment[:, 0, :], status[0, :]
+            base = (numeric[:, 0, 0, :], numeric[:, 0, 1, :], payment[:, 0, :], status[0, :])
+            if config.architecture_version != 5:
+                return base
+            return base + (
+                outputs["amount_length_logits"][0, :],
+                outputs["amount_digit_logits"][0, :, :],
+                outputs["time_digit_logits"][0, :, :],
+                outputs["time_hour_width_logits"][0, :],
+                outputs["payment_prefix_logits"][:, 0, :],
+                outputs["payment_tail_digit_logits"][0, :, :],
+                outputs["payment_structure_logits"][0, :],
+                outputs["payment_parentheses_logits"][0, :],
+            )
 
     wrapper = OneReceiptExport(model)
+    output_names = list(_onnx_output_names(config))
     output_path.parent.mkdir(parents=True, exist_ok=True)
     dummy = torch.zeros((len(SLOT_ORDER), 1, config.image_height, config.image_width), dtype=torch.float32)
     try:
@@ -1320,7 +2097,7 @@ def export_unified_onnx(*, checkpoint_path: Path, output_path: Path) -> tuple[Pa
                 dummy,
                 temporary_output,
                 input_names=["field_images"],
-                output_names=["amount_logits", "time_logits", "payment_logits", "status_logits"],
+                output_names=output_names,
                 opset_version=17,
                 do_constant_folding=True,
                 dynamo=False,
@@ -1331,21 +2108,27 @@ def export_unified_onnx(*, checkpoint_path: Path, output_path: Path) -> tuple[Pa
                 dummy,
                 temporary_output,
                 input_names=["field_images"],
-                output_names=["amount_logits", "time_logits", "payment_logits", "status_logits"],
+                output_names=output_names,
                 opset_version=17,
                 do_constant_folding=True,
             )
         with torch.no_grad():
-            amount_logits, time_logits, payment_logits, status_logits = wrapper(dummy)
+            exported_outputs = wrapper(dummy)
         _validate_exported_onnx(
             temporary_output,
             dummy=dummy,
-            expected_outputs=(amount_logits, time_logits, payment_logits, status_logits),
+            output_names=output_names,
+            expected_outputs=exported_outputs,
         )
         temporary_output.replace(output_path)
     except Exception:
         temporary_output.unlink(missing_ok=True)
         raise
+    output_values = dict(zip(output_names, exported_outputs))
+    amount_logits = output_values["amount_logits"]
+    time_logits = output_values["time_logits"]
+    payment_logits = output_values["payment_logits"]
+    status_logits = output_values["status_logits"]
     labels_payload = {
         "schema_version": SCHEMA_VERSION,
         "numeric_blank_index": NUMERIC_BLANK_INDEX,
@@ -1355,7 +2138,105 @@ def export_unified_onnx(*, checkpoint_path: Path, output_path: Path) -> tuple[Pa
         "status_classes": status_classes,
         "payment_charset_sha256": hashlib.sha256("".join(payment_characters).encode("utf-8")).hexdigest(),
     }
+    if config.architecture_version == 5:
+        labels_payload["structured_decoder"] = {
+            "schema_version": 1,
+            "amount_max_integer_digits": AMOUNT_MAX_INTEGER_DIGITS,
+            "amount_digit_slots": AMOUNT_DIGIT_SLOTS,
+            "time_digit_slots": TIME_DIGIT_SLOTS,
+            "payment_tail_digit_slots": PAYMENT_TAIL_DIGIT_SLOTS,
+            "payment_structure_classes": list(PAYMENT_STRUCTURE_CLASSES),
+            "payment_parentheses_classes": list(PAYMENT_PARENTHESIS_CLASSES),
+            "time_display_policy": "preserve_h_mm_or_hh_mm_via_hour_width_logits",
+            "payment_card_rendering": "prefix + predicted_visible_parentheses_style + exact_four_ascii_digits",
+        }
     _atomic_write_json(labels_path, labels_payload)
+    output_contract: dict[str, object] = {
+        "amount_logits": {
+            "shape": list(amount_logits.shape),
+            "layout": "[time,class]",
+            "decoder": "ctc_greedy",
+            "blank_index": NUMERIC_BLANK_INDEX,
+            "characters": "numeric_characters",
+        },
+        "time_logits": {
+            "shape": list(time_logits.shape),
+            "layout": "[time,class]",
+            "decoder": "ctc_greedy",
+            "blank_index": NUMERIC_BLANK_INDEX,
+            "characters": "numeric_characters",
+        },
+        "payment_logits": {
+            "shape": list(payment_logits.shape),
+            "layout": "[time,class]",
+            "decoder": "ctc_greedy",
+            "blank_index": PAYMENT_BLANK_INDEX,
+            "characters": "payment_characters",
+            "target": "visible_payment_method_value",
+        },
+        "status_logits": {
+            "shape": list(status_logits.shape),
+            "layout": "[class]",
+            "classes": "status_classes",
+            "runtime_policy": status_policy["runtime_policy"],
+            "review_value": "review" if status_policy["runtime_policy"] == "review_only" else None,
+        },
+    }
+    if config.architecture_version == 5:
+        output_contract.update(
+            {
+                "amount_length_logits": {
+                    "shape": list(output_values["amount_length_logits"].shape),
+                    "layout": "[integer_length_class]",
+                    "classes": list(range(1, AMOUNT_MAX_INTEGER_DIGITS + 1)),
+                    "target": "integer_digit_count",
+                },
+                "amount_digit_logits": {
+                    "shape": list(output_values["amount_digit_logits"].shape),
+                    "layout": "[right_aligned_integer_slots_plus_cents,digit]",
+                    "digits": "0-9",
+                    "target": "right_aligned_decimal_digits",
+                },
+                "time_digit_logits": {
+                    "shape": list(output_values["time_digit_logits"].shape),
+                    "layout": "[HHMM_position,digit]",
+                    "digits": "0-9",
+                    "target": "canonical_zero_padded_hhmm",
+                },
+                "time_hour_width_logits": {
+                    "shape": list(output_values["time_hour_width_logits"].shape),
+                    "layout": "[hour_width_class]",
+                    "classes": [1, 2],
+                    "target": "visible_hour_digit_width",
+                },
+                "payment_prefix_logits": {
+                    "shape": list(output_values["payment_prefix_logits"].shape),
+                    "layout": "[time,class]",
+                    "decoder": "ctc_greedy",
+                    "blank_index": PAYMENT_BLANK_INDEX,
+                    "characters": "payment_characters",
+                    "target": "visible_payment_prefix_before_card_tail",
+                },
+                "payment_tail_digit_logits": {
+                    "shape": list(output_values["payment_tail_digit_logits"].shape),
+                    "layout": "[tail_position,digit]",
+                    "digits": "0-9",
+                    "target": "exact_four_card_tail_digits",
+                },
+                "payment_structure_logits": {
+                    "shape": list(output_values["payment_structure_logits"].shape),
+                    "layout": "[class]",
+                    "classes": list(PAYMENT_STRUCTURE_CLASSES),
+                    "target": "payment_card_tail_format",
+                },
+                "payment_parentheses_logits": {
+                    "shape": list(output_values["payment_parentheses_logits"].shape),
+                    "layout": "[class]",
+                    "classes": list(PAYMENT_PARENTHESIS_CLASSES),
+                    "target": "visible_card_tail_parentheses_style",
+                },
+            }
+        )
     _atomic_write_json(
         contract_path,
         {
@@ -1374,40 +2255,15 @@ def export_unified_onnx(*, checkpoint_path: Path, output_path: Path) -> tuple[Pa
                 "name": "field_images",
                 "dtype": "float32",
                 "shape": [len(SLOT_ORDER), 1, config.image_height, config.image_width],
-                "preprocess": "RGB crop -> grayscale -> aspect-preserving resize -> white letterbox -> divide by 255.0",
+                "preprocess": (
+                    "RGB crop -> grayscale -> aspect-preserving resize -> white right-aligned letterbox for "
+                    "amount/time/payment (centered status) -> divide by 255.0"
+                    if config.architecture_version == 5
+                    else "RGB crop -> grayscale -> aspect-preserving resize -> white centered letterbox -> divide by 255.0"
+                ),
                 "absent_slot_policy": "white_placeholder_not_decoded; emit review instead",
             },
-            "outputs": {
-                "amount_logits": {
-                    "shape": list(amount_logits.shape),
-                    "layout": "[time,class]",
-                    "decoder": "ctc_greedy",
-                    "blank_index": NUMERIC_BLANK_INDEX,
-                    "characters": "numeric_characters",
-                },
-                "time_logits": {
-                    "shape": list(time_logits.shape),
-                    "layout": "[time,class]",
-                    "decoder": "ctc_greedy",
-                    "blank_index": NUMERIC_BLANK_INDEX,
-                    "characters": "numeric_characters",
-                },
-                "payment_logits": {
-                    "shape": list(payment_logits.shape),
-                    "layout": "[time,class]",
-                    "decoder": "ctc_greedy",
-                    "blank_index": PAYMENT_BLANK_INDEX,
-                    "characters": "payment_characters",
-                    "target": "visible_payment_method_value",
-                },
-                "status_logits": {
-                    "shape": list(status_logits.shape),
-                    "layout": "[class]",
-                    "classes": "status_classes",
-                    "runtime_policy": status_policy["runtime_policy"],
-                    "review_value": "review" if status_policy["runtime_policy"] == "review_only" else None,
-                },
-            },
+            "outputs": output_contract,
             "model": asdict(config),
             "warning": (
                 "The reader is not a detector or perspective rectifier. Delivery must use the same field crop geometry "
@@ -1471,6 +2327,20 @@ def _load_onnx_artifacts(model_path: Path) -> tuple[UnifiedReaderConfig, list[st
         raise ValueError("Unified OCR ONNX payment charset SHA-256 is invalid")
     if status != list(STATUS_CLASSES):
         raise ValueError("Unified OCR ONNX status class order is unsupported")
+    if config.architecture_version == 5:
+        structured_decoder = labels.get("structured_decoder")
+        if not isinstance(structured_decoder, Mapping):
+            raise ValueError("Unified v5 OCR label sidecar has no structured decoder contract")
+        if (
+            structured_decoder.get("schema_version") != 1
+            or structured_decoder.get("amount_max_integer_digits") != AMOUNT_MAX_INTEGER_DIGITS
+            or structured_decoder.get("amount_digit_slots") != AMOUNT_DIGIT_SLOTS
+            or structured_decoder.get("time_digit_slots") != TIME_DIGIT_SLOTS
+            or structured_decoder.get("payment_tail_digit_slots") != PAYMENT_TAIL_DIGIT_SLOTS
+            or structured_decoder.get("payment_structure_classes") != list(PAYMENT_STRUCTURE_CLASSES)
+            or structured_decoder.get("payment_parentheses_classes") != list(PAYMENT_PARENTHESIS_CLASSES)
+        ):
+            raise ValueError("Unified v5 OCR structured decoder sidecar is unsupported")
     # v3 did not record a policy; the helper derives a conservative fallback
     # from its audit counts instead of trusting raw logits.
     status_policy = _contract_status_policy(contract)
@@ -1481,7 +2351,7 @@ def _load_onnx_artifacts(model_path: Path) -> tuple[UnifiedReaderConfig, list[st
     expected_input = [len(SLOT_ORDER), 1, config.image_height, config.image_width]
     if raw_input.get("name") != "field_images" or raw_input.get("shape") != expected_input:
         raise ValueError("Unified OCR ONNX input must be static [4,1,H,W]")
-    expected_outputs = {"amount_logits", "time_logits", "payment_logits", "status_logits"}
+    expected_outputs = set(_onnx_output_names(config))
     if set(outputs) != expected_outputs:
         raise ValueError("Unified OCR ONNX output names are unsupported")
     time_steps = config.image_width // 4
@@ -1491,14 +2361,31 @@ def _load_onnx_artifacts(model_path: Path) -> tuple[UnifiedReaderConfig, list[st
         "payment_logits": [time_steps, len(payment) + 1],
         "status_logits": [len(STATUS_CLASSES)],
     }
+    if config.architecture_version == 5:
+        expected_shapes.update(
+            {
+                "amount_length_logits": [AMOUNT_MAX_INTEGER_DIGITS],
+                "amount_digit_logits": [AMOUNT_DIGIT_SLOTS, 10],
+                "time_digit_logits": [TIME_DIGIT_SLOTS, 10],
+                "time_hour_width_logits": [2],
+                "payment_prefix_logits": [time_steps, len(payment) + 1],
+                "payment_tail_digit_logits": [PAYMENT_TAIL_DIGIT_SLOTS, 10],
+                "payment_structure_logits": [len(PAYMENT_STRUCTURE_CLASSES)],
+                "payment_parentheses_logits": [len(PAYMENT_PARENTHESIS_CLASSES)],
+            }
+        )
     for name, expected_shape in expected_shapes.items():
         output = outputs[name]
         if not isinstance(output, Mapping) or output.get("shape") != expected_shape:
             raise ValueError(f"Unified OCR ONNX output {name!r} has an invalid static shape")
-        if name != "status_logits" and output.get("blank_index") != NUMERIC_BLANK_INDEX:
+        expected_blank_index = CTC_ONNX_BLANK_INDICES.get(name)
+        if expected_blank_index is None:
+            if "blank_index" in output:
+                raise ValueError(f"Unified OCR ONNX structured output {name!r} must not declare a CTC blank index")
+        elif output.get("blank_index") != expected_blank_index:
             raise ValueError(f"Unified OCR ONNX output {name!r} has an invalid CTC blank index")
     status_output = outputs["status_logits"]
-    if contract.get("kind") == KIND_V4:
+    if contract.get("kind") in {KIND_V4, KIND_V5}:
         if status_output.get("runtime_policy") != status_policy["runtime_policy"]:
             raise ValueError("Unified OCR ONNX status output policy differs from status_head_policy")
         expected_review = "review" if status_policy["runtime_policy"] == "review_only" else None
@@ -1610,6 +2497,29 @@ def _softmax_confidence(logits: np.ndarray) -> tuple[int, float]:
     return index, float(probabilities[index])
 
 
+def _delivery_text(
+    *,
+    architecture_version: int,
+    field: str,
+    candidate_text: str,
+    ctc_text: str | None,
+    structured_text: str | None,
+) -> str:
+    """Return a conservative delivery value without hiding diagnostics.
+
+    v5's plain CTC outputs remain useful for training/debugging, but they are
+    not an independently calibrated financial delivery path. A text field is
+    eligible only when both its specialised structural reader and CTC reader
+    render exactly the same visible value. Missing structure or a disagreement
+    stays ``review``.  Status follows its separate coverage policy upstream.
+    """
+    if architecture_version != 5 or field == "transfer_status":
+        return candidate_text
+    if structured_text is not None and ctc_text is not None and structured_text == ctc_text:
+        return candidate_text
+    return "review"
+
+
 def _comparison_metrics(rows: Sequence[Mapping[str, object]]) -> dict[str, object]:
     if not rows:
         return {
@@ -1619,6 +2529,10 @@ def _comparison_metrics(rows: Sequence[Mapping[str, object]]) -> dict[str, objec
             "micro_cer": None,
             "oov_reference_rate": None,
             "non_success_to_success": 0,
+            "delivery_coverage": None,
+            "delivery_exact_match": None,
+            "delivery_exact_overall": None,
+            "delivery_false_accepts": 0,
         }
     records = len(rows)
     raw_exact = sum(bool(row["raw_exact"]) for row in rows)
@@ -1628,6 +2542,8 @@ def _comparison_metrics(rows: Sequence[Mapping[str, object]]) -> dict[str, objec
     reference_characters = sum(int(row["reference_characters"]) for row in rows)
     oov = sum(bool(row["reference_has_oov_character"]) for row in rows)
     non_success_to_success = sum(bool(row.get("non_success_to_success", False)) for row in rows)
+    delivered_rows = [row for row in rows if str(row.get("delivery_text", row["candidate_text"])) != "review"]
+    delivered_exact = sum(bool(row.get("delivery_raw_exact", row["raw_exact"])) for row in delivered_rows)
     return {
         "records": records,
         "raw_exact_matches": raw_exact,
@@ -1640,6 +2556,11 @@ def _comparison_metrics(rows: Sequence[Mapping[str, object]]) -> dict[str, objec
         "oov_reference_records": oov,
         "oov_reference_rate": oov / records,
         "non_success_to_success": non_success_to_success,
+        "delivery_coverage": len(delivered_rows) / records,
+        "delivery_exact_matches": delivered_exact,
+        "delivery_exact_match": delivered_exact / max(1, len(delivered_rows)),
+        "delivery_exact_overall": delivered_exact / records,
+        "delivery_false_accepts": len(delivered_rows) - delivered_exact,
     }
 
 
@@ -1680,6 +2601,9 @@ def _unified_acceptance_failures(
     min_status_exact_match: float | None,
     max_payment_oov_rate: float | None,
     max_non_success_to_success: int | None,
+    min_delivery_coverage: float | None,
+    min_delivery_exact_match: float | None,
+    max_delivery_false_accepts: int | None,
 ) -> list[str]:
     failures: list[str] = []
     desired = {
@@ -1708,6 +2632,31 @@ def _unified_acceptance_failures(
             failures.append(
                 f"transfer_status: non_success_to_success={observed} > {max_non_success_to_success}"
             )
+    # Candidate parity (raw_exact_match above) and safe delivery are different
+    # concepts.  In v5 a structural/CTC disagreement deliberately becomes
+    # review, so a model cannot pass a deployment gate merely by producing the
+    # correct value in an unsafe candidate channel.
+    for field in ("amount", "time", "payment_method_field"):
+        if min_delivery_coverage is not None:
+            observed_coverage = metrics[field]["delivery_coverage"]
+            if observed_coverage is None or float(observed_coverage) < min_delivery_coverage:
+                rendered = "n/a" if observed_coverage is None else f"{float(observed_coverage):.4f}"
+                failures.append(
+                    f"{field}: delivery_coverage={rendered} < {min_delivery_coverage:.4f}"
+                )
+        if min_delivery_exact_match is not None:
+            observed_exact = metrics[field]["delivery_exact_match"]
+            if observed_exact is None or float(observed_exact) < min_delivery_exact_match:
+                rendered = "n/a" if observed_exact is None else f"{float(observed_exact):.4f}"
+                failures.append(
+                    f"{field}: delivery_exact_match={rendered} < {min_delivery_exact_match:.4f}"
+                )
+        if max_delivery_false_accepts is not None:
+            observed_false_accepts = int(metrics[field]["delivery_false_accepts"])
+            if observed_false_accepts > max_delivery_false_accepts:
+                failures.append(
+                    f"{field}: delivery_false_accepts={observed_false_accepts} > {max_delivery_false_accepts}"
+                )
     return failures
 
 
@@ -1725,6 +2674,9 @@ def evaluate_unified_onnx(
     min_status_exact_match: float | None = None,
     max_payment_oov_rate: float | None = None,
     max_non_success_to_success: int | None = None,
+    min_delivery_coverage: float | None = None,
+    min_delivery_exact_match: float | None = None,
+    max_delivery_false_accepts: int | None = None,
 ) -> tuple[dict[str, object], list[str]]:
     """Compare one ONNX session run per held-out receipt with teacher labels."""
     if split not in {"val", "test"}:
@@ -1735,10 +2687,16 @@ def evaluate_unified_onnx(
         ("min_payment_exact_match", min_payment_exact_match),
         ("min_status_exact_match", min_status_exact_match),
         ("max_payment_oov_rate", max_payment_oov_rate),
+        ("min_delivery_coverage", min_delivery_coverage),
+        ("min_delivery_exact_match", min_delivery_exact_match),
     ):
         _finite_probability(value, name=name)
-    if max_non_success_to_success is not None and max_non_success_to_success < 0:
-        raise ValueError("max_non_success_to_success cannot be negative")
+    for name, value in (
+        ("max_non_success_to_success", max_non_success_to_success),
+        ("max_delivery_false_accepts", max_delivery_false_accepts),
+    ):
+        if value is not None and value < 0:
+            raise ValueError(f"{name} cannot be negative")
     output_dir = output_dir.resolve()
     if output_dir.exists() and any(output_dir.iterdir()):
         raise ValueError(f"evaluation output already contains files: {output_dir}. Choose a new empty directory.")
@@ -1764,7 +2722,7 @@ def evaluate_unified_onnx(
     session, active_providers = _create_onnx_session(onnxruntime, model_path, device=device)
     input_names = [item.name for item in session.get_inputs()]
     output_names = [item.name for item in session.get_outputs()]
-    expected_outputs = ["amount_logits", "time_logits", "payment_logits", "status_logits"]
+    expected_outputs = list(_onnx_output_names(config))
     if input_names != ["field_images"] or output_names != expected_outputs:
         raise ValueError(
             "Unified OCR ONNX input/output names differ from its delivery contract: "
@@ -1782,6 +2740,19 @@ def evaluate_unified_onnx(
         "payment_logits": [config.image_width // 4, len(payment_characters) + 1],
         "status_logits": [len(STATUS_CLASSES)],
     }
+    if config.architecture_version == 5:
+        expected_output_shapes.update(
+            {
+                "amount_length_logits": [AMOUNT_MAX_INTEGER_DIGITS],
+                "amount_digit_logits": [AMOUNT_DIGIT_SLOTS, 10],
+                "time_digit_logits": [TIME_DIGIT_SLOTS, 10],
+                "time_hour_width_logits": [2],
+                "payment_prefix_logits": [config.image_width // 4, len(payment_characters) + 1],
+                "payment_tail_digit_logits": [PAYMENT_TAIL_DIGIT_SLOTS, 10],
+                "payment_structure_logits": [len(PAYMENT_STRUCTURE_CLASSES)],
+                "payment_parentheses_logits": [len(PAYMENT_PARENTHESIS_CLASSES)],
+            }
+        )
     for output in session.get_outputs():
         actual_shape = list(output.shape)
         expected_shape = expected_output_shapes[output.name]
@@ -1798,25 +2769,53 @@ def evaluate_unified_onnx(
     for record in evaluation_records:
         field_images = np.ascontiguousarray(_input_tensor(record, config=config), dtype=np.float32)
         started = perf_counter()
-        amount_logits, time_logits, payment_logits, status_logits = session.run(
-            expected_outputs,
-            {"field_images": field_images},
-        )
+        runtime_outputs = dict(zip(expected_outputs, session.run(expected_outputs, {"field_images": field_images})))
         latency_ms = (perf_counter() - started) * 1000.0
         receipt_latencies.append(latency_ms)
+        amount_logits = runtime_outputs["amount_logits"]
+        time_logits = runtime_outputs["time_logits"]
+        payment_logits = runtime_outputs["payment_logits"]
+        status_logits = runtime_outputs["status_logits"]
         amount_text, amount_confidence = _ctc_single_output(amount_logits, characters=NUMERIC_CHARACTERS)
         time_text, time_confidence = _ctc_single_output(time_logits, characters=NUMERIC_CHARACTERS)
         payment_text, payment_confidence = _ctc_single_output(payment_logits, characters=payment_characters)
         status_index, status_confidence = _softmax_confidence(status_logits)
         raw_status_text = STATUS_CLASSES[status_index]
-        predictions: dict[str, tuple[str, float]] = {
+        ctc_predictions: dict[str, tuple[str, float]] = {
             "amount": (amount_text, amount_confidence),
             "time": (time_text, time_confidence),
             "payment_method_field": (payment_text, payment_confidence),
-            # A status head with incomplete classes must never become a
-            # business decision, even if its raw argmax says success.
-            "transfer_status": (raw_status_text if status_delivery_allowed else "review", status_confidence),
         }
+        structured_predictions: dict[str, tuple[str | None, float]] = {}
+        if config.architecture_version == 5:
+            structured_predictions = {
+                "amount": _structured_amount_predictions(
+                    np.asarray(runtime_outputs["amount_length_logits"])[np.newaxis, :],
+                    np.asarray(runtime_outputs["amount_digit_logits"])[np.newaxis, :, :],
+                )[0],
+                "time": _structured_time_predictions(
+                    np.asarray(runtime_outputs["time_digit_logits"])[np.newaxis, :, :],
+                    np.asarray(runtime_outputs["time_hour_width_logits"])[np.newaxis, :],
+                )[0],
+                "payment_method_field": _structured_payment_predictions(
+                    np.asarray(runtime_outputs["payment_prefix_logits"])[:, np.newaxis, :],
+                    np.asarray(runtime_outputs["payment_tail_digit_logits"])[np.newaxis, :, :],
+                    np.asarray(runtime_outputs["payment_structure_logits"])[np.newaxis, :],
+                    np.asarray(runtime_outputs["payment_parentheses_logits"])[np.newaxis, :],
+                    payment_characters=payment_characters,
+                )[0],
+            }
+        predictions: dict[str, tuple[str, float]] = dict(ctc_predictions)
+        for field, structured_prediction in structured_predictions.items():
+            structured_text, structured_confidence = structured_prediction
+            if structured_text is not None:
+                predictions[field] = (str(structured_text), float(structured_confidence))
+        # A status head with incomplete classes must never become a business
+        # decision, even if its raw argmax says success.
+        predictions["transfer_status"] = (
+            raw_status_text if status_delivery_allowed else "review",
+            status_confidence,
+        )
         for field in SLOT_ORDER:
             slot = dict(record["slots"]).get(field)
             if not isinstance(slot, Mapping):
@@ -1829,8 +2828,31 @@ def evaluate_unified_onnx(
                 semantic_value = slot.get("semantic_value")
                 reference_semantic = str(semantic_value) if isinstance(semantic_value, str) else _semantic_value(field, reference_text)
             candidate_text, confidence = predictions[field]
+            ctc_candidate = ctc_predictions.get(field)
+            structured_candidate = structured_predictions.get(field)
+            structured_text = structured_candidate[0] if structured_candidate is not None else None
+            structured_confidence = structured_candidate[1] if structured_candidate is not None else None
+            decoder_agrees = (
+                None
+                if structured_text is None or ctc_candidate is None
+                else str(structured_text) == str(ctc_candidate[0])
+            )
+            # v5 never treats agreement between a structural digit head and
+            # the legacy CTC head as a probability calibration. It is merely
+            # a conservative first gate: both an explicit disagreement and a
+            # missing structural candidate are review. A raw CTC fallback is
+            # retained in this report for diagnosis, but has no calibrated
+            # delivery threshold yet and therefore cannot be emitted.
+            delivery_text = _delivery_text(
+                architecture_version=config.architecture_version,
+                field=field,
+                candidate_text=candidate_text,
+                ctc_text=ctc_candidate[0] if ctc_candidate is not None else None,
+                structured_text=structured_text,
+            )
             candidate_semantic = _semantic_value(field, candidate_text)
             raw_exact = candidate_text == reference_text
+            delivery_raw_exact = delivery_text == reference_text
             semantic_exact = reference_semantic is not None and candidate_semantic == reference_semantic
             non_success_to_success = (
                 field == "transfer_status" and reference_text in {"pending", "failed"} and candidate_text == "success"
@@ -1852,9 +2874,25 @@ def evaluate_unified_onnx(
                     "paddle_text": slot.get("paddle_text"),
                     "reference_text": reference_text,
                     "candidate_text": candidate_text,
+                    "ctc_candidate_text": ctc_candidate[0] if ctc_candidate is not None else None,
+                    "structured_candidate_text": structured_text,
+                    "structured_confidence": round(float(structured_confidence), 6)
+                    if structured_confidence is not None
+                    else None,
+                    "decoder_agrees": decoder_agrees,
+                    "delivery_text": delivery_text,
+                    "delivery_raw_exact": delivery_raw_exact,
                     "raw_model_candidate_text": raw_status_text if field == "transfer_status" else None,
                     "confidence": round(confidence, 6),
-                    "runtime_policy": status_policy["runtime_policy"] if field == "transfer_status" else "decode",
+                    "runtime_policy": (
+                        status_policy["runtime_policy"]
+                        if field == "transfer_status"
+                        else "structured_ctc_agreement_required"
+                        if config.architecture_version == 5 and structured_text is not None
+                        else "ctc_fallback_review_required"
+                        if config.architecture_version == 5
+                        else "decode"
+                    ),
                     "raw_exact": raw_exact,
                     "reference_semantic": reference_semantic,
                     "candidate_semantic": candidate_semantic,
@@ -1880,6 +2918,9 @@ def evaluate_unified_onnx(
         min_status_exact_match=min_status_exact_match,
         max_payment_oov_rate=max_payment_oov_rate,
         max_non_success_to_success=max_non_success_to_success,
+        min_delivery_coverage=min_delivery_coverage,
+        min_delivery_exact_match=min_delivery_exact_match,
+        max_delivery_false_accepts=max_delivery_false_accepts,
     )
     if (
         (min_status_exact_match is not None or max_non_success_to_success is not None)
@@ -1898,6 +2939,9 @@ def evaluate_unified_onnx(
             min_status_exact_match,
             max_payment_oov_rate,
             max_non_success_to_success,
+            min_delivery_coverage,
+            min_delivery_exact_match,
+            max_delivery_false_accepts,
         )
     )
     label_sources = sorted({str(record.get("label_source", "unspecified")) for record in evaluation_records})
@@ -1927,6 +2971,9 @@ def evaluate_unified_onnx(
             "min_status_exact_match": min_status_exact_match,
             "max_payment_oov_rate": max_payment_oov_rate,
             "max_non_success_to_success": max_non_success_to_success,
+            "min_delivery_coverage": min_delivery_coverage,
+            "min_delivery_exact_match": min_delivery_exact_match,
+            "max_delivery_false_accepts": max_delivery_false_accepts,
             # A report with no requested gate is informative, but it must not
             # be rendered as an accepted delivery candidate simply because no
             # threshold was supplied.
@@ -1970,16 +3017,28 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--weight-decay", type=float, default=1e-4)
     train.add_argument("--payment-loss-weight", type=float, default=1.0)
     train.add_argument(
-        "--architecture",
-        choices=("v3", "v4"),
-        default="v4",
-        help="v4 is the recommended 64px, independent amount/time decoder; v3 is checkpoint-compatible only",
+        "--ctc-loss-weight",
+        type=float,
+        default=0.35,
+        help="v5 auxiliary raw-CTC loss weight; v3/v4 keep their historical loss composition",
     )
-    train.add_argument("--image-height", type=int, default=64)
-    train.add_argument("--image-width", type=int, default=384)
-    train.add_argument("--base-channels", type=int, default=24)
-    train.add_argument("--numeric-hidden-size", type=int, default=64)
-    train.add_argument("--payment-hidden-size", type=int, default=96)
+    train.add_argument(
+        "--structured-loss-weight",
+        type=float,
+        default=1.0,
+        help="v5 fixed-position financial-digit/prefix loss weight",
+    )
+    train.add_argument(
+        "--architecture",
+        choices=("v3", "v4", "v5"),
+        default="v5",
+        help="v5 is the recommended structured financial reader; v4/v3 are checkpoint-compatible only",
+    )
+    train.add_argument("--image-height", type=int, default=80)
+    train.add_argument("--image-width", type=int, default=512)
+    train.add_argument("--base-channels", type=int, default=32)
+    train.add_argument("--numeric-hidden-size", type=int, default=96)
+    train.add_argument("--payment-hidden-size", type=int, default=128)
     train.add_argument("--pooled-width", type=int, default=8)
     train.add_argument("--seed", type=int, default=42)
     train.add_argument(
@@ -2011,6 +3070,21 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--min-status-exact-match", type=float)
     evaluate.add_argument("--max-payment-oov-rate", type=float)
     evaluate.add_argument("--max-non-success-to-success", type=int)
+    evaluate.add_argument(
+        "--min-delivery-coverage",
+        type=float,
+        help="Require this non-review coverage for each v5 text field (amount/time/payment)",
+    )
+    evaluate.add_argument(
+        "--min-delivery-exact-match",
+        type=float,
+        help="Require this raw exact match among non-review v5 text-field deliveries",
+    )
+    evaluate.add_argument(
+        "--max-delivery-false-accepts",
+        type=int,
+        help="Maximum incorrect non-review v5 deliveries allowed per text field",
+    )
     return parser
 
 
@@ -2038,6 +3112,8 @@ def main(argv: list[str] | None = None) -> None:
                 learning_rate=args.learning_rate,
                 weight_decay=args.weight_decay,
                 payment_loss_weight=args.payment_loss_weight,
+                ctc_loss_weight=args.ctc_loss_weight,
+                structured_loss_weight=args.structured_loss_weight,
                 seed=args.seed,
                 num_workers=args.num_workers,
             )
@@ -2070,6 +3146,9 @@ def main(argv: list[str] | None = None) -> None:
                 min_status_exact_match=args.min_status_exact_match,
                 max_payment_oov_rate=args.max_payment_oov_rate,
                 max_non_success_to_success=args.max_non_success_to_success,
+                min_delivery_coverage=args.min_delivery_coverage,
+                min_delivery_exact_match=args.min_delivery_exact_match,
+                max_delivery_false_accepts=args.max_delivery_false_accepts,
             )
             metrics = summary["by_field"]
             status_policy = summary.get("status_head_policy")

@@ -27,6 +27,12 @@ from pathlib import Path
 from typing import Any
 
 from .ocr import clean_text, extract_field_value
+from .ocr_unified_targets import (
+    parse_amount_aux_target,
+    parse_payment_card_tail_target,
+    parse_time_aux_target,
+    structured_target_config,
+)
 
 
 SCHEMA_VERSION = 1
@@ -174,7 +180,7 @@ def _slot_payload(record: Mapping[str, object]) -> dict[str, object] | None:
         target = _numeric_target(field, semantic_value)
         if target is None:
             return None
-        return {
+        payload: dict[str, object] = {
             "image": str(record["image"]),
             "text": target,
             "semantic_value": semantic_value,
@@ -183,6 +189,23 @@ def _slot_payload(record: Mapping[str, object]) -> dict[str, object] | None:
             "detector_score": record.get("detector_score"),
             "crop_sha256": record.get("crop_sha256"),
         }
+        # Keep the pre-existing CTC text exactly as before, while adding an
+        # optional structured target only where it is mathematically safe.
+        # A future v5 reader can train a compact fixed-position digit head
+        # without pretending that a malformed decimal is a valid amount.
+        if field == "amount":
+            amount_aux = parse_amount_aux_target(target)
+            if amount_aux is not None:
+                payload["amount_aux"] = amount_aux
+        else:
+            # The legacy CTC slot may still contain a seconds-bearing value,
+            # but v5's time-specific target deliberately excludes it.  Do not
+            # drop the whole receipt or silently remove seconds here; the
+            # contract count makes the omission auditable.
+            time_aux = parse_time_aux_target(target)
+            if time_aux is not None:
+                payload["time_aux"] = time_aux
+        return payload
     if field == "transfer_status":
         if semantic_value not in STATUS_CLASSES:
             return None
@@ -216,7 +239,7 @@ def _slot_payload(record: Mapping[str, object]) -> dict[str, object] | None:
         text = clean_text(text)
         if not text or any(not character.isprintable() for character in text):
             return None
-        return {
+        payload = {
             "image": str(record["image"]),
             "text": text,
             "semantic_value": semantic_value,
@@ -225,6 +248,13 @@ def _slot_payload(record: Mapping[str, object]) -> dict[str, object] | None:
             "detector_score": record.get("detector_score"),
             "crop_sha256": record.get("crop_sha256"),
         }
+        # The full visible text remains the CTC target.  Only an exact final
+        # (ASCII-digit) card suffix is additionally split for a specialised
+        # small tail head; malformed/unknown forms retain their CTC label.
+        payment_card_tail = parse_payment_card_tail_target(text)
+        if payment_card_tail is not None:
+            payload["payment_card_tail"] = payment_card_tail
+        return payload
     raise AssertionError(field)
 
 
@@ -377,6 +407,44 @@ def build_unified_dataset(*, records_path: Path, output_dir: Path) -> dict[str, 
     ambiguous_slot_counts = Counter(
         field for record in unified_records for field in list(record.get("ambiguous_slots", []))
     )
+    aux_name_by_slot = {
+        "amount": "amount_aux",
+        "time": "time_aux",
+        "payment_method_field": "payment_card_tail",
+    }
+    structured_target_counts: dict[str, int] = {}
+    structured_target_counts_by_split: dict[str, dict[str, int]] = {}
+    for slot_name, aux_name in aux_name_by_slot.items():
+        structured_target_counts[aux_name] = sum(
+            1
+            for record in unified_records
+            for slot in [dict(record["slots"]).get(slot_name)]
+            if isinstance(slot, Mapping) and aux_name in slot
+        )
+        structured_target_counts_by_split[aux_name] = {
+            split: sum(
+                1
+                for record in unified_records
+                if str(record["split"]) == split
+                for slot in [dict(record["slots"]).get(slot_name)]
+                if isinstance(slot, Mapping) and aux_name in slot
+            )
+            for split in ("train", "val", "test")
+        }
+        unparsed_name = f"{aux_name}_unparsed"
+        structured_target_counts[unparsed_name] = int(slot_counts[slot_name]) - structured_target_counts[aux_name]
+        structured_target_counts_by_split[unparsed_name] = {
+            split: int(
+                sum(
+                    1
+                    for record in unified_records
+                    if str(record["split"]) == split
+                    for slot in [dict(record["slots"]).get(slot_name)]
+                    if isinstance(slot, Mapping) and aux_name not in slot
+                )
+            )
+            for split in ("train", "val", "test")
+        }
     summary: dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
         "kind": KIND,
@@ -392,6 +460,9 @@ def build_unified_dataset(*, records_path: Path, output_dir: Path) -> dict[str, 
         "rejected_records": len(rejected),
         "ambiguous_slot_records": {field: int(ambiguous_slot_counts[field]) for field in SLOT_ORDER},
         "payment_target": "visible_payment_method_value",
+        "structured_target_config": structured_target_config(),
+        "structured_target_counts": structured_target_counts,
+        "structured_target_counts_by_split": structured_target_counts_by_split,
         "missing_slot_policy": "white_placeholder_with_masked_loss_and_review_at_runtime",
         "warning": (
             "Paddle-derived records are teacher labels, not independent business truth. "

@@ -451,34 +451,42 @@ python -m transfer_receipt_ai.ocr_evaluate `
 测试字符、训练中见过/未见过的文本，以及 ONNX 实际 provider 和延迟。这个比较证明的是“对保留的
 Paddle 输出的一致性”；要证明真实业务准确率仍需一批人工标注的独立回单。
 
-## 单模型轻量字段识别 v4（当前路线；v3 只保留兼容）
+## 单模型轻量字段识别 v5（当前实验路线；v3/v4 只保留兼容）
 
-最终交付目标不是四个小模型，而是 **一个 ONNX、一个 ONNX Runtime Session、每张回单一次推理**。
+最终交付目标不是四个小模型，而是 **一个 OCR ONNX、一个 ONNX Runtime Session、每张回单一次 `Run`**。
 检测器 `receipt_lrcnn_v1.onnx` 和设备识别器仍是独立模型；本节只替代字段 OCR。
 
+v4 的 1 万张试验已经证明：把金额、时间和卡尾号都当作普通整行 CTC 不够安全。例如 CTC 可以把
+`900.00` 识别成 `300.00`，同时给出很高的 token confidence。因此 v5 保留 CTC 作为诊断候选，
+并在**同一张 ONNX 图**中增加固定位置的结构化输出：金额整数位数和 9 个数字位、时间 `HHMM` 与显示
+小时宽度、付款方式前缀 + 四位卡尾号 + 括号样式/结构类别。
+
 ```text
-field_images [4,1,64,384]
+field_images [4,1,80,512]
   0=amount / 1=time / 2=transfer_status / 3=payment_method_field
         ↓
-共享轻量 CNN 主干（垂直下采样 /8）
-  ├─ amount 数字 CTC（独立 GRU + classifier）
-  ├─ time 数字 CTC（独立 GRU + classifier）
-  ├─ payment_method 原文 CTC（保留银行名、卡类型、尾号）
-  └─ transfer_status 三分类（状态类别不完整时运行时固定为 review）
+共享轻量 CNN 主干 + 每字段轻量 GRU
+  ├─ amount: CTC + 整数长度/固定数字位
+  ├─ time: CTC + HHMM/小时宽度（保留 1:44 与 01:44 的差异）
+  ├─ payment: 原文 CTC + 可见前缀/四位卡尾/括号样式
+  └─ transfer_status: 三分类（类别覆盖不完整时固定为 review）
 ```
 
-所以它仍是一个模型文件，虽然有四个输出节点：`amount_logits`、`time_logits`、`payment_logits`、
-`status_logits`。v4 保留较多的垂直笔画信息，并把金额与时间改为各自独立的数字解码器；付款方式仍保留
-画面可见的原文，不会把 `建设银行储蓄卡(3667)` 降成只有 `bank_card` 的分类。
+它仍是一个模型文件、一个输入和一次推理；v5 有 12 个输出节点，其中前四个保持 CTC/status 诊断兼容，
+后八个是同一图内的结构化辅助头，不是额外模型或额外 Session。金额、时间和付款方式裁图在 v5 统一
+右对齐白底 letterbox；交付端必须严格复用 sidecar contract 的 `[4,1,H,W]` slot 顺序和预处理。
 
-v4 有意不包含自由中文 `recipient_field`：此前小识别器的收款方精度不合格；要接近 Paddle 的
-任意中文原文，需要单独的宽字符模型和更多人工真值。缺失或低置信的字段必须返回 `review`，不能猜测。
-如果改用交易真值训练付款方式，真值必须提供画面可见的原文（例如 `建设银行储蓄卡(3667)`）；只有
-`bank_card` / `balance` 这类归一化类别不能作为付款方式 CTC 标签，会被 unified manifest 拒绝。
+v5 的交付规则是保守的：文本字段只有“结构化候选存在且与 CTC 可见文本完全一致”时才允许输出；二者
+不一致、结构化格式不合法、或付款方式不是精确的 `前缀（四位 ASCII 卡尾）` 格式，都返回 `review`。
+CTC 候选会写进评估报告，方便分析，但在建立独立校准门槛前不会被自动交付。这一点用于避免把高置信
+错金额、错时间或错卡尾号伪装成成功结果。
 
-已经生成的 v3 checkpoint / ONNX / sidecar 仍可被 `export`、`evaluate` 加载，方便历史回归；但 v3 是
-1000 张 pilot 的历史架构，不能与 v4 的 sidecar 混用，也不能把 v3 权重直接当作 v4 的独立金额/时间头权重。
-新训练一律显式使用 `--architecture v4`。
+v5 有意不包含自由中文 `recipient_field`：此前小识别器的收款方精度不合格；要接近 Paddle 的任意中文
+原文，需要独立宽字符模型和更多人工真值。付款方式仍以画面可见的原文训练，例如
+`建设银行储蓄卡（3667）`；不能把 `bank_card` / `balance` 这类归一化类别当成原文 OCR 标签。
+
+已生成的 v3/v4 checkpoint、ONNX 和 sidecar 仍可被 `export`、`evaluate` 加载，便于历史回归；但不能与
+v5 sidecar 或权重混用。新的训练一律显式使用 `--architecture v5`。
 
 ### 1. 将已经生成的 Paddle 教师标签聚合为“一张回单一行” manifest
 
@@ -488,16 +496,20 @@ train/val/test；同一字段出现相互矛盾的教师文本时，会移出训
 ```powershell
 $outputRoot = "D:\alipay-ai-data\receipt-lite-teacher-10k-v1"
 $teacherLabels = "$outputRoot\paddle-teacher-labels"
-$unifiedManifest = "$outputRoot\unified-manifest"
+$unifiedManifest = "$outputRoot\unified-manifest-v5"
 
 python -m transfer_receipt_ai.ocr_unified_dataset `
   --records "$teacherLabels\pseudo_labels.jsonl" `
   --output $unifiedManifest
 ```
 
-成功后查看 `$unifiedManifest\dataset.contract.json`。它会列出四个 slot 在 train/val/test 的数量、完整回单数、
-冲突裁图数。当前 1 万张教师集已经足够用于 v4 的第一轮训练；但它仍是 Paddle 伪标签，不能把 teacher-parity
-当作人工业务真值。
+成功后查看 `$unifiedManifest\dataset.contract.json`。除四个 slot 的 train/val/test 数量、完整回单数和
+冲突裁图数外，v5 还会写出 `structured_target_counts`：`amount_aux`、`time_aux`、
+`payment_card_tail` 及未解析数量。训练器会再次检查 train/val 中是否同时有金额、时间、精确四位卡尾号和
+非卡尾付款方式；缺任何一种会拒绝训练，而不是静默降级成旧 CTC。
+
+当前 1 万张教师集适合做 v5 的第一轮 A/B，不应直接拿 12 万张盲目训练。它仍是 Paddle 伪标签，不能把
+teacher-parity 当作人工业务真值。
 
 ### 2. 训练并直接导出一个 ONNX
 
@@ -508,29 +520,32 @@ python -m transfer_receipt_ai.ocr_unified_dataset `
 Torch/ORT 输出对齐验证。
 
 ```powershell
-$unifiedRun = "$outputRoot\unified-run-v4"
-$unifiedModel = "$outputRoot\models\receipt_unified_field_reader_v4_10k.onnx"
+$unifiedRun = "$outputRoot\unified-run-v5"
+$unifiedModel = "$outputRoot\models\receipt_unified_field_reader_v5_10k.onnx"
 
 python -m transfer_receipt_ai.ocr_unified train `
   --records "$unifiedManifest\unified_fields.jsonl" `
   --dataset-root $teacherLabels `
   --output $unifiedRun `
   --device cuda:0 `
-  --architecture v4 `
-  --image-height 64 `
-  --image-width 384 `
-  --base-channels 24 `
-  --numeric-hidden-size 64 `
-  --payment-hidden-size 96 `
-  --epochs 40 `
-  --batch-size 32 `
+  --architecture v5 `
+  --image-height 80 `
+  --image-width 512 `
+  --base-channels 32 `
+  --numeric-hidden-size 96 `
+  --payment-hidden-size 128 `
+  --epochs 80 `
+  --batch-size 24 `
+  --ctc-loss-weight 0.35 `
+  --structured-loss-weight 1.0 `
+  --num-workers 0 `
   --onnx-output $unifiedModel
 ```
 
 输出包括：
 
 - `$unifiedRun\best.pt`：只用于后续再导出；不是交付物；
-- `$unifiedModel`：一个固定输入 `[4,1,64,384]` 的 ONNX；
+- `$unifiedModel`：一个固定输入 `[4,1,80,512]`、一次推理返回 12 个 v5 输出的 ONNX；
 - `$unifiedModel` 同名的 `.labels.json` 和 `.contract.json`：字符表、slot 顺序、SHA-256、预处理和输出协议，必须与 ONNX 一起交付。
 
 检查 `training_summary.json` 的 `status_head_policy`。若 `runtime_policy` 为 `review_only`（例如当前 1 万张中
@@ -541,8 +556,9 @@ python -m transfer_receipt_ai.ocr_unified train `
 ### 3. 用 ONNX 实际运行做保留集 teacher-parity 验收
 
 这是 CPU 验证命令，确保最终没有 GPU 时也能跑；若只验证 GPU，将 `--device cpu` 改成 `cuda:0`。每张回单
-只调用一次 ONNX Session，然后统计金额、时间、付款方式原文；状态头只有在 delivery contract 的
-`status_head_policy.runtime_policy=classify` 时才可参与状态及 `pending/failed -> success` 的验收。
+只调用一次 ONNX Session，然后同时报告“候选 teacher-parity”与“实际可交付 delivery”指标；状态头只有在
+delivery contract 的 `status_head_policy.runtime_policy=classify` 时才可参与状态及 `pending/failed -> success`
+的验收。
 
 ```powershell
 python -m transfer_receipt_ai.ocr_unified evaluate `
@@ -550,12 +566,27 @@ python -m transfer_receipt_ai.ocr_unified evaluate `
   --records "$unifiedManifest\unified_fields.jsonl" `
   --dataset-root $teacherLabels `
   --split test `
-  --output "$outputRoot\unified-eval-v4-cpu" `
-  --device cpu
+  --output "$outputRoot\unified-eval-v5-cpu" `
+  --device cpu `
+  --max-delivery-false-accepts 0
 ```
 
-先阅读 `summary.json`、`disagreements.jsonl` 和付款方式的 `oov_reference_rate`。v4 的 1 万张 teacher-parity
-通过后，仍必须加上分组隔离的人工真值保留集，才能接入 .NET；教师一致性并不等于真实业务准确率。
+先阅读 `summary.json`、`comparisons.jsonl`、`disagreements.jsonl`，尤其是每个字段的
+`raw_exact_match`、`delivery_coverage`、`delivery_exact_match`、`delivery_false_accepts` 和付款方式的
+`oov_reference_rate`。`raw_exact_match` 只是候选与教师的一致性；只有 delivery 指标才代表 v5 当前会实际
+输出的值。只设置 `--max-delivery-false-accepts 0` 的首轮运行也**不能**判定模型合格：若所有结果都变成
+`review`，它仍可能是零错误交付但零业务覆盖。
+
+达到预先确认的业务门槛后，再加上下面三个 delivery gate。数值应来自独立人工真值保留集，而不是把未验证的
+阈值当作精度承诺；`0` 个错误交付是金额/时间/卡尾号的最低安全要求。
+
+```powershell
+  --min-delivery-coverage <已确认的覆盖率门槛> `
+  --min-delivery-exact-match <已确认的交付准确率门槛> `
+  --max-delivery-false-accepts 0
+```
+
+v5 的 1 万张 teacher-parity 和人工真值验收都通过后，才应接入 .NET；教师一致性并不等于真实业务准确率。
 
 ### 历史分模型 v2（仅保留为对照，不是本次交付路线）
 
@@ -872,9 +903,10 @@ contract JSON 交付给 .NET。
 `paddle_ocr_delivery.contract.json` 的 SHA-256。
 
 上面的 `--ocr onnx --ocr-bundle` 仅适用于冻结的 PP-OCR bundle，**不能**把单模型
-`receipt_unified_field_reader_v3` 或 `receipt_unified_field_reader_v4` 传给它。统一 reader 目前仍未接入
-.NET CLI；只有 v4 通过 Python 的保留集及人工真值验收后，才会以独立的 `--ocr unified` 路径接入，并复用同一份
-`[4,1,H,W]` 预处理、slot 顺序和 `status_head_policy`。
+`receipt_unified_field_reader_v3`、`receipt_unified_field_reader_v4` 或
+`receipt_unified_field_reader_v5` 传给它。统一 reader 目前仍未接入 .NET CLI；只有 v5 同时通过 Python 的
+保留集 delivery gate 和人工真值验收后，才会以独立的 `--ocr unified` 路径接入，并复用同一份 `[4,1,H,W]`
+预处理、slot 顺序、结构化解码规则和 `status_head_policy`。
 
 该项目覆盖**模型层**：EXIF 摆正、letterbox、检测框坐标还原、阈值/每类最佳框、设备识别规则，
 并写出 JSON / manifest / 标注 JPG。默认 `--annotate all`，每张会输出与 Python 相同命名的
