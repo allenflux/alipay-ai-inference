@@ -4,8 +4,8 @@ The model intentionally has one shared visual encoder and one ONNX artifact,
 while retaining specialised heads where the output spaces differ:
 
 * amount/time: independent readers.  v5 adds fixed-position digit heads
-  beside the CTC readers; v6 additionally keeps their visible-format CTC and
-  verifier paths separate after the shared encoder;
+  beside the CTC readers; v6 keeps visible-format CTC and verifier paths
+  separate, while v7 shares the time CTC state with its format heads;
 * payment method: a raw CTC fallback plus a visible prefix, a finite known-bank
   classifier, and exact four-digit card-tail readers; and
 * transfer status: a finite three-class head.
@@ -62,11 +62,12 @@ KIND_V3 = "receipt_unified_field_reader_v3"
 KIND_V4 = "receipt_unified_field_reader_v4"
 KIND_V5 = "receipt_unified_field_reader_v5"
 KIND_V6 = "receipt_unified_field_reader_v6"
+KIND_V7 = "receipt_unified_field_reader_v7"
 # Keep the public alias for callers that only need the current training
 # format.  Loading/export code must use SUPPORTED_KINDS instead so that the
-# already-produced v3 checkpoint and ONNX bundle remain usable.
-KIND = KIND_V6
-SUPPORTED_KINDS = frozenset((KIND_V3, KIND_V4, KIND_V5, KIND_V6))
+# already-produced v3-v6 checkpoints and ONNX bundles remain usable.
+KIND = KIND_V7
+SUPPORTED_KINDS = frozenset((KIND_V3, KIND_V4, KIND_V5, KIND_V6, KIND_V7))
 # Kept as the frozen v3-v5 shared charset.  Do not append v6 symbols here:
 # old ONNX sidecars/checkpoints must remain loadable byte-for-byte.
 NUMERIC_CHARACTERS = tuple("0123456789.:")
@@ -157,32 +158,51 @@ V6_TEXT_DELIVERY_REASON = (
     "teacher labels are still Paddle-derived. Emit review until a group-isolated human-truth calibration "
     "accepts their format-and-agreement policy."
 )
+V7_TEXT_DELIVERY_POLICY = "review_only_pending_independent_human_truth_calibration"
+V7_TEXT_DELIVERY_REASON = (
+    "Visible CTC and format heads share the time reader in this compact student, and all teacher labels are "
+    "still Paddle-derived. Emit review until a group-isolated human-truth calibration accepts the "
+    "format-and-agreement policy."
+)
 
 
 def _uses_structured_heads(config: "UnifiedReaderConfig") -> bool:
     return config.architecture_version >= 5
 
 
-def _is_v6(config: "UnifiedReaderConfig") -> bool:
-    return config.architecture_version == 6
+def _uses_v6_protocol(config: "UnifiedReaderConfig") -> bool:
+    """Return whether an artifact uses v6's visible-format/bank output protocol.
+
+    v7 intentionally keeps that external protocol (charsets, 14 ONNX
+    outputs, and structured decoders) while changing only the time-reader
+    training topology.  Keeping this distinct from an exact ``== 6`` test is
+    what lets a v6 checkpoint continue to use its original forward path.
+    """
+    return config.architecture_version >= 6
+
+
+def _is_v7(config: "UnifiedReaderConfig") -> bool:
+    return config.architecture_version == 7
 
 
 def _amount_characters(config: "UnifiedReaderConfig") -> tuple[str, ...]:
-    return V6_AMOUNT_CHARACTERS if _is_v6(config) else NUMERIC_CHARACTERS
+    return V6_AMOUNT_CHARACTERS if _uses_v6_protocol(config) else NUMERIC_CHARACTERS
 
 
 def _time_characters(config: "UnifiedReaderConfig") -> tuple[str, ...]:
-    return V6_TIME_CHARACTERS if _is_v6(config) else NUMERIC_CHARACTERS
+    return V6_TIME_CHARACTERS if _uses_v6_protocol(config) else NUMERIC_CHARACTERS
 
 
 def _text_delivery_policy(config: "UnifiedReaderConfig") -> tuple[str, str]:
     if config.architecture_version == 6:
         return V6_TEXT_DELIVERY_POLICY, V6_TEXT_DELIVERY_REASON
+    if config.architecture_version == 7:
+        return V7_TEXT_DELIVERY_POLICY, V7_TEXT_DELIVERY_REASON
     return V5_TEXT_DELIVERY_POLICY, V5_TEXT_DELIVERY_REASON
 
 
 def _onnx_output_names(config: "UnifiedReaderConfig") -> tuple[str, ...]:
-    if config.architecture_version == 6:
+    if _uses_v6_protocol(config):
         return V6_ONNX_OUTPUT_NAMES
     return V5_ONNX_OUTPUT_NAMES if config.architecture_version == 5 else LEGACY_ONNX_OUTPUT_NAMES
 
@@ -196,6 +216,8 @@ def _kind_for_architecture(architecture_version: int) -> str:
         return KIND_V5
     if architecture_version == 6:
         return KIND_V6
+    if architecture_version == 7:
+        return KIND_V7
     raise ValueError(f"Unsupported unified reader architecture v{architecture_version}")
 
 
@@ -212,6 +234,8 @@ def _architecture_for_kind(kind: object) -> int:
         return 5
     if kind == KIND_V6:
         return 6
+    if kind == KIND_V7:
+        return 7
     raise ValueError(f"Unsupported unified OCR artifact kind: {kind!r}")
 
 
@@ -219,7 +243,7 @@ def _architecture_for_kind(kind: object) -> int:
 class UnifiedReaderConfig:
     # v5 uses a still-small 80x512 view so financial glyphs retain enough
     # detail for the structural heads. v3/v4 stay loadable for compatibility.
-    architecture_version: int = 6
+    architecture_version: int = 7
     image_height: int = 80
     image_width: int = 512
     base_channels: int = 32
@@ -228,8 +252,8 @@ class UnifiedReaderConfig:
     pooled_width: int = 8
 
     def validate(self) -> None:
-        if self.architecture_version not in {3, 4, 5, 6}:
-            raise ValueError("architecture_version must be 3, 4, 5, or 6")
+        if self.architecture_version not in {3, 4, 5, 6, 7}:
+            raise ValueError("architecture_version must be 3, 4, 5, 6, or 7")
         if self.image_height < 16 or self.image_width < 64 or self.image_width % 4:
             raise ValueError("image_height must be >=16 and image_width must be a multiple of 4 >=64")
         if self.base_channels < 8:
@@ -326,13 +350,16 @@ def build_unified_reader(
     per-field vertical reducers and emits structural financial-digit heads in
     the same graph.  v6 preserves a single graph/input but branches CTC and
     format verification after the encoder, and uses a finite train-only bank
-    prefix class head.  v3/v4 output tuples are intentionally unchanged.
+    prefix class head.  v7 keeps v6's external protocol but shares the time
+    CTC reader with the fixed-format time heads, so their gradients reinforce
+    the same punctuation evidence.  v3/v4 output tuples are intentionally
+    unchanged.
     """
     if payment_vocab_size < 2:
         raise ValueError("payment_vocab_size must include CTC blank plus at least one character")
     config.validate()
-    if _is_v6(config) and (payment_bank_prefix_vocab_size is None or payment_bank_prefix_vocab_size < 2):
-        raise ValueError("v6 needs payment_bank_prefix_vocab_size including __other__ plus one class")
+    if _uses_v6_protocol(config) and (payment_bank_prefix_vocab_size is None or payment_bank_prefix_vocab_size < 2):
+        raise ValueError("v6/v7 needs payment_bank_prefix_vocab_size including __other__ plus one class")
     torch, nn = _require_torch()
 
     class DepthwiseBlock(nn.Module):
@@ -407,12 +434,13 @@ def build_unified_reader(
                 # part of the legacy checkpoint compatibility contract.
                 self.numeric_sequence = nn.GRU(fourth, config.numeric_hidden_size, bidirectional=True)
                 self.numeric_classifier = nn.Linear(config.numeric_hidden_size * 2, len(NUMERIC_CHARACTERS) + 1)
-            elif config.architecture_version == 6:
+            elif _uses_v6_protocol(config):
                 feature_height = (config.image_height + 7) // 8
-                # CTC and verifier paths do not reuse a vertical reducer or
-                # recurrent state.  Their only shared evidence is the compact
-                # CNN encoder, so agreement becomes a meaningful diagnostic
-                # rather than two projections of the same GRU hidden state.
+                # Amount/payment CTC and verifier paths deliberately remain
+                # independent after the compact CNN encoder.  v6 preserves a
+                # separate time verifier as part of its frozen checkpoint
+                # topology; v7 instead shares time CTC state with its compact
+                # format heads (constructed below without legacy modules).
                 self.amount_ctc_vertical_reducer = VerticalTextReducer(fourth, feature_height)
                 self.amount_ctc_sequence = nn.GRU(fourth, config.numeric_hidden_size, bidirectional=True)
                 self.amount_ctc_classifier = nn.Linear(
@@ -433,8 +461,12 @@ def build_unified_reader(
                 self.amount_length_classifier = nn.Linear(config.numeric_hidden_size * 2, AMOUNT_MAX_INTEGER_DIGITS)
                 self.amount_digit_classifier = nn.Linear(config.numeric_hidden_size * 2, AMOUNT_DIGIT_SLOTS * 10)
 
-                self.time_verifier_vertical_reducer = VerticalTextReducer(fourth, feature_height)
-                self.time_verifier_sequence = nn.GRU(fourth, config.numeric_hidden_size, bidirectional=True)
+                if config.architecture_version == 6:
+                    # Do not rename/remove these v6 modules: an existing v6
+                    # checkpoint must reproduce its original forward/export
+                    # path exactly.  v7 has its own kind and omits them.
+                    self.time_verifier_vertical_reducer = VerticalTextReducer(fourth, feature_height)
+                    self.time_verifier_sequence = nn.GRU(fourth, config.numeric_hidden_size, bidirectional=True)
                 self.time_format_classifier = nn.Linear(
                     config.numeric_hidden_size * 2, len(TIME_DISPLAY_FORMAT_CLASSES)
                 )
@@ -462,7 +494,7 @@ def build_unified_reader(
                 self.amount_classifier = nn.Linear(config.numeric_hidden_size * 2, len(NUMERIC_CHARACTERS) + 1)
                 self.time_sequence = nn.GRU(fourth, config.numeric_hidden_size, bidirectional=True)
                 self.time_classifier = nn.Linear(config.numeric_hidden_size * 2, len(NUMERIC_CHARACTERS) + 1)
-            if config.architecture_version != 6:
+            if not _uses_v6_protocol(config):
                 self.payment_sequence = nn.GRU(fourth, config.payment_hidden_size, bidirectional=True)
                 self.payment_classifier = nn.Linear(config.payment_hidden_size * 2, payment_vocab_size)
             if config.architecture_version == 5:
@@ -516,12 +548,12 @@ def build_unified_reader(
                 numeric_logits = self.numeric_classifier(numeric_sequence).reshape(
                     feature_width, batch, 2, len(NUMERIC_CHARACTERS) + 1
                 )
-            elif self.architecture_version == 6:
+            elif self.architecture_version >= 6:
                 amount_ctc_features = self.amount_ctc_vertical_reducer(encoded[:, 0]).permute(2, 0, 1)
                 amount_ctc_sequence, _ = self.amount_ctc_sequence(amount_ctc_features)
                 amount_logits = self.amount_ctc_classifier(amount_ctc_sequence)
                 time_ctc_features = self.time_ctc_vertical_reducer(encoded[:, 1]).permute(2, 0, 1)
-                time_ctc_sequence, _ = self.time_ctc_sequence(time_ctc_features)
+                time_ctc_sequence, time_ctc_hidden = self.time_ctc_sequence(time_ctc_features)
                 time_logits = self.time_ctc_classifier(time_ctc_sequence)
             else:
                 # v4 keeps a common visual trunk but lets amount and time
@@ -538,7 +570,7 @@ def build_unified_reader(
                 time_logits = self.time_classifier(time_sequence)
                 numeric_logits = torch.stack((amount_logits, time_logits), dim=2)
 
-            if self.architecture_version == 6:
+            if self.architecture_version >= 6:
                 payment_features = self.payment_ctc_vertical_reducer(encoded[:, 3])  # [batch,C,T]
                 payment_sequence, _ = self.payment_ctc_sequence(payment_features.permute(2, 0, 1))
                 payment_logits = self.payment_ctc_classifier(payment_sequence)
@@ -555,13 +587,23 @@ def build_unified_reader(
 
             status_features = self.status_pool(encoded[:, 2]).flatten(1)
             status_logits = self.status_classifier(status_features)
-            if self.architecture_version == 6:
+            if self.architecture_version >= 6:
                 amount_verifier_features = self.amount_verifier_vertical_reducer(encoded[:, 0]).permute(2, 0, 1)
                 _, amount_verifier_hidden = self.amount_verifier_sequence(amount_verifier_features)
                 amount_summary = torch.cat((amount_verifier_hidden[0], amount_verifier_hidden[1]), dim=1)
-                time_verifier_features = self.time_verifier_vertical_reducer(encoded[:, 1]).permute(2, 0, 1)
-                _, time_verifier_hidden = self.time_verifier_sequence(time_verifier_features)
-                time_summary = torch.cat((time_verifier_hidden[0], time_verifier_hidden[1]), dim=1)
+                if self.architecture_version == 6:
+                    # Frozen v6 topology: keep its checkpoint semantics and
+                    # independent verifier branch exactly as trained.
+                    time_verifier_features = self.time_verifier_vertical_reducer(encoded[:, 1]).permute(2, 0, 1)
+                    _, time_verifier_hidden = self.time_verifier_sequence(time_verifier_features)
+                    time_summary = torch.cat((time_verifier_hidden[0], time_verifier_hidden[1]), dim=1)
+                else:
+                    # v7: CTC and the fixed-format time heads train on the
+                    # same recurrent state.  CTC supplies per-timestep
+                    # gradients for thin colon/digit evidence while the
+                    # separate projections retain the compact 14-output ONNX
+                    # delivery interface.
+                    time_summary = torch.cat((time_ctc_hidden[0], time_ctc_hidden[1]), dim=1)
                 payment_verifier_features = self.payment_verifier_vertical_reducer(encoded[:, 3]).permute(2, 0, 1)
                 payment_prefix_sequence, payment_prefix_hidden = self.payment_prefix_sequence(payment_verifier_features)
                 payment_prefix_logits = self.payment_prefix_classifier(payment_prefix_sequence)
@@ -998,9 +1040,9 @@ def _unpack_reader_outputs(outputs: object, *, config: UnifiedReaderConfig) -> d
     """Give training/evaluation named tensors while preserving v3/v4 tuples."""
     if not isinstance(outputs, tuple):
         raise ValueError("Unified reader must return a tuple of tensors")
-    if config.architecture_version == 6:
+    if _uses_v6_protocol(config):
         if len(outputs) != 14:
-            raise ValueError("Unified v6 reader must return fourteen output tensors")
+            raise ValueError("Unified v6/v7 reader must return fourteen output tensors")
         (
             amount_logits,
             time_logits,
@@ -1358,6 +1400,35 @@ def _structured_payment_v6_predictions(
     return output
 
 
+def _select_report_candidates(
+    ctc_predictions: Mapping[str, tuple[str, float]],
+    structured_predictions: Mapping[str, tuple[str | None, float]],
+    *,
+    config: UnifiedReaderConfig,
+) -> dict[str, tuple[str, float]]:
+    """Choose visible diagnostic candidates without weakening delivery policy.
+
+    A v6 time verifier explicitly predicts a valid clock/date-time template,
+    so it owns separators such as ``:`` / ``-`` / the date-time space.  The
+    raw CTC trace is retained separately for debugging, but showing it as the
+    primary candidate would incorrectly render a correct ``02:40`` verifier
+    result as ``0240``.  Amount keeps CTC as its display candidate because its
+    verifier deliberately predicts a canonical decimal without choosing a
+    visible currency symbol, grouping, or spacing.  Payment keeps CTC pending
+    a calibrated known-bank acceptance policy.
+    """
+    predictions = dict(ctc_predictions)
+    if config.architecture_version == 5:
+        for field, (structured_text, structured_confidence) in structured_predictions.items():
+            if structured_text is not None:
+                predictions[field] = (str(structured_text), float(structured_confidence))
+    elif _uses_v6_protocol(config):
+        structured_time = structured_predictions.get("time")
+        if structured_time is not None and structured_time[0] is not None:
+            predictions["time"] = (str(structured_time[0]), float(structured_time[1]))
+    return predictions
+
+
 def _slot_text(record: Mapping[str, object], field: str) -> str | None:
     slot = dict(record["slots"]).get(field)
     if not isinstance(slot, Mapping):
@@ -1377,7 +1448,7 @@ def _ctc_slot_text(record: Mapping[str, object], field: str, *, config: UnifiedR
     slot = dict(record["slots"]).get(field)
     if not isinstance(slot, Mapping):
         return None
-    if _is_v6(config) and field in {"amount", "time"}:
+    if _uses_v6_protocol(config) and field in {"amount", "time"}:
         visible = slot.get("visible_text")
         if isinstance(visible, str) and visible:
             return visible
@@ -2067,7 +2138,7 @@ def _batch_loss(
             labels=[1 if target is not None else 0 if _slot_text(record, "payment_method_field") is not None else None for record, target in zip(records, payment_targets)],
             torch=torch,
         )
-    elif config.architecture_version == 6:
+    elif _uses_v6_protocol(config):
         if structured_outputs is None:
             raise ValueError("Unified v6 loss requires structured output tensors")
         if payment_bank_prefix_classes is None:
@@ -2343,7 +2414,7 @@ def _evaluate_model(
                     "time": [None] * len(records),
                     "payment_method_field": [None] * len(records),
                 }
-            elif config.architecture_version == 6:
+            elif _uses_v6_protocol(config):
                 structured_amount = _structured_amount_v6_predictions(
                     outputs["amount_sign_logits"].detach().cpu().numpy(),
                     outputs["amount_length_logits"].detach().cpu().numpy(),
@@ -2547,7 +2618,7 @@ def train_unified_reader(
     _require_train_and_validation_coverage(field_counts, required_fields=required_fields)
     if config.architecture_version == 5:
         _require_v5_structured_coverage(structured_counts)
-    elif config.architecture_version == 6:
+    elif _uses_v6_protocol(config):
         _require_v6_structured_coverage(structured_counts)
     _validate_ctc_capacity(records, config=config)
     payment_characters = _payment_charset(train_records)
@@ -2558,7 +2629,7 @@ def train_unified_reader(
     time_to_id = {character: index for index, character in enumerate(time_characters, start=1)}
     status_to_id = {name: index for index, name in enumerate(STATUS_CLASSES)}
     payment_oov = _payment_oov_by_split(records, payment_characters=set(payment_characters))
-    if _is_v6(config):
+    if _uses_v6_protocol(config):
         payment_bank_prefix_classes, payment_bank_prefix_counts = _payment_bank_prefix_classes(
             train_records,
             min_support=payment_bank_prefix_min_support,
@@ -2747,7 +2818,7 @@ def train_unified_reader(
             "config": asdict(config),
             "amount_characters": amount_characters,
             "time_characters": time_characters,
-            **({"numeric_characters": amount_characters} if not _is_v6(config) else {}),
+            **({"numeric_characters": amount_characters} if not _uses_v6_protocol(config) else {}),
             "payment_characters": payment_characters,
             "status_classes": list(STATUS_CLASSES),
             "field_counts": field_counts,
@@ -2774,7 +2845,7 @@ def train_unified_reader(
         # their historical selection rule for checkpoint compatibility.
         verifier_score = (
             float(validation["verifier_macro_exact_match"])
-            if config.architecture_version == 6 and validation["verifier_macro_exact_match"] is not None
+            if _uses_v6_protocol(config) and validation["verifier_macro_exact_match"] is not None
             else float(validation["delivery_exact_overall"])
         )
         score = (
@@ -2892,7 +2963,7 @@ def _checkpoint_labels(
         raise ValueError("Unified OCR checkpoint payment charset is empty or has duplicates")
     if status != list(STATUS_CLASSES):
         raise ValueError("Unified OCR checkpoint status class order is unsupported")
-    if _is_v6(config):
+    if _uses_v6_protocol(config):
         if amount != list(V6_AMOUNT_CHARACTERS) or time != list(V6_TIME_CHARACTERS):
             raise ValueError("Unified v6 OCR checkpoint amount/time label maps are unsupported")
         bank_classes = payload.get("payment_bank_prefix_classes")
@@ -3024,7 +3095,7 @@ def export_unified_onnx(*, checkpoint_path: Path, output_path: Path) -> tuple[Pa
                 payment[:, 0, :],
                 status[0, :],
             )
-            if config.architecture_version == 6:
+            if _uses_v6_protocol(config):
                 return base + (
                     outputs["amount_sign_logits"][0, :],
                     outputs["amount_length_logits"][0, :],
@@ -3127,7 +3198,7 @@ def export_unified_onnx(*, checkpoint_path: Path, output_path: Path) -> tuple[Pa
             "time_display_policy": "preserve_h_mm_or_hh_mm_via_hour_width_logits",
             "payment_card_rendering": "prefix + predicted_visible_parentheses_style + exact_four_ascii_digits",
         }
-    elif config.architecture_version == 6:
+    elif _uses_v6_protocol(config):
         labels_payload["structured_decoder"] = {
             "schema_version": 1,
             "amount_max_integer_digits": AMOUNT_MAX_INTEGER_DIGITS,
@@ -3152,7 +3223,7 @@ def export_unified_onnx(*, checkpoint_path: Path, output_path: Path) -> tuple[Pa
             "decoder": "ctc_greedy",
             "blank_index": NUMERIC_BLANK_INDEX,
             "characters": "amount_characters",
-            "target": "visible_cny_amount" if _is_v6(config) else "canonical_amount",
+            "target": "visible_cny_amount" if _uses_v6_protocol(config) else "canonical_amount",
         },
         "time_logits": {
             "shape": list(time_logits.shape),
@@ -3160,7 +3231,7 @@ def export_unified_onnx(*, checkpoint_path: Path, output_path: Path) -> tuple[Pa
             "decoder": "ctc_greedy",
             "blank_index": NUMERIC_BLANK_INDEX,
             "characters": "time_characters",
-            "target": "visible_clock_or_datetime" if _is_v6(config) else "canonical_time",
+            "target": "visible_clock_or_datetime" if _uses_v6_protocol(config) else "canonical_time",
         },
         "payment_logits": {
             "shape": list(payment_logits.shape),
@@ -3233,7 +3304,7 @@ def export_unified_onnx(*, checkpoint_path: Path, output_path: Path) -> tuple[Pa
                 },
             }
         )
-    elif config.architecture_version == 6:
+    elif _uses_v6_protocol(config):
         if payment_bank_prefix_classes is None:
             raise AssertionError("v6 export requires payment bank-prefix classes")
         output_contract.update(
@@ -3402,14 +3473,14 @@ def _load_onnx_artifacts(model_path: Path) -> tuple[UnifiedReaderConfig, list[st
     if status != list(STATUS_CLASSES):
         raise ValueError("Unified OCR ONNX status class order is unsupported")
     payment_bank_prefix_classes: list[str] | None = None
-    if config.architecture_version == 6:
+    if _uses_v6_protocol(config):
         if (
             labels.get("amount_blank_index") != NUMERIC_BLANK_INDEX
             or labels.get("time_blank_index") != NUMERIC_BLANK_INDEX
             or labels.get("amount_characters") != list(V6_AMOUNT_CHARACTERS)
             or labels.get("time_characters") != list(V6_TIME_CHARACTERS)
         ):
-            raise ValueError("Unified v6 OCR amount/time charset or blank index is unsupported")
+            raise ValueError("Unified v6/v7 OCR amount/time charset or blank index is unsupported")
         bank_classes = labels.get("payment_bank_prefix_classes")
         if (
             not isinstance(bank_classes, list)
@@ -3419,9 +3490,9 @@ def _load_onnx_artifacts(model_path: Path) -> tuple[UnifiedReaderConfig, list[st
             or len(set(bank_classes)) != len(bank_classes)
             or bank_classes[1:] != sorted(bank_classes[1:])
         ):
-            raise ValueError("Unified v6 OCR bank-prefix label map is invalid")
+            raise ValueError("Unified v6/v7 OCR bank-prefix label map is invalid")
         if contract.get("payment_bank_prefix_classes") != bank_classes:
-            raise ValueError("Unified v6 OCR bank-prefix classes differ between labels and contract")
+            raise ValueError("Unified v6/v7 OCR bank-prefix classes differ between labels and contract")
         payment_bank_prefix_classes = list(bank_classes)
     else:
         if labels.get("numeric_blank_index") != NUMERIC_BLANK_INDEX or labels.get("numeric_characters") != list(
@@ -3453,10 +3524,10 @@ def _load_onnx_artifacts(model_path: Path) -> tuple[UnifiedReaderConfig, list[st
                 raise ValueError("Unified v5 OCR text_delivery_policy must remain review-only")
             if raw_text_delivery_policy.get("review_value") != "review":
                 raise ValueError("Unified v5 OCR text_delivery_policy review value is invalid")
-    elif config.architecture_version == 6:
+    elif _uses_v6_protocol(config):
         structured_decoder = labels.get("structured_decoder")
         if not isinstance(structured_decoder, Mapping):
-            raise ValueError("Unified v6 OCR label sidecar has no structured decoder contract")
+            raise ValueError("Unified v6/v7 OCR label sidecar has no structured decoder contract")
         if (
             structured_decoder.get("schema_version") != 1
             or structured_decoder.get("amount_max_integer_digits") != AMOUNT_MAX_INTEGER_DIGITS
@@ -3472,14 +3543,15 @@ def _load_onnx_artifacts(model_path: Path) -> tuple[UnifiedReaderConfig, list[st
             or structured_decoder.get("payment_bank_prefix_format") != PAYMENT_BANK_PREFIX_FORMAT
             or structured_decoder.get("payment_bank_prefix_other_class") != PAYMENT_BANK_OTHER_CLASS
         ):
-            raise ValueError("Unified v6 OCR structured decoder sidecar is unsupported")
+            raise ValueError("Unified v6/v7 OCR structured decoder sidecar is unsupported")
         raw_text_delivery_policy = contract.get("text_delivery_policy")
         if not isinstance(raw_text_delivery_policy, Mapping):
-            raise ValueError("Unified v6 OCR text_delivery_policy is missing")
-        if raw_text_delivery_policy.get("runtime_policy") != V6_TEXT_DELIVERY_POLICY:
-            raise ValueError("Unified v6 OCR text_delivery_policy must remain review-only")
+            raise ValueError("Unified v6/v7 OCR text_delivery_policy is missing")
+        expected_text_delivery_policy, _ = _text_delivery_policy(config)
+        if raw_text_delivery_policy.get("runtime_policy") != expected_text_delivery_policy:
+            raise ValueError("Unified v6/v7 OCR text_delivery_policy must remain review-only")
         if raw_text_delivery_policy.get("review_value") != "review":
-            raise ValueError("Unified v6 OCR text_delivery_policy review value is invalid")
+            raise ValueError("Unified v6/v7 OCR text_delivery_policy review value is invalid")
     # v3 did not record a policy; the helper derives a conservative fallback
     # from its audit counts instead of trusting raw logits.
     status_policy = _contract_status_policy(contract)
@@ -3513,7 +3585,7 @@ def _load_onnx_artifacts(model_path: Path) -> tuple[UnifiedReaderConfig, list[st
                 "payment_parentheses_logits": [len(PAYMENT_PARENTHESIS_CLASSES)],
             }
         )
-    elif config.architecture_version == 6:
+    elif _uses_v6_protocol(config):
         assert payment_bank_prefix_classes is not None
         expected_shapes.update(
             {
@@ -3540,7 +3612,7 @@ def _load_onnx_artifacts(model_path: Path) -> tuple[UnifiedReaderConfig, list[st
         elif output.get("blank_index") != expected_blank_index:
             raise ValueError(f"Unified OCR ONNX output {name!r} has an invalid CTC blank index")
     status_output = outputs["status_logits"]
-    if contract.get("kind") in {KIND_V4, KIND_V5, KIND_V6}:
+    if contract.get("kind") in {KIND_V4, KIND_V5, KIND_V6, KIND_V7}:
         if status_output.get("runtime_policy") != status_policy["runtime_policy"]:
             raise ValueError("Unified OCR ONNX status output policy differs from status_head_policy")
         expected_review = "review" if status_policy["runtime_policy"] == "review_only" else None
@@ -3912,7 +3984,7 @@ def evaluate_unified_onnx(
                 "payment_parentheses_logits": [len(PAYMENT_PARENTHESIS_CLASSES)],
             }
         )
-    elif config.architecture_version == 6:
+    elif _uses_v6_protocol(config):
         raw_bank_classes = contract.get("payment_bank_prefix_classes")
         if not isinstance(raw_bank_classes, list) or len(raw_bank_classes) < 2:
             raise ValueError("Unified v6 OCR contract has no valid payment bank-prefix classes")
@@ -3982,7 +4054,7 @@ def evaluate_unified_onnx(
                     payment_characters=payment_characters,
                 )[0],
             }
-        elif config.architecture_version == 6:
+        elif _uses_v6_protocol(config):
             raw_bank_classes = contract.get("payment_bank_prefix_classes")
             if not isinstance(raw_bank_classes, list):
                 raise AssertionError("v6 bank-prefix classes were validated with the output contract")
@@ -4004,12 +4076,11 @@ def evaluate_unified_onnx(
                     payment_bank_prefix_classes=[str(value) for value in raw_bank_classes],
                 )[0],
             }
-        predictions: dict[str, tuple[str, float]] = dict(ctc_predictions)
-        if config.architecture_version == 5:
-            for field, structured_prediction in structured_predictions.items():
-                structured_text, structured_confidence = structured_prediction
-                if structured_text is not None:
-                    predictions[field] = (str(structured_text), float(structured_confidence))
+        predictions = _select_report_candidates(
+            ctc_predictions,
+            structured_predictions,
+            config=config,
+        )
         # A status head with incomplete classes must never become a business
         # decision, even if its raw argmax says success.
         predictions["transfer_status"] = (
@@ -4038,7 +4109,7 @@ def evaluate_unified_onnx(
                 else (
                     _semantic_value(field, str(structured_text))
                     == _semantic_value(field, str(ctc_candidate[0]))
-                    if config.architecture_version == 6 and field in {"amount", "time"}
+                    if _uses_v6_protocol(config) and field in {"amount", "time"}
                     else str(structured_text) == str(ctc_candidate[0])
                 )
             )
@@ -4223,21 +4294,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--ctc-loss-weight",
         type=float,
         default=0.35,
-        help="v5/v6 auxiliary raw-CTC loss weight; v3/v4 keep their historical loss composition",
+        help="v5/v6/v7 auxiliary raw-CTC loss weight; v3/v4 keep their historical loss composition",
     )
     train.add_argument(
         "--structured-loss-weight",
         type=float,
         default=1.0,
-        help="v5/v6 structured financial-format and bank-verifier loss weight",
+        help="v5/v6/v7 structured financial-format and bank-verifier loss weight",
     )
     train.add_argument(
         "--architecture",
-        choices=("v3", "v4", "v5", "v6"),
-        default="v6",
+        choices=("v3", "v4", "v5", "v6", "v7"),
+        default="v7",
         help=(
-            "v6 is the recommended visible-format and bank-verifier reader; "
-            "v5/v4/v3 are checkpoint-compatible only"
+            "v7 is the recommended visible-format reader; it keeps v6's delivery protocol "
+            "but shares the time CTC reader with its format heads. v6/v5/v4/v3 remain checkpoint-compatible"
         ),
     )
     train.add_argument(
@@ -4245,7 +4316,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=3,
         help=(
-            "v6 only: minimum train-split examples needed to retain a bank-prefix class; "
+            "v6/v7 only: minimum train-split examples needed to retain a bank-prefix class; "
             "rarer/unknown prefixes map to __other__ and remain review-only"
         ),
     )
@@ -4288,17 +4359,17 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument(
         "--min-delivery-coverage",
         type=float,
-        help="Require this non-review coverage for each v5/v6 text field (amount/time/payment)",
+        help="Require this non-review coverage for each v5/v6/v7 text field (amount/time/payment)",
     )
     evaluate.add_argument(
         "--min-delivery-exact-match",
         type=float,
-        help="Require this raw exact match among non-review v5/v6 text-field deliveries",
+        help="Require this raw exact match among non-review v5/v6/v7 text-field deliveries",
     )
     evaluate.add_argument(
         "--max-delivery-false-accepts",
         type=int,
-        help="Maximum incorrect non-review v5/v6 deliveries allowed per text field",
+        help="Maximum incorrect non-review v5/v6/v7 deliveries allowed per text field",
     )
     return parser
 

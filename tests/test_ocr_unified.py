@@ -13,6 +13,7 @@ from transfer_receipt_ai.ocr_unified import (
     KIND_V3,
     KIND_V5,
     KIND_V6,
+    KIND_V7,
     PAYMENT_BANK_OTHER_CLASS,
     V6_AMOUNT_CHARACTERS,
     V6_ONNX_OUTPUT_NAMES,
@@ -24,6 +25,7 @@ from transfer_receipt_ai.ocr_unified import (
     _format_exact_match,
     _load_onnx_artifacts,
     _amount_v6_structured_target,
+    _select_report_candidates,
     _structured_amount_predictions,
     _structured_amount_v6_predictions,
     _structured_payment_predictions,
@@ -282,8 +284,46 @@ def test_unified_v6_model_keeps_one_input_but_separates_visible_ctc_and_verifier
     assert list(payment_structure.shape) == [2, 2]
     assert list(payment_parentheses.shape) == [2, 2]
     assert model.amount_ctc_sequence is not model.amount_verifier_sequence
-    assert model.time_ctc_sequence is not model.time_verifier_sequence
     assert model.payment_ctc_sequence is not model.payment_prefix_sequence
+
+
+def test_unified_v6_checkpoint_topology_keeps_the_original_separate_time_verifier() -> None:
+    """v6's existing state dict and forward route must remain frozen."""
+    config = _tiny_config(architecture_version=6)
+    model = build_unified_reader(
+        payment_vocab_size=6,
+        payment_bank_prefix_vocab_size=2,
+        config=config,
+    )
+    outputs = model(torch.zeros((2, 4, 1, 32, 64), dtype=torch.float32))
+    (outputs[7].sum() + outputs[8].sum()).backward()
+    assert model.time_ctc_sequence.weight_ih_l0.grad is None
+    assert model.time_verifier_sequence.weight_ih_l0.grad is not None
+
+    reloaded = build_unified_reader(
+        payment_vocab_size=6,
+        payment_bank_prefix_vocab_size=2,
+        config=config,
+    )
+    reloaded.load_state_dict(model.state_dict(), strict=True)
+    assert hasattr(reloaded, "time_verifier_vertical_reducer")
+    assert hasattr(reloaded, "time_verifier_sequence")
+
+
+def test_unified_v7_time_format_heads_backpropagate_through_the_time_ctc_branch() -> None:
+    """v7 lets format supervision reinforce the CTC time reader."""
+    config = _tiny_config(architecture_version=7)
+    model = build_unified_reader(
+        payment_vocab_size=6,
+        payment_bank_prefix_vocab_size=2,
+        config=config,
+    )
+    outputs = model(torch.zeros((2, 4, 1, 32, 64), dtype=torch.float32))
+    assert len(outputs) == len(V6_ONNX_OUTPUT_NAMES)
+    (outputs[7].sum() + outputs[8].sum()).backward()
+    assert model.time_ctc_sequence.weight_ih_l0.grad is not None
+    assert model.time_ctc_vertical_reducer.depthwise.weight.grad is not None
+    assert not hasattr(model, "time_verifier_sequence")
 
 
 def test_unified_v3_config_keeps_the_existing_output_protocol() -> None:
@@ -313,6 +353,25 @@ def test_legacy_v3_checkpoint_config_infers_architecture_from_kind() -> None:
     )
     assert config.architecture_version == 3
     assert config.image_height == 48
+
+
+def test_v7_checkpoint_config_has_its_own_kind_and_does_not_relabel_v6() -> None:
+    config = _checkpoint_config(
+        {
+            "kind": KIND_V7,
+            "config": {
+                "architecture_version": 7,
+                "image_height": 32,
+                "image_width": 64,
+                "base_channels": 8,
+                "numeric_hidden_size": 16,
+                "payment_hidden_size": 16,
+                "pooled_width": 2,
+            },
+        }
+    )
+    assert config.architecture_version == 7
+    assert KIND_V6 != KIND_V7
 
 
 def test_optional_exact_metric_formats_as_na_without_status_labels() -> None:
@@ -415,6 +474,26 @@ def test_v6_verifier_decoders_require_valid_signed_time_and_known_bank_forms() -
         parentheses,
         payment_bank_prefix_classes=bank_classes,
     ) == [(None, 0.0)]
+
+
+@pytest.mark.parametrize("architecture_version", (6, 7))
+def test_v6_protocol_report_candidate_uses_time_template_but_retains_raw_amount_display(
+    architecture_version: int,
+) -> None:
+    ctc = {
+        "amount": ("￥99.96", 0.91),
+        "time": ("0240", 0.92),
+        "payment_method_field": ("建设银行储蓄卡（3667）", 0.93),
+    }
+    structured = {
+        "amount": ("99.96", 0.99),
+        "time": ("02:40", 0.99),
+        "payment_method_field": ("建设银行储蓄卡（3667）", 0.99),
+    }
+    selected = _select_report_candidates(ctc, structured, config=_tiny_config(architecture_version=architecture_version))
+    assert selected["time"] == ("02:40", 0.99)
+    assert selected["amount"] == ("￥99.96", 0.91)
+    assert selected["payment_method_field"] == ("建设银行储蓄卡（3667）", 0.93)
 
 
 def test_v5_right_aligned_preprocess_has_a_distinct_fixed_position_from_legacy_center(tmp_path: Path) -> None:
@@ -689,3 +768,28 @@ def test_unified_v6_export_loads_and_evaluates_one_receipt_when_onnx_is_availabl
     assert amount["reference_text"] == "¥199.00"
     assert amount["runtime_policy"].startswith("review_only")
     assert amount["delivery_text"] == "review"
+
+
+def test_unified_v7_export_loads_the_same_visible_format_protocol_when_onnx_is_available(tmp_path: Path) -> None:
+    onnx = pytest.importorskip("onnx")
+    pytest.importorskip("onnxruntime")
+    records_path = _write_v6_dataset(tmp_path)
+    checkpoint = train_unified_reader(
+        records_path=records_path,
+        output_dir=tmp_path / "run-v7",
+        config=_tiny_config(architecture_version=7),
+        device="cpu",
+        epochs=1,
+        batch_size=2,
+        payment_bank_prefix_min_support=1,
+    )
+    model_path, _, contract_path = export_unified_onnx(
+        checkpoint_path=checkpoint,
+        output_path=tmp_path / "reader-v7.onnx",
+    )
+    onnx.checker.check_model(onnx.load_model(model_path))
+    config_from_contract, _, loaded_contract = _load_onnx_artifacts(model_path)
+    assert config_from_contract.architecture_version == 7
+    assert loaded_contract["kind"] == KIND_V7
+    contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    assert set(contract["outputs"]) == set(V6_ONNX_OUTPUT_NAMES)
