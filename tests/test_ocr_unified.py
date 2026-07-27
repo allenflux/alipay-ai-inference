@@ -297,7 +297,7 @@ def test_v5_refuses_a_legacy_manifest_without_strict_auxiliary_targets(tmp_path:
         )
 
 
-def test_v5_delivery_requires_structured_ctc_agreement_and_never_emits_uncalibrated_fallback() -> None:
+def test_v5_delivery_is_review_only_until_independent_calibration_exists() -> None:
     assert _delivery_text(
         architecture_version=5,
         field="amount",
@@ -318,7 +318,7 @@ def test_v5_delivery_requires_structured_ctc_agreement_and_never_emits_uncalibra
         candidate_text="1:44",
         ctc_text="1:44",
         structured_text="1:44",
-    ) == "1:44"
+    ) == "review"
     assert _delivery_text(
         architecture_version=4,
         field="amount",

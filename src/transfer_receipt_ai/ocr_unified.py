@@ -109,6 +109,19 @@ CTC_ONNX_BLANK_INDICES = {
 ONNX_EXPORT_RTOL = 1e-3
 ONNX_EXPORT_ATOL = 1e-3
 
+# A v5 CTC prediction and its structural prediction are deliberately exposed
+# together for diagnostics, but they are not independent evidence: both are
+# derived from the same student model and the same Paddle-derived labels.
+# Until an artifact has a separately implemented and human-truth-calibrated
+# acceptance policy, text values must stay review-only.  Keeping this as a
+# contract value makes a future .NET consumer unable to mistake a diagnostic
+# candidate for a safe business value.
+V5_TEXT_DELIVERY_POLICY = "review_only_pending_independent_calibration"
+V5_TEXT_DELIVERY_REASON = (
+    "CTC and structured heads share the student model; agreement is diagnostic only. "
+    "Emit review until a separately implemented policy passes group-isolated human-truth calibration."
+)
+
 
 def _onnx_output_names(config: "UnifiedReaderConfig") -> tuple[str, ...]:
     return V5_ONNX_OUTPUT_NAMES if config.architecture_version == 5 else LEGACY_ONNX_OUTPUT_NAMES
@@ -1568,23 +1581,16 @@ def _evaluate_model(
                     structured if structured is not None else ctc
                     for ctc, (structured, _) in zip(payment_ctc_predictions, structured_payment)
                 ]
-                # Structural digits/prefixes are the delivery path.  A CTC
-                # fallback is still recorded for diagnostics, but until it has
-                # a separately calibrated safe policy it cannot be emitted.
-                # A disagreement is therefore review, never a tie-breaker.
+                # Structural and CTC values are both diagnostic candidates.
+                # They share the same student representation, so agreement
+                # between them is not independent evidence and cannot be
+                # emitted as a financial delivery value.  A later version may
+                # introduce a separately calibrated acceptance policy; until
+                # then every v5 text value remains review-only.
                 delivery_predictions = {
-                    "amount": [
-                        structured if structured is not None and structured == ctc else None
-                        for ctc, (structured, _) in zip(amount_ctc_predictions, structured_amount)
-                    ],
-                    "time": [
-                        structured if structured is not None and structured == ctc else None
-                        for ctc, (structured, _) in zip(time_ctc_predictions, structured_time)
-                    ],
-                    "payment_method_field": [
-                        structured if structured is not None and structured == ctc else None
-                        for ctc, (structured, _) in zip(payment_ctc_predictions, structured_payment)
-                    ],
+                    "amount": [None] * len(records),
+                    "time": [None] * len(records),
+                    "payment_method_field": [None] * len(records),
                 }
             status_predictions = status_logits.argmax(dim=1).detach().cpu().tolist()
             for index, record in enumerate(records):
@@ -1907,8 +1913,10 @@ def train_unified_reader(
                 "payment_oov_by_split": payment_oov,
                 "records": history,
                 "warning": (
-                    "Paddle teacher labels are not independent truth. When status_head_policy.runtime_policy is "
-                    "review_only, status logits are not a delivery decision and runtime must emit review."
+                    "Paddle teacher labels are not independent truth. v5 text candidates remain review-only until "
+                    "a separate acceptance policy passes group-isolated human-truth calibration. When "
+                    "status_head_policy.runtime_policy is review_only, status logits are also not a delivery "
+                    "decision and runtime must emit review."
                 ),
             },
         )
@@ -2267,6 +2275,15 @@ def export_unified_onnx(*, checkpoint_path: Path, output_path: Path) -> tuple[Pa
             "training_field_counts": field_counts,
             "training_status_class_counts": status_counts,
             "status_head_policy": status_policy,
+            "text_delivery_policy": (
+                {
+                    "runtime_policy": V5_TEXT_DELIVERY_POLICY,
+                    "review_value": "review",
+                    "reason": V5_TEXT_DELIVERY_REASON,
+                }
+                if config.architecture_version == 5
+                else None
+            ),
             "input": {
                 "name": "field_images",
                 "dtype": "float32",
@@ -2357,6 +2374,17 @@ def _load_onnx_artifacts(model_path: Path) -> tuple[UnifiedReaderConfig, list[st
             or structured_decoder.get("payment_parentheses_classes") != list(PAYMENT_PARENTHESIS_CLASSES)
         ):
             raise ValueError("Unified v5 OCR structured decoder sidecar is unsupported")
+        # Older v5 artifacts did not record this policy.  The loader applies
+        # the same strict review-only fallback to them, so a stale sidecar
+        # cannot silently enable automatic financial-text delivery.
+        raw_text_delivery_policy = contract.get("text_delivery_policy")
+        if raw_text_delivery_policy is not None:
+            if not isinstance(raw_text_delivery_policy, Mapping):
+                raise ValueError("Unified v5 OCR text_delivery_policy is invalid")
+            if raw_text_delivery_policy.get("runtime_policy") != V5_TEXT_DELIVERY_POLICY:
+                raise ValueError("Unified v5 OCR text_delivery_policy must remain review-only")
+            if raw_text_delivery_policy.get("review_value") != "review":
+                raise ValueError("Unified v5 OCR text_delivery_policy review value is invalid")
     # v3 did not record a policy; the helper derives a conservative fallback
     # from its audit counts instead of trusting raw logits.
     status_policy = _contract_status_policy(contract)
@@ -2523,16 +2551,20 @@ def _delivery_text(
 ) -> str:
     """Return a conservative delivery value without hiding diagnostics.
 
-    v5's plain CTC outputs remain useful for training/debugging, but they are
-    not an independently calibrated financial delivery path. A text field is
-    eligible only when both its specialised structural reader and CTC reader
-    render exactly the same visible value. Missing structure or a disagreement
-    stays ``review``.  Status follows its separate coverage policy upstream.
+    v5's CTC and structural outputs remain useful for training/debugging, but
+    they are not independent, calibrated financial delivery paths: their
+    heads share the same student visual representation and teacher labels.
+    Agreement therefore cannot promote a value to a business decision.  Text
+    values stay ``review`` until a separate acceptance policy is implemented
+    and proven on group-isolated human truth.  Status follows its separate
+    coverage policy upstream.
     """
     if architecture_version != 5 or field == "transfer_status":
         return candidate_text
-    if structured_text is not None and ctc_text is not None and structured_text == ctc_text:
-        return candidate_text
+    # Keep the arguments in the public helper signature: callers still record
+    # them in comparisons.jsonl, which is the evidence needed to build the
+    # later calibration policy.
+    del ctc_text, structured_text
     return "review"
 
 
@@ -2903,9 +2935,7 @@ def evaluate_unified_onnx(
                     "runtime_policy": (
                         status_policy["runtime_policy"]
                         if field == "transfer_status"
-                        else "structured_ctc_agreement_required"
-                        if config.architecture_version == 5 and structured_text is not None
-                        else "ctc_fallback_review_required"
+                        else V5_TEXT_DELIVERY_POLICY
                         if config.architecture_version == 5
                         else "decode"
                     ),
