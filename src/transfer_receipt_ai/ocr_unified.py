@@ -1671,6 +1671,17 @@ def evaluate_unified_onnx(
         max_payment_oov_rate=max_payment_oov_rate,
         max_non_success_to_success=max_non_success_to_success,
     )
+    acceptance_requested = any(
+        value is not None
+        for value in (
+            min_amount_exact_match,
+            min_time_exact_match,
+            min_payment_exact_match,
+            min_status_exact_match,
+            max_payment_oov_rate,
+            max_non_success_to_success,
+        )
+    )
     label_sources = sorted({str(record.get("label_source", "unspecified")) for record in evaluation_records})
     summary: dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
@@ -1697,7 +1708,11 @@ def evaluate_unified_onnx(
             "min_status_exact_match": min_status_exact_match,
             "max_payment_oov_rate": max_payment_oov_rate,
             "max_non_success_to_success": max_non_success_to_success,
-            "passed": not failures,
+            # A report with no requested gate is informative, but it must not
+            # be rendered as an accepted delivery candidate simply because no
+            # threshold was supplied.
+            "requested": acceptance_requested,
+            "passed": (not failures) if acceptance_requested else None,
             "failures": failures,
         },
         "warning": (
