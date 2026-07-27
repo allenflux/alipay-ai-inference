@@ -3,7 +3,8 @@
 The model intentionally has one shared visual encoder and one ONNX artifact,
 while retaining specialised heads where the output spaces differ:
 
-* amount/time: a shared, small numeric CTC head;
+* amount/time: independent, small numeric CTC heads in the current v4
+  architecture (v3's shared head remains loadable for compatibility);
 * payment method: a separate CTC head which preserves bank/card text; and
 * transfer status: a finite three-class head.
 
@@ -37,15 +38,45 @@ from .ocr_unified_dataset import SLOT_ORDER, STATUS_CLASSES
 
 
 SCHEMA_VERSION = 1
-KIND = "receipt_unified_field_reader_v3"
+KIND_V3 = "receipt_unified_field_reader_v3"
+KIND_V4 = "receipt_unified_field_reader_v4"
+# Keep the public alias for callers that only need the current training
+# format.  Loading/export code must use SUPPORTED_KINDS instead so that the
+# already-produced v3 checkpoint and ONNX bundle remain usable.
+KIND = KIND_V4
+SUPPORTED_KINDS = frozenset((KIND_V3, KIND_V4))
 NUMERIC_CHARACTERS = tuple("0123456789.:")
 NUMERIC_BLANK_INDEX = 0
 PAYMENT_BLANK_INDEX = 0
 
 
+def _kind_for_architecture(architecture_version: int) -> str:
+    if architecture_version == 3:
+        return KIND_V3
+    if architecture_version == 4:
+        return KIND_V4
+    raise ValueError(f"Unsupported unified reader architecture v{architecture_version}")
+
+
+def _kind_for_config(config: "UnifiedReaderConfig") -> str:
+    return _kind_for_architecture(config.architecture_version)
+
+
+def _architecture_for_kind(kind: object) -> int:
+    if kind == KIND_V3:
+        return 3
+    if kind == KIND_V4:
+        return 4
+    raise ValueError(f"Unsupported unified OCR artifact kind: {kind!r}")
+
+
 @dataclass(frozen=True)
 class UnifiedReaderConfig:
-    image_height: int = 48
+    # v4 retains more vertical detail (64px input, /8 vertical reduction)
+    # and gives amount/time independent decoders.  v3 stays loadable when a
+    # legacy checkpoint/contract has no architecture_version field.
+    architecture_version: int = 4
+    image_height: int = 64
     image_width: int = 384
     base_channels: int = 24
     numeric_hidden_size: int = 64
@@ -53,6 +84,8 @@ class UnifiedReaderConfig:
     pooled_width: int = 8
 
     def validate(self) -> None:
+        if self.architecture_version not in {3, 4}:
+            raise ValueError("architecture_version must be 3 or 4")
         if self.image_height < 16 or self.image_width < 64 or self.image_width % 4:
             raise ValueError("image_height must be >=16 and image_width must be a multiple of 4 >=64")
         if self.base_channels < 8:
@@ -134,7 +167,14 @@ def _group_count(channels: int) -> int:
 
 
 def build_unified_reader(*, payment_vocab_size: int, config: UnifiedReaderConfig) -> Any:
-    """Return the shared-trunk, four-slot reader used for training and ONNX export."""
+    """Return the shared-trunk, four-slot reader used for training and ONNX export.
+
+    Architecture v3 deliberately preserves the original module names and
+    topology.  That is necessary for strict loading of existing v3 checkpoints.
+    Architecture v4 uses a less destructive vertical downsampling path and
+    independent amount/time decoders, without changing the one-input/four-output
+    ONNX protocol.
+    """
     if payment_vocab_size < 2:
         raise ValueError("payment_vocab_size must include CTC blank plus at least one character")
     config.validate()
@@ -158,6 +198,7 @@ def build_unified_reader(*, payment_vocab_size: int, config: UnifiedReaderConfig
     class UnifiedFieldReader(nn.Module):
         def __init__(self) -> None:
             super().__init__()
+            self.architecture_version = config.architecture_version
             first = config.base_channels
             second = first * 2
             third = first * 3
@@ -168,16 +209,25 @@ def build_unified_reader(*, payment_vocab_size: int, config: UnifiedReaderConfig
                 nn.SiLU(inplace=True),
             )
             # Horizontal resolution is reduced exactly by 4, leaving 96 CTC
-            # steps at the default 384px crop width.
+            # steps at the default 384px crop width.  v3 reduces vertical
+            # resolution by 16; v4 retains twice as much vertical evidence.
             self.encoder = nn.Sequential(
                 DepthwiseBlock(first, second, stride=(2, 2)),
                 DepthwiseBlock(second, third, stride=(2, 1)),
-                DepthwiseBlock(third, fourth, stride=(2, 1)),
+                DepthwiseBlock(third, fourth, stride=(2 if config.architecture_version == 3 else 1, 1)),
             )
             self.slot_embedding = nn.Parameter(torch.empty(4, fourth, 1, 1))
             nn.init.normal_(self.slot_embedding, std=0.02)
-            self.numeric_sequence = nn.GRU(fourth, config.numeric_hidden_size, bidirectional=True)
-            self.numeric_classifier = nn.Linear(config.numeric_hidden_size * 2, len(NUMERIC_CHARACTERS) + 1)
+            if config.architecture_version == 3:
+                # Do not rename these v3 modules: their state_dict keys are
+                # part of the legacy checkpoint compatibility contract.
+                self.numeric_sequence = nn.GRU(fourth, config.numeric_hidden_size, bidirectional=True)
+                self.numeric_classifier = nn.Linear(config.numeric_hidden_size * 2, len(NUMERIC_CHARACTERS) + 1)
+            else:
+                self.amount_sequence = nn.GRU(fourth, config.numeric_hidden_size, bidirectional=True)
+                self.amount_classifier = nn.Linear(config.numeric_hidden_size * 2, len(NUMERIC_CHARACTERS) + 1)
+                self.time_sequence = nn.GRU(fourth, config.numeric_hidden_size, bidirectional=True)
+                self.time_classifier = nn.Linear(config.numeric_hidden_size * 2, len(NUMERIC_CHARACTERS) + 1)
             self.payment_sequence = nn.GRU(fourth, config.payment_hidden_size, bidirectional=True)
             self.payment_classifier = nn.Linear(config.payment_hidden_size * 2, payment_vocab_size)
             self.status_pool = nn.AdaptiveAvgPool2d((1, config.pooled_width))
@@ -193,14 +243,28 @@ def build_unified_reader(*, payment_vocab_size: int, config: UnifiedReaderConfig
             encoded = encoded.reshape(batch, slots, feature_channels, feature_height, feature_width)
             encoded = encoded + self.slot_embedding.unsqueeze(0)
 
-            # amount/time slots share one numeric CTC projection but retain a
-            # slot embedding, allowing the decoder to distinguish '.' and ':'.
-            numeric_features = encoded[:, :2].mean(dim=3)  # [batch,2,C,T]
-            numeric_sequence = numeric_features.permute(3, 0, 1, 2).reshape(feature_width, batch * 2, feature_channels)
-            numeric_sequence, _ = self.numeric_sequence(numeric_sequence)
-            numeric_logits = self.numeric_classifier(numeric_sequence).reshape(
-                feature_width, batch, 2, len(NUMERIC_CHARACTERS) + 1
-            )
+            if self.architecture_version == 3:
+                # amount/time slots share one numeric CTC projection but retain
+                # a slot embedding, allowing the decoder to distinguish '.'
+                # and ':'.  This exact v3 branch preserves checkpoint loading.
+                numeric_features = encoded[:, :2].mean(dim=3)  # [batch,2,C,T]
+                numeric_sequence = numeric_features.permute(3, 0, 1, 2).reshape(
+                    feature_width, batch * 2, feature_channels
+                )
+                numeric_sequence, _ = self.numeric_sequence(numeric_sequence)
+                numeric_logits = self.numeric_classifier(numeric_sequence).reshape(
+                    feature_width, batch, 2, len(NUMERIC_CHARACTERS) + 1
+                )
+            else:
+                # v4 keeps a common visual trunk but lets amount and time
+                # specialize their recurrent decoder and final character logits.
+                amount_features = encoded[:, 0].mean(dim=2).permute(2, 0, 1)
+                amount_sequence, _ = self.amount_sequence(amount_features)
+                amount_logits = self.amount_classifier(amount_sequence)
+                time_features = encoded[:, 1].mean(dim=2).permute(2, 0, 1)
+                time_sequence, _ = self.time_sequence(time_features)
+                time_logits = self.time_classifier(time_sequence)
+                numeric_logits = torch.stack((amount_logits, time_logits), dim=2)
 
             payment_features = encoded[:, 3].mean(dim=2)  # [batch,C,T]
             payment_sequence = payment_features.permute(2, 0, 1)
@@ -545,9 +609,12 @@ def _status_split_counts(records: Iterable[Mapping[str, object]]) -> dict[str, d
     }
 
 
-def _require_train_and_validation_coverage(field_counts: Mapping[str, Mapping[str, int]]) -> None:
-    missing_train = [field for field, counts in field_counts.items() if int(counts["train"]) <= 0]
-    missing_validation = [field for field, counts in field_counts.items() if int(counts["val"]) <= 0]
+def _require_train_and_validation_coverage(
+    field_counts: Mapping[str, Mapping[str, int]], *, required_fields: Iterable[str] = SLOT_ORDER
+) -> None:
+    required = tuple(required_fields)
+    missing_train = [field for field in required if int(field_counts[field]["train"]) <= 0]
+    missing_validation = [field for field in required if int(field_counts[field]["val"]) <= 0]
     if missing_train or missing_validation:
         parts: list[str] = []
         if missing_train:
@@ -558,6 +625,51 @@ def _require_train_and_validation_coverage(field_counts: Mapping[str, Mapping[st
             "; ".join(parts)
             + ". Rebuild the teacher manifest with more labels or adjust its train/validation split."
         )
+
+
+def _status_head_policy(status_counts: Mapping[str, Mapping[str, int]]) -> dict[str, object]:
+    """Return the safety policy for the optional status head.
+
+    A data set with only ``success`` examples cannot establish that pending or
+    failed receipts are safe.  In that case status loss is disabled so it does
+    not consume shared-trunk capacity, and the exported delivery contract says
+    that callers must emit ``review`` rather than consume status logits.
+    """
+    missing_by_split = {
+        split: [name for name in STATUS_CLASSES if int(status_counts[split][name]) <= 0]
+        for split in ("train", "val", "test")
+    }
+    training_enabled = not missing_by_split["train"] and not missing_by_split["val"]
+    delivery_allowed = training_enabled and not missing_by_split["test"]
+    return {
+        "training_enabled": training_enabled,
+        "delivery_allowed": delivery_allowed,
+        "runtime_policy": "classify" if delivery_allowed else "review_only",
+        "missing_classes_by_split": missing_by_split,
+        "reason": (
+            "all success/pending/failed classes are represented in train, val, and test"
+            if delivery_allowed
+            else "one or more status classes are absent from train, val, or test; emit review at runtime",
+        ),
+    }
+
+
+def _status_policy_from_counts(raw_counts: object, *, source: str) -> dict[str, object]:
+    """Validate persisted status audit counts and derive their safe policy."""
+    if not isinstance(raw_counts, Mapping):
+        raise ValueError(f"{source} is missing status class audit counts")
+    counts: dict[str, dict[str, int]] = {}
+    try:
+        for split in ("train", "val", "test"):
+            raw_split = raw_counts[split]
+            if not isinstance(raw_split, Mapping):
+                raise TypeError(split)
+            counts[split] = {name: int(raw_split[name]) for name in STATUS_CLASSES}
+            if any(value < 0 for value in counts[split].values()):
+                raise ValueError(split)
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError(f"{source} has invalid status class audit counts") from error
+    return _status_head_policy(counts)
 
 
 def _payment_oov_by_split(
@@ -653,7 +765,8 @@ def _batch_loss(
     numeric_to_id: Mapping[str, int],
     payment_to_id: Mapping[str, int],
     status_to_id: Mapping[str, int],
-    status_criterion: Any,
+    status_criterion: Any | None,
+    status_enabled: bool,
     payment_loss_weight: float,
     torch: Any,
     allow_empty: bool = False,
@@ -676,13 +789,18 @@ def _batch_loss(
         character_to_id=payment_to_id,
         torch=torch,
     )
-    status_loss, status_used = _status_loss(
-        status_logits,
-        labels=[_status_name(record) for record in records],
-        status_to_id=status_to_id,
-        criterion=status_criterion,
-        torch=torch,
-    )
+    if status_enabled:
+        if status_criterion is None:
+            raise ValueError("status_criterion is required when status_enabled is true")
+        status_loss, status_used = _status_loss(
+            status_logits,
+            labels=[_status_name(record) for record in records],
+            status_to_id=status_to_id,
+            criterion=status_criterion,
+            torch=torch,
+        )
+    else:
+        status_loss, status_used = None, 0
     pieces: list[Any] = []
     if amount_loss is not None:
         pieces.append(amount_loss)
@@ -720,7 +838,8 @@ def _evaluate_model(
     payment_characters: Sequence[str],
     payment_to_id: Mapping[str, int],
     status_to_id: Mapping[str, int],
-    status_criterion: Any,
+    status_criterion: Any | None,
+    status_enabled: bool,
     payment_loss_weight: float,
     torch: Any,
 ) -> dict[str, object]:
@@ -744,6 +863,7 @@ def _evaluate_model(
                 payment_to_id=payment_to_id,
                 status_to_id=status_to_id,
                 status_criterion=status_criterion,
+                status_enabled=status_enabled,
                 payment_loss_weight=payment_loss_weight,
                 torch=torch,
                 allow_empty=True,
@@ -769,11 +889,12 @@ def _evaluate_model(
                         _slot_text(record, "payment_method_field"),
                         payment_predictions[index],
                     ),
-                    "transfer_status": (
+                }
+                if status_enabled:
+                    values["transfer_status"] = (
                         _status_name(record),
                         STATUS_CLASSES[int(status_predictions[index])],
-                    ),
-                }
+                    )
                 for field, (expected, predicted) in values.items():
                     if expected is None:
                         continue
@@ -805,6 +926,7 @@ def _evaluate_model(
             for field, counter in counters.items()
         },
         "status_non_success_to_success": int(counters["transfer_status"]["non_success_to_success"]),
+        "status_training_enabled": status_enabled,
     }
 
 
@@ -833,9 +955,10 @@ def train_unified_reader(
     """Train one shared-trunk reader and return the best validation checkpoint.
 
     The function intentionally accepts incomplete receipt rows: an absent slot
-    gets a white input image but contributes no loss.  It refuses a manifest
-    missing any *head* in train or validation, because such a pilot cannot
-    prove that the exported ONNX interface is working end to end.
+    gets a white input image but contributes no loss.  Amount, time, and
+    payment must be represented in train/validation.  A status head is trained
+    only when all three status classes are represented in both splits;
+    otherwise its final delivery policy is review-only.
     """
     config.validate()
     if epochs <= 0 or batch_size <= 0:
@@ -853,14 +976,18 @@ def train_unified_reader(
     if not train_records or not validation_records:
         raise ValueError("The unified manifest must contain non-empty train and val receipt splits")
     field_counts = _field_split_counts(records)
-    _require_train_and_validation_coverage(field_counts)
+    status_counts = _status_split_counts(records)
+    status_policy = _status_head_policy(status_counts)
+    required_fields = ["amount", "time", "payment_method_field"]
+    if bool(status_policy["training_enabled"]):
+        required_fields.append("transfer_status")
+    _require_train_and_validation_coverage(field_counts, required_fields=required_fields)
     _validate_ctc_capacity(records, config=config)
     payment_characters = _payment_charset(train_records)
     payment_to_id = {character: index for index, character in enumerate(payment_characters, start=1)}
     numeric_characters = list(NUMERIC_CHARACTERS)
     numeric_to_id = {character: index for index, character in enumerate(numeric_characters, start=1)}
     status_to_id = {name: index for index, name in enumerate(STATUS_CLASSES)}
-    status_counts = _status_split_counts(records)
     payment_oov = _payment_oov_by_split(records, payment_characters=set(payment_characters))
 
     torch, _ = _require_torch()
@@ -890,23 +1017,21 @@ def train_unified_reader(
         pin_memory=target_device.startswith("cuda"),
     )
     model = build_unified_reader(payment_vocab_size=len(payment_characters) + 1, config=config).to(target_device)
-    observed_status_classes = [name for name in STATUS_CLASSES if status_counts["train"][name] > 0]
-    total_status = sum(status_counts["train"].values())
-    status_weights = torch.tensor(
-        [
-            total_status / (len(observed_status_classes) * status_counts["train"][name])
-            if status_counts["train"][name] > 0
-            else 0.0
-            for name in STATUS_CLASSES
-        ],
-        dtype=torch.float32,
-        device=target_device,
-    )
-    status_train_criterion = torch.nn.CrossEntropyLoss(weight=status_weights)
-    # Validation must not reuse zero weights for status classes unseen in
-    # train.  Such a batch would otherwise have a zero denominator and return
-    # NaN, hiding the very coverage gap that the summary reports.
-    status_validation_criterion = torch.nn.CrossEntropyLoss()
+    if bool(status_policy["training_enabled"]):
+        total_status = sum(status_counts["train"].values())
+        status_weights = torch.tensor(
+            [total_status / (len(STATUS_CLASSES) * status_counts["train"][name]) for name in STATUS_CLASSES],
+            dtype=torch.float32,
+            device=target_device,
+        )
+        status_train_criterion: Any | None = torch.nn.CrossEntropyLoss(weight=status_weights)
+        status_validation_criterion: Any | None = torch.nn.CrossEntropyLoss()
+    else:
+        # Do not optimize an all-success status head.  Its logits are retained
+        # only to preserve the stable single-ONNX interface and must be mapped
+        # to review by delivery code.
+        status_train_criterion = None
+        status_validation_criterion = None
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -924,8 +1049,9 @@ def train_unified_reader(
     )
 
     history: list[dict[str, object]] = []
-    # Prefer a checkpoint that never maps a held-out pending/failed label to
-    # success.  Exact match and loss only break ties inside that safety rule.
+    # When the status head has full validation coverage, prefer a checkpoint
+    # that never maps pending/failed to success.  In review-only mode that
+    # metric is deliberately excluded and the three text heads choose best.
     best_score = (float("-inf"), -1.0, float("-inf"))
     best_path = output_dir / "best.pt"
     for epoch in range(1, epochs + 1):
@@ -945,6 +1071,7 @@ def train_unified_reader(
                 payment_to_id=payment_to_id,
                 status_to_id=status_to_id,
                 status_criterion=status_train_criterion,
+                status_enabled=bool(status_policy["training_enabled"]),
                 payment_loss_weight=payment_loss_weight,
                 torch=torch,
             )
@@ -963,6 +1090,7 @@ def train_unified_reader(
             payment_to_id=payment_to_id,
             status_to_id=status_to_id,
             status_criterion=status_validation_criterion,
+            status_enabled=bool(status_policy["training_enabled"]),
             payment_loss_weight=payment_loss_weight,
             torch=torch,
         )
@@ -977,7 +1105,7 @@ def train_unified_reader(
         history.append(epoch_record)
         checkpoint_payload = {
             "schema_version": SCHEMA_VERSION,
-            "kind": KIND,
+            "kind": _kind_for_config(config),
             "state_dict": model.state_dict(),
             "config": asdict(config),
             "numeric_characters": numeric_characters,
@@ -985,6 +1113,7 @@ def train_unified_reader(
             "status_classes": list(STATUS_CLASSES),
             "field_counts": field_counts,
             "status_class_counts": status_counts,
+            "status_head_policy": status_policy,
             "payment_oov_by_split": payment_oov,
             "payment_loss_weight": payment_loss_weight,
             "epoch": epoch,
@@ -992,7 +1121,9 @@ def train_unified_reader(
         }
         _write_checkpoint(output_dir / "last.pt", checkpoint_payload, torch=torch)
         score = (
-            -float(validation["status_non_success_to_success"]),
+            -float(validation["status_non_success_to_success"])
+            if bool(status_policy["training_enabled"])
+            else 0.0,
             float(validation["exact_match"]),
             -float(validation["loss"]),
         )
@@ -1003,17 +1134,15 @@ def train_unified_reader(
             output_dir / "training_summary.json",
             {
                 "schema_version": SCHEMA_VERSION,
-                "kind": KIND,
+                "kind": _kind_for_config(config),
                 "field_counts": field_counts,
                 "status_class_counts": status_counts,
+                "status_head_policy": status_policy,
                 "payment_oov_by_split": payment_oov,
-                "status_classes_missing_from_train": [
-                    name for name in STATUS_CLASSES if status_counts["train"][name] == 0
-                ],
                 "records": history,
                 "warning": (
-                    "Paddle teacher labels are not independent truth. A model with any status class missing from "
-                    "the train split must not be used to accept that unseen class in production."
+                    "Paddle teacher labels are not independent truth. When status_head_policy.runtime_policy is "
+                    "review_only, status logits are not a delivery decision and runtime must emit review."
                 ),
             },
         )
@@ -1031,17 +1160,26 @@ def _load_checkpoint(path: Path, *, torch: Any) -> Mapping[str, object]:
         payload = torch.load(path, map_location="cpu")
     if not isinstance(payload, Mapping):
         raise ValueError("Unified OCR checkpoint must be a mapping")
-    if payload.get("schema_version") != SCHEMA_VERSION or payload.get("kind") != KIND:
+    if payload.get("schema_version") != SCHEMA_VERSION or payload.get("kind") not in SUPPORTED_KINDS:
         raise ValueError("Unsupported unified OCR checkpoint schema")
     return payload
 
 
-def _checkpoint_config(payload: Mapping[str, object]) -> UnifiedReaderConfig:
-    raw = payload.get("config")
-    if not isinstance(raw, Mapping):
-        raise ValueError("Unified OCR checkpoint has no model config")
+def _config_from_mapping(
+    raw: Mapping[str, object], *, artifact_kind: object, source: str
+) -> UnifiedReaderConfig:
+    """Read a config while treating pre-v4 artifacts as explicit v3.
+
+    Old v3 artifacts predate ``architecture_version``.  Its absence is only
+    valid when the kind itself says v3; this avoids accidentally loading a v3
+    state dict into the v4 decoder topology.
+    """
+    inferred_architecture = _architecture_for_kind(artifact_kind)
+    raw_architecture = raw.get("architecture_version", inferred_architecture)
     try:
+        architecture_version = int(raw_architecture)
         config = UnifiedReaderConfig(
+            architecture_version=architecture_version,
             image_height=int(raw["image_height"]),
             image_width=int(raw["image_width"]),
             base_channels=int(raw["base_channels"]),
@@ -1050,9 +1188,20 @@ def _checkpoint_config(payload: Mapping[str, object]) -> UnifiedReaderConfig:
             pooled_width=int(raw["pooled_width"]),
         )
     except (KeyError, TypeError, ValueError) as error:
-        raise ValueError("Unified OCR checkpoint has an invalid model config") from error
+        raise ValueError(f"{source} has an invalid model config") from error
     config.validate()
+    if _kind_for_config(config) != artifact_kind:
+        raise ValueError(
+            f"{source} architecture v{config.architecture_version} does not match artifact kind {artifact_kind!r}"
+        )
     return config
+
+
+def _checkpoint_config(payload: Mapping[str, object]) -> UnifiedReaderConfig:
+    raw = payload.get("config")
+    if not isinstance(raw, Mapping):
+        raise ValueError("Unified OCR checkpoint has no model config")
+    return _config_from_mapping(raw, artifact_kind=payload.get("kind"), source="Unified OCR checkpoint")
 
 
 def _checkpoint_labels(payload: Mapping[str, object]) -> tuple[list[str], list[str], list[str]]:
@@ -1144,6 +1293,7 @@ def export_unified_onnx(*, checkpoint_path: Path, output_path: Path) -> tuple[Pa
     status_counts = payload.get("status_class_counts")
     if not isinstance(state_dict, Mapping) or not isinstance(field_counts, Mapping) or not isinstance(status_counts, Mapping):
         raise ValueError("Unified OCR checkpoint is missing state_dict or audit counts")
+    status_policy = _status_policy_from_counts(status_counts, source="Unified OCR checkpoint")
     model = build_unified_reader(payment_vocab_size=len(payment_characters) + 1, config=config)
     model.load_state_dict(state_dict)
     model.eval()
@@ -1210,7 +1360,7 @@ def export_unified_onnx(*, checkpoint_path: Path, output_path: Path) -> tuple[Pa
         contract_path,
         {
             "schema_version": SCHEMA_VERSION,
-            "kind": KIND,
+            "kind": _kind_for_config(config),
             "onnx_file": output_path.name,
             "onnx_sha256": _sha256(output_path),
             "labels_file": labels_path.name,
@@ -1219,6 +1369,7 @@ def export_unified_onnx(*, checkpoint_path: Path, output_path: Path) -> tuple[Pa
             "status_classes": status_classes,
             "training_field_counts": field_counts,
             "training_status_class_counts": status_counts,
+            "status_head_policy": status_policy,
             "input": {
                 "name": "field_images",
                 "dtype": "float32",
@@ -1253,6 +1404,8 @@ def export_unified_onnx(*, checkpoint_path: Path, output_path: Path) -> tuple[Pa
                     "shape": list(status_logits.shape),
                     "layout": "[class]",
                     "classes": "status_classes",
+                    "runtime_policy": status_policy["runtime_policy"],
+                    "review_value": "review" if status_policy["runtime_policy"] == "review_only" else None,
                 },
             },
             "model": asdict(config),
@@ -1283,7 +1436,7 @@ def _load_onnx_artifacts(model_path: Path) -> tuple[UnifiedReaderConfig, list[st
     contract_path = model_path.with_suffix(".contract.json")
     labels = _load_json_object(labels_path)
     contract = _load_json_object(contract_path)
-    if contract.get("schema_version") != SCHEMA_VERSION or contract.get("kind") != KIND:
+    if contract.get("schema_version") != SCHEMA_VERSION or contract.get("kind") not in SUPPORTED_KINDS:
         raise ValueError("Unified OCR ONNX contract kind/schema is unsupported")
     if contract.get("onnx_sha256") != _sha256(model_path):
         raise ValueError("Unified OCR ONNX SHA-256 does not match its contract")
@@ -1294,18 +1447,11 @@ def _load_onnx_artifacts(model_path: Path) -> tuple[UnifiedReaderConfig, list[st
     raw_config = contract.get("model")
     if not isinstance(raw_config, Mapping):
         raise ValueError("Unified OCR ONNX contract has no model config")
-    try:
-        config = UnifiedReaderConfig(
-            image_height=int(raw_config["image_height"]),
-            image_width=int(raw_config["image_width"]),
-            base_channels=int(raw_config["base_channels"]),
-            numeric_hidden_size=int(raw_config["numeric_hidden_size"]),
-            payment_hidden_size=int(raw_config["payment_hidden_size"]),
-            pooled_width=int(raw_config["pooled_width"]),
-        )
-    except (KeyError, TypeError, ValueError) as error:
-        raise ValueError("Unified OCR ONNX contract model config is invalid") from error
-    config.validate()
+    config = _config_from_mapping(
+        raw_config,
+        artifact_kind=contract.get("kind"),
+        source="Unified OCR ONNX contract",
+    )
     numeric = labels.get("numeric_characters")
     payment = labels.get("payment_characters")
     status = labels.get("status_classes")
@@ -1325,6 +1471,9 @@ def _load_onnx_artifacts(model_path: Path) -> tuple[UnifiedReaderConfig, list[st
         raise ValueError("Unified OCR ONNX payment charset SHA-256 is invalid")
     if status != list(STATUS_CLASSES):
         raise ValueError("Unified OCR ONNX status class order is unsupported")
+    # v3 did not record a policy; the helper derives a conservative fallback
+    # from its audit counts instead of trusting raw logits.
+    status_policy = _contract_status_policy(contract)
     raw_input = contract.get("input")
     outputs = contract.get("outputs")
     if not isinstance(raw_input, Mapping) or not isinstance(outputs, Mapping):
@@ -1348,7 +1497,46 @@ def _load_onnx_artifacts(model_path: Path) -> tuple[UnifiedReaderConfig, list[st
             raise ValueError(f"Unified OCR ONNX output {name!r} has an invalid static shape")
         if name != "status_logits" and output.get("blank_index") != NUMERIC_BLANK_INDEX:
             raise ValueError(f"Unified OCR ONNX output {name!r} has an invalid CTC blank index")
+    status_output = outputs["status_logits"]
+    if contract.get("kind") == KIND_V4:
+        if status_output.get("runtime_policy") != status_policy["runtime_policy"]:
+            raise ValueError("Unified OCR ONNX status output policy differs from status_head_policy")
+        expected_review = "review" if status_policy["runtime_policy"] == "review_only" else None
+        if status_output.get("review_value") != expected_review:
+            raise ValueError("Unified OCR ONNX status output review value is invalid")
     return config, list(payment), contract
+
+
+def _contract_status_policy(contract: Mapping[str, Any]) -> dict[str, object]:
+    """Return an explicit status policy, including conservative v3 fallback."""
+    raw_policy = contract.get("status_head_policy")
+    if raw_policy is None:
+        return _status_policy_from_counts(
+            contract.get("training_status_class_counts"),
+            source="Unified OCR ONNX contract",
+        )
+    if not isinstance(raw_policy, Mapping):
+        raise ValueError("Unified OCR ONNX status_head_policy is invalid")
+    derived = _status_policy_from_counts(
+        contract.get("training_status_class_counts"),
+        source="Unified OCR ONNX contract",
+    )
+    # Counts, rather than a manually edited string in a sidecar, determine
+    # whether a decision may be delivered.  A stale policy can only make the
+    # artifact stricter, never promote it to classify.
+    requested_policy = raw_policy.get("runtime_policy")
+    if requested_policy not in {"classify", "review_only"}:
+        raise ValueError("Unified OCR ONNX status_head_policy runtime_policy is invalid")
+    if requested_policy == "classify" and derived["runtime_policy"] != "classify":
+        raise ValueError("Unified OCR ONNX status_head_policy overstates status class coverage")
+    if requested_policy == "review_only":
+        derived = dict(derived)
+        derived["delivery_allowed"] = False
+        derived["runtime_policy"] = "review_only"
+        reason = raw_policy.get("reason")
+        if isinstance(reason, str) and reason:
+            derived["reason"] = reason
+    return derived
 
 
 def _create_onnx_session(onnxruntime: Any, model_path: Path, *, device: str) -> tuple[Any, list[str]]:
@@ -1476,6 +1664,13 @@ def _finite_probability(value: float | None, *, name: str) -> float | None:
     return value
 
 
+def _format_exact_match(value: object) -> str:
+    """Format optional held-out metrics without treating no labels as zero."""
+    if isinstance(value, (int, float)) and math.isfinite(float(value)):
+        return f"{float(value):.2%}"
+    return "n/a"
+
+
 def _unified_acceptance_failures(
     metrics: Mapping[str, Mapping[str, object]],
     *,
@@ -1494,8 +1689,13 @@ def _unified_acceptance_failures(
         "transfer_status": min_status_exact_match,
     }
     for field, threshold in desired.items():
-        if threshold is not None and float(metrics[field]["raw_exact_match"]) < threshold:
-            failures.append(f"{field}: raw_exact_match={float(metrics[field]['raw_exact_match']):.4f} < {threshold:.4f}")
+        if threshold is None:
+            continue
+        observed = metrics[field]["raw_exact_match"]
+        if observed is None:
+            failures.append(f"{field}: no held-out reference labels remain for the requested acceptance gate")
+        elif float(observed) < threshold:
+            failures.append(f"{field}: raw_exact_match={float(observed):.4f} < {threshold:.4f}")
     if max_payment_oov_rate is not None and float(metrics["payment_method_field"]["oov_reference_rate"]) > max_payment_oov_rate:
         failures.append(
             "payment_method_field: "
@@ -1542,12 +1742,17 @@ def evaluate_unified_onnx(
     output_dir = output_dir.resolve()
     if output_dir.exists() and any(output_dir.iterdir()):
         raise ValueError(f"evaluation output already contains files: {output_dir}. Choose a new empty directory.")
-    config, payment_characters, _contract = _load_onnx_artifacts(model_path)
+    config, payment_characters, contract = _load_onnx_artifacts(model_path)
+    status_policy = _contract_status_policy(contract)
+    status_delivery_allowed = status_policy["runtime_policy"] == "classify"
     records = load_records(records_path, dataset_root=dataset_root)
     evaluation_records = [record for record in records if record["split"] == split]
     if not evaluation_records:
         raise ValueError(f"No {split} receipt records found")
-    for field in SLOT_ORDER:
+    required_evaluation_fields = ["amount", "time", "payment_method_field"]
+    if status_delivery_allowed or min_status_exact_match is not None or max_non_success_to_success is not None:
+        required_evaluation_fields.append("transfer_status")
+    for field in required_evaluation_fields:
         if not any(
             (_status_name(record) if field == "transfer_status" else _slot_text(record, field)) is not None
             for record in evaluation_records
@@ -1603,11 +1808,14 @@ def evaluate_unified_onnx(
         time_text, time_confidence = _ctc_single_output(time_logits, characters=NUMERIC_CHARACTERS)
         payment_text, payment_confidence = _ctc_single_output(payment_logits, characters=payment_characters)
         status_index, status_confidence = _softmax_confidence(status_logits)
+        raw_status_text = STATUS_CLASSES[status_index]
         predictions: dict[str, tuple[str, float]] = {
             "amount": (amount_text, amount_confidence),
             "time": (time_text, time_confidence),
             "payment_method_field": (payment_text, payment_confidence),
-            "transfer_status": (STATUS_CLASSES[status_index], status_confidence),
+            # A status head with incomplete classes must never become a
+            # business decision, even if its raw argmax says success.
+            "transfer_status": (raw_status_text if status_delivery_allowed else "review", status_confidence),
         }
         for field in SLOT_ORDER:
             slot = dict(record["slots"]).get(field)
@@ -1644,7 +1852,9 @@ def evaluate_unified_onnx(
                     "paddle_text": slot.get("paddle_text"),
                     "reference_text": reference_text,
                     "candidate_text": candidate_text,
+                    "raw_model_candidate_text": raw_status_text if field == "transfer_status" else None,
                     "confidence": round(confidence, 6),
+                    "runtime_policy": status_policy["runtime_policy"] if field == "transfer_status" else "decode",
                     "raw_exact": raw_exact,
                     "reference_semantic": reference_semantic,
                     "candidate_semantic": candidate_semantic,
@@ -1671,6 +1881,14 @@ def evaluate_unified_onnx(
         max_payment_oov_rate=max_payment_oov_rate,
         max_non_success_to_success=max_non_success_to_success,
     )
+    if (
+        (min_status_exact_match is not None or max_non_success_to_success is not None)
+        and not status_delivery_allowed
+    ):
+        failures.append(
+            "transfer_status: acceptance was requested, but the artifact is review_only because its status "
+            "class coverage is incomplete"
+        )
     acceptance_requested = any(
         value is not None
         for value in (
@@ -1700,6 +1918,7 @@ def evaluate_unified_onnx(
         "status_reference_class_counts": {
             class_name: int(status_reference_counts[class_name]) for class_name in STATUS_CLASSES
         },
+        "status_head_policy": status_policy,
         "receipt_latency_ms": _latency_metrics(receipt_latencies),
         "acceptance": {
             "min_amount_exact_match": min_amount_exact_match,
@@ -1750,7 +1969,13 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--learning-rate", type=float, default=1e-3)
     train.add_argument("--weight-decay", type=float, default=1e-4)
     train.add_argument("--payment-loss-weight", type=float, default=1.0)
-    train.add_argument("--image-height", type=int, default=48)
+    train.add_argument(
+        "--architecture",
+        choices=("v3", "v4"),
+        default="v4",
+        help="v4 is the recommended 64px, independent amount/time decoder; v3 is checkpoint-compatible only",
+    )
+    train.add_argument("--image-height", type=int, default=64)
     train.add_argument("--image-width", type=int, default=384)
     train.add_argument("--base-channels", type=int, default=24)
     train.add_argument("--numeric-hidden-size", type=int, default=64)
@@ -1794,6 +2019,7 @@ def main(argv: list[str] | None = None) -> None:
     try:
         if args.command == "train":
             config = UnifiedReaderConfig(
+                architecture_version=int(args.architecture.removeprefix("v")),
                 image_height=args.image_height,
                 image_width=args.image_width,
                 base_channels=args.base_channels,
@@ -1846,12 +2072,18 @@ def main(argv: list[str] | None = None) -> None:
                 max_non_success_to_success=args.max_non_success_to_success,
             )
             metrics = summary["by_field"]
+            status_policy = summary.get("status_head_policy")
+            status_display = (
+                "review_only"
+                if isinstance(status_policy, Mapping) and status_policy.get("runtime_policy") == "review_only"
+                else _format_exact_match(metrics["transfer_status"]["raw_exact_match"])
+            )
             print(
                 f"Wrote unified ONNX evaluation to {args.output} "
-                f"(amount={float(metrics['amount']['raw_exact_match']):.2%}, "
-                f"time={float(metrics['time']['raw_exact_match']):.2%}, "
-                f"payment={float(metrics['payment_method_field']['raw_exact_match']):.2%}, "
-                f"status={float(metrics['transfer_status']['raw_exact_match']):.2%})"
+                f"(amount={_format_exact_match(metrics['amount']['raw_exact_match'])}, "
+                f"time={_format_exact_match(metrics['time']['raw_exact_match'])}, "
+                f"payment={_format_exact_match(metrics['payment_method_field']['raw_exact_match'])}, "
+                f"status={status_display})"
             )
             if failures:
                 raise SystemExit("Unified OCR candidate did not meet the requested acceptance gate:\n- " + "\n- ".join(failures))
