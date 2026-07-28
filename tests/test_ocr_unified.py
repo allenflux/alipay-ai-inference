@@ -9,11 +9,16 @@ from PIL import Image
 
 torch = pytest.importorskip("torch")
 
+import transfer_receipt_ai.ocr_unified as ocr_unified
+
 from transfer_receipt_ai.ocr_unified import (
     KIND_V3,
     KIND_V5,
     KIND_V6,
     KIND_V7,
+    ONNX_EXPORT_ATOL,
+    ONNX_EXPORT_PAYMENT_LOGITS_ATOL,
+    ONNX_EXPORT_RTOL,
     PAYMENT_BANK_OTHER_CLASS,
     V6_AMOUNT_CHARACTERS,
     V6_ONNX_OUTPUT_NAMES,
@@ -24,6 +29,7 @@ from transfer_receipt_ai.ocr_unified import (
     _delivery_text,
     _format_exact_match,
     _load_onnx_artifacts,
+    _onnx_export_atol,
     _amount_v6_structured_target,
     _select_report_candidates,
     _structured_amount_predictions,
@@ -33,6 +39,7 @@ from transfer_receipt_ai.ocr_unified import (
     _structured_time_predictions,
     _structured_time_v6_predictions,
     _time_v6_structured_target,
+    _validate_exported_onnx,
     build_unified_reader,
     decode_ctc_logits,
     evaluate_unified_onnx,
@@ -377,6 +384,60 @@ def test_v7_checkpoint_config_has_its_own_kind_and_does_not_relabel_v6() -> None
 def test_optional_exact_metric_formats_as_na_without_status_labels() -> None:
     assert _format_exact_match(None) == "n/a"
     assert _format_exact_match(0.5) == "50.00%"
+
+
+def test_payment_onnx_export_tolerance_allows_bounded_gru_drift_without_argmax_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Permit bounded payment-GRU round-off, never a changed greedy decision."""
+    expected = np.asarray([[0.0, 0.5, -0.4]], dtype=np.float32)
+    actual = expected.copy()
+    actual[0, 0] += np.float32(0.001765964)
+    assert np.argmax(actual, axis=-1).tolist() == np.argmax(expected, axis=-1).tolist()
+    assert not np.allclose(actual, expected, rtol=ONNX_EXPORT_RTOL, atol=ONNX_EXPORT_ATOL)
+    assert np.allclose(actual, expected, rtol=ONNX_EXPORT_RTOL, atol=ONNX_EXPORT_PAYMENT_LOGITS_ATOL)
+    assert _onnx_export_atol("payment_logits") == ONNX_EXPORT_PAYMENT_LOGITS_ATOL
+    assert _onnx_export_atol("time_logits") == ONNX_EXPORT_ATOL
+
+    def validate(output_name: str, runtime_output: np.ndarray, torch_output: np.ndarray) -> None:
+        class NamedItem:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+        class FakeSession:
+            def get_inputs(self) -> list[NamedItem]:
+                return [NamedItem("field_images")]
+
+            def get_outputs(self) -> list[NamedItem]:
+                return [NamedItem(output_name)]
+
+            def run(self, names: list[str], feed: dict[str, np.ndarray]) -> list[np.ndarray]:
+                assert names == [output_name]
+                assert list(feed) == ["field_images"]
+                return [runtime_output]
+
+        class FakeOnnxRuntime:
+            def InferenceSession(self, path: str, providers: list[str]) -> FakeSession:
+                assert providers == ["CPUExecutionProvider"]
+                return FakeSession()
+
+        monkeypatch.setattr(ocr_unified, "_require_onnxruntime", lambda: FakeOnnxRuntime())
+        _validate_exported_onnx(
+            Path("ignored.onnx"),
+            dummy=torch.zeros((1, 4), dtype=torch.float32),
+            output_names=[output_name],
+            expected_outputs=[torch.as_tensor(torch_output)],
+        )
+
+    validate("payment_logits", actual, expected)
+
+    changed_decision = np.asarray([[0.0018, 0.0005]], dtype=np.float32)
+    expected_decision = np.asarray([[0.0, 0.0005]], dtype=np.float32)
+    with pytest.raises(ValueError, match=r"argmax_mismatches=1/1"):
+        validate("payment_logits", changed_decision, expected_decision)
+
+    with pytest.raises(ValueError, match=r"amount_logits.*atol=0.001"):
+        validate("amount_logits", actual, expected)
 
 
 def test_unified_ctc_decoder_collapses_repeats_and_blanks() -> None:
