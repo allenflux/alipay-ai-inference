@@ -37,6 +37,7 @@ from transfer_receipt_ai.ocr_unified import (
     _select_report_candidates,
     _structured_amount_predictions,
     _structured_amount_v6_predictions,
+    _structured_amount_v8_predictions,
     _structured_payment_predictions,
     _structured_payment_v6_predictions,
     _structured_time_predictions,
@@ -649,6 +650,96 @@ def test_v8_report_candidate_applies_only_a_safe_amount_format_and_time_template
     assert selected["amount"] == ("¥1,234.56", 0.99)
     assert selected["time"] == ("02:40", 0.99)
     assert selected["payment_method_field"] == ("建设银行储蓄卡（3667）", 0.93)
+
+
+def test_v8_positive_amount_does_not_gate_on_irrelevant_sign_confidence() -> None:
+    """A positive canonical amount has no sign placement to decide.
+
+    Low confidence in the unused negative-sign classes must not discard an
+    otherwise safe visible-CNY rendering.  The currency decision remains
+    explicit and high-confidence here.
+    """
+    rendered = _structured_amount_v8_predictions(
+        [("99.99", 0.99)],
+        np.asarray([[-9.0, 9.0, -9.0, -9.0, -9.0]], dtype=np.float32),  # ¥
+        np.asarray([[9.0, -9.0]], dtype=np.float32),  # ungrouped
+        np.asarray([[0.0, 0.0, 0.0]], dtype=np.float32),  # irrelevant for a positive value
+        min_confidence=0.90,
+    )
+    assert rendered == [("¥99.99", 0.99)]
+
+
+def test_v8_sub_thousand_amount_does_not_gate_on_irrelevant_grouping_confidence() -> None:
+    """Grouping cannot change a <1000 integer, so it is not a safety gate."""
+    rendered = _structured_amount_v8_predictions(
+        [("99.99", 0.99)],
+        np.asarray([[-9.0, 9.0, -9.0, -9.0, -9.0]], dtype=np.float32),  # ¥
+        np.asarray([[0.0, 0.0]], dtype=np.float32),  # irrelevant for a two-digit integer
+        np.asarray([[9.0, -9.0, -9.0]], dtype=np.float32),  # no sign
+        min_confidence=0.90,
+    )
+    assert rendered == [("¥99.99", 0.99)]
+
+
+def test_v8_bare_negative_amount_does_not_gate_on_irrelevant_sign_position_confidence() -> None:
+    """A bare negative can only render with its leading minus already in CTC."""
+    rendered = _structured_amount_v8_predictions(
+        [("-99.99", 0.99)],
+        np.asarray([[9.0, -9.0, -9.0, -9.0, -9.0]], dtype=np.float32),  # no currency
+        np.asarray([[9.0, -9.0]], dtype=np.float32),
+        np.asarray([[0.0, 0.0, 0.0]], dtype=np.float32),  # no visible choice without currency
+        min_confidence=0.90,
+    )
+    assert rendered == [("-99.99", 0.99)]
+
+
+def test_v8_amount_keeps_currency_style_as_a_required_confidence_gate() -> None:
+    """The visible currency symbol can change, so a low-confidence vote stays review-only."""
+    rendered = _structured_amount_v8_predictions(
+        [("99.99", 0.99)],
+        np.asarray([[0.0, 0.0, 0.0, 0.0, 0.0]], dtype=np.float32),  # no style reaches 0.90
+        np.asarray([[9.0, -9.0]], dtype=np.float32),
+        np.asarray([[9.0, -9.0, -9.0]], dtype=np.float32),
+        min_confidence=0.90,
+    )
+    assert rendered == [(None, 0.0)]
+
+
+@pytest.mark.parametrize(
+    ("canonical", "currency_logits", "grouping_logits", "sign_logits"),
+    (
+        # A negative amount needs its sign position.  Its argmax is correct,
+        # but the confidence is intentionally below the delivery threshold.
+        (
+            "-99.99",
+            [[-9.0, 9.0, -9.0, -9.0, -9.0]],
+            [[9.0, -9.0]],
+            [[0.0, 0.1, 0.0]],
+        ),
+        # A four-digit amount needs an explicit grouping decision.  Its
+        # ungrouped argmax is correct but deliberately not confident enough.
+        (
+            "1234.56",
+            [[-9.0, 9.0, -9.0, -9.0, -9.0]],
+            [[0.1, 0.0]],
+            [[9.0, -9.0, -9.0]],
+        ),
+    ),
+)
+def test_v8_amount_keeps_relevant_sign_and_grouping_as_confidence_gates(
+    canonical: str,
+    currency_logits: list[list[float]],
+    grouping_logits: list[list[float]],
+    sign_logits: list[list[float]],
+) -> None:
+    rendered = _structured_amount_v8_predictions(
+        [(canonical, 0.99)],
+        np.asarray(currency_logits, dtype=np.float32),
+        np.asarray(grouping_logits, dtype=np.float32),
+        np.asarray(sign_logits, dtype=np.float32),
+        min_confidence=0.90,
+    )
+    assert rendered == [(None, 0.0)]
 
 
 def test_v5_right_aligned_preprocess_has_a_distinct_fixed_position_from_legacy_center(tmp_path: Path) -> None:

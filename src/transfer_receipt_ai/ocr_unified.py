@@ -1466,8 +1466,13 @@ def _structured_amount_v8_predictions(
     """Render v8 display grammar only when it preserves CTC's digits.
 
     The finite heads are never a second number recogniser. A malformed CTC
-    value, an inconsistent sign style, or any low-confidence format component
-    produces ``None`` so callers retain the canonical raw CTC diagnostic.
+    value or a low-confidence *relevant* format component produces ``None``
+    so callers retain the canonical raw CTC diagnostic.  A component that
+    cannot change the rendered text must not block that diagnostic candidate:
+    positive values always have no sign, and grouping a sub-1000 integer is
+    visually identical to leaving it ungrouped.  Requiring confidence from
+    those irrelevant classifiers was an accidental all-three gate that
+    rejected otherwise safe visible renderings.
     """
     if not 0.0 <= min_confidence <= 1.0:
         raise ValueError("amount v8 format confidence must be between 0 and 1")
@@ -1490,19 +1495,48 @@ def _structured_amount_v8_predictions(
         ):
             output.append((None, 0.0))
             continue
-        component_confidence = min(
-            float(currency_confidence[index]),
-            float(grouping_confidence[index]),
-            float(sign_confidence[index]),
+        integer = parsed.get("integer_digits")
+        negative = parsed.get("sign") == "negative"
+        if not isinstance(integer, str) or not integer.isascii() or not integer.isdigit():
+            output.append((None, 0.0))
+            continue
+
+        # Currency is always visible-or-absent, so it always matters.  A
+        # sign choice matters only for a negative canonical number; for a
+        # positive one, force the grammar-safe "none" state instead of
+        # allowing an irrelevant uncertain sign head to suppress output.  A
+        # comma can only become visible for four or more integer digits.
+        currency_style = AMOUNT_CURRENCY_STYLE_CLASSES[int(currencies[index])]
+        grouped_thousands = (
+            AMOUNT_GROUPED_THOUSANDS_CLASSES[int(groupings[index])]
+            if len(integer) >= 4
+            else "ungrouped"
         )
+        # A bare negative amount has only one grammar-safe representation
+        # (``-123.45``), so the sign-position classifier cannot add useful
+        # information there either.  It is needed only to distinguish
+        # ``-¥123.45`` from ``¥-123.45``.
+        sign_position = (
+            AMOUNT_SIGN_POSITION_CLASSES[int(signs[index])]
+            if negative and currency_style != "none"
+            else "before_currency_or_number"
+            if negative
+            else "none"
+        )
+        relevant_confidences = [float(currency_confidence[index])]
+        if len(integer) >= 4:
+            relevant_confidences.append(float(grouping_confidence[index]))
+        if negative and currency_style != "none":
+            relevant_confidences.append(float(sign_confidence[index]))
+        component_confidence = min(relevant_confidences)
         if component_confidence < min_confidence:
             output.append((None, 0.0))
             continue
         candidate = render_amount_visible_format(
             canonical,
-            currency_style=AMOUNT_CURRENCY_STYLE_CLASSES[int(currencies[index])],
-            grouped_thousands=AMOUNT_GROUPED_THOUSANDS_CLASSES[int(groupings[index])],
-            sign_position=AMOUNT_SIGN_POSITION_CLASSES[int(signs[index])],
+            currency_style=currency_style,
+            grouped_thousands=grouped_thousands,
+            sign_position=sign_position,
         )
         if candidate is None:
             output.append((None, 0.0))
