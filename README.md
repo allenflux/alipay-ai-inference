@@ -451,40 +451,42 @@ python -m transfer_receipt_ai.ocr_evaluate `
 测试字符、训练中见过/未见过的文本，以及 ONNX 实际 provider 和延迟。这个比较证明的是“对保留的
 Paddle 输出的一致性”；要证明真实业务准确率仍需一批人工标注的独立回单。
 
-## 单模型轻量字段识别 v7（当前实验路线；v3–v6 只保留兼容）
+## 单模型轻量字段识别 v8（当前实验路线；v3–v7 只保留兼容）
 
 最终交付目标不是四个小模型，而是 **一个 OCR ONNX、一个 ONNX Runtime Session、每张回单一次 `Run`**。
 检测器 `receipt_lrcnn_v1.onnx` 和设备识别器仍是独立模型；本节只替代字段 OCR。
 
 v4/v5 的 1 万张试验已经证明：把金额、时间和卡尾号都当作普通整行 CTC 不够安全。例如 CTC 可以把
-`900.00` 识别成 `300.00`，同时给出很高的 token confidence。v7 保留 CTC 作为教师一致性候选，
-但把业务讨论中的三项规则写进**同一张 ONNX 图**的独立轻量校验头：金额的 `¥`、千分位逗号和负号；
-时间的 `-` 与空格日期模板；付款方式的有限银行前缀分类 + 四位卡尾号。
+`900.00` 识别成 `300.00`，同时给出很高的 token confidence。v8 保留 CTC 作为教师一致性候选，
+并把金额显示样式、时间模板和付款方式银行规则写进**同一张 ONNX 图**的轻量有限分类头。金额数字仍完全由
+CTC 决定；样式头只能在高置信时恢复 `¥`、千分位逗号和负号，绝不能编造或改写数字。
 
 ```text
 field_images [4,1,80,512]
   0=amount / 1=time / 2=transfer_status / 3=payment_method_field
         ↓
 共享轻量 CNN 主干 + 每字段轻量 CTC / 校验 GRU
-  ├─ amount: 可见 CTC（¥、￥、,、-）+ 符号/整数长度/固定数字位
+  ├─ amount: 规范金额 CTC（例如 -1234.56）+ 货币/千分位/负号位置三项有限样式头
   ├─ time: 可见 CTC（:、-、空格）+ 时钟/日期时间模板与固定数字位
   ├─ payment: 原文 CTC + 银行前缀分类 + 四位卡尾/括号样式
   └─ transfer_status: 三分类（类别覆盖不完整时固定为 review）
 ```
 
-它仍是一个模型文件、一个输入和一次推理；v7 保持 v6 的 14 个输出节点，其中前四个保持 CTC/status 诊断兼容，
-后十个是同一图内的格式/银行校验头，不是额外模型或额外 Session。金额、时间和付款方式裁图在 v7 统一
-右对齐白底 letterbox；交付端必须严格复用 sidecar contract 的 `[4,1,H,W]` slot 顺序和预处理。
+它仍是一个模型文件、一个输入和一次推理；v8 保持 14 个输出节点：前四个为 CTC/status，后十个为同一图内的
+金额样式、时间和付款方式辅助头，不是额外模型或额外 Session。金额、时间和付款方式裁图在 v8 统一右对齐
+白底 letterbox；交付端必须严格复用 sidecar contract 的 `[4,1,H,W]` slot 顺序和预处理。
 
-v7 的时间格式头直接复用时间 CTC 的 GRU 状态：逐字符 CTC 损失会同时训练数字与 `:`/`-`/空格等细小符号，
-避免 v6 中独立格式分支在右对齐空白前缀下学不到冒号的问题。旧 v6 checkpoint 仍按原路径加载和导出，不会
-被新代码改写。
+v8 的时间格式头直接复用时间 CTC 的 GRU 状态：逐字符 CTC 损失会同时训练数字与 `:`/`-`/空格等细小符号，
+避免 v6 中独立格式分支在右对齐空白前缀下学不到冒号的问题。金额显示头同样复用金额 CTC 的状态；任一样式
+头低于 `--amount-format-min-confidence` 时，运行时只保留规范 CTC 候选。旧 v3–v7 checkpoint 仍按原路径
+加载和导出，不会被新代码改写。
 
-v7 的文本字段目前仍是**固定 review-only**：可见 CTC 与格式/银行校验头即使渲染出相同可见文本，也只作为
+v8 的文本字段目前仍是**固定 review-only**：CTC 与格式/银行校验头即使渲染出相同可见文本，也只作为
 诊断候选，不会自动交付。训练标签仍来自同一 Paddle 伪标签；二者
 不一致、金额不符合严格 CNY 格式、时间不符合已知时钟/日期模板、或银行前缀为 `__other__` 时都必须返回
-`review`。CTC 和结构化候选会写进评估报告；v6/v7 的时间主候选优先使用有效的结构化模板，例如原始 CTC
-`0240` 会显示为 `02:40`，但原始 CTC 仍保留在 JSON 中供诊断。这只改变评估报告的候选展示，不改变任何
+`review`。CTC 和结构化候选会写进评估报告；v6/v7/v8 的时间主候选优先使用有效的结构化模板，例如原始 CTC
+`0240` 会显示为 `02:40`，但原始 CTC 仍保留在 JSON 中供诊断。v8 的金额主候选也只会用高置信样式渲染
+规范 CTC 数字。这只改变评估报告的候选展示，不改变任何
 已生成 ONNX 的权重、输入或输出协议。只有在按回单分组隔离的人工真值集上
 证明“零错误放行 + 非零覆盖率”后，才可以把文本改为自动交付。
 
@@ -497,8 +499,8 @@ v5 有意不包含自由中文 `recipient_field`：此前小识别器的收款�
 原文，需要独立宽字符模型和更多人工真值。付款方式仍以画面可见的原文训练，例如
 `建设银行储蓄卡（3667）`；不能把 `bank_card` / `balance` 这类归一化类别当成原文 OCR 标签。
 
-已生成的 v3–v6 checkpoint、ONNX 和 sidecar 仍可被 `export`、`evaluate` 加载，便于历史回归；但不能与
-v7 sidecar 或权重混用。新的训练一律显式使用 `--architecture v7`。
+已生成的 v3–v7 checkpoint、ONNX 和 sidecar 仍可被 `export`、`evaluate` 加载，便于历史回归；但不能与
+v8 sidecar 或权重混用。新的训练一律显式使用 `--architecture v8`。
 
 ### 1. 将已经生成的 Paddle 教师标签聚合为“一张回单一行” manifest
 
@@ -516,13 +518,13 @@ python -m transfer_receipt_ai.ocr_unified_dataset `
 ```
 
 成功后查看 `$unifiedManifest\dataset.contract.json`。除四个 slot 的 train/val/test 数量、完整回单数和
-冲突裁图数外，v7 还会写出 `structured_target_counts`：旧兼容目标以及 `amount_display`、`time_display`、
+冲突裁图数外，manifest 还会写出 `structured_target_counts`：旧兼容目标以及 `amount_display`、`time_display`、
 `payment_bank_prefix` 和各自未解析数量。训练器会再次检查 train/val 中是否同时有严格可见金额、严格可见时间
 和精确银行前缀；缺任何一种会拒绝训练，而不是静默降级成旧 CTC。
 
-当前 1 万张教师集适合做 v7 的第一轮 A/B。若时间、金额和付款方式的教师一致性都改善，再按同一套命令扩展
-到 12 万张 Paddle 教师样本；整个蒸馏循环不需要人工标注。它仍是 Paddle 伪标签，不能把 teacher-parity
-当作人工业务真值。
+现有的 v7 manifest 已经包含 v8 所需的 `visible_text` 与规范金额信息，因此升级 v8 **不需要重新运行 Paddle、
+不需要重新裁图，也不需要人工标注**：直接用既有 `unified_fields.jsonl` 训练即可。整个蒸馏循环仍是 Paddle
+伪标签，不能把 teacher-parity 当作人工业务真值。
 
 ### 2. 训练并直接导出一个 ONNX
 
@@ -533,15 +535,15 @@ python -m transfer_receipt_ai.ocr_unified_dataset `
 Torch/ORT 输出对齐验证。
 
 ```powershell
-$unifiedRun = "$outputRoot\unified-run-v7"
-$unifiedModel = "$outputRoot\models\receipt_unified_field_reader_v7_10k.onnx"
+$unifiedRun = "$outputRoot\unified-run-v8"
+$unifiedModel = "$outputRoot\models\receipt_unified_field_reader_v8_120k.onnx"
 
 python -m transfer_receipt_ai.ocr_unified train `
   --records "$unifiedManifest\unified_fields.jsonl" `
   --dataset-root $teacherLabels `
   --output $unifiedRun `
   --device cuda:0 `
-  --architecture v7 `
+  --architecture v8 `
   --image-height 80 `
   --image-width 512 `
   --base-channels 32 `
@@ -551,6 +553,7 @@ python -m transfer_receipt_ai.ocr_unified train `
   --batch-size 24 `
   --ctc-loss-weight 0.35 `
   --structured-loss-weight 1.0 `
+  --amount-format-min-confidence 0.90 `
   --payment-bank-prefix-min-support 3 `
   --num-workers 0 `
   --onnx-output $unifiedModel
@@ -559,12 +562,11 @@ python -m transfer_receipt_ai.ocr_unified train `
 输出包括：
 
 - `$unifiedRun\best.pt`：只用于后续再导出；不是交付物；
-- `$unifiedModel`：一个固定输入 `[4,1,80,512]`、一次推理返回 14 个 v7 输出的 ONNX；
+- `$unifiedModel`：一个固定输入 `[4,1,80,512]`、一次推理返回 14 个 v8 输出的 ONNX；
 - `$unifiedModel` 同名的 `.labels.json` 和 `.contract.json`：字符表、slot 顺序、SHA-256、预处理和输出协议，必须与 ONNX 一起交付。
 
-v7 的 `best.pt` 按验证集的金额、时间、付款方式**校验头宏平均准确率**优先选择，避免样本数量较多的字段或原始
-CTC 指标掩盖格式/银行验证的退化；原始 CTC 一致性和 loss 只用于同分时的后续排序。它仍是教师标签上的训练选择，
-不是业务上线验收。
+v8 的 `best.pt` 按验证集实际候选文本（金额/时间/付款方式）的宏平均 teacher-parity 优先选择，随后才比较
+结构辅助头和 loss，避免校验头看似提高但最终候选文本退化。它仍是教师标签上的训练选择，不是业务上线验收。
 
 检查 `training_summary.json` 的 `status_head_policy`。若 `runtime_policy` 为 `review_only`（例如当前 1 万张中
 状态全是 `success`），训练会主动关闭状态损失以免浪费共享主干容量；ONNX 仍保留稳定的 `status_logits` 输出协议，
@@ -584,14 +586,14 @@ python -m transfer_receipt_ai.ocr_unified evaluate `
   --records "$unifiedManifest\unified_fields.jsonl" `
   --dataset-root $teacherLabels `
   --split test `
-  --output "$outputRoot\unified-eval-v7-cpu" `
+  --output "$outputRoot\unified-eval-v8-cpu" `
   --device cpu `
   --max-delivery-false-accepts 0
 ```
 
 先阅读 `summary.json`、`comparisons.jsonl`、`disagreements.jsonl`，尤其是每个字段的
 `raw_exact_match`、`delivery_coverage`、`delivery_exact_match`、`delivery_false_accepts` 和付款方式的
-`oov_reference_rate`。`raw_exact_match` 只是候选与教师的一致性；只有 delivery 指标才代表 v7 当前会实际
+`oov_reference_rate`。`raw_exact_match` 只是候选与教师的一致性；只有 delivery 指标才代表 v8 当前会实际
 输出的值。只设置 `--max-delivery-false-accepts 0` 的首轮运行也**不能**判定模型合格：若所有结果都变成
 `review`，它仍可能是零错误交付但零业务覆盖。
 
@@ -604,7 +606,7 @@ python -m transfer_receipt_ai.ocr_unified evaluate `
   --max-delivery-false-accepts 0
 ```
 
-v7 的 1 万张 teacher-parity 通过后，再扩展到 12 万张自动教师蒸馏；教师一致性并不等于真实业务准确率。
+v8 可以直接在已生成的 12 万张 manifest 上训练和评估；教师一致性并不等于真实业务准确率。
 
 ### 可选人工复核候选差异（不修改原图）
 
@@ -613,7 +615,7 @@ v7 的 1 万张 teacher-parity 通过后，再扩展到 12 万张自动教师蒸
 绑定 `127.0.0.1`，不访问网络；每一次选择都会原子写入 JSONL，因此可随时关闭、重新运行后继续。
 
 ```powershell
-$eval = "$outputRoot\unified-eval-v7-cpu"
+$eval = "$outputRoot\unified-eval-v8-cpu"
 
 python -m transfer_receipt_ai.ocr_review `
   --input "$eval\comparisons.jsonl" `

@@ -16,6 +16,7 @@ from transfer_receipt_ai.ocr_unified import (
     KIND_V5,
     KIND_V6,
     KIND_V7,
+    KIND_V8,
     ONNX_EXPORT_ATOL,
     ONNX_EXPORT_PAYMENT_LOGITS_ATOL,
     ONNX_EXPORT_RTOL,
@@ -23,6 +24,8 @@ from transfer_receipt_ai.ocr_unified import (
     V6_AMOUNT_CHARACTERS,
     V6_ONNX_OUTPUT_NAMES,
     V6_TIME_CHARACTERS,
+    V8_AMOUNT_CHARACTERS,
+    V8_ONNX_OUTPUT_NAMES,
     V5_ONNX_OUTPUT_NAMES,
     UnifiedReaderConfig,
     _checkpoint_config,
@@ -48,6 +51,7 @@ from transfer_receipt_ai.ocr_unified import (
     train_unified_reader,
 )
 from transfer_receipt_ai.ocr_unified_targets import (
+    AMOUNT_VISIBLE_FORMAT_V8,
     parse_amount_aux_target,
     parse_amount_display_target,
     parse_payment_bank_prefix_target,
@@ -333,6 +337,56 @@ def test_unified_v7_time_format_heads_backpropagate_through_the_time_ctc_branch(
     assert not hasattr(model, "time_verifier_sequence")
 
 
+def test_unified_v8_model_shares_amount_ctc_state_with_tiny_format_heads() -> None:
+    """v8 keeps one graph while moving visible amount punctuation out of CTC."""
+    config = _tiny_config(architecture_version=8)
+    model = build_unified_reader(
+        payment_vocab_size=6,
+        payment_bank_prefix_vocab_size=2,
+        config=config,
+    )
+    outputs = model(torch.zeros((2, 4, 1, 32, 64), dtype=torch.float32))
+
+    assert len(outputs) == len(V8_ONNX_OUTPUT_NAMES)
+    (
+        amount,
+        time,
+        payment,
+        status,
+        amount_currency_style,
+        amount_grouped_thousands,
+        amount_sign_position,
+        time_format,
+        time_digits,
+        payment_prefix,
+        payment_bank,
+        payment_tail,
+        payment_structure,
+        payment_parentheses,
+    ) = outputs
+    assert list(amount.shape) == [16, 2, len(V8_AMOUNT_CHARACTERS) + 1]
+    assert list(time.shape) == [16, 2, len(V6_TIME_CHARACTERS) + 1]
+    assert list(payment.shape) == [16, 2, 6]
+    assert list(status.shape) == [2, 3]
+    assert list(amount_currency_style.shape) == [2, 5]
+    assert list(amount_grouped_thousands.shape) == [2, 2]
+    assert list(amount_sign_position.shape) == [2, 3]
+    assert list(time_format.shape) == [2, 6]
+    assert list(time_digits.shape) == [2, 14, 10]
+    assert list(payment_prefix.shape) == [16, 2, 6]
+    assert list(payment_bank.shape) == [2, 2]
+    assert list(payment_tail.shape) == [2, 4, 10]
+    assert list(payment_structure.shape) == [2, 2]
+    assert list(payment_parentheses.shape) == [2, 2]
+    assert not hasattr(model, "amount_verifier_sequence")
+
+    # The three finite format heads must reinforce the canonical amount CTC
+    # sequence rather than adding a second amount reader/session.
+    (amount_currency_style.sum() + amount_grouped_thousands.sum() + amount_sign_position.sum()).backward()
+    assert model.amount_ctc_sequence.weight_ih_l0.grad is not None
+    assert model.amount_ctc_vertical_reducer.depthwise.weight.grad is not None
+
+
 def test_unified_v3_config_keeps_the_existing_output_protocol() -> None:
     config = _tiny_config(architecture_version=3)
     model = build_unified_reader(payment_vocab_size=6, config=config)
@@ -379,6 +433,26 @@ def test_v7_checkpoint_config_has_its_own_kind_and_does_not_relabel_v6() -> None
     )
     assert config.architecture_version == 7
     assert KIND_V6 != KIND_V7
+
+
+def test_v8_checkpoint_config_has_a_distinct_kind_and_keeps_the_compact_amount_charset() -> None:
+    config = _checkpoint_config(
+        {
+            "kind": KIND_V8,
+            "config": {
+                "architecture_version": 8,
+                "image_height": 32,
+                "image_width": 64,
+                "base_channels": 8,
+                "numeric_hidden_size": 16,
+                "payment_hidden_size": 16,
+                "pooled_width": 2,
+            },
+        }
+    )
+    assert config.architecture_version == 8
+    assert KIND_V7 != KIND_V8
+    assert set(V8_AMOUNT_CHARACTERS) == set("0123456789.-")
 
 
 def test_optional_exact_metric_formats_as_na_without_status_labels() -> None:
@@ -557,6 +631,26 @@ def test_v6_protocol_report_candidate_uses_time_template_but_retains_raw_amount_
     assert selected["payment_method_field"] == ("建设银行储蓄卡（3667）", 0.93)
 
 
+def test_v8_report_candidate_applies_only_a_safe_amount_format_and_time_template() -> None:
+    ctc = {
+        "amount": ("1234.56", 0.91),
+        "time": ("0240", 0.92),
+        "payment_method_field": ("建设银行储蓄卡（3667）", 0.93),
+    }
+    structured = {
+        "amount": ("¥1,234.56", 0.99),
+        "time": ("02:40", 0.99),
+        # Payment's known-bank heads remain audit-only until there is a
+        # calibrated acceptance policy, so CTC must remain the candidate.
+        "payment_method_field": ("工商银行储蓄卡（3667）", 0.99),
+    }
+    selected = _select_report_candidates(ctc, structured, config=_tiny_config(architecture_version=8))
+
+    assert selected["amount"] == ("¥1,234.56", 0.99)
+    assert selected["time"] == ("02:40", 0.99)
+    assert selected["payment_method_field"] == ("建设银行储蓄卡（3667）", 0.93)
+
+
 def test_v5_right_aligned_preprocess_has_a_distinct_fixed_position_from_legacy_center(tmp_path: Path) -> None:
     image_path = tmp_path / "narrow.png"
     Image.fromarray(np.zeros((20, 20), dtype=np.uint8)).save(image_path)
@@ -696,6 +790,48 @@ def test_tiny_v6_training_writes_train_only_bank_classes_and_visible_charsets(tm
         "time",
         "payment_method_field",
     }
+
+
+def test_tiny_v8_training_writes_compact_amount_charset_and_candidate_metrics(tmp_path: Path) -> None:
+    """v8's canonical amount CTC and display grammar must train without ONNX.
+
+    Keep this separate from the ONNX integration test so a broken v8 training
+    path is caught even on environments that intentionally do not install ONNX
+    Runtime.
+    """
+    checkpoint = train_unified_reader(
+        records_path=_write_v6_dataset(tmp_path),
+        output_dir=tmp_path / "run-v8",
+        config=_tiny_config(architecture_version=8),
+        device="cpu",
+        epochs=1,
+        batch_size=2,
+        payment_bank_prefix_min_support=1,
+    )
+
+    assert checkpoint.is_file()
+    assert (checkpoint.parent / "last.pt").is_file()
+    labels = json.loads((checkpoint.parent / "labels.json").read_text(encoding="utf-8"))
+    summary = json.loads((checkpoint.parent / "training_summary.json").read_text(encoding="utf-8"))
+    assert summary["kind"] == KIND_V8
+    assert labels["amount_characters"] == list(V8_AMOUNT_CHARACTERS)
+    assert labels["time_characters"] == list(V6_TIME_CHARACTERS)
+    assert labels["payment_bank_prefix_classes"] == [PAYMENT_BANK_OTHER_CLASS, "建设银行储蓄卡"]
+
+    structured_counts = labels["structured_target_counts"]
+    for target in ("amount_visible_format_v8", "time_display", "payment_bank_prefix"):
+        assert structured_counts[target]["train"] > 0
+        assert structured_counts[target]["val"] > 0
+
+    epoch = summary["records"][0]
+    assert epoch["val_candidate_text_exact_match"] is not None
+    assert epoch["val_candidate_text_macro_exact_match"] is not None
+    assert set(epoch["val_candidate_text_by_field"]) == {
+        "amount",
+        "time",
+        "payment_method_field",
+    }
+    assert epoch["val_candidate_text_by_field"]["amount"]["records"] > 0
 
 
 def test_unified_export_has_one_fixed_receipt_input_when_onnx_is_available(tmp_path: Path) -> None:
@@ -854,3 +990,62 @@ def test_unified_v7_export_loads_the_same_visible_format_protocol_when_onnx_is_a
     assert loaded_contract["kind"] == KIND_V7
     contract = json.loads(contract_path.read_text(encoding="utf-8"))
     assert set(contract["outputs"]) == set(V6_ONNX_OUTPUT_NAMES)
+
+
+def test_unified_v8_export_loads_and_evaluates_guarded_visible_amounts_when_onnx_is_available(
+    tmp_path: Path,
+) -> None:
+    """The v8 artifact must carry its grammar through the deployed ONNX path."""
+    onnx = pytest.importorskip("onnx")
+    ort = pytest.importorskip("onnxruntime")
+    records_path = _write_v6_dataset(tmp_path)
+    checkpoint = train_unified_reader(
+        records_path=records_path,
+        output_dir=tmp_path / "run-v8",
+        config=_tiny_config(architecture_version=8),
+        device="cpu",
+        epochs=1,
+        batch_size=2,
+        payment_bank_prefix_min_support=1,
+    )
+    model_path, labels_path, contract_path = export_unified_onnx(
+        checkpoint_path=checkpoint,
+        output_path=tmp_path / "reader-v8.onnx",
+    )
+    onnx.checker.check_model(onnx.load_model(model_path))
+    session = ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])
+    assert [item.name for item in session.get_outputs()] == list(V8_ONNX_OUTPUT_NAMES)
+    outputs = session.run(None, {"field_images": np.zeros((4, 1, 32, 64), dtype=np.float32)})
+    contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    assert [list(value.shape) for value in outputs] == [
+        contract["outputs"][name]["shape"] for name in V8_ONNX_OUTPUT_NAMES
+    ]
+    labels = json.loads(labels_path.read_text(encoding="utf-8"))
+    assert labels["amount_characters"] == list(V8_AMOUNT_CHARACTERS)
+    assert labels["structured_decoder"]["amount_visible_format"] == AMOUNT_VISIBLE_FORMAT_V8
+
+    config_from_contract, _, loaded_contract = _load_onnx_artifacts(model_path)
+    assert config_from_contract.architecture_version == 8
+    assert loaded_contract["kind"] == KIND_V8
+    assert loaded_contract["text_delivery_policy"]["runtime_policy"].startswith("review_only")
+
+    summary, failures = evaluate_unified_onnx(
+        model_path=model_path,
+        records_path=records_path,
+        output_dir=tmp_path / "eval-v8",
+        split="test",
+        device="cpu",
+    )
+    assert failures == []
+    assert summary["by_field"]["amount"]["records"] == 1
+    comparisons = [
+        json.loads(line)
+        for line in (tmp_path / "eval-v8" / "comparisons.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    amount = next(row for row in comparisons if row["field"] == "amount")
+    # v8's CTC target is canonical, but its report/evaluation target is the
+    # audited visible teacher text so rendered CNY punctuation is measured.
+    assert amount["reference_text"] == "¥199.00"
+    assert amount["ctc_candidate_text"] is not None
+    assert "structured_candidate_text" in amount
+    assert amount["runtime_policy"].startswith("review_only")

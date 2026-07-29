@@ -31,6 +31,21 @@ PAYMENT_CARD_TAIL_FORMAT = "visible_prefix_exact_ascii_4_digit_card_tail_v1"
 AMOUNT_DISPLAY_AUX_FORMAT = "visible_cny_amount_strict_v6"
 TIME_DISPLAY_AUX_FORMAT = "visible_clock_or_datetime_strict_v6"
 PAYMENT_BANK_PREFIX_FORMAT = "visible_payment_bank_prefix_v6"
+# v8 keeps the visible amount grammar but makes its four formatting choices
+# explicit, so the compact reader can render currency/grouping without asking
+# a CTC stream to learn every punctuation combination together with the
+# digits.  These are deliberately finite and grammar-safe: their decoder
+# cannot produce an invalid sign/currency/space combination.
+AMOUNT_VISIBLE_FORMAT_V8 = "visible_cny_amount_format_v8"
+AMOUNT_CURRENCY_STYLE_CLASSES = (
+    "none",
+    "yen",
+    "yen_space",
+    "fullwidth_yen",
+    "fullwidth_yen_space",
+)
+AMOUNT_GROUPED_THOUSANDS_CLASSES = ("ungrouped", "grouped_thousands")
+AMOUNT_SIGN_POSITION_CLASSES = ("none", "before_currency_or_number", "after_currency")
 
 AMOUNT_MAX_INTEGER_DIGITS = 7
 AMOUNT_CENTS_DIGITS = 2
@@ -126,6 +141,106 @@ def parse_amount_display_target(value: str) -> dict[str, object] | None:
         "right_aligned_digits": [None] * padding + list(integer_digits + cents),
         "right_aligned_mask": [False] * padding + [True] * len(integer_digits + cents),
     }
+
+
+def parse_amount_visible_format_target(value: str) -> dict[str, object] | None:
+    """Return v8's finite display grammar for one strict visible amount.
+
+    This intentionally derives every label from :func:`parse_amount_display_target`
+    rather than accepting a second, looser parser.  The CTC reader owns the
+    signed canonical digits; these labels only describe how to render those
+    same digits back as visible Alipay text.
+    """
+    parsed = parse_amount_display_target(value)
+    if parsed is None:
+        return None
+    currency = parsed["currency"]
+    currency_space = bool(parsed["currency_space"])
+    if currency is None:
+        currency_style = "none"
+    elif currency == "¥":
+        currency_style = "yen_space" if currency_space else "yen"
+    elif currency == "￥":
+        currency_style = "fullwidth_yen_space" if currency_space else "fullwidth_yen"
+    else:  # Defensive: the strict parser currently admits only these two glyphs.
+        return None
+
+    if parsed["sign"] == "positive":
+        sign_position = "none"
+    elif value.startswith("-"):
+        sign_position = "before_currency_or_number"
+    elif currency is not None and value.startswith(f"{currency}-"):
+        sign_position = "after_currency"
+    else:
+        return None
+    grouped_thousands = "grouped_thousands" if bool(parsed["grouped_thousands"]) else "ungrouped"
+    return {
+        "schema_version": STRUCTURED_TARGET_SCHEMA_VERSION,
+        "format": AMOUNT_VISIBLE_FORMAT_V8,
+        "visible_text": value,
+        "canonical_decimal": parsed["canonical_decimal"],
+        "currency_style": currency_style,
+        "grouped_thousands": grouped_thousands,
+        "sign_position": sign_position,
+    }
+
+
+def render_amount_visible_format(
+    canonical_decimal: str,
+    *,
+    currency_style: str,
+    grouped_thousands: str,
+    sign_position: str,
+) -> str | None:
+    """Render a strict visible amount without changing its signed digits.
+
+    ``canonical_decimal`` must itself be a valid bare amount (for example
+    ``-1234.56``).  The renderer refuses inconsistent choices instead of
+    "repairing" a numeric candidate.  Its final strict parse is a useful
+    invariant: callers can safely fall back to raw CTC text on ``None``.
+    """
+    parsed = parse_amount_display_target(canonical_decimal)
+    if parsed is None or parsed["currency"] is not None or bool(parsed["grouped_thousands"]):
+        return None
+    if currency_style not in AMOUNT_CURRENCY_STYLE_CLASSES:
+        return None
+    if grouped_thousands not in AMOUNT_GROUPED_THOUSANDS_CLASSES:
+        return None
+    if sign_position not in AMOUNT_SIGN_POSITION_CLASSES:
+        return None
+
+    negative = parsed["sign"] == "negative"
+    if negative != (sign_position != "none"):
+        return None
+    if sign_position == "after_currency" and currency_style == "none":
+        return None
+
+    integer = str(parsed["integer_digits"])
+    if grouped_thousands == "grouped_thousands":
+        groups: list[str] = []
+        while integer:
+            groups.append(integer[-3:])
+            integer = integer[:-3]
+        integer = ",".join(reversed(groups))
+    numeric = f"{integer}.{parsed['cents_digits']}"
+    currency_prefix = {
+        "none": "",
+        "yen": "¥",
+        "yen_space": "¥ ",
+        "fullwidth_yen": "￥",
+        "fullwidth_yen_space": "￥ ",
+    }[currency_style]
+    if sign_position == "before_currency_or_number":
+        rendered = "-" + currency_prefix + numeric
+    elif sign_position == "after_currency":
+        rendered = currency_prefix.rstrip(" ") + "-" + (" " if currency_prefix.endswith(" ") else "") + numeric
+    else:
+        rendered = currency_prefix + numeric
+
+    round_trip = parse_amount_display_target(rendered)
+    if round_trip is None or round_trip["canonical_decimal"] != canonical_decimal:
+        return None
+    return rendered
 
 
 def parse_time_display_target(value: str) -> dict[str, object] | None:
@@ -369,6 +484,14 @@ def structured_target_config() -> dict[str, object]:
             "requires_valid_thousands_grouping": True,
             "negative_zero_allowed": False,
             "canonical_value": "signed_decimal_without_currency_or_grouping",
+        },
+        "amount_visible_format_v8": {
+            "format": AMOUNT_VISIBLE_FORMAT_V8,
+            "source": "strict_amount_display_target; canonical digits stay in the CTC reader",
+            "currency_style_classes": list(AMOUNT_CURRENCY_STYLE_CLASSES),
+            "grouped_thousands_classes": list(AMOUNT_GROUPED_THOUSANDS_CLASSES),
+            "sign_position_classes": list(AMOUNT_SIGN_POSITION_CLASSES),
+            "rendering_rule": "only render when the strict canonical value and predicted sign grammar agree",
         },
         "time_display": {
             "format": TIME_DISPLAY_AUX_FORMAT,

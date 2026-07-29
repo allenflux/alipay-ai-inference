@@ -9,8 +9,12 @@ from PIL import Image
 
 from transfer_receipt_ai.ocr_unified_targets import (
     AMOUNT_AUX_FORMAT,
+    AMOUNT_CURRENCY_STYLE_CLASSES,
     AMOUNT_DISPLAY_AUX_FORMAT,
+    AMOUNT_GROUPED_THOUSANDS_CLASSES,
     AMOUNT_SIGN_CLASSES,
+    AMOUNT_SIGN_POSITION_CLASSES,
+    AMOUNT_VISIBLE_FORMAT_V8,
     PAYMENT_CARD_TAIL_FORMAT,
     PAYMENT_BANK_PREFIX_FORMAT,
     PARENTHESIS_STYLE_ASCII,
@@ -21,11 +25,13 @@ from transfer_receipt_ai.ocr_unified_targets import (
     is_structured_target,
     parse_amount_aux_target,
     parse_amount_display_target,
+    parse_amount_visible_format_target,
     parse_payment_bank_prefix_target,
     parse_payment_card_tail_target,
     parse_time_aux_target,
     parse_time_display_target,
     recompose_payment_card_tail_target,
+    render_amount_visible_format,
     structured_target_config,
 )
 
@@ -71,6 +77,61 @@ def test_v6_amount_display_target_keeps_visible_symbols_but_has_a_strict_canonic
 )
 def test_v6_amount_display_target_refuses_ambiguous_or_noncanonical_visible_formats(value: str) -> None:
     assert parse_amount_display_target(value) is None
+
+
+@pytest.mark.parametrize(
+    ("visible_text", "canonical", "currency_style", "grouped_thousands", "sign_position"),
+    (
+        ("99.99", "99.99", "none", "ungrouped", "none"),
+        ("¥1,234.56", "1234.56", "yen", "grouped_thousands", "none"),
+        ("￥ 1,234.56", "1234.56", "fullwidth_yen_space", "grouped_thousands", "none"),
+        ("-¥1,234.56", "-1234.56", "yen", "grouped_thousands", "before_currency_or_number"),
+        ("¥-1,234.56", "-1234.56", "yen", "grouped_thousands", "after_currency"),
+    ),
+)
+def test_v8_amount_visible_format_target_is_a_finite_round_trip_grammar(
+    visible_text: str,
+    canonical: str,
+    currency_style: str,
+    grouped_thousands: str,
+    sign_position: str,
+) -> None:
+    """v8 may add presentation, but it must never alter CTC-owned digits."""
+    target = parse_amount_visible_format_target(visible_text)
+
+    assert target is not None
+    assert target["format"] == AMOUNT_VISIBLE_FORMAT_V8
+    assert target["canonical_decimal"] == canonical
+    assert target["currency_style"] == currency_style
+    assert target["grouped_thousands"] == grouped_thousands
+    assert target["sign_position"] == sign_position
+    assert render_amount_visible_format(
+        canonical,
+        currency_style=currency_style,
+        grouped_thousands=grouped_thousands,
+        sign_position=sign_position,
+    ) == visible_text
+
+
+def test_v8_amount_visible_format_renderer_refuses_to_invent_or_move_a_sign() -> None:
+    assert render_amount_visible_format(
+        "1234.56",
+        currency_style="yen",
+        grouped_thousands="grouped_thousands",
+        sign_position="before_currency_or_number",
+    ) is None
+    assert render_amount_visible_format(
+        "-1234.56",
+        currency_style="none",
+        grouped_thousands="ungrouped",
+        sign_position="after_currency",
+    ) is None
+    assert render_amount_visible_format(
+        "1234.56",
+        currency_style="unknown",
+        grouped_thousands="ungrouped",
+        sign_position="none",
+    ) is None
 
 
 @pytest.mark.parametrize(
@@ -267,6 +328,12 @@ def test_structured_target_contract_describes_strict_auxiliary_formats() -> None
     assert contract["time_aux"]["preserve_hour_width"] is True
     assert contract["payment_card_tail"]["format"] == PAYMENT_CARD_TAIL_FORMAT
     assert contract["payment_card_tail"]["tail_digits"] == 4
+    amount_v8 = contract["amount_visible_format_v8"]
+    assert amount_v8["format"] == AMOUNT_VISIBLE_FORMAT_V8
+    assert amount_v8["currency_style_classes"] == list(AMOUNT_CURRENCY_STYLE_CLASSES)
+    assert amount_v8["grouped_thousands_classes"] == list(AMOUNT_GROUPED_THOUSANDS_CLASSES)
+    assert amount_v8["sign_position_classes"] == list(AMOUNT_SIGN_POSITION_CLASSES)
+    assert "canonical digits stay in the CTC reader" in str(amount_v8["source"])
 
 
 def _write_crop(path: Path) -> None:
