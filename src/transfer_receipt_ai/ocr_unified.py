@@ -26,7 +26,7 @@ import math
 import random
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from time import perf_counter
 from typing import Any
@@ -4563,6 +4563,7 @@ def evaluate_unified_onnx(
     min_delivery_coverage: float | None = None,
     min_delivery_exact_match: float | None = None,
     max_delivery_false_accepts: int | None = None,
+    amount_format_min_confidence_override: float | None = None,
 ) -> tuple[dict[str, object], list[str]]:
     """Compare one ONNX session run per held-out receipt with teacher labels."""
     if split not in {"val", "test"}:
@@ -4577,6 +4578,10 @@ def evaluate_unified_onnx(
         ("min_delivery_exact_match", min_delivery_exact_match),
     ):
         _finite_probability(value, name=name)
+    _finite_probability(
+        amount_format_min_confidence_override,
+        name="amount_format_min_confidence_override",
+    )
     for name, value in (
         ("max_non_success_to_success", max_non_success_to_success),
         ("max_delivery_false_accepts", max_delivery_false_accepts),
@@ -4587,6 +4592,18 @@ def evaluate_unified_onnx(
     if output_dir.exists() and any(output_dir.iterdir()):
         raise ValueError(f"evaluation output already contains files: {output_dir}. Choose a new empty directory.")
     config, payment_characters, contract = _load_onnx_artifacts(model_path)
+    artifact_amount_format_min_confidence = config.amount_format_min_confidence if _is_v8(config) else None
+    if amount_format_min_confidence_override is not None:
+        if not _is_v8(config):
+            raise ValueError("amount_format_min_confidence_override is supported only by v8 ONNX artifacts")
+        # This is deliberately evaluation-only: validate the artifact's
+        # persisted sidecar/contract first, then replace the in-memory
+        # renderer threshold.  It must never mutate the ONNX bundle or make a
+        # diagnostic calibration result look like a delivery artifact.
+        config = replace(
+            config,
+            amount_format_min_confidence=float(amount_format_min_confidence_override),
+        )
     status_policy = _contract_status_policy(contract)
     status_delivery_allowed = status_policy["runtime_policy"] == "classify"
     records = load_records(records_path, dataset_root=dataset_root)
@@ -4939,6 +4956,11 @@ def evaluate_unified_onnx(
         "label_sources": label_sources,
         "providers": active_providers,
         "slot_order": list(SLOT_ORDER),
+        "amount_format_policy": {
+            "artifact_min_confidence": artifact_amount_format_min_confidence,
+            "effective_min_confidence": config.amount_format_min_confidence if _is_v8(config) else None,
+            "evaluation_override": amount_format_min_confidence_override,
+        },
         "by_field": by_field,
         "status_confusion": dict(sorted(status_confusion.items())),
         "status_reference_class_counts": {
@@ -5067,6 +5089,14 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--output", type=Path, required=True, help="New empty evaluation output directory")
     evaluate.add_argument("--split", choices=("val", "test"), default="test")
     evaluate.add_argument("--device", default="auto")
+    evaluate.add_argument(
+        "--amount-format-min-confidence-override",
+        type=float,
+        help=(
+            "v8 evaluation only: temporarily override the amount visible-format confidence gate without "
+            "rewriting the ONNX artifact, labels, or contract"
+        ),
+    )
     evaluate.add_argument("--min-amount-exact-match", type=float)
     evaluate.add_argument("--min-time-exact-match", type=float)
     evaluate.add_argument("--min-payment-exact-match", type=float)
@@ -5154,6 +5184,7 @@ def main(argv: list[str] | None = None) -> None:
                 min_delivery_coverage=args.min_delivery_coverage,
                 min_delivery_exact_match=args.min_delivery_exact_match,
                 max_delivery_false_accepts=args.max_delivery_false_accepts,
+                amount_format_min_confidence_override=args.amount_format_min_confidence_override,
             )
             metrics = summary["by_field"]
             status_policy = summary.get("status_head_policy")

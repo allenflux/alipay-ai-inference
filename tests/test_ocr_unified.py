@@ -210,6 +210,23 @@ def _tiny_config(*, architecture_version: int) -> UnifiedReaderConfig:
     )
 
 
+def _ctc_logits_for_test_text(text: str, characters: tuple[str, ...], *, time_steps: int) -> np.ndarray:
+    """Return a deterministic greedy CTC tensor for evaluator-only tests."""
+    logits = np.full((time_steps, len(characters) + 1), -9.0, dtype=np.float32)
+    previous = 0
+    position = 0
+    for character in text:
+        current = characters.index(character) + 1
+        if current == previous:
+            logits[position, 0] = 9.0
+            position += 1
+        logits[position, current] = 9.0
+        previous = current
+        position += 1
+    logits[position:, 0] = 9.0
+    return logits
+
+
 def test_unified_v4_model_emits_all_head_shapes_with_independent_numeric_heads() -> None:
     config = _tiny_config(architecture_version=4)
     model = build_unified_reader(payment_vocab_size=6, config=config)
@@ -740,6 +757,190 @@ def test_v8_amount_keeps_relevant_sign_and_grouping_as_confidence_gates(
         min_confidence=0.90,
     )
     assert rendered == [(None, 0.0)]
+
+
+def test_v8_evaluation_amount_format_override_changes_candidate_summary_without_mutating_artifact_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A calibration override is evaluation-only, never an artifact rewrite.
+
+    This uses a deterministic fake ONNX session so the test exercises the
+    public evaluator path without requiring ONNX Runtime.  The amount CTC has
+    the correct canonical digits, while its selected ¥ style has deliberately
+    low confidence: the persisted 0.90 gate must retain ``199.00``; a 0.0
+    evaluator override may render ``¥199.00`` and improve only the report.
+    """
+    records_path = _write_v6_dataset(tmp_path)
+    model_path = tmp_path / "reader-v8.onnx"
+    model_path.write_bytes(b"test-v8-artifact-must-not-change")
+    artifact_bytes = model_path.read_bytes()
+    artifact_config = _tiny_config(architecture_version=8)
+    assert artifact_config.amount_format_min_confidence == 0.90
+
+    payment_characters = ("x",)
+    time_steps = artifact_config.image_width // 4
+    output_names = list(V8_ONNX_OUTPUT_NAMES)
+
+    def classification_logits(classes: int, selected: int, *, high: bool = True) -> np.ndarray:
+        logits = np.full((classes,), -9.0 if high else 0.0, dtype=np.float32)
+        logits[selected] = 9.0 if high else 0.2
+        return logits
+
+    time_digits = np.full((ocr_unified.TIME_DISPLAY_DIGIT_SLOTS, 10), -9.0, dtype=np.float32)
+    # clock_h_mm consumes the first 4 positions as HHMM: 01:44 -> 1:44.
+    for index, digit in enumerate((0, 1, 4, 4)):
+        time_digits[index, digit] = 9.0
+    time_digits[4:, 0] = 9.0
+    runtime_outputs = {
+        "amount_logits": _ctc_logits_for_test_text("199.00", V8_AMOUNT_CHARACTERS, time_steps=time_steps),
+        "time_logits": _ctc_logits_for_test_text("1:44", V6_TIME_CHARACTERS, time_steps=time_steps),
+        "payment_logits": np.full((time_steps, len(payment_characters) + 1), -9.0, dtype=np.float32),
+        "status_logits": classification_logits(3, 0),
+        # Index 1 is ¥ but a 0.2-vs-0.0 logit is deliberately below 0.90.
+        "amount_currency_style_logits": classification_logits(5, 1, high=False),
+        "amount_grouped_thousands_logits": classification_logits(2, 0),
+        "amount_sign_position_logits": classification_logits(3, 0),
+        "time_format_logits": classification_logits(len(ocr_unified.TIME_DISPLAY_FORMAT_CLASSES), 0),
+        "time_digit_logits": time_digits,
+        "payment_prefix_logits": np.full((time_steps, len(payment_characters) + 1), -9.0, dtype=np.float32),
+        "payment_bank_prefix_logits": classification_logits(2, 0),
+        "payment_tail_digit_logits": np.eye(10, dtype=np.float32)[[0, 0, 0, 0]] * 18.0 - 9.0,
+        "payment_structure_logits": classification_logits(2, 0),
+        "payment_parentheses_logits": classification_logits(2, 0),
+    }
+    # The CTC blank has to win for the unused payment CTC stream.
+    runtime_outputs["payment_logits"][:, 0] = 9.0
+    runtime_outputs["payment_prefix_logits"][:, 0] = 9.0
+
+    class NamedValue:
+        def __init__(self, name: str, shape: list[int]) -> None:
+            self.name = name
+            self.shape = shape
+
+    class FakeSession:
+        def get_inputs(self) -> list[NamedValue]:
+            return [NamedValue("field_images", [4, 1, 32, 64])]
+
+        def get_outputs(self) -> list[NamedValue]:
+            return [NamedValue(name, list(np.asarray(runtime_outputs[name]).shape)) for name in output_names]
+
+        def get_providers(self) -> list[str]:
+            return ["CPUExecutionProvider"]
+
+        def run(self, names: list[str], feed: dict[str, np.ndarray]) -> list[np.ndarray]:
+            assert names == output_names
+            assert list(feed) == ["field_images"]
+            assert list(feed["field_images"].shape) == [4, 1, 32, 64]
+            return [runtime_outputs[name] for name in names]
+
+    status_counts = {
+        split: {"success": 1, "pending": 0, "failed": 0}
+        for split in ("train", "val", "test")
+    }
+    contract = {
+        "payment_bank_prefix_classes": [PAYMENT_BANK_OTHER_CLASS, "建设银行储蓄卡"],
+        "training_status_class_counts": status_counts,
+        "status_head_policy": {"runtime_policy": "review_only"},
+    }
+    monkeypatch.setattr(
+        ocr_unified,
+        "_load_onnx_artifacts",
+        lambda _path: (artifact_config, list(payment_characters), contract),
+    )
+    monkeypatch.setattr(ocr_unified, "_require_onnxruntime", lambda: object())
+    monkeypatch.setattr(
+        ocr_unified,
+        "_create_onnx_session",
+        lambda _ort, _path, *, device: (FakeSession(), ["CPUExecutionProvider"]),
+    )
+
+    baseline, baseline_failures = evaluate_unified_onnx(
+        model_path=model_path,
+        records_path=records_path,
+        output_dir=tmp_path / "eval-artifact-threshold",
+        split="test",
+        device="cpu",
+    )
+    overridden, overridden_failures = evaluate_unified_onnx(
+        model_path=model_path,
+        records_path=records_path,
+        output_dir=tmp_path / "eval-override-threshold",
+        split="test",
+        device="cpu",
+        amount_format_min_confidence_override=0.0,
+    )
+
+    assert baseline_failures == overridden_failures == []
+    assert baseline["amount_format_policy"] == {
+        "artifact_min_confidence": 0.90,
+        "effective_min_confidence": 0.90,
+        "evaluation_override": None,
+    }
+    assert overridden["amount_format_policy"] == {
+        "artifact_min_confidence": 0.90,
+        "effective_min_confidence": 0.0,
+        "evaluation_override": 0.0,
+    }
+    assert baseline["by_field"]["amount"]["raw_exact_match"] == 0.0
+    assert overridden["by_field"]["amount"]["raw_exact_match"] == 1.0
+
+    def amount_comparison(output_dir: Path) -> dict[str, object]:
+        rows = [
+            json.loads(line)
+            for line in (output_dir / "comparisons.jsonl").read_text(encoding="utf-8").splitlines()
+        ]
+        return next(row for row in rows if row["field"] == "amount")
+
+    assert amount_comparison(tmp_path / "eval-artifact-threshold")["candidate_text"] == "199.00"
+    assert amount_comparison(tmp_path / "eval-override-threshold")["candidate_text"] == "¥199.00"
+    # ``replace`` in the evaluator must not mutate the loaded frozen config,
+    # and evaluation must not rewrite the ONNX binary.
+    assert artifact_config.amount_format_min_confidence == 0.90
+    assert model_path.read_bytes() == artifact_bytes
+
+
+def test_v8_amount_format_override_is_validated_and_rejected_for_non_v8_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with pytest.raises(ValueError, match="amount_format_min_confidence_override must be between 0 and 1"):
+        evaluate_unified_onnx(
+            model_path=tmp_path / "ignored.onnx",
+            records_path=tmp_path / "ignored.jsonl",
+            output_dir=tmp_path / "ignored-output",
+            amount_format_min_confidence_override=1.01,
+        )
+
+    monkeypatch.setattr(
+        ocr_unified,
+        "_load_onnx_artifacts",
+        lambda _path: (_tiny_config(architecture_version=7), ["x"], {}),
+    )
+    with pytest.raises(ValueError, match="supported only by v8 ONNX artifacts"):
+        evaluate_unified_onnx(
+            model_path=tmp_path / "ignored-v7.onnx",
+            records_path=tmp_path / "ignored-v7.jsonl",
+            output_dir=tmp_path / "ignored-v7-output",
+            amount_format_min_confidence_override=0.0,
+        )
+
+
+def test_evaluate_parser_exposes_v8_amount_format_confidence_override() -> None:
+    args = ocr_unified.build_parser().parse_args(
+        [
+            "evaluate",
+            "--model",
+            "reader.onnx",
+            "--records",
+            "records.jsonl",
+            "--output",
+            "eval",
+            "--amount-format-min-confidence-override",
+            "0.25",
+        ]
+    )
+    assert args.amount_format_min_confidence_override == 0.25
 
 
 def test_v5_right_aligned_preprocess_has_a_distinct_fixed_position_from_legacy_center(tmp_path: Path) -> None:
