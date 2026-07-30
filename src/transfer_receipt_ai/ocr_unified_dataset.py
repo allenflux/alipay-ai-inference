@@ -1,14 +1,20 @@
 """Build receipt-level manifests for the unified lightweight field reader.
 
 The detection/pseudo-label pipeline stores one crop per field.  A unified
-reader, however, receives the four crops from *one receipt* in a fixed order
+reader, however, receives the field crops from *one receipt* in a fixed order
 and returns all field outputs in one ONNX invocation.  This module turns the
 flat crop manifest into that receipt-level representation without copying any
 images or importing Paddle/Torch.
 
-Only four deployable fields are included:
+The frozen v8 contract contains four slots:
 
 ``amount``, ``time``, ``transfer_status`` and ``payment_method_field``.
+
+The v9 contract appends ``recipient_field`` as a fifth slot.  It is a distinct
+dataset kind so an old four-slot model can never silently consume a five-slot
+manifest.  Its recipient CTC alphabet is generated from *train only* and the
+contract records validation/test OOV evidence rather than leaking those
+characters into the deployable charset.
 
 The payment slot deliberately retains the visible payment-method value (for
 example ``建设银行储蓄卡(3667)``) as a CTC target.  Its normalised business
@@ -39,9 +45,39 @@ from .ocr_unified_targets import (
 
 
 SCHEMA_VERSION = 1
-KIND = "receipt_unified_field_dataset_v1"
+# ``KIND`` and ``SLOT_ORDER`` are the long-lived v8 aliases imported by the
+# existing v3-v8 reader.  Do not repoint them to v9: old manifests/checkpoints
+# must remain byte-for-byte compatible with the four-slot protocol.
+KIND_V8 = "receipt_unified_field_dataset_v1"
+KIND_V9 = "receipt_unified_field_dataset_v2"
+KIND = KIND_V8
 SLOT_ORDER = ("amount", "time", "transfer_status", "payment_method_field")
+V9_SLOT_ORDER = (*SLOT_ORDER, "recipient_field")
+ARCHITECTURE_V8 = "v8"
+ARCHITECTURE_V9 = "v9"
 STATUS_CLASSES = ("success", "pending", "failed")
+
+
+def _dataset_spec(architecture: str) -> tuple[str, str, tuple[str, ...]]:
+    """Return the immutable manifest contract selected by an architecture.
+
+    Keep this mapping intentionally closed.  A custom ordering might look
+    harmless in a JSONL file, but it would move tensor channels and let a
+    five-slot artifact be fed to an incompatible runtime.
+    """
+    if not isinstance(architecture, str):
+        raise ValueError("architecture must be v8 or v9")
+    normalized = architecture.strip().casefold()
+    if normalized == ARCHITECTURE_V8:
+        return ARCHITECTURE_V8, KIND_V8, SLOT_ORDER
+    if normalized == ARCHITECTURE_V9:
+        return ARCHITECTURE_V9, KIND_V9, V9_SLOT_ORDER
+    raise ValueError("architecture must be v8 or v9")
+
+
+def slot_order_for_architecture(architecture: str) -> tuple[str, ...]:
+    """Return the fixed input channel order for a supported dataset contract."""
+    return _dataset_spec(architecture)[2]
 
 
 def _atomic_write_json(path: Path, payload: Mapping[str, object]) -> None:
@@ -57,6 +93,13 @@ def _atomic_write_jsonl(path: Path, records: Iterable[Mapping[str, object]]) -> 
     with temporary.open("w", encoding="utf-8") as stream:
         for record in records:
             stream.write(json.dumps(dict(record), ensure_ascii=False) + "\n")
+    temporary.replace(path)
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(text, encoding="utf-8")
     temporary.replace(path)
 
 
@@ -121,7 +164,11 @@ def _receipt_key(record: Mapping[str, object]) -> str:
     return "record:" + str(record["id"])
 
 
-def _read_flat_records(records_path: Path) -> tuple[Path, list[dict[str, object]], list[dict[str, object]]]:
+def _read_flat_records(
+    records_path: Path,
+    *,
+    slot_order: tuple[str, ...],
+) -> tuple[Path, list[dict[str, object]], list[dict[str, object]]]:
     records_path = records_path.resolve()
     if not records_path.is_file():
         raise FileNotFoundError(records_path)
@@ -159,7 +206,7 @@ def _read_flat_records(records_path: Path) -> tuple[Path, list[dict[str, object]
                     raise ValueError("image escapes the source dataset root") from None
                 if not image_path.is_file():
                     raise FileNotFoundError(f"image not found: {image_path}")
-                if not isinstance(field, str) or field not in SLOT_ORDER:
+                if not isinstance(field, str) or field not in slot_order:
                     raise ValueError("field is not a unified-reader slot")
                 if not isinstance(text, str) or not clean_text(text):
                     raise ValueError("text must be a non-empty string")
@@ -183,7 +230,7 @@ def _read_flat_records(records_path: Path) -> tuple[Path, list[dict[str, object]
                     }
                 )
     if not accepted:
-        raise ValueError("No valid amount/time/status/payment records found")
+        raise ValueError("No valid unified-reader slot records found")
     return dataset_root, accepted, rejected
 
 
@@ -281,6 +328,30 @@ def _slot_payload(record: Mapping[str, object]) -> dict[str, object] | None:
         if payment_bank_prefix is not None:
             payload["payment_bank_prefix"] = payment_bank_prefix
         return payload
+    if field == "recipient_field":
+        # v9 keeps the visible recipient/business name as free-text CTC
+        # supervision.  It must not be reduced to an observed-name
+        # classifier: unseen merchants are precisely the cases a recipient
+        # reader needs to surface for review.  The source crop can include a
+        # left-side label such as ``收款方``; retain only the value just as the
+        # Python/Paddle output does.
+        source_text = clean_text(str(record["text"]))
+        text = clean_text(extract_field_value(source_text, "recipient"))
+        if text in {"收款方", "收款人", "收款账户", "收款账号"}:
+            # A row consisting of the label alone is not a readable recipient
+            # value.  Do not teach that label as a merchant name.
+            return None
+        if not text or any(not character.isprintable() for character in text):
+            return None
+        return {
+            "image": str(record["image"]),
+            "text": text,
+            "semantic_value": semantic_value,
+            "paddle_text": record.get("paddle_text"),
+            "paddle_confidence": record.get("paddle_confidence"),
+            "detector_score": record.get("detector_score"),
+            "crop_sha256": record.get("crop_sha256"),
+        }
     raise AssertionError(field)
 
 
@@ -291,15 +362,86 @@ def _target_signature(field: str, slot: Mapping[str, object]) -> str:
     return str(slot["text"])
 
 
-def build_unified_dataset(*, records_path: Path, output_dir: Path) -> dict[str, object]:
+def _recipient_charset_payload(records: Iterable[Mapping[str, object]]) -> dict[str, object]:
+    """Build a v9 recipient alphabet from train labels and audit held-out OOVs.
+
+    The recipient CTC output is deliberately open text, not a finite merchant
+    catalog.  Its vocabulary must therefore be frozen from train only.  A
+    validation/test character cannot be silently appended just because it is
+    available in the manifest: that would make held-out teacher parity look
+    better than the deployable artifact can actually achieve.
+    """
+    stable_records = list(records)
+    charset = sorted(
+        {
+            glyph
+            for record in stable_records
+            if str(record["split"]) == "train"
+            for slot in [dict(record["slots"]).get("recipient_field")]
+            if isinstance(slot, Mapping)
+            for text in [slot.get("text")]
+            if isinstance(text, str)
+            for glyph in text
+        }
+    )
+    known = set(charset)
+    counters: dict[str, Counter[str]] = {split: Counter() for split in ("train", "val", "test")}
+    examples: dict[str, list[dict[str, str]]] = {split: [] for split in ("train", "val", "test")}
+    for record in stable_records:
+        split = str(record["split"])
+        slot = dict(record["slots"]).get("recipient_field")
+        if not isinstance(slot, Mapping):
+            continue
+        text = slot.get("text")
+        if not isinstance(text, str):
+            raise AssertionError("recipient slot has a non-string CTC target")
+        counters[split]["records"] += 1
+        unknown = sorted(set(text) - known)
+        if unknown:
+            counters[split]["oov_records"] += 1
+            counters[split]["oov_characters"] += len(unknown)
+            if len(examples[split]) < 20:
+                examples[split].append(
+                    {
+                        "id": str(record["id"]),
+                        "characters": "".join(unknown),
+                        "text": text,
+                    }
+                )
+    return {
+        "source": "train_only_visible_recipient_text",
+        "characters": charset,
+        "sha256": hashlib.sha256("".join(charset).encode("utf-8")).hexdigest(),
+        "oov_by_split": {
+            split: {
+                "records": int(counters[split]["records"]),
+                "oov_records": int(counters[split]["oov_records"]),
+                "oov_characters": int(counters[split]["oov_characters"]),
+                "examples": examples[split],
+            }
+            for split in ("train", "val", "test")
+        },
+    }
+
+
+def build_unified_dataset(
+    *,
+    records_path: Path,
+    output_dir: Path,
+    architecture: str = ARCHITECTURE_V8,
+) -> dict[str, object]:
     """Create ``unified_fields.jsonl`` from flat Paddle/truth crop records.
 
-    A unified record may contain fewer than four slots.  The training model
-    uses a white placeholder for missing images and masks their losses.  This
-    retains good labels instead of discarding an entire receipt because one
-    field was below the teacher confidence threshold.
+    The default ``v8`` keeps the established four-slot protocol.  Select
+    ``v9`` only with a flat manifest containing all five field labels from one
+    pseudo-label export; its fifth channel is ``recipient_field``.  A unified
+    record may omit a slot.  The training model uses a white placeholder for
+    missing images and masks its loss, preserving good labels rather than
+    discarding an entire receipt because one field was below the teacher
+    confidence threshold.
     """
-    dataset_root, records, rejected = _read_flat_records(records_path)
+    architecture, dataset_kind, slot_order = _dataset_spec(architecture)
+    dataset_root, records, rejected = _read_flat_records(records_path, slot_order=slot_order)
     output_dir = output_dir.resolve()
     if output_dir.exists() and any(output_dir.iterdir()):
         raise ValueError(f"output directory already contains files: {output_dir}")
@@ -416,8 +558,8 @@ def build_unified_dataset(*, records_path: Path, output_dir: Path) -> dict[str, 
         if ambiguous:
             entry["ambiguous_slots"] = sorted(ambiguous)
         entry["id"] = f"receipt-{digest[:24]}"
-        entry["slot_order"] = list(SLOT_ORDER)
-        entry["complete"] = all(field in slots for field in SLOT_ORDER)
+        entry["slot_order"] = list(slot_order)
+        entry["complete"] = all(field in slots for field in slot_order)
         unified_records.append(entry)
     unified_records.sort(key=lambda value: str(value["id"]))
     if not unified_records:
@@ -474,18 +616,18 @@ def build_unified_dataset(*, records_path: Path, output_dir: Path) -> dict[str, 
             }
     summary: dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
-        "kind": KIND,
+        "kind": dataset_kind,
         "source_records": records_path.resolve().as_posix(),
         "dataset_root": dataset_root.as_posix(),
-        "slot_order": list(SLOT_ORDER),
+        "slot_order": list(slot_order),
         "status_classes": list(STATUS_CLASSES),
         "records": len(unified_records),
         "complete_records": sum(bool(record["complete"]) for record in unified_records),
-        "slot_records": {field: int(slot_counts[field]) for field in SLOT_ORDER},
+        "slot_records": {field: int(slot_counts[field]) for field in slot_order},
         "by_split": {split: int(by_split[split]) for split in ("train", "val", "test")},
         "complete_by_split": {split: int(complete_by_split[split]) for split in ("train", "val", "test")},
         "rejected_records": len(rejected),
-        "ambiguous_slot_records": {field: int(ambiguous_slot_counts[field]) for field in SLOT_ORDER},
+        "ambiguous_slot_records": {field: int(ambiguous_slot_counts[field]) for field in slot_order},
         "payment_target": "visible_payment_method_value",
         "structured_target_config": structured_target_config(),
         "structured_target_counts": structured_target_counts,
@@ -496,8 +638,30 @@ def build_unified_dataset(*, records_path: Path, output_dir: Path) -> dict[str, 
             "Do not claim production accuracy without a held-out teacher-parity and human-truth evaluation."
         ),
     }
+    recipient_charset_characters: list[str] | None = None
+    if architecture == ARCHITECTURE_V9:
+        recipient_charset = _recipient_charset_payload(unified_records)
+        # Keep the full audit in the contract and a tiny deterministic text
+        # sidecar for training scripts that accept a character list directly.
+        # The newline is a file terminator, not a trainable character.
+        # Keep a v8 contract byte-for-byte shaped like the established one;
+        # v9 is a separate kind and carries its explicit architecture marker.
+        summary["architecture"] = architecture
+        summary["recipient_target"] = "visible_recipient_value"
+        recipient_charset_characters = list(recipient_charset["characters"])
+        summary["recipient_charset"] = recipient_charset_characters
+        summary["recipient_charset_sha256"] = recipient_charset["sha256"]
+        summary["recipient_charset_source"] = recipient_charset["source"]
+        summary["recipient_oov_by_split"] = recipient_charset["oov_by_split"]
     _atomic_write_jsonl(output_dir / "unified_fields.jsonl", unified_records)
     _atomic_write_jsonl(output_dir / "rejected.jsonl", rejected)
+    if architecture == ARCHITECTURE_V9:
+        if recipient_charset_characters is None:  # Internal construction invariant.
+            raise AssertionError("v9 recipient charset was not initialized")
+        _atomic_write_text(
+            output_dir / "recipient_charset.txt",
+            "".join(recipient_charset_characters) + "\n",
+        )
     _atomic_write_json(output_dir / "dataset.contract.json", summary)
     return summary
 
@@ -508,13 +672,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--records", type=Path, required=True, help="Flat pseudo_labels.jsonl or transaction-truth JSONL")
     parser.add_argument("--output", type=Path, required=True, help="New empty output directory")
+    parser.add_argument(
+        "--architecture",
+        choices=(ARCHITECTURE_V8, ARCHITECTURE_V9),
+        default=ARCHITECTURE_V8,
+        help="v8 keeps four slots; v9 appends recipient_field as a fifth slot",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
     try:
-        summary = build_unified_dataset(records_path=args.records, output_dir=args.output)
+        summary = build_unified_dataset(
+            records_path=args.records,
+            output_dir=args.output,
+            architecture=args.architecture,
+        )
     except (OSError, ValueError) as error:
         raise SystemExit(f"Unified OCR dataset build failed:\n{error}") from error
     slot_summary = ", ".join(f"{field}={count}" for field, count in dict(summary["slot_records"]).items())

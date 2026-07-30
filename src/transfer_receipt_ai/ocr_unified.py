@@ -1,4 +1,4 @@
-"""Train, export and evaluate one ONNX reader for four receipt fields.
+"""Train, export and evaluate one ONNX reader for receipt fields.
 
 The model intentionally has one shared visual encoder and one ONNX artifact,
 while retaining specialised heads where the output spaces differ:
@@ -9,12 +9,13 @@ while retaining specialised heads where the output spaces differ:
   canonical amount digits in CTC while learning a tiny visible-format grammar;
 * payment method: a raw CTC fallback plus a visible prefix, a finite known-bank
   classifier, and exact four-digit card-tail readers; and
-* transfer status: a finite three-class head.
+* transfer status: a finite three-class head; and
+* v9 recipient: a dedicated free-text Chinese CTC reader.
 
 That is materially different from putting all Chinese payment characters and
 numeric characters in one CTC vocabulary: the latter makes the financial
 fields compete with a much larger alphabet.  The exported wrapper consumes
-four fixed-order crops in one call, so deployment needs one ORT session.
+fixed-order crops in one call, so deployment needs one ORT session.
 """
 
 from __future__ import annotations
@@ -35,9 +36,10 @@ import numpy as np
 from PIL import Image
 
 from .onnx_runtime import _preload_cuda_dlls, onnx_providers
-from .ocr import normalize_payment_method
-from .ocr_unified_dataset import KIND as DATASET_KIND
-from .ocr_unified_dataset import SLOT_ORDER, STATUS_CLASSES
+from .ocr import clean_text, normalize_payment_method
+from .ocr_unified_dataset import KIND as DATASET_KIND_V8
+from .ocr_unified_dataset import KIND_V9 as DATASET_KIND_V9
+from .ocr_unified_dataset import SLOT_ORDER, STATUS_CLASSES, V9_SLOT_ORDER
 from .ocr_unified_targets import (
     AMOUNT_AUX_FORMAT,
     AMOUNT_CURRENCY_STYLE_CLASSES,
@@ -71,11 +73,14 @@ KIND_V5 = "receipt_unified_field_reader_v5"
 KIND_V6 = "receipt_unified_field_reader_v6"
 KIND_V7 = "receipt_unified_field_reader_v7"
 KIND_V8 = "receipt_unified_field_reader_v8"
-# Keep the public alias for callers that only need the current training
-# format.  Loading/export code must use SUPPORTED_KINDS instead so that the
-# already-produced v3-v6 checkpoints and ONNX bundles remain usable.
+KIND_V9 = "receipt_unified_field_reader_v9"
+# Keep the public/default alias on the established four-slot protocol.
+# Five-slot v9 is deliberately opt-in: callers must select ``architecture=v9``
+# rather than silently changing an existing v8 training or deployment path.
+# Loading/export code uses SUPPORTED_KINDS so every published version remains
+# independently loadable.
 KIND = KIND_V8
-SUPPORTED_KINDS = frozenset((KIND_V3, KIND_V4, KIND_V5, KIND_V6, KIND_V7, KIND_V8))
+SUPPORTED_KINDS = frozenset((KIND_V3, KIND_V4, KIND_V5, KIND_V6, KIND_V7, KIND_V8, KIND_V9))
 # Kept as the frozen v3-v5 shared charset.  Do not append v6 symbols here:
 # old ONNX sidecars/checkpoints must remain loadable byte-for-byte.
 NUMERIC_CHARACTERS = tuple("0123456789.:")
@@ -88,6 +93,7 @@ V6_TIME_CHARACTERS = tuple("0123456789:- ")
 V8_AMOUNT_CHARACTERS = tuple("0123456789.-")
 NUMERIC_BLANK_INDEX = 0
 PAYMENT_BLANK_INDEX = 0
+RECIPIENT_BLANK_INDEX = 0
 PAYMENT_BANK_OTHER_CLASS = "__other__"
 
 # v5 keeps these structural pieces deliberately small and fixed.  They are
@@ -150,6 +156,11 @@ V8_ONNX_OUTPUT_NAMES = (
     "payment_structure_logits",
     "payment_parentheses_logits",
 )
+# v9 is deliberately an additive protocol: the established v8 output order is
+# frozen byte-for-byte and the fifth free-text slot is appended.  This lets a
+# runtime distinguish an incompatible five-slot artifact before it ever runs
+# a four-slot model.
+V9_ONNX_OUTPUT_NAMES = V8_ONNX_OUTPUT_NAMES + ("recipient_logits",)
 # Only these output tensors use CTC.  The remaining v5 tensors are ordinary
 # fixed-position / classification logits and deliberately have no blank index.
 # Keeping this distinction in one place prevents the delivery contract loader
@@ -159,6 +170,7 @@ CTC_ONNX_BLANK_INDICES = {
     "time_logits": NUMERIC_BLANK_INDEX,
     "payment_logits": PAYMENT_BLANK_INDEX,
     "payment_prefix_logits": PAYMENT_BLANK_INDEX,
+    "recipient_logits": RECIPIENT_BLANK_INDEX,
 }
 
 # Match the project-wide fixed-graph export tolerance.  The unified reader
@@ -204,6 +216,11 @@ V8_TEXT_DELIVERY_REASON = (
     "Canonical amount CTC and visible-format heads share the same student model, and all teacher labels are "
     "Paddle-derived. Emit review until a group-isolated human-truth calibration accepts the rendered policy."
 )
+V9_TEXT_DELIVERY_POLICY = "review_only_pending_independent_human_truth_calibration"
+V9_TEXT_DELIVERY_REASON = (
+    "Recipient CTC and the other text heads share one compact student, and all current labels are "
+    "Paddle-derived. Emit review until a group-isolated human-truth calibration accepts the full five-field policy."
+)
 
 
 def _uses_structured_heads(config: "UnifiedReaderConfig") -> bool:
@@ -229,13 +246,27 @@ def _is_v8(config: "UnifiedReaderConfig") -> bool:
     return config.architecture_version == 8
 
 
+def _is_v9(config: "UnifiedReaderConfig") -> bool:
+    return config.architecture_version == 9
+
+
+def _uses_v8_protocol(config: "UnifiedReaderConfig") -> bool:
+    """Return whether the v8 amount/time/payment output protocol is present."""
+    return config.architecture_version >= 8
+
+
+def _slot_order(config: "UnifiedReaderConfig") -> tuple[str, ...]:
+    """Return the immutable input-channel order for this artifact version."""
+    return V9_SLOT_ORDER if _is_v9(config) else SLOT_ORDER
+
+
 def _uses_modern_protocol(config: "UnifiedReaderConfig") -> bool:
     """Return whether a reader uses the v6+ time/payment protocol."""
     return config.architecture_version >= 6
 
 
 def _amount_characters(config: "UnifiedReaderConfig") -> tuple[str, ...]:
-    if _is_v8(config):
+    if _uses_v8_protocol(config):
         return V8_AMOUNT_CHARACTERS
     return V6_AMOUNT_CHARACTERS if _uses_v6_protocol(config) else NUMERIC_CHARACTERS
 
@@ -251,10 +282,14 @@ def _text_delivery_policy(config: "UnifiedReaderConfig") -> tuple[str, str]:
         return V7_TEXT_DELIVERY_POLICY, V7_TEXT_DELIVERY_REASON
     if config.architecture_version == 8:
         return V8_TEXT_DELIVERY_POLICY, V8_TEXT_DELIVERY_REASON
+    if config.architecture_version == 9:
+        return V9_TEXT_DELIVERY_POLICY, V9_TEXT_DELIVERY_REASON
     return V5_TEXT_DELIVERY_POLICY, V5_TEXT_DELIVERY_REASON
 
 
 def _onnx_output_names(config: "UnifiedReaderConfig") -> tuple[str, ...]:
+    if _is_v9(config):
+        return V9_ONNX_OUTPUT_NAMES
     if _is_v8(config):
         return V8_ONNX_OUTPUT_NAMES
     if _uses_v6_protocol(config):
@@ -280,6 +315,8 @@ def _kind_for_architecture(architecture_version: int) -> str:
         return KIND_V7
     if architecture_version == 8:
         return KIND_V8
+    if architecture_version == 9:
+        return KIND_V9
     raise ValueError(f"Unsupported unified reader architecture v{architecture_version}")
 
 
@@ -300,6 +337,8 @@ def _architecture_for_kind(kind: object) -> int:
         return 7
     if kind == KIND_V8:
         return 8
+    if kind == KIND_V9:
+        return 9
     raise ValueError(f"Unsupported unified OCR artifact kind: {kind!r}")
 
 
@@ -307,6 +346,9 @@ def _architecture_for_kind(kind: object) -> int:
 class UnifiedReaderConfig:
     # v5 uses a still-small 80x512 view so financial glyphs retain enough
     # detail for the structural heads. v3/v4 stay loadable for compatibility.
+    # Keep v8 as the default for existing callers.  v9 is selected explicitly
+    # by the five-field training command so an old four-slot invocation never
+    # gains an uninitialised recipient channel by accident.
     architecture_version: int = 8
     image_height: int = 80
     image_width: int = 512
@@ -321,8 +363,8 @@ class UnifiedReaderConfig:
     amount_format_min_confidence: float = 0.90
 
     def validate(self) -> None:
-        if self.architecture_version not in {3, 4, 5, 6, 7, 8}:
-            raise ValueError("architecture_version must be 3, 4, 5, 6, 7, or 8")
+        if self.architecture_version not in {3, 4, 5, 6, 7, 8, 9}:
+            raise ValueError("architecture_version must be 3, 4, 5, 6, 7, 8, or 9")
         if self.image_height < 16 or self.image_width < 64 or self.image_width % 4:
             raise ValueError("image_height must be >=16 and image_width must be a multiple of 4 >=64")
         if self.base_channels < 8:
@@ -410,8 +452,9 @@ def build_unified_reader(
     payment_vocab_size: int,
     config: UnifiedReaderConfig,
     payment_bank_prefix_vocab_size: int | None = None,
+    recipient_vocab_size: int | None = None,
 ) -> Any:
-    """Return the shared-trunk, four-slot reader used for training and ONNX export.
+    """Return the shared-trunk reader used for training and ONNX export.
 
     Architecture v3 deliberately preserves the original module names and
     topology.  That is necessary for strict loading of existing v3 checkpoints.
@@ -425,13 +468,16 @@ def build_unified_reader(
     CTC reader with the fixed-format time heads, so their gradients reinforce
     the same punctuation evidence. v8 keeps that compact time/payment protocol
     but attaches finite amount-display grammar heads directly to canonical
-    amount CTC state. v3/v4 output tuples are intentionally unchanged.
+    amount CTC state. v9 retains that 14-output protocol and appends a fifth
+    free-recipient CTC head. v3/v4 output tuples are intentionally unchanged.
     """
     if payment_vocab_size < 2:
         raise ValueError("payment_vocab_size must include CTC blank plus at least one character")
     config.validate()
     if _uses_modern_protocol(config) and (payment_bank_prefix_vocab_size is None or payment_bank_prefix_vocab_size < 2):
         raise ValueError("v6/v7/v8 needs payment_bank_prefix_vocab_size including __other__ plus one class")
+    if _is_v9(config) and (recipient_vocab_size is None or recipient_vocab_size < 2):
+        raise ValueError("v9 needs recipient_vocab_size including CTC blank plus at least one character")
     torch, nn = _require_torch()
 
     class DepthwiseBlock(nn.Module):
@@ -499,7 +545,7 @@ def build_unified_reader(
                 DepthwiseBlock(second, third, stride=(2, 1)),
                 DepthwiseBlock(third, fourth, stride=(2 if config.architecture_version == 3 else 1, 1)),
             )
-            self.slot_embedding = nn.Parameter(torch.empty(4, fourth, 1, 1))
+            self.slot_embedding = nn.Parameter(torch.empty(len(_slot_order(config)), fourth, 1, 1))
             nn.init.normal_(self.slot_embedding, std=0.02)
             if config.architecture_version == 3:
                 # Do not rename these v3 modules: their state_dict keys are
@@ -527,7 +573,19 @@ def build_unified_reader(
                 self.payment_ctc_sequence = nn.GRU(fourth, config.payment_hidden_size, bidirectional=True)
                 self.payment_ctc_classifier = nn.Linear(config.payment_hidden_size * 2, payment_vocab_size)
 
-                if _is_v8(config):
+                if _is_v9(config):
+                    # A recipient is open Chinese text, not a closed merchant
+                    # catalogue.  It therefore gets its own compact CTC head
+                    # while sharing the visual trunk and ONNX session.
+                    self.recipient_ctc_vertical_reducer = VerticalTextReducer(fourth, feature_height)
+                    self.recipient_ctc_sequence = nn.GRU(
+                        fourth, config.payment_hidden_size, bidirectional=True
+                    )
+                    self.recipient_classifier = nn.Linear(
+                        config.payment_hidden_size * 2, int(recipient_vocab_size)
+                    )
+
+                if _uses_v8_protocol(config):
                     # The v8 CTC stream owns signed canonical digits. These
                     # finite heads only choose display grammar; they cannot
                     # invent or replace a monetary digit.
@@ -615,9 +673,12 @@ def build_unified_reader(
             self.status_classifier = nn.Linear(fourth * config.pooled_width, len(STATUS_CLASSES))
 
         def forward(self, field_images: Any) -> tuple[Any, ...]:
-            # Training input: [batch, slot=4, channel=1, height, width].
-            if field_images.ndim != 5 or field_images.shape[1] != len(SLOT_ORDER) or field_images.shape[2] != 1:
-                raise ValueError("field_images must have shape [batch,4,1,height,width]")
+            # Training input: [batch, fixed slot count, channel=1, height, width].
+            expected_slots = len(_slot_order(config))
+            if field_images.ndim != 5 or field_images.shape[1] != expected_slots or field_images.shape[2] != 1:
+                raise ValueError(
+                    f"field_images must have shape [batch,{expected_slots},1,height,width]"
+                )
             batch, slots, channels, height, width = field_images.shape
             encoded = self.encoder(self.stem(field_images.reshape(batch * slots, channels, height, width)))
             _, feature_channels, feature_height, feature_width = encoded.shape
@@ -662,6 +723,10 @@ def build_unified_reader(
                 payment_features = self.payment_ctc_vertical_reducer(encoded[:, 3])  # [batch,C,T]
                 payment_sequence, _ = self.payment_ctc_sequence(payment_features.permute(2, 0, 1))
                 payment_logits = self.payment_ctc_classifier(payment_sequence)
+                if _is_v9(config):
+                    recipient_features = self.recipient_ctc_vertical_reducer(encoded[:, 4])
+                    recipient_sequence, _ = self.recipient_ctc_sequence(recipient_features.permute(2, 0, 1))
+                    recipient_logits = self.recipient_classifier(recipient_sequence)
             elif self.architecture_version == 5:
                 payment_features = self.payment_vertical_reducer(encoded[:, 3])  # [batch,C,T]
                 payment_sequence = payment_features.permute(2, 0, 1)
@@ -676,7 +741,7 @@ def build_unified_reader(
             status_features = self.status_pool(encoded[:, 2]).flatten(1)
             status_logits = self.status_classifier(status_features)
             if self.architecture_version >= 6:
-                if _is_v8(config):
+                if _uses_v8_protocol(config):
                     amount_summary = torch.cat((amount_ctc_hidden[0], amount_ctc_hidden[1]), dim=1)
                 else:
                     amount_verifier_features = self.amount_verifier_vertical_reducer(encoded[:, 0]).permute(2, 0, 1)
@@ -699,7 +764,7 @@ def build_unified_reader(
                 payment_prefix_sequence, payment_prefix_hidden = self.payment_prefix_sequence(payment_verifier_features)
                 payment_prefix_logits = self.payment_prefix_classifier(payment_prefix_sequence)
                 payment_summary = torch.cat((payment_prefix_hidden[0], payment_prefix_hidden[1]), dim=1)
-                if _is_v8(config):
+                if _uses_v8_protocol(config):
                     amount_currency_style_logits = self.amount_currency_style_classifier(amount_summary)
                     amount_grouped_thousands_logits = self.amount_grouped_thousands_classifier(amount_summary)
                     amount_sign_position_logits = self.amount_sign_position_classifier(amount_summary)
@@ -715,8 +780,8 @@ def build_unified_reader(
                 )
                 payment_structure_logits = self.payment_structure_classifier(payment_summary)
                 payment_parentheses_logits = self.payment_parentheses_classifier(payment_summary)
-                if _is_v8(config):
-                    return (
+                if _uses_v8_protocol(config):
+                    v8_outputs = (
                         amount_logits,
                         time_logits,
                         payment_logits,
@@ -732,6 +797,9 @@ def build_unified_reader(
                         payment_structure_logits,
                         payment_parentheses_logits,
                     )
+                    if _is_v9(config):
+                        return v8_outputs + (recipient_logits,)
+                    return v8_outputs
                 return (
                     amount_logits,
                     time_logits,
@@ -840,7 +908,7 @@ def _parse_slot(
         raise FileNotFoundError(f"{records_path}:{line_number}: slot {field} image not found: {image_path}")
     slot = dict(raw)
     slot["image_path"] = image_path
-    if field in {"amount", "time", "payment_method_field"}:
+    if field in {"amount", "time", "payment_method_field", "recipient_field"}:
         text = slot.get("text")
         if not isinstance(text, str) or not text:
             raise ValueError(f"{records_path}:{line_number}: slot {field} must have a non-empty CTC target")
@@ -854,6 +922,8 @@ def _parse_slot(
             raise ValueError(f"{records_path}:{line_number}: time CTC target is invalid")
         if field == "payment_method_field" and any(not character.isprintable() for character in text):
             raise ValueError(f"{records_path}:{line_number}: payment CTC target contains a non-printable character")
+        if field == "recipient_field" and any(not character.isprintable() for character in text):
+            raise ValueError(f"{records_path}:{line_number}: recipient CTC target contains a non-printable character")
     else:
         class_name = slot.get("class_name")
         if class_name not in STATUS_CLASSES:
@@ -861,17 +931,26 @@ def _parse_slot(
     return slot
 
 
-def load_records(records_path: Path, *, dataset_root: Path | None = None) -> list[dict[str, object]]:
+def load_records(
+    records_path: Path,
+    *,
+    dataset_root: Path | None = None,
+    config: UnifiedReaderConfig | None = None,
+) -> list[dict[str, object]]:
     """Load receipt-level records and protect train/val/test group isolation."""
+    if config is not None:
+        config.validate()
+    slot_order = _slot_order(config) if config is not None else SLOT_ORDER
+    expected_dataset_kind = DATASET_KIND_V9 if slot_order == V9_SLOT_ORDER else DATASET_KIND_V8
     records_path = records_path.resolve()
     if not records_path.is_file():
         raise FileNotFoundError(records_path)
     contract_path = records_path.parent / "dataset.contract.json"
     if contract_path.is_file():
         contract = _load_json_object(contract_path)
-        if contract.get("schema_version") != SCHEMA_VERSION or contract.get("kind") != DATASET_KIND:
+        if contract.get("schema_version") != SCHEMA_VERSION or contract.get("kind") != expected_dataset_kind:
             raise ValueError(f"{contract_path}: unsupported unified dataset contract")
-        if contract.get("slot_order") != list(SLOT_ORDER) or contract.get("status_classes") != list(STATUS_CLASSES):
+        if contract.get("slot_order") != list(slot_order) or contract.get("status_classes") != list(STATUS_CLASSES):
             raise ValueError(f"{contract_path}: slot order or status classes do not match the unified reader")
     dataset_root = (dataset_root if dataset_root is not None else records_path.parent).resolve()
     if not dataset_root.is_dir():
@@ -905,11 +984,11 @@ def load_records(records_path: Path, *, dataset_root: Path | None = None) -> lis
                 raise ValueError(f"{records_path}:{line_number}: split must be train, val, or test")
             if not isinstance(slots, Mapping):
                 raise ValueError(f"{records_path}:{line_number}: slots must be an object")
-            unknown_slots = sorted(set(slots) - set(SLOT_ORDER))
+            unknown_slots = sorted(set(slots) - set(slot_order))
             if unknown_slots:
                 raise ValueError(f"{records_path}:{line_number}: unknown unified slot(s): {','.join(unknown_slots)}")
             declared_order = raw.get("slot_order")
-            if declared_order is not None and declared_order != list(SLOT_ORDER):
+            if declared_order is not None and declared_order != list(slot_order):
                 raise ValueError(f"{records_path}:{line_number}: slot_order does not match the unified reader")
             prior_split = group_splits.setdefault(group_id, split)
             if prior_split != split:
@@ -932,7 +1011,7 @@ def load_records(records_path: Path, *, dataset_root: Path | None = None) -> lis
                     line_number=line_number,
                     dataset_root=dataset_root,
                 )
-                for field in SLOT_ORDER
+                for field in slot_order
             }
             if not any(value is not None for value in parsed_slots.values()):
                 raise ValueError(f"{records_path}:{line_number}: receipt has no labelled slot")
@@ -977,6 +1056,49 @@ def _payment_charset(records: Iterable[Mapping[str, object]]) -> list[str]:
     if not characters:
         raise ValueError("No payment_method_field CTC labels remain in the training split")
     return characters
+
+
+def _recipient_charset(records: Iterable[Mapping[str, object]]) -> list[str]:
+    """Freeze a train-only Unicode character set for recipient CTC.
+
+    This is deliberately not a merchant classifier.  A character seen only in
+    held-out data stays out of the deployed alphabet and is recorded as OOV
+    evidence instead of leaking validation/test text into the model.
+    """
+    characters = sorted(
+        {
+            character
+            for record in records
+            for slot in [dict(record["slots"]).get("recipient_field")]
+            if isinstance(slot, Mapping)
+            for character in str(slot["text"])
+        }
+    )
+    if not characters:
+        raise ValueError("No recipient_field CTC labels remain in the training split")
+    return characters
+
+
+def _recipient_oov_by_split(
+    records: Iterable[Mapping[str, object]], *, characters: Sequence[str]
+) -> dict[str, dict[str, int]]:
+    known = set(characters)
+    counters: dict[str, Counter[str]] = {split: Counter() for split in ("train", "val", "test")}
+    for record in records:
+        text = _slot_text(record, "recipient_field")
+        if text is None:
+            continue
+        split = str(record["split"])
+        counters[split]["records"] += 1
+        if any(character not in known for character in text):
+            counters[split]["oov_records"] += 1
+    return {
+        split: {
+            "records": int(counters[split]["records"]),
+            "oov_records": int(counters[split]["oov_records"]),
+        }
+        for split in ("train", "val", "test")
+    }
 
 
 def _payment_bank_prefix_classes(
@@ -1075,10 +1197,20 @@ def _ctc_required_steps(text: str) -> int:
     return len(text) + sum(left == right for left, right in zip(text, text[1:]))
 
 
-def _validate_ctc_capacity(records: Iterable[Mapping[str, object]], *, config: UnifiedReaderConfig) -> None:
+def _validate_ctc_capacity(
+    records: Iterable[Mapping[str, object]],
+    *,
+    config: UnifiedReaderConfig,
+    recipient_characters: Sequence[str] | None = None,
+) -> None:
     available = config.image_width // 4
     for record in records:
-        for field in ("amount", "time", "payment_method_field"):
+        fields = ("amount", "time", "payment_method_field", "recipient_field") if _is_v9(config) else (
+            "amount",
+            "time",
+            "payment_method_field",
+        )
+        for field in fields:
             text = _ctc_slot_text(record, field, config=config)
             if text is None:
                 continue
@@ -1087,9 +1219,18 @@ def _validate_ctc_capacity(records: Iterable[Mapping[str, object]], *, config: U
                 if field == "amount"
                 else _time_characters(config)
                 if field == "time"
+                else recipient_characters
+                if field == "recipient_field"
                 else None
             )
-            if characters is not None and any(character not in characters for character in text):
+            if field == "recipient_field" and characters is None:
+                raise ValueError("v9 recipient CTC validation needs a train-only recipient charset")
+            # Validation/test recipient OOV is intentional evidence for a
+            # train-only Unicode alphabet.  It must not make the manifest
+            # unloadable; those rows are scored/reviewed later.  Train labels,
+            # by contrast, must always be encodable.
+            validate_characters = field != "recipient_field" or str(record["split"]) == "train"
+            if characters is not None and validate_characters and any(character not in characters for character in text):
                 raise ValueError(
                     f"CTC target has a character outside the architecture v{config.architecture_version} {field} charset: "
                     f"id={record['id']}, text={text!r}."
@@ -1104,15 +1245,17 @@ def _validate_ctc_capacity(records: Iterable[Mapping[str, object]], *, config: U
 
 
 def _input_tensor(record: Mapping[str, object], *, config: UnifiedReaderConfig) -> np.ndarray:
-    field_images = np.stack([_blank_image(config) for _ in SLOT_ORDER], axis=0)
+    slot_order = _slot_order(config)
+    field_images = np.stack([_blank_image(config) for _ in slot_order], axis=0)
     slots = dict(record["slots"])
-    for index, field in enumerate(SLOT_ORDER):
+    for index, field in enumerate(slot_order):
         slot = slots.get(field)
         if isinstance(slot, Mapping):
             right_align = _uses_structured_heads(config) and field in {
                 "amount",
                 "time",
                 "payment_method_field",
+                "recipient_field",
             }
             field_images[index] = preprocess_image(
                 Path(slot["image_path"]),
@@ -1153,6 +1296,11 @@ def _unpack_reader_outputs(outputs: object, *, config: UnifiedReaderConfig) -> d
     """Give training/evaluation named tensors while preserving v3/v4 tuples."""
     if not isinstance(outputs, tuple):
         raise ValueError("Unified reader must return a tuple of tensors")
+    if _is_v9(config):
+        if len(outputs) != len(V9_ONNX_OUTPUT_NAMES):
+            raise ValueError("Unified v9 reader must return fifteen output tensors")
+        names = V9_ONNX_OUTPUT_NAMES
+        return {name: value for name, value in zip(names, outputs)}
     if _is_v8(config):
         if len(outputs) != 14:
             raise ValueError("Unified v8 reader must return fourteen output tensors")
@@ -1659,7 +1807,7 @@ def _select_report_candidates(
         for field, (structured_text, structured_confidence) in structured_predictions.items():
             if structured_text is not None:
                 predictions[field] = (str(structured_text), float(structured_confidence))
-    elif _is_v8(config):
+    elif _uses_v8_protocol(config):
         for field in ("amount", "time"):
             structured = structured_predictions.get(field)
             if structured is not None and structured[0] is not None:
@@ -1690,7 +1838,7 @@ def _ctc_slot_text(record: Mapping[str, object], field: str, *, config: UnifiedR
     slot = dict(record["slots"]).get(field)
     if not isinstance(slot, Mapping):
         return None
-    if _is_v8(config) and field == "amount":
+    if _uses_v8_protocol(config) and field == "amount":
         visible = slot.get("visible_text")
         parsed = parse_amount_display_target(visible) if isinstance(visible, str) else None
         if parsed is not None:
@@ -2068,11 +2216,14 @@ def _structured_cross_entropy_loss(
     )
 
 
-def _field_split_counts(records: Iterable[Mapping[str, object]]) -> dict[str, dict[str, int]]:
-    counts: dict[str, Counter[str]] = {field: Counter() for field in SLOT_ORDER}
+def _field_split_counts(
+    records: Iterable[Mapping[str, object]], *, config: UnifiedReaderConfig
+) -> dict[str, dict[str, int]]:
+    slot_order = _slot_order(config)
+    counts: dict[str, Counter[str]] = {field: Counter() for field in slot_order}
     for record in records:
         split = str(record["split"])
-        for field in SLOT_ORDER:
+        for field in slot_order:
             if field == "transfer_status":
                 labelled = _status_name(record) is not None
             else:
@@ -2081,7 +2232,7 @@ def _field_split_counts(records: Iterable[Mapping[str, object]]) -> dict[str, di
                 counts[field][split] += 1
     return {
         field: {split: int(counts[field][split]) for split in ("train", "val", "test")}
-        for field in SLOT_ORDER
+        for field in slot_order
     }
 
 
@@ -2328,6 +2479,8 @@ def _batch_loss(
     amount_to_id: Mapping[str, int],
     time_to_id: Mapping[str, int],
     payment_to_id: Mapping[str, int],
+    recipient_logits: Any | None = None,
+    recipient_to_id: Mapping[str, int] | None = None,
     payment_bank_prefix_classes: Sequence[str] | None,
     payment_bank_class_weights: Any | None,
     status_to_id: Mapping[str, int],
@@ -2359,6 +2512,17 @@ def _batch_loss(
         character_to_id=payment_to_id,
         torch=torch,
     )
+    if _is_v9(config):
+        if recipient_logits is None or recipient_to_id is None:
+            raise ValueError("Unified v9 loss requires recipient logits and a train-only recipient charset")
+        recipient_loss, recipient_used, recipient_oov = _ctc_loss(
+            recipient_logits,
+            labels=[_slot_text(record, "recipient_field") for record in records],
+            character_to_id=recipient_to_id,
+            torch=torch,
+        )
+    else:
+        recipient_loss, recipient_used, recipient_oov = None, 0, 0
     if status_enabled:
         if status_criterion is None:
             raise ValueError("status_criterion is required when status_enabled is true")
@@ -2438,7 +2602,7 @@ def _batch_loss(
             labels=[1 if target is not None else 0 if _slot_text(record, "payment_method_field") is not None else None for record, target in zip(records, payment_targets)],
             torch=torch,
         )
-    elif _is_v8(config):
+    elif _uses_v8_protocol(config):
         if structured_outputs is None:
             raise ValueError("Unified v8 loss requires structured output tensors")
         if payment_bank_prefix_classes is None:
@@ -2578,6 +2742,8 @@ def _batch_loss(
             pieces.append(time_loss * ctc_loss_weight)
         if payment_loss is not None:
             pieces.append(payment_loss * payment_loss_weight * ctc_loss_weight)
+        if recipient_loss is not None:
+            pieces.append(recipient_loss * ctc_loss_weight)
         if amount_length_loss is not None:
             pieces.append(amount_length_loss * structured_loss_weight)
         if amount_digits_loss is not None:
@@ -2626,6 +2792,8 @@ def _batch_loss(
             pieces.append(time_loss)
         if payment_loss is not None:
             pieces.append(payment_loss * payment_loss_weight)
+        if recipient_loss is not None:
+            pieces.append(recipient_loss)
     if status_loss is not None:
         pieces.append(status_loss)
     if not pieces:
@@ -2641,6 +2809,11 @@ def _batch_loss(
             "loss": float(payment_loss.detach().cpu()) if payment_loss is not None else math.nan,
             "used": payment_used,
             "oov": payment_oov,
+        },
+        "recipient_field": {
+            "loss": float(recipient_loss.detach().cpu()) if recipient_loss is not None else math.nan,
+            "used": recipient_used,
+            "oov": recipient_oov,
         },
         "transfer_status": {"loss": float(status_loss.detach().cpu()) if status_loss is not None else math.nan, "used": status_used, "oov": 0},
         "amount_structured": {
@@ -2693,6 +2866,8 @@ def _evaluate_model(
     time_to_id: Mapping[str, int],
     payment_characters: Sequence[str],
     payment_to_id: Mapping[str, int],
+    recipient_characters: Sequence[str] | None,
+    recipient_to_id: Mapping[str, int] | None,
     payment_bank_prefix_classes: Sequence[str] | None,
     payment_bank_class_weights: Any | None,
     status_to_id: Mapping[str, int],
@@ -2703,15 +2878,21 @@ def _evaluate_model(
     structured_loss_weight: float,
     torch: Any,
 ) -> dict[str, object]:
-    """Evaluate all four heads without discarding OOV held-out labels."""
+    """Evaluate every available reader head without discarding held-out OOV labels."""
     model.eval()
     total_loss = 0.0
     loss_receipts = 0
     exact_total = 0
     label_total = 0
-    counters: dict[str, Counter[str]] = {field: Counter() for field in SLOT_ORDER}
+    slot_order = _slot_order(config)
+    counters: dict[str, Counter[str]] = {field: Counter() for field in slot_order}
     ctc_counters: dict[str, Counter[str]] = {
-        field: Counter() for field in ("amount", "time", "payment_method_field")
+        field: Counter()
+        for field in (("amount", "time", "payment_method_field", "recipient_field") if _is_v9(config) else (
+            "amount",
+            "time",
+            "payment_method_field",
+        ))
     }
     verifier_counters: dict[str, Counter[str]] = {
         field: Counter() for field in ("amount", "time", "payment_method_field")
@@ -2724,6 +2905,7 @@ def _evaluate_model(
             time_logits = outputs["time_logits"]
             payment_logits = outputs["payment_logits"]
             status_logits = outputs["status_logits"]
+            recipient_logits = outputs.get("recipient_logits")
             loss, _ = _batch_loss(
                 amount_logits,
                 time_logits,
@@ -2733,6 +2915,8 @@ def _evaluate_model(
                 amount_to_id=amount_to_id,
                 time_to_id=time_to_id,
                 payment_to_id=payment_to_id,
+                recipient_logits=recipient_logits,
+                recipient_to_id=recipient_to_id,
                 payment_bank_prefix_classes=payment_bank_prefix_classes,
                 payment_bank_class_weights=payment_bank_class_weights,
                 status_to_id=status_to_id,
@@ -2759,6 +2943,14 @@ def _evaluate_model(
             payment_ctc_predictions = decode_ctc_logits(
                 payment_logits.detach().cpu().numpy(), characters=payment_characters
             )
+            if _is_v9(config):
+                if recipient_logits is None or recipient_characters is None:
+                    raise AssertionError("v9 evaluation requires recipient logits and charset")
+                recipient_ctc_predictions = decode_ctc_logits(
+                    recipient_logits.detach().cpu().numpy(), characters=recipient_characters
+                )
+            else:
+                recipient_ctc_predictions = []
             amount_predictions = list(amount_ctc_predictions)
             time_predictions = list(time_ctc_predictions)
             payment_predictions = list(payment_ctc_predictions)
@@ -2768,6 +2960,10 @@ def _evaluate_model(
                 "time": list(time_ctc_predictions),
                 "payment_method_field": list(payment_ctc_predictions),
             }
+            if _is_v9(config):
+                # Paddle-derived v9 text must remain a diagnostic/review value
+                # until human-truth calibration accepts it.
+                delivery_predictions["recipient_field"] = [None] * len(records)
             if config.architecture_version == 5:
                 structured_amount = _structured_amount_predictions(
                     outputs["amount_length_logits"].detach().cpu().numpy(),
@@ -2807,7 +3003,7 @@ def _evaluate_model(
                     "time": [None] * len(records),
                     "payment_method_field": [None] * len(records),
                 }
-            elif _is_v8(config):
+            elif _uses_v8_protocol(config):
                 structured_amount = _structured_amount_v8_predictions(
                     amount_ctc_scored,
                     outputs["amount_currency_style_logits"].detach().cpu().numpy(),
@@ -2834,6 +3030,8 @@ def _evaluate_model(
                     "time": [None] * len(records),
                     "payment_method_field": [None] * len(records),
                 }
+                if _is_v9(config):
+                    delivery_predictions["recipient_field"] = [None] * len(records)
             elif _uses_v6_protocol(config):
                 structured_amount = _structured_amount_v6_predictions(
                     outputs["amount_sign_logits"].detach().cpu().numpy(),
@@ -2881,6 +3079,11 @@ def _evaluate_model(
                     "time": (_ctc_slot_text(record, "time", config=config), time_ctc_predictions[index]),
                     "payment_method_field": (_slot_text(record, "payment_method_field"), payment_ctc_predictions[index]),
                 }
+                if _is_v9(config):
+                    raw_values["recipient_field"] = (
+                        _slot_text(record, "recipient_field"),
+                        recipient_ctc_predictions[index],
+                    )
                 for field, (expected, predicted) in raw_values.items():
                     if expected is None:
                         continue
@@ -2888,7 +3091,7 @@ def _evaluate_model(
                     raw_counter["records"] += 1
                     raw_counter["exact_matches"] += int(str(expected) == str(predicted))
                 amount_expected = _ctc_slot_text(record, "amount", config=config)
-                if _is_v8(config):
+                if _uses_v8_protocol(config):
                     amount_slot = dict(record["slots"]).get("amount")
                     visible = amount_slot.get("visible_text") if isinstance(amount_slot, Mapping) else None
                     if isinstance(visible, str) and parse_amount_visible_format_target(visible) is not None:
@@ -2910,6 +3113,12 @@ def _evaluate_model(
                         delivery_predictions["payment_method_field"][index],
                     ),
                 }
+                if _is_v9(config):
+                    values["recipient_field"] = (
+                        _slot_text(record, "recipient_field"),
+                        recipient_ctc_predictions[index],
+                        delivery_predictions["recipient_field"][index],
+                    )
                 if status_enabled:
                     values["transfer_status"] = (
                         _status_name(record),
@@ -2923,6 +3132,10 @@ def _evaluate_model(
                     field_counter["records"] += 1
                     if field == "payment_method_field" and any(
                         character not in payment_to_id for character in str(expected)
+                    ):
+                        field_counter["oov_reference"] += 1
+                    if field == "recipient_field" and recipient_to_id is not None and any(
+                        character not in recipient_to_id for character in str(expected)
                     ):
                         field_counter["oov_reference"] += 1
                     matched = str(expected) == str(predicted)
@@ -2955,7 +3168,9 @@ def _evaluate_model(
         for counter in verifier_counters.values()
         if counter["records"]
     ]
-    candidate_text_fields = ("amount", "time", "payment_method_field")
+    candidate_text_fields = ("amount", "time", "payment_method_field") + (
+        ("recipient_field",) if _is_v9(config) else ()
+    )
     candidate_text_records = sum(counters[field]["records"] for field in candidate_text_fields)
     candidate_text_exact_matches = sum(counters[field]["exact_matches"] for field in candidate_text_fields)
     candidate_text_field_scores = [
@@ -3076,34 +3291,49 @@ def train_unified_reader(
     output_dir = output_dir.resolve()
     if output_dir.exists() and any(output_dir.iterdir()):
         raise ValueError(f"training output already contains files: {output_dir}. Choose a new empty directory.")
-    records = load_records(records_path, dataset_root=dataset_root)
+    records = load_records(records_path, dataset_root=dataset_root, config=config)
     train_records = [record for record in records if record["split"] == "train"]
     validation_records = [record for record in records if record["split"] == "val"]
     if not train_records or not validation_records:
         raise ValueError("The unified manifest must contain non-empty train and val receipt splits")
-    field_counts = _field_split_counts(records)
+    field_counts = _field_split_counts(records, config=config)
     structured_counts = _structured_split_counts(records)
     status_counts = _status_split_counts(records)
     status_policy = _status_head_policy(status_counts)
     required_fields = ["amount", "time", "payment_method_field"]
+    if _is_v9(config):
+        required_fields.append("recipient_field")
     if bool(status_policy["training_enabled"]):
         required_fields.append("transfer_status")
     _require_train_and_validation_coverage(field_counts, required_fields=required_fields)
     if config.architecture_version == 5:
         _require_v5_structured_coverage(structured_counts)
-    elif _is_v8(config):
+    elif _uses_v8_protocol(config):
         _require_v8_structured_coverage(structured_counts)
     elif _uses_v6_protocol(config):
         _require_v6_structured_coverage(structured_counts)
-    _validate_ctc_capacity(records, config=config)
     payment_characters = _payment_charset(train_records)
     payment_to_id = {character: index for index, character in enumerate(payment_characters, start=1)}
     amount_characters = list(_amount_characters(config))
     amount_to_id = {character: index for index, character in enumerate(amount_characters, start=1)}
     time_characters = list(_time_characters(config))
     time_to_id = {character: index for index, character in enumerate(time_characters, start=1)}
+    if _is_v9(config):
+        recipient_characters: list[str] | None = _recipient_charset(train_records)
+        recipient_to_id: dict[str, int] | None = {
+            character: index for index, character in enumerate(recipient_characters, start=1)
+        }
+    else:
+        recipient_characters = None
+        recipient_to_id = None
+    _validate_ctc_capacity(records, config=config, recipient_characters=recipient_characters)
     status_to_id = {name: index for index, name in enumerate(STATUS_CLASSES)}
     payment_oov = _payment_oov_by_split(records, payment_characters=set(payment_characters))
+    recipient_oov = (
+        _recipient_oov_by_split(records, characters=recipient_characters)
+        if recipient_characters is not None
+        else None
+    )
     if _uses_modern_protocol(config):
         payment_bank_prefix_classes, payment_bank_prefix_counts = _payment_bank_prefix_classes(
             train_records,
@@ -3159,6 +3389,7 @@ def train_unified_reader(
         payment_vocab_size=len(payment_characters) + 1,
         config=config,
         payment_bank_prefix_vocab_size=(len(payment_bank_prefix_classes) if payment_bank_prefix_classes is not None else None),
+        recipient_vocab_size=(len(recipient_characters) + 1 if recipient_characters is not None else None),
     ).to(target_device)
     if bool(status_policy["training_enabled"]):
         total_status = sum(status_counts["train"].values())
@@ -3191,6 +3422,19 @@ def train_unified_reader(
             "status_classes": list(STATUS_CLASSES),
             "structured_target_counts": structured_counts,
             "payment_charset_sha256": hashlib.sha256("".join(payment_characters).encode("utf-8")).hexdigest(),
+            **(
+                {
+                    "recipient_blank_index": RECIPIENT_BLANK_INDEX,
+                    "recipient_characters": recipient_characters,
+                    "recipient_charset_sha256": hashlib.sha256(
+                        "".join(recipient_characters).encode("utf-8")
+                    ).hexdigest(),
+                    "recipient_charset_source": "train_only_visible_recipient_text",
+                    "recipient_oov_by_split": recipient_oov,
+                }
+                if recipient_characters is not None
+                else {}
+            ),
             **(
                 {
                     "payment_bank_prefix_classes": payment_bank_prefix_classes,
@@ -3232,6 +3476,8 @@ def train_unified_reader(
                 amount_to_id=amount_to_id,
                 time_to_id=time_to_id,
                 payment_to_id=payment_to_id,
+                recipient_logits=outputs.get("recipient_logits"),
+                recipient_to_id=recipient_to_id,
                 payment_bank_prefix_classes=payment_bank_prefix_classes,
                 payment_bank_class_weights=payment_bank_train_weights,
                 status_to_id=status_to_id,
@@ -3260,6 +3506,8 @@ def train_unified_reader(
             time_to_id=time_to_id,
             payment_characters=payment_characters,
             payment_to_id=payment_to_id,
+            recipient_characters=recipient_characters,
+            recipient_to_id=recipient_to_id,
             payment_bank_prefix_classes=payment_bank_prefix_classes,
             payment_bank_class_weights=None,
             status_to_id=status_to_id,
@@ -3299,6 +3547,19 @@ def train_unified_reader(
             "time_characters": time_characters,
             **({"numeric_characters": amount_characters} if not _uses_modern_protocol(config) else {}),
             "payment_characters": payment_characters,
+            **(
+                {
+                    "recipient_characters": recipient_characters,
+                    "recipient_blank_index": RECIPIENT_BLANK_INDEX,
+                    "recipient_charset_sha256": hashlib.sha256(
+                        "".join(recipient_characters).encode("utf-8")
+                    ).hexdigest(),
+                    "recipient_charset_source": "train_only_visible_recipient_text",
+                    "recipient_oov_by_split": recipient_oov,
+                }
+                if recipient_characters is not None
+                else {}
+            ),
             "status_classes": list(STATUS_CLASSES),
             "field_counts": field_counts,
             "status_class_counts": status_counts,
@@ -3368,9 +3629,10 @@ def train_unified_reader(
                 "payment_bank_prefix_class_counts": payment_bank_prefix_counts,
                 "payment_bank_prefix_train_class_counts": payment_bank_train_counts,
                 "payment_bank_prefix_oov_by_split": payment_bank_prefix_oov,
+                "recipient_oov_by_split": recipient_oov,
                 "records": history,
                 "warning": (
-                    "Paddle teacher labels are not independent truth. v5-v8 text candidates remain review-only until "
+                    "Paddle teacher labels are not independent truth. v5-v9 text candidates remain review-only until "
                     "a separate acceptance policy passes group-isolated human-truth calibration. When "
                     "status_head_policy.runtime_policy is review_only, status logits are also not a delivery "
                     "decision and runtime must emit review."
@@ -3442,7 +3704,14 @@ def _checkpoint_config(payload: Mapping[str, object]) -> UnifiedReaderConfig:
 
 def _checkpoint_labels(
     payload: Mapping[str, object], *, config: UnifiedReaderConfig
-) -> tuple[list[str], list[str], list[str], list[str], list[str] | None]:
+) -> tuple[
+    list[str],
+    list[str],
+    list[str],
+    list[str] | None,
+    list[str],
+    list[str] | None,
+]:
     """Load architecture-specific CTC and finite-class label maps safely."""
     numeric = payload.get("numeric_characters")
     amount = payload.get("amount_characters")
@@ -3458,9 +3727,9 @@ def _checkpoint_labels(
     if status != list(STATUS_CLASSES):
         raise ValueError("Unified OCR checkpoint status class order is unsupported")
     if _uses_modern_protocol(config):
-        expected_amount = V8_AMOUNT_CHARACTERS if _is_v8(config) else V6_AMOUNT_CHARACTERS
+        expected_amount = V8_AMOUNT_CHARACTERS if _uses_v8_protocol(config) else V6_AMOUNT_CHARACTERS
         if amount != list(expected_amount) or time != list(V6_TIME_CHARACTERS):
-            raise ValueError("Unified v6/v7/v8 OCR checkpoint amount/time label maps are unsupported")
+            raise ValueError("Unified v6/v7/v8/v9 OCR checkpoint amount/time label maps are unsupported")
         bank_classes = payload.get("payment_bank_prefix_classes")
         if (
             not isinstance(bank_classes, list)
@@ -3470,11 +3739,32 @@ def _checkpoint_labels(
             or len(set(bank_classes)) != len(bank_classes)
             or bank_classes[1:] != sorted(bank_classes[1:])
         ):
-            raise ValueError("Unified v6/v7/v8 OCR checkpoint bank-prefix class map is invalid")
-        return list(amount), list(time), list(payment), list(status), list(bank_classes)
+            raise ValueError("Unified v6/v7/v8/v9 OCR checkpoint bank-prefix class map is invalid")
+        recipient: list[str] | None = None
+        if _is_v9(config):
+            raw_recipient = payload.get("recipient_characters")
+            if (
+                not isinstance(raw_recipient, list)
+                or not raw_recipient
+                or not all(
+                    isinstance(character, str)
+                    and len(character) == 1
+                    and character.isprintable()
+                    for character in raw_recipient
+                )
+                or len(set(raw_recipient)) != len(raw_recipient)
+                or raw_recipient != sorted(raw_recipient)
+                or payload.get("recipient_blank_index") != RECIPIENT_BLANK_INDEX
+            ):
+                raise ValueError("Unified v9 OCR checkpoint recipient charset or blank index is invalid")
+            recipient_sha256 = hashlib.sha256("".join(raw_recipient).encode("utf-8")).hexdigest()
+            if payload.get("recipient_charset_sha256") != recipient_sha256:
+                raise ValueError("Unified v9 OCR checkpoint recipient charset SHA-256 is invalid")
+            recipient = list(raw_recipient)
+        return list(amount), list(time), list(payment), recipient, list(status), list(bank_classes)
     if numeric != list(NUMERIC_CHARACTERS):
         raise ValueError("Unified OCR checkpoint numeric label map is not the supported fixed numeric charset")
-    return list(numeric), list(numeric), list(payment), list(status), None
+    return list(numeric), list(numeric), list(payment), None, list(status), None
 
 
 def _validate_exported_onnx(
@@ -3544,7 +3834,7 @@ def export_unified_onnx(
 ) -> tuple[Path, Path, Path]:
     """Export a static one-receipt ONNX graph plus labels and a delivery contract.
 
-    ``amount_format_min_confidence`` is a v8-only *bundle* override.  It
+    ``amount_format_min_confidence`` is a v8/v9 *bundle* override.  It
     changes the finite amount-display renderer policy recorded in the newly
     exported labels/contract, never the checkpoint or an existing ONNX
     artifact.  The neural graph is unchanged because this threshold is a
@@ -3576,13 +3866,17 @@ def export_unified_onnx(
             raise ValueError("amount_format_min_confidence must be between 0 and 1") from None
         if not math.isfinite(configured_threshold) or not 0.0 <= configured_threshold <= 1.0:
             raise ValueError("amount_format_min_confidence must be between 0 and 1")
-        if not _is_v8(config):
-            raise ValueError("amount_format_min_confidence export override is supported only by v8 checkpoints")
+        if not _uses_v8_protocol(config):
+            raise ValueError("amount_format_min_confidence export override is supported only by v8/v9 checkpoints")
         config = replace(config, amount_format_min_confidence=configured_threshold)
-    amount_characters, time_characters, payment_characters, status_classes, payment_bank_prefix_classes = _checkpoint_labels(
-        payload,
-        config=config,
-    )
+    (
+        amount_characters,
+        time_characters,
+        payment_characters,
+        recipient_characters,
+        status_classes,
+        payment_bank_prefix_classes,
+    ) = _checkpoint_labels(payload, config=config)
     state_dict = payload.get("state_dict")
     field_counts = payload.get("field_counts")
     status_counts = payload.get("status_class_counts")
@@ -3595,6 +3889,7 @@ def export_unified_onnx(
         payment_bank_prefix_vocab_size=(
             len(payment_bank_prefix_classes) if payment_bank_prefix_classes is not None else None
         ),
+        recipient_vocab_size=(len(recipient_characters) + 1 if recipient_characters is not None else None),
     )
     model.load_state_dict(state_dict)
     model.eval()
@@ -3605,7 +3900,8 @@ def export_unified_onnx(
             self.reader = reader
 
         def forward(self, field_images: Any) -> tuple[Any, ...]:
-            # ONNX input is one receipt in fixed field order: [4,1,H,W].
+            # ONNX input is one receipt in architecture-specific fixed field
+            # order: v3-v8 use [4,1,H,W], v9 uses [5,1,H,W].
             outputs = _unpack_reader_outputs(self.reader(field_images.unsqueeze(0)), config=config)
             payment = outputs["payment_logits"]
             status = outputs["status_logits"]
@@ -3617,8 +3913,8 @@ def export_unified_onnx(
                 payment[:, 0, :],
                 status[0, :],
             )
-            if _is_v8(config):
-                return base + (
+            if _uses_v8_protocol(config):
+                v8_outputs = base + (
                     outputs["amount_currency_style_logits"][0, :],
                     outputs["amount_grouped_thousands_logits"][0, :],
                     outputs["amount_sign_position_logits"][0, :],
@@ -3630,6 +3926,9 @@ def export_unified_onnx(
                     outputs["payment_structure_logits"][0, :],
                     outputs["payment_parentheses_logits"][0, :],
                 )
+                if _is_v9(config):
+                    return v8_outputs + (outputs["recipient_logits"][:, 0, :],)
+                return v8_outputs
             if _uses_v6_protocol(config):
                 return base + (
                     outputs["amount_sign_logits"][0, :],
@@ -3659,7 +3958,7 @@ def export_unified_onnx(
     wrapper = OneReceiptExport(model)
     output_names = list(_onnx_output_names(config))
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    dummy = torch.zeros((len(SLOT_ORDER), 1, config.image_height, config.image_width), dtype=torch.float32)
+    dummy = torch.zeros((len(_slot_order(config)), 1, config.image_height, config.image_width), dtype=torch.float32)
     try:
         try:
             torch.onnx.export(
@@ -3711,6 +4010,19 @@ def export_unified_onnx(
         "payment_charset_sha256": hashlib.sha256("".join(payment_characters).encode("utf-8")).hexdigest(),
         **(
             {
+                "recipient_blank_index": RECIPIENT_BLANK_INDEX,
+                "recipient_characters": recipient_characters,
+                "recipient_charset_sha256": hashlib.sha256(
+                    "".join(recipient_characters).encode("utf-8")
+                ).hexdigest(),
+                "recipient_charset_source": payload.get("recipient_charset_source"),
+                "recipient_oov_by_split": payload.get("recipient_oov_by_split"),
+            }
+            if recipient_characters is not None
+            else {}
+        ),
+        **(
+            {
                 "payment_bank_prefix_classes": payment_bank_prefix_classes,
                 "payment_bank_prefix_min_support": payload.get("payment_bank_prefix_min_support"),
                 "payment_bank_prefix_class_counts": payload.get("payment_bank_prefix_class_counts"),
@@ -3733,7 +4045,7 @@ def export_unified_onnx(
             "time_display_policy": "preserve_h_mm_or_hh_mm_via_hour_width_logits",
             "payment_card_rendering": "prefix + predicted_visible_parentheses_style + exact_four_ascii_digits",
         }
-    elif _is_v8(config):
+    elif _uses_v8_protocol(config):
         labels_payload["structured_decoder"] = {
             "schema_version": 1,
             "amount_visible_format": AMOUNT_VISIBLE_FORMAT_V8,
@@ -3777,7 +4089,13 @@ def export_unified_onnx(
             "decoder": "ctc_greedy",
             "blank_index": NUMERIC_BLANK_INDEX,
             "characters": "amount_characters",
-            "target": "visible_cny_amount" if _uses_v6_protocol(config) else "canonical_amount_for_guarded_display_rendering" if _is_v8(config) else "canonical_amount",
+            "target": (
+                "visible_cny_amount"
+                if _uses_v6_protocol(config)
+                else "canonical_amount_for_guarded_display_rendering"
+                if _uses_v8_protocol(config)
+                else "canonical_amount"
+            ),
         },
         "time_logits": {
             "shape": list(time_logits.shape),
@@ -3803,6 +4121,18 @@ def export_unified_onnx(
             "review_value": "review" if status_policy["runtime_policy"] == "review_only" else None,
         },
     }
+    if _is_v9(config):
+        if recipient_characters is None:
+            raise AssertionError("v9 export requires a train-only recipient charset")
+        output_contract["recipient_logits"] = {
+            "shape": list(output_values["recipient_logits"].shape),
+            "layout": "[time,class]",
+            "decoder": "ctc_greedy",
+            "blank_index": RECIPIENT_BLANK_INDEX,
+            "characters": "recipient_characters",
+            "target": "visible_recipient_value",
+            "runtime_policy": "review_only",
+        }
     if config.architecture_version == 5:
         output_contract.update(
             {
@@ -3858,9 +4188,9 @@ def export_unified_onnx(
                 },
             }
         )
-    elif _is_v8(config):
+    elif _uses_v8_protocol(config):
         if payment_bank_prefix_classes is None:
-            raise AssertionError("v8 export requires payment bank-prefix classes")
+            raise AssertionError("v8/v9 export requires payment bank-prefix classes")
         output_contract.update(
             {
                 "amount_currency_style_logits": {
@@ -4007,7 +4337,7 @@ def export_unified_onnx(
             "onnx_sha256": _sha256(output_path),
             "labels_file": labels_path.name,
             "labels_sha256": _sha256(labels_path),
-            "slot_order": list(SLOT_ORDER),
+            "slot_order": list(_slot_order(config)),
             "status_classes": status_classes,
             "training_field_counts": field_counts,
             "training_status_class_counts": status_counts,
@@ -4018,6 +4348,14 @@ def export_unified_onnx(
             "payment_bank_prefix_class_counts": payload.get("payment_bank_prefix_class_counts"),
             "payment_bank_prefix_train_class_counts": payload.get("payment_bank_prefix_train_class_counts"),
             "payment_bank_prefix_oov_by_split": payload.get("payment_bank_prefix_oov_by_split"),
+            **(
+                {
+                    "recipient_charset_source": payload.get("recipient_charset_source"),
+                    "recipient_oov_by_split": payload.get("recipient_oov_by_split"),
+                }
+                if recipient_characters is not None
+                else {}
+            ),
             "text_delivery_policy": (
                 {
                     "runtime_policy": _text_delivery_policy(config)[0],
@@ -4030,10 +4368,14 @@ def export_unified_onnx(
             "input": {
                 "name": "field_images",
                 "dtype": "float32",
-                "shape": [len(SLOT_ORDER), 1, config.image_height, config.image_width],
+                "shape": [len(_slot_order(config)), 1, config.image_height, config.image_width],
                 "preprocess": (
                     "RGB crop -> grayscale -> aspect-preserving resize -> white right-aligned letterbox for "
-                    "amount/time/payment (centered status) -> divide by 255.0"
+                    + (
+                        "amount/time/payment/recipient (centered status) -> divide by 255.0"
+                        if _is_v9(config)
+                        else "amount/time/payment (centered status) -> divide by 255.0"
+                    )
                     if _uses_structured_heads(config)
                     else "RGB crop -> grayscale -> aspect-preserving resize -> white centered letterbox -> divide by 255.0"
                 ),
@@ -4060,7 +4402,15 @@ def _load_json_object(path: Path) -> Mapping[str, Any]:
     return value
 
 
-def _load_onnx_artifacts(model_path: Path) -> tuple[UnifiedReaderConfig, list[str], Mapping[str, Any]]:
+def _load_onnx_artifact_details(
+    model_path: Path,
+) -> tuple[UnifiedReaderConfig, list[str], list[str] | None, Mapping[str, Any]]:
+    """Load and validate an ONNX bundle, including v9-only sidecars.
+
+    This is the internal detailed loader.  Keep :func:`_load_onnx_artifacts`
+    below as its historic three-item compatibility wrapper for callers that
+    only know about the payment reader.
+    """
     model_path = model_path.resolve()
     if not model_path.is_file():
         raise FileNotFoundError(model_path)
@@ -4074,8 +4424,6 @@ def _load_onnx_artifacts(model_path: Path) -> tuple[UnifiedReaderConfig, list[st
         raise ValueError("Unified OCR ONNX SHA-256 does not match its contract")
     if contract.get("labels_file") != labels_path.name or contract.get("labels_sha256") != _sha256(labels_path):
         raise ValueError("Unified OCR label sidecar does not match its contract")
-    if contract.get("slot_order") != list(SLOT_ORDER):
-        raise ValueError("Unified OCR ONNX contract slot order is unsupported")
     raw_config = contract.get("model")
     if not isinstance(raw_config, Mapping):
         raise ValueError("Unified OCR ONNX contract has no model config")
@@ -4084,6 +4432,8 @@ def _load_onnx_artifacts(model_path: Path) -> tuple[UnifiedReaderConfig, list[st
         artifact_kind=contract.get("kind"),
         source="Unified OCR ONNX contract",
     )
+    if contract.get("slot_order") != list(_slot_order(config)):
+        raise ValueError("Unified OCR ONNX contract slot order is unsupported")
     payment = labels.get("payment_characters")
     status = labels.get("status_classes")
     if labels.get("schema_version") != SCHEMA_VERSION or labels.get("payment_blank_index") != PAYMENT_BLANK_INDEX:
@@ -4097,15 +4447,16 @@ def _load_onnx_artifacts(model_path: Path) -> tuple[UnifiedReaderConfig, list[st
     if status != list(STATUS_CLASSES):
         raise ValueError("Unified OCR ONNX status class order is unsupported")
     payment_bank_prefix_classes: list[str] | None = None
+    recipient_characters: list[str] | None = None
     if _uses_modern_protocol(config):
-        expected_amount_characters = V8_AMOUNT_CHARACTERS if _is_v8(config) else V6_AMOUNT_CHARACTERS
+        expected_amount_characters = V8_AMOUNT_CHARACTERS if _uses_v8_protocol(config) else V6_AMOUNT_CHARACTERS
         if (
             labels.get("amount_blank_index") != NUMERIC_BLANK_INDEX
             or labels.get("time_blank_index") != NUMERIC_BLANK_INDEX
             or labels.get("amount_characters") != list(expected_amount_characters)
             or labels.get("time_characters") != list(V6_TIME_CHARACTERS)
         ):
-            raise ValueError("Unified v6/v7/v8 OCR amount/time charset or blank index is unsupported")
+            raise ValueError("Unified v6/v7/v8/v9 OCR amount/time charset or blank index is unsupported")
         bank_classes = labels.get("payment_bank_prefix_classes")
         if (
             not isinstance(bank_classes, list)
@@ -4115,10 +4466,59 @@ def _load_onnx_artifacts(model_path: Path) -> tuple[UnifiedReaderConfig, list[st
             or len(set(bank_classes)) != len(bank_classes)
             or bank_classes[1:] != sorted(bank_classes[1:])
         ):
-            raise ValueError("Unified v6/v7/v8 OCR bank-prefix label map is invalid")
+            raise ValueError("Unified v6/v7/v8/v9 OCR bank-prefix label map is invalid")
         if contract.get("payment_bank_prefix_classes") != bank_classes:
-            raise ValueError("Unified v6/v7/v8 OCR bank-prefix classes differ between labels and contract")
+            raise ValueError("Unified v6/v7/v8/v9 OCR bank-prefix classes differ between labels and contract")
         payment_bank_prefix_classes = list(bank_classes)
+        if _is_v9(config):
+            raw_recipient = labels.get("recipient_characters")
+            if (
+                not isinstance(raw_recipient, list)
+                or not raw_recipient
+                or not all(
+                    isinstance(character, str)
+                    and len(character) == 1
+                    and character.isprintable()
+                    for character in raw_recipient
+                )
+                or len(set(raw_recipient)) != len(raw_recipient)
+                or raw_recipient != sorted(raw_recipient)
+                or labels.get("recipient_blank_index") != RECIPIENT_BLANK_INDEX
+            ):
+                raise ValueError("Unified v9 OCR recipient charset or blank index is invalid")
+            recipient_sha256 = hashlib.sha256("".join(raw_recipient).encode("utf-8")).hexdigest()
+            if labels.get("recipient_charset_sha256") != recipient_sha256:
+                raise ValueError("Unified v9 OCR recipient charset SHA-256 is invalid")
+            if labels.get("recipient_charset_source") != "train_only_visible_recipient_text":
+                raise ValueError("Unified v9 OCR recipient charset must be train-only")
+            recipient_oov_by_split = labels.get("recipient_oov_by_split")
+            if not isinstance(recipient_oov_by_split, Mapping) or set(recipient_oov_by_split) != {
+                "train",
+                "val",
+                "test",
+            }:
+                raise ValueError("Unified v9 OCR recipient OOV audit is invalid")
+            for split in ("train", "val", "test"):
+                audit = recipient_oov_by_split[split]
+                if (
+                    not isinstance(audit, Mapping)
+                    or set(audit) != {"records", "oov_records"}
+                    or isinstance(audit.get("records"), bool)
+                    or not isinstance(audit.get("records"), int)
+                    or isinstance(audit.get("oov_records"), bool)
+                    or not isinstance(audit.get("oov_records"), int)
+                    or audit["records"] < 0
+                    or audit["oov_records"] < 0
+                    or audit["oov_records"] > audit["records"]
+                ):
+                    raise ValueError("Unified v9 OCR recipient OOV audit is invalid")
+            if recipient_oov_by_split["train"]["oov_records"] != 0:
+                raise ValueError("Unified v9 OCR recipient train split must not contain OOV characters")
+            if contract.get("recipient_charset_source") != labels.get("recipient_charset_source"):
+                raise ValueError("Unified v9 OCR recipient charset source differs between labels and contract")
+            if contract.get("recipient_oov_by_split") != labels.get("recipient_oov_by_split"):
+                raise ValueError("Unified v9 OCR recipient OOV audit differs between labels and contract")
+            recipient_characters = list(raw_recipient)
     else:
         if labels.get("numeric_blank_index") != NUMERIC_BLANK_INDEX or labels.get("numeric_characters") != list(
             NUMERIC_CHARACTERS
@@ -4149,14 +4549,14 @@ def _load_onnx_artifacts(model_path: Path) -> tuple[UnifiedReaderConfig, list[st
                 raise ValueError("Unified v5 OCR text_delivery_policy must remain review-only")
             if raw_text_delivery_policy.get("review_value") != "review":
                 raise ValueError("Unified v5 OCR text_delivery_policy review value is invalid")
-    elif _is_v8(config):
+    elif _uses_v8_protocol(config):
         structured_decoder = labels.get("structured_decoder")
         if not isinstance(structured_decoder, Mapping):
-            raise ValueError("Unified v8 OCR label sidecar has no structured decoder contract")
+            raise ValueError("Unified v8/v9 OCR label sidecar has no structured decoder contract")
         try:
             amount_format_min_confidence = float(structured_decoder.get("amount_format_min_confidence"))
         except (TypeError, ValueError):
-            raise ValueError("Unified v8 OCR amount format confidence is invalid") from None
+            raise ValueError("Unified v8/v9 OCR amount format confidence is invalid") from None
         if (
             structured_decoder.get("schema_version") != 1
             or structured_decoder.get("amount_visible_format") != AMOUNT_VISIBLE_FORMAT_V8
@@ -4180,15 +4580,15 @@ def _load_onnx_artifacts(model_path: Path) -> tuple[UnifiedReaderConfig, list[st
             or structured_decoder.get("payment_bank_prefix_format") != PAYMENT_BANK_PREFIX_FORMAT
             or structured_decoder.get("payment_bank_prefix_other_class") != PAYMENT_BANK_OTHER_CLASS
         ):
-            raise ValueError("Unified v8 OCR structured decoder sidecar is unsupported")
+            raise ValueError("Unified v8/v9 OCR structured decoder sidecar is unsupported")
         raw_text_delivery_policy = contract.get("text_delivery_policy")
         if not isinstance(raw_text_delivery_policy, Mapping):
-            raise ValueError("Unified v8 OCR text_delivery_policy is missing")
+            raise ValueError("Unified v8/v9 OCR text_delivery_policy is missing")
         expected_text_delivery_policy, _ = _text_delivery_policy(config)
         if raw_text_delivery_policy.get("runtime_policy") != expected_text_delivery_policy:
-            raise ValueError("Unified v8 OCR text_delivery_policy is unsupported")
+            raise ValueError("Unified v8/v9 OCR text_delivery_policy is unsupported")
         if raw_text_delivery_policy.get("review_value") != "review":
-            raise ValueError("Unified v8 OCR text_delivery_policy review value is invalid")
+            raise ValueError("Unified v8/v9 OCR text_delivery_policy review value is invalid")
     elif _uses_v6_protocol(config):
         structured_decoder = labels.get("structured_decoder")
         if not isinstance(structured_decoder, Mapping):
@@ -4224,9 +4624,11 @@ def _load_onnx_artifacts(model_path: Path) -> tuple[UnifiedReaderConfig, list[st
     outputs = contract.get("outputs")
     if not isinstance(raw_input, Mapping) or not isinstance(outputs, Mapping):
         raise ValueError("Unified OCR ONNX contract input/output schema is missing")
-    expected_input = [len(SLOT_ORDER), 1, config.image_height, config.image_width]
+    expected_input = [len(_slot_order(config)), 1, config.image_height, config.image_width]
     if raw_input.get("name") != "field_images" or raw_input.get("shape") != expected_input:
-        raise ValueError("Unified OCR ONNX input must be static [4,1,H,W]")
+        raise ValueError(
+            f"Unified OCR ONNX input must be static [{len(_slot_order(config))},1,H,W]"
+        )
     expected_outputs = set(_onnx_output_names(config))
     if set(outputs) != expected_outputs:
         raise ValueError("Unified OCR ONNX output names are unsupported")
@@ -4250,7 +4652,7 @@ def _load_onnx_artifacts(model_path: Path) -> tuple[UnifiedReaderConfig, list[st
                 "payment_parentheses_logits": [len(PAYMENT_PARENTHESIS_CLASSES)],
             }
         )
-    elif _is_v8(config):
+    elif _uses_v8_protocol(config):
         assert payment_bank_prefix_classes is not None
         expected_shapes.update(
             {
@@ -4266,6 +4668,10 @@ def _load_onnx_artifacts(model_path: Path) -> tuple[UnifiedReaderConfig, list[st
                 "payment_parentheses_logits": [len(PAYMENT_PARENTHESIS_CLASSES)],
             }
         )
+        if _is_v9(config):
+            if recipient_characters is None:
+                raise AssertionError("v9 recipient characters were validated above")
+            expected_shapes["recipient_logits"] = [time_steps, len(recipient_characters) + 1]
     elif _uses_v6_protocol(config):
         assert payment_bank_prefix_classes is not None
         expected_shapes.update(
@@ -4292,14 +4698,35 @@ def _load_onnx_artifacts(model_path: Path) -> tuple[UnifiedReaderConfig, list[st
                 raise ValueError(f"Unified OCR ONNX structured output {name!r} must not declare a CTC blank index")
         elif output.get("blank_index") != expected_blank_index:
             raise ValueError(f"Unified OCR ONNX output {name!r} has an invalid CTC blank index")
+    if _is_v9(config):
+        recipient_output = outputs["recipient_logits"]
+        if (
+            recipient_output.get("characters") != "recipient_characters"
+            or recipient_output.get("target") != "visible_recipient_value"
+            or recipient_output.get("runtime_policy") != "review_only"
+        ):
+            raise ValueError("Unified v9 OCR recipient output contract is unsupported")
     status_output = outputs["status_logits"]
-    if contract.get("kind") in {KIND_V4, KIND_V5, KIND_V6, KIND_V7, KIND_V8}:
+    if contract.get("kind") in {KIND_V4, KIND_V5, KIND_V6, KIND_V7, KIND_V8, KIND_V9}:
         if status_output.get("runtime_policy") != status_policy["runtime_policy"]:
             raise ValueError("Unified OCR ONNX status output policy differs from status_head_policy")
         expected_review = "review" if status_policy["runtime_policy"] == "review_only" else None
         if status_output.get("review_value") != expected_review:
             raise ValueError("Unified OCR ONNX status output review value is invalid")
-    return config, list(payment), contract
+    return config, list(payment), recipient_characters, contract
+
+
+def _load_onnx_artifacts(
+    model_path: Path,
+) -> tuple[UnifiedReaderConfig, list[str], Mapping[str, Any]]:
+    """Load an ONNX bundle using the historic three-item return contract.
+
+    The recipient charset is meaningful only to the v9 evaluator.  Preserving
+    this wrapper prevents old v3-v8 integrations that import this private
+    helper from failing solely because v9 appended a fifth OCR field.
+    """
+    config, payment_characters, _, contract = _load_onnx_artifact_details(model_path)
+    return config, payment_characters, contract
 
 
 def _contract_status_policy(contract: Mapping[str, Any]) -> dict[str, object]:
@@ -4382,6 +4809,8 @@ def _semantic_value(field: str, text: str) -> str | None:
             return None
     if field == "payment_method_field":
         return normalize_payment_method(text)["normalized"]
+    if field == "recipient_field":
+        return clean_text(text) or None
     if field == "transfer_status":
         return text if text in STATUS_CLASSES else None
     raise AssertionError(field)
@@ -4510,8 +4939,10 @@ def _unified_acceptance_failures(
     min_amount_exact_match: float | None,
     min_time_exact_match: float | None,
     min_payment_exact_match: float | None,
+    min_recipient_exact_match: float | None,
     min_status_exact_match: float | None,
     max_payment_oov_rate: float | None,
+    max_recipient_oov_rate: float | None,
     max_non_success_to_success: int | None,
     min_delivery_coverage: float | None,
     min_delivery_exact_match: float | None,
@@ -4522,6 +4953,7 @@ def _unified_acceptance_failures(
         "amount": min_amount_exact_match,
         "time": min_time_exact_match,
         "payment_method_field": min_payment_exact_match,
+        "recipient_field": min_recipient_exact_match,
         "transfer_status": min_status_exact_match,
     }
     for field, threshold in desired.items():
@@ -4538,6 +4970,16 @@ def _unified_acceptance_failures(
             f"oov_reference_rate={float(metrics['payment_method_field']['oov_reference_rate']):.4f} "
             f"> {max_payment_oov_rate:.4f}"
         )
+    if max_recipient_oov_rate is not None:
+        recipient_metrics = metrics.get("recipient_field")
+        if recipient_metrics is None:
+            failures.append("recipient_field: the artifact has no recipient CTC head")
+        elif float(recipient_metrics["oov_reference_rate"]) > max_recipient_oov_rate:
+            failures.append(
+                "recipient_field: "
+                f"oov_reference_rate={float(recipient_metrics['oov_reference_rate']):.4f} "
+                f"> {max_recipient_oov_rate:.4f}"
+            )
     if max_non_success_to_success is not None:
         observed = int(metrics["transfer_status"]["non_success_to_success"])
         if observed > max_non_success_to_success:
@@ -4548,7 +4990,10 @@ def _unified_acceptance_failures(
     # concepts.  In v5 a structural/CTC disagreement deliberately becomes
     # review, so a model cannot pass a deployment gate merely by producing the
     # correct value in an unsafe candidate channel.
-    for field in ("amount", "time", "payment_method_field"):
+    delivery_fields = ["amount", "time", "payment_method_field"]
+    if "recipient_field" in metrics:
+        delivery_fields.append("recipient_field")
+    for field in delivery_fields:
         if min_delivery_coverage is not None:
             observed_coverage = metrics[field]["delivery_coverage"]
             if observed_coverage is None or float(observed_coverage) < min_delivery_coverage:
@@ -4583,8 +5028,10 @@ def evaluate_unified_onnx(
     min_amount_exact_match: float | None = None,
     min_time_exact_match: float | None = None,
     min_payment_exact_match: float | None = None,
+    min_recipient_exact_match: float | None = None,
     min_status_exact_match: float | None = None,
     max_payment_oov_rate: float | None = None,
+    max_recipient_oov_rate: float | None = None,
     max_non_success_to_success: int | None = None,
     min_delivery_coverage: float | None = None,
     min_delivery_exact_match: float | None = None,
@@ -4598,8 +5045,10 @@ def evaluate_unified_onnx(
         ("min_amount_exact_match", min_amount_exact_match),
         ("min_time_exact_match", min_time_exact_match),
         ("min_payment_exact_match", min_payment_exact_match),
+        ("min_recipient_exact_match", min_recipient_exact_match),
         ("min_status_exact_match", min_status_exact_match),
         ("max_payment_oov_rate", max_payment_oov_rate),
+        ("max_recipient_oov_rate", max_recipient_oov_rate),
         ("min_delivery_coverage", min_delivery_coverage),
         ("min_delivery_exact_match", min_delivery_exact_match),
     ):
@@ -4617,11 +5066,20 @@ def evaluate_unified_onnx(
     output_dir = output_dir.resolve()
     if output_dir.exists() and any(output_dir.iterdir()):
         raise ValueError(f"evaluation output already contains files: {output_dir}. Choose a new empty directory.")
+    # Start from the historic loader so existing integrations and lightweight
+    # evaluator fakes keep their original three-value seam.  A v9 model alone
+    # needs its separate recipient alphabet, which is read from the validated
+    # detailed sidecar below.
     config, payment_characters, contract = _load_onnx_artifacts(model_path)
-    artifact_amount_format_min_confidence = config.amount_format_min_confidence if _is_v8(config) else None
+    recipient_characters: list[str] | None = None
+    if _is_v9(config):
+        _, _, recipient_characters, _ = _load_onnx_artifact_details(model_path)
+    artifact_amount_format_min_confidence = (
+        config.amount_format_min_confidence if _uses_v8_protocol(config) else None
+    )
     if amount_format_min_confidence_override is not None:
-        if not _is_v8(config):
-            raise ValueError("amount_format_min_confidence_override is supported only by v8 ONNX artifacts")
+        if not _uses_v8_protocol(config):
+            raise ValueError("amount_format_min_confidence_override is supported only by v8/v9 ONNX artifacts")
         # This is deliberately evaluation-only: validate the artifact's
         # persisted sidecar/contract first, then replace the in-memory
         # renderer threshold.  It must never mutate the ONNX bundle or make a
@@ -4632,11 +5090,13 @@ def evaluate_unified_onnx(
         )
     status_policy = _contract_status_policy(contract)
     status_delivery_allowed = status_policy["runtime_policy"] == "classify"
-    records = load_records(records_path, dataset_root=dataset_root)
+    records = load_records(records_path, dataset_root=dataset_root, config=config)
     evaluation_records = [record for record in records if record["split"] == split]
     if not evaluation_records:
         raise ValueError(f"No {split} receipt records found")
     required_evaluation_fields = ["amount", "time", "payment_method_field"]
+    if _is_v9(config):
+        required_evaluation_fields.append("recipient_field")
     if status_delivery_allowed or min_status_exact_match is not None or max_non_success_to_success is not None:
         required_evaluation_fields.append("transfer_status")
     for field in required_evaluation_fields:
@@ -4657,7 +5117,7 @@ def evaluate_unified_onnx(
             "Unified OCR ONNX input/output names differ from its delivery contract: "
             f"inputs={input_names}, outputs={output_names}"
         )
-    expected_input_shape = [len(SLOT_ORDER), 1, config.image_height, config.image_width]
+    expected_input_shape = [len(_slot_order(config)), 1, config.image_height, config.image_width]
     actual_input_shape = list(session.get_inputs()[0].shape)
     if actual_input_shape != expected_input_shape:
         raise ValueError(
@@ -4682,10 +5142,10 @@ def evaluate_unified_onnx(
                 "payment_parentheses_logits": [len(PAYMENT_PARENTHESIS_CLASSES)],
             }
         )
-    elif _is_v8(config):
+    elif _uses_v8_protocol(config):
         raw_bank_classes = contract.get("payment_bank_prefix_classes")
         if not isinstance(raw_bank_classes, list) or len(raw_bank_classes) < 2:
-            raise ValueError("Unified v8 OCR contract has no valid payment bank-prefix classes")
+            raise ValueError("Unified v8/v9 OCR contract has no valid payment bank-prefix classes")
         expected_output_shapes.update(
             {
                 "amount_currency_style_logits": [len(AMOUNT_CURRENCY_STYLE_CLASSES)],
@@ -4700,6 +5160,13 @@ def evaluate_unified_onnx(
                 "payment_parentheses_logits": [len(PAYMENT_PARENTHESIS_CLASSES)],
             }
         )
+        if _is_v9(config):
+            if recipient_characters is None:
+                raise AssertionError("v9 recipient characters were validated with the ONNX sidecar")
+            expected_output_shapes["recipient_logits"] = [
+                config.image_width // 4,
+                len(recipient_characters) + 1,
+            ]
     elif _uses_v6_protocol(config):
         raw_bank_classes = contract.get("payment_bank_prefix_classes")
         if not isinstance(raw_bank_classes, list) or len(raw_bank_classes) < 2:
@@ -4729,6 +5196,7 @@ def evaluate_unified_onnx(
     comparisons: list[dict[str, object]] = []
     receipt_latencies: list[float] = []
     payment_character_set = set(payment_characters)
+    recipient_character_set = set(recipient_characters or ())
     status_confusion: Counter[str] = Counter()
     status_reference_counts: Counter[str] = Counter()
     for record in evaluation_records:
@@ -4744,6 +5212,12 @@ def evaluate_unified_onnx(
         amount_text, amount_confidence = _ctc_single_output(amount_logits, characters=_amount_characters(config))
         time_text, time_confidence = _ctc_single_output(time_logits, characters=_time_characters(config))
         payment_text, payment_confidence = _ctc_single_output(payment_logits, characters=payment_characters)
+        if _is_v9(config):
+            if recipient_characters is None:
+                raise AssertionError("v9 recipient characters were validated with the ONNX sidecar")
+            recipient_text, recipient_confidence = _ctc_single_output(
+                runtime_outputs["recipient_logits"], characters=recipient_characters
+            )
         status_index, status_confidence = _softmax_confidence(status_logits)
         raw_status_text = STATUS_CLASSES[status_index]
         ctc_predictions: dict[str, tuple[str, float]] = {
@@ -4751,6 +5225,8 @@ def evaluate_unified_onnx(
             "time": (time_text, time_confidence),
             "payment_method_field": (payment_text, payment_confidence),
         }
+        if _is_v9(config):
+            ctc_predictions["recipient_field"] = (recipient_text, recipient_confidence)
         structured_predictions: dict[str, tuple[str | None, float]] = {}
         if config.architecture_version == 5:
             structured_predictions = {
@@ -4770,7 +5246,7 @@ def evaluate_unified_onnx(
                     payment_characters=payment_characters,
                 )[0],
             }
-        elif _is_v8(config):
+        elif _uses_v8_protocol(config):
             raw_bank_classes = contract.get("payment_bank_prefix_classes")
             if not isinstance(raw_bank_classes, list):
                 raise AssertionError("v8 bank-prefix classes were validated with the output contract")
@@ -4824,13 +5300,17 @@ def evaluate_unified_onnx(
             structured_predictions,
             config=config,
         )
+        if _is_v9(config):
+            # An unseen recipient remains open-text CTC evidence.  It never
+            # becomes a finite merchant-class decision or a delivered value.
+            predictions["recipient_field"] = ctc_predictions["recipient_field"]
         # A status head with incomplete classes must never become a business
         # decision, even if its raw argmax says success.
         predictions["transfer_status"] = (
             raw_status_text if status_delivery_allowed else "review",
             status_confidence,
         )
-        for field in SLOT_ORDER:
+        for field in _slot_order(config):
             slot = dict(record["slots"]).get(field)
             if not isinstance(slot, Mapping):
                 continue
@@ -4838,7 +5318,7 @@ def evaluate_unified_onnx(
                 reference_text = str(slot["class_name"])
                 reference_semantic = reference_text
             else:
-                if _is_v8(config) and field == "amount":
+                if _uses_v8_protocol(config) and field == "amount":
                     visible = slot.get("visible_text")
                     reference_text = (
                         visible
@@ -4925,23 +5405,32 @@ def evaluate_unified_onnx(
                     "candidate_semantic_valid": candidate_semantic is not None,
                     "cer_edits": levenshtein_distance(reference_text, candidate_text),
                     "reference_characters": len(reference_text),
-                    "reference_has_oov_character": field == "payment_method_field"
-                    and bool(set(reference_text) - payment_character_set),
+                    "reference_has_oov_character": (
+                        field == "payment_method_field"
+                        and bool(set(reference_text) - payment_character_set)
+                    )
+                    or (
+                        field == "recipient_field"
+                        and bool(set(reference_text) - recipient_character_set)
+                    ),
                     "non_success_to_success": non_success_to_success,
                     "receipt_latency_ms": round(latency_ms, 4),
                 }
             )
     comparisons.sort(key=lambda row: (str(row["field"]), str(row["id"])))
     by_field = {
-        field: _comparison_metrics([row for row in comparisons if row["field"] == field]) for field in SLOT_ORDER
+        field: _comparison_metrics([row for row in comparisons if row["field"] == field])
+        for field in _slot_order(config)
     }
     failures = _unified_acceptance_failures(
         by_field,
         min_amount_exact_match=min_amount_exact_match,
         min_time_exact_match=min_time_exact_match,
         min_payment_exact_match=min_payment_exact_match,
+        min_recipient_exact_match=min_recipient_exact_match,
         min_status_exact_match=min_status_exact_match,
         max_payment_oov_rate=max_payment_oov_rate,
+        max_recipient_oov_rate=max_recipient_oov_rate,
         max_non_success_to_success=max_non_success_to_success,
         min_delivery_coverage=min_delivery_coverage,
         min_delivery_exact_match=min_delivery_exact_match,
@@ -4961,8 +5450,10 @@ def evaluate_unified_onnx(
             min_amount_exact_match,
             min_time_exact_match,
             min_payment_exact_match,
+            min_recipient_exact_match,
             min_status_exact_match,
             max_payment_oov_rate,
+            max_recipient_oov_rate,
             max_non_success_to_success,
             min_delivery_coverage,
             min_delivery_exact_match,
@@ -4981,10 +5472,10 @@ def evaluate_unified_onnx(
         "evaluation_split": split,
         "label_sources": label_sources,
         "providers": active_providers,
-        "slot_order": list(SLOT_ORDER),
+        "slot_order": list(_slot_order(config)),
         "amount_format_policy": {
             "artifact_min_confidence": artifact_amount_format_min_confidence,
-            "effective_min_confidence": config.amount_format_min_confidence if _is_v8(config) else None,
+            "effective_min_confidence": config.amount_format_min_confidence if _uses_v8_protocol(config) else None,
             "evaluation_override": amount_format_min_confidence_override,
         },
         "by_field": by_field,
@@ -4998,8 +5489,10 @@ def evaluate_unified_onnx(
             "min_amount_exact_match": min_amount_exact_match,
             "min_time_exact_match": min_time_exact_match,
             "min_payment_exact_match": min_payment_exact_match,
+            "min_recipient_exact_match": min_recipient_exact_match,
             "min_status_exact_match": min_status_exact_match,
             "max_payment_oov_rate": max_payment_oov_rate,
+            "max_recipient_oov_rate": max_recipient_oov_rate,
             "max_non_success_to_success": max_non_success_to_success,
             "min_delivery_coverage": min_delivery_coverage,
             "min_delivery_exact_match": min_delivery_exact_match,
@@ -5028,7 +5521,7 @@ def evaluate_unified_onnx(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Train, export, and evaluate one offline ONNX reader for amount/time/status/payment fields"
+        description="Train, export, and evaluate one offline ONNX reader for amount/time/status/payment/recipient fields"
     )
     commands = parser.add_subparsers(dest="command", required=True)
 
@@ -5050,21 +5543,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--ctc-loss-weight",
         type=float,
         default=0.35,
-        help="v5/v6/v7/v8 auxiliary raw-CTC loss weight; v3/v4 keep their historical loss composition",
+        help="v5/v6/v7/v8/v9 auxiliary raw-CTC loss weight; v3/v4 keep their historical loss composition",
     )
     train.add_argument(
         "--structured-loss-weight",
         type=float,
         default=1.0,
-        help="v5/v6/v7/v8 structured financial-format and bank-verifier loss weight",
+        help="v5/v6/v7/v8/v9 structured financial-format and bank-verifier loss weight",
     )
     train.add_argument(
         "--architecture",
-        choices=("v3", "v4", "v5", "v6", "v7", "v8"),
+        choices=("v3", "v4", "v5", "v6", "v7", "v8", "v9"),
         default="v8",
         help=(
-            "v8 is the recommended reader: canonical amount CTC plus guarded display-format heads, "
-            "with v7's shared time reader and payment protocol. v7/v6/v5/v4/v3 remain checkpoint-compatible"
+            "v9 is the five-field reader: v8's compact amount/time/payment protocol plus an open-text recipient "
+            "CTC head. v8 remains the compatible four-field default; v7/v6/v5/v4/v3 remain checkpoint-compatible"
         ),
     )
     train.add_argument(
@@ -5072,7 +5565,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.90,
         help=(
-            "v8 only: require every amount display-format head to meet this confidence before it can render "
+            "v8/v9 only: require every amount display-format head to meet this confidence before it can render "
             "currency/sign/thousands punctuation; otherwise retain the raw canonical CTC candidate"
         ),
     )
@@ -5081,7 +5574,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=3,
         help=(
-            "v6/v7/v8 only: minimum train-split examples needed to retain a bank-prefix class; "
+            "v6/v7/v8/v9 only: minimum train-split examples needed to retain a bank-prefix class; "
             "rarer/unknown prefixes map to __other__ and remain review-only"
         ),
     )
@@ -5107,7 +5600,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--amount-format-min-confidence",
         type=float,
         help=(
-            "v8 only: write this validated amount display-format confidence gate into a new ONNX bundle; "
+            "v8/v9 only: write this validated amount display-format confidence gate into a new ONNX bundle; "
             "the checkpoint and existing artifacts are never modified"
         ),
     )
@@ -5127,30 +5620,32 @@ def build_parser() -> argparse.ArgumentParser:
         "--amount-format-min-confidence-override",
         type=float,
         help=(
-            "v8 evaluation only: temporarily override the amount visible-format confidence gate without "
+            "v8/v9 evaluation only: temporarily override the amount visible-format confidence gate without "
             "rewriting the ONNX artifact, labels, or contract"
         ),
     )
     evaluate.add_argument("--min-amount-exact-match", type=float)
     evaluate.add_argument("--min-time-exact-match", type=float)
     evaluate.add_argument("--min-payment-exact-match", type=float)
+    evaluate.add_argument("--min-recipient-exact-match", type=float)
     evaluate.add_argument("--min-status-exact-match", type=float)
     evaluate.add_argument("--max-payment-oov-rate", type=float)
+    evaluate.add_argument("--max-recipient-oov-rate", type=float)
     evaluate.add_argument("--max-non-success-to-success", type=int)
     evaluate.add_argument(
         "--min-delivery-coverage",
         type=float,
-        help="Require this non-review coverage for each v5/v6/v7/v8 text field (amount/time/payment)",
+        help="Require this non-review coverage for each v5/v6/v7/v8/v9 text field",
     )
     evaluate.add_argument(
         "--min-delivery-exact-match",
         type=float,
-        help="Require this raw exact match among non-review v5/v6/v7/v8 text-field deliveries",
+        help="Require this raw exact match among non-review v5/v6/v7/v8/v9 text-field deliveries",
     )
     evaluate.add_argument(
         "--max-delivery-false-accepts",
         type=int,
-        help="Maximum incorrect non-review v5/v6/v7/v8 deliveries allowed per text field",
+        help="Maximum incorrect non-review v5/v6/v7/v8/v9 deliveries allowed per text field",
     )
     return parser
 
@@ -5213,8 +5708,10 @@ def main(argv: list[str] | None = None) -> None:
                 min_amount_exact_match=args.min_amount_exact_match,
                 min_time_exact_match=args.min_time_exact_match,
                 min_payment_exact_match=args.min_payment_exact_match,
+                min_recipient_exact_match=args.min_recipient_exact_match,
                 min_status_exact_match=args.min_status_exact_match,
                 max_payment_oov_rate=args.max_payment_oov_rate,
+                max_recipient_oov_rate=args.max_recipient_oov_rate,
                 max_non_success_to_success=args.max_non_success_to_success,
                 min_delivery_coverage=args.min_delivery_coverage,
                 min_delivery_exact_match=args.min_delivery_exact_match,
@@ -5228,12 +5725,17 @@ def main(argv: list[str] | None = None) -> None:
                 if isinstance(status_policy, Mapping) and status_policy.get("runtime_policy") == "review_only"
                 else _format_exact_match(metrics["transfer_status"]["raw_exact_match"])
             )
+            recipient_display = (
+                f", recipient={_format_exact_match(metrics['recipient_field']['raw_exact_match'])}"
+                if "recipient_field" in metrics
+                else ""
+            )
             print(
                 f"Wrote unified ONNX evaluation to {args.output} "
                 f"(amount={_format_exact_match(metrics['amount']['raw_exact_match'])}, "
                 f"time={_format_exact_match(metrics['time']['raw_exact_match'])}, "
                 f"payment={_format_exact_match(metrics['payment_method_field']['raw_exact_match'])}, "
-                f"status={status_display})"
+                f"status={status_display}{recipient_display})"
             )
             if failures:
                 raise SystemExit("Unified OCR candidate did not meet the requested acceptance gate:\n- " + "\n- ".join(failures))
