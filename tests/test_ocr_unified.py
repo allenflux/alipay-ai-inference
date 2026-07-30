@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
@@ -943,6 +944,108 @@ def test_evaluate_parser_exposes_v8_amount_format_confidence_override() -> None:
     assert args.amount_format_min_confidence_override == 0.25
 
 
+def test_export_parser_and_main_forward_v8_amount_format_confidence_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The export CLI must forward the policy into a new bundle, not evaluation."""
+    args = ocr_unified.build_parser().parse_args(
+        [
+            "export",
+            "--checkpoint",
+            "reader.pt",
+            "--output",
+            "reader.onnx",
+            "--amount-format-min-confidence",
+            "0.80",
+        ]
+    )
+    assert args.amount_format_min_confidence == 0.80
+
+    observed: dict[str, object] = {}
+
+    def fake_export(**kwargs: object) -> tuple[Path, Path, Path]:
+        observed.update(kwargs)
+        return tmp_path / "reader.onnx", tmp_path / "reader.labels.json", tmp_path / "reader.contract.json"
+
+    monkeypatch.setattr(ocr_unified, "export_unified_onnx", fake_export)
+    ocr_unified.main(
+        [
+            "export",
+            "--checkpoint",
+            "checkpoint.pt",
+            "--output",
+            "bundle.onnx",
+            "--amount-format-min-confidence",
+            "0.80",
+        ]
+    )
+    assert observed == {
+        "checkpoint_path": Path("checkpoint.pt"),
+        "output_path": Path("bundle.onnx"),
+        "amount_format_min_confidence": 0.80,
+    }
+
+
+@pytest.mark.parametrize("threshold", (-0.01, 1.01, float("nan"), float("inf")))
+def test_export_amount_format_threshold_rejects_invalid_values_before_writing(
+    threshold: float,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A malformed override must never create a partial ONNX bundle."""
+    checkpoint_path = tmp_path / "reader.pt"
+    checkpoint_path.write_bytes(b"not-loaded-because-validation-precedes-export")
+    output_path = tmp_path / "reader.onnx"
+    checkpoint_payload = {
+        "schema_version": ocr_unified.SCHEMA_VERSION,
+        "kind": KIND_V8,
+        "config": asdict(_tiny_config(architecture_version=8)),
+    }
+    monkeypatch.setattr(ocr_unified, "_require_torch", lambda: (object(), object()))
+    monkeypatch.setattr(ocr_unified, "_load_checkpoint", lambda _path, *, torch: checkpoint_payload)
+
+    with pytest.raises(ValueError, match="amount_format_min_confidence must be between 0 and 1"):
+        export_unified_onnx(
+            checkpoint_path=checkpoint_path,
+            output_path=output_path,
+            amount_format_min_confidence=threshold,
+        )
+
+    assert not output_path.exists()
+    assert not output_path.with_suffix(".labels.json").exists()
+    assert not output_path.with_suffix(".contract.json").exists()
+    assert not output_path.with_name(".reader.exporting.onnx").exists()
+
+
+def test_export_amount_format_threshold_rejects_non_v8_before_writing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Historical decoding protocols must stay unchanged by the v8 option."""
+    checkpoint_path = tmp_path / "reader-v7.pt"
+    checkpoint_path.write_bytes(b"not-loaded-because-v7-rejects-before-export")
+    output_path = tmp_path / "reader-v7.onnx"
+    checkpoint_payload = {
+        "schema_version": ocr_unified.SCHEMA_VERSION,
+        "kind": KIND_V7,
+        "config": asdict(_tiny_config(architecture_version=7)),
+    }
+    monkeypatch.setattr(ocr_unified, "_require_torch", lambda: (object(), object()))
+    monkeypatch.setattr(ocr_unified, "_load_checkpoint", lambda _path, *, torch: checkpoint_payload)
+
+    with pytest.raises(ValueError, match="export override is supported only by v8 checkpoints"):
+        export_unified_onnx(
+            checkpoint_path=checkpoint_path,
+            output_path=output_path,
+            amount_format_min_confidence=0.80,
+        )
+
+    assert not output_path.exists()
+    assert not output_path.with_suffix(".labels.json").exists()
+    assert not output_path.with_suffix(".contract.json").exists()
+
+
 def test_v5_right_aligned_preprocess_has_a_distinct_fixed_position_from_legacy_center(tmp_path: Path) -> None:
     image_path = tmp_path / "narrow.png"
     Image.fromarray(np.zeros((20, 20), dtype=np.uint8)).save(image_path)
@@ -1303,6 +1406,7 @@ def test_unified_v8_export_loads_and_evaluates_guarded_visible_amounts_when_onnx
     model_path, labels_path, contract_path = export_unified_onnx(
         checkpoint_path=checkpoint,
         output_path=tmp_path / "reader-v8.onnx",
+        amount_format_min_confidence=0.80,
     )
     onnx.checker.check_model(onnx.load_model(model_path))
     session = ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])
@@ -1315,11 +1419,18 @@ def test_unified_v8_export_loads_and_evaluates_guarded_visible_amounts_when_onnx
     labels = json.loads(labels_path.read_text(encoding="utf-8"))
     assert labels["amount_characters"] == list(V8_AMOUNT_CHARACTERS)
     assert labels["structured_decoder"]["amount_visible_format"] == AMOUNT_VISIBLE_FORMAT_V8
+    assert labels["structured_decoder"]["amount_format_min_confidence"] == 0.80
+    assert contract["model"]["amount_format_min_confidence"] == 0.80
 
     config_from_contract, _, loaded_contract = _load_onnx_artifacts(model_path)
     assert config_from_contract.architecture_version == 8
+    assert config_from_contract.amount_format_min_confidence == 0.80
     assert loaded_contract["kind"] == KIND_V8
     assert loaded_contract["text_delivery_policy"]["runtime_policy"].startswith("review_only")
+    # The export policy belongs only to the new bundle: the training
+    # checkpoint remains an auditable record of the original 0.90 policy.
+    checkpoint_config = _checkpoint_config(ocr_unified._load_checkpoint(checkpoint, torch=torch))
+    assert checkpoint_config.amount_format_min_confidence == 0.90
 
     summary, failures = evaluate_unified_onnx(
         model_path=model_path,

@@ -3536,8 +3536,20 @@ def _validate_exported_onnx(
             )
 
 
-def export_unified_onnx(*, checkpoint_path: Path, output_path: Path) -> tuple[Path, Path, Path]:
-    """Export a static one-receipt ONNX graph plus labels and a delivery contract."""
+def export_unified_onnx(
+    *,
+    checkpoint_path: Path,
+    output_path: Path,
+    amount_format_min_confidence: float | None = None,
+) -> tuple[Path, Path, Path]:
+    """Export a static one-receipt ONNX graph plus labels and a delivery contract.
+
+    ``amount_format_min_confidence`` is a v8-only *bundle* override.  It
+    changes the finite amount-display renderer policy recorded in the newly
+    exported labels/contract, never the checkpoint or an existing ONNX
+    artifact.  The neural graph is unchanged because this threshold is a
+    decoder policy, not a learned parameter.
+    """
     checkpoint_path = checkpoint_path.resolve()
     if not checkpoint_path.is_file():
         raise FileNotFoundError(checkpoint_path)
@@ -3553,6 +3565,20 @@ def export_unified_onnx(*, checkpoint_path: Path, output_path: Path) -> tuple[Pa
     torch, nn = _require_torch()
     payload = _load_checkpoint(checkpoint_path, torch=torch)
     config = _checkpoint_config(payload)
+    if amount_format_min_confidence is not None:
+        # Validate an export override before creating any output.  It is
+        # intentionally unsupported for historical architectures so their
+        # already-published decoding protocols remain byte-for-byte
+        # compatible.
+        try:
+            configured_threshold = float(amount_format_min_confidence)
+        except (TypeError, ValueError):
+            raise ValueError("amount_format_min_confidence must be between 0 and 1") from None
+        if not math.isfinite(configured_threshold) or not 0.0 <= configured_threshold <= 1.0:
+            raise ValueError("amount_format_min_confidence must be between 0 and 1")
+        if not _is_v8(config):
+            raise ValueError("amount_format_min_confidence export override is supported only by v8 checkpoints")
+        config = replace(config, amount_format_min_confidence=configured_threshold)
     amount_characters, time_characters, payment_characters, status_classes, payment_bank_prefix_classes = _checkpoint_labels(
         payload,
         config=config,
@@ -5077,6 +5103,14 @@ def build_parser() -> argparse.ArgumentParser:
     export = commands.add_parser("export", help="export a trained unified reader checkpoint")
     export.add_argument("--checkpoint", type=Path, required=True)
     export.add_argument("--output", type=Path, required=True)
+    export.add_argument(
+        "--amount-format-min-confidence",
+        type=float,
+        help=(
+            "v8 only: write this validated amount display-format confidence gate into a new ONNX bundle; "
+            "the checkpoint and existing artifacts are never modified"
+        ),
+    )
 
     evaluate = commands.add_parser("evaluate", help="compare an ONNX reader with held-out teacher/truth labels")
     evaluate.add_argument("--model", type=Path, required=True)
@@ -5164,6 +5198,7 @@ def main(argv: list[str] | None = None) -> None:
             output, labels, contract = export_unified_onnx(
                 checkpoint_path=args.checkpoint,
                 output_path=args.output,
+                amount_format_min_confidence=args.amount_format_min_confidence,
             )
             print(f"Exported unified ONNX reader: {output}\nLabels: {labels}\nContract: {contract}")
             return
