@@ -608,6 +608,89 @@ python -m transfer_receipt_ai.ocr_unified evaluate `
 
 v8 可以直接在已生成的 12 万张 manifest 上训练和评估；教师一致性并不等于真实业务准确率。
 
+### v10 五字段收款方修正（当前推荐的候选训练）
+
+v9 的 `recipient_field` 把教师文字中的“收款方”标题从 CTC 目标中删除，却仍把**包含标题的整行裁图**送入模型；
+这会造成输入像素和监督文本不一致，并表现为大量 `normal OCR mismatch`。v10 不新增第二个模型、不重跑
+Paddle，也不把商户做成有限分类器：它仍是一个 `[5,1,80,512]` 输入、15 个输出的单一 ONNX，但将
+`recipient_field` 的 CTC 目标改为完整可见行（例如 `收款方 商户甲`），再在解码后提取业务值 `商户甲`。
+
+因此**不能**拿旧 v9 的 manifest、checkpoint 或 ONNX 继续训练；需要从已有的五字段 Paddle 教师标签重建一个
+v10 manifest。以下命令只读取已经生成的 `pseudo_labels.jsonl` 和字段裁图，不会重新调用 Paddle，也不需要手动
+标注。每个输出目录和 ONNX 文件名都必须是新的、尚不存在的路径。
+
+```powershell
+$teacherRoot = "D:\alipay-ai-data\receipt-lite-teacher-120k-v1"
+$teacherLabels5 = "$teacherRoot\paddle-teacher-labels-5field-v1"
+$unifiedManifestV10 = "$teacherRoot\unified-manifest-v10-r1"
+$unifiedRunV10 = "$teacherRoot\unified-run-v10-120k-r1"
+$unifiedModelV10 = "$teacherRoot\models\receipt_unified_field_reader_v10_120k_r1.onnx"
+
+# 1) 只重建五字段的回单级 manifest；不跑 Paddle、不训练。
+python -m transfer_receipt_ai.ocr_unified_dataset `
+  --records "$teacherLabels5\pseudo_labels.jsonl" `
+  --output $unifiedManifestV10 `
+  --architecture v10
+
+# 2) GPU 训练共享的五槽单模型，并直接导出新 ONNX。
+# recipient-loss-weight=3.0 是针对收款方的受控实验权重；其余字段仍共享同一主干。
+python -m transfer_receipt_ai.ocr_unified train `
+  --records "$unifiedManifestV10\unified_fields.jsonl" `
+  --dataset-root $teacherLabels5 `
+  --output $unifiedRunV10 `
+  --device cuda:0 `
+  --architecture v10 `
+  --image-height 80 `
+  --image-width 512 `
+  --base-channels 32 `
+  --numeric-hidden-size 96 `
+  --payment-hidden-size 128 `
+  --pooled-width 8 `
+  --epochs 80 `
+  --batch-size 24 `
+  --learning-rate 0.001 `
+  --weight-decay 0.0001 `
+  --payment-loss-weight 1.0 `
+  --ctc-loss-weight 0.75 `
+  --structured-loss-weight 1.0 `
+  --recipient-loss-weight 3.0 `
+  --amount-format-min-confidence 0.80 `
+  --payment-bank-prefix-min-support 3 `
+  --seed 42 `
+  --num-workers 0 `
+  --onnx-output $unifiedModelV10
+
+# 3) 先用 GPU 跑保留 test；这是调参/回归速度优先的 teacher-parity 报告。
+$unifiedEvalV10Gpu = "$teacherRoot\unified-eval-v10-120k-r1-test-gpu"
+python -m transfer_receipt_ai.ocr_unified evaluate `
+  --model $unifiedModelV10 `
+  --records "$unifiedManifestV10\unified_fields.jsonl" `
+  --dataset-root $teacherLabels5 `
+  --split test `
+  --output $unifiedEvalV10Gpu `
+  --device cuda:0
+
+# 4) 仅当 GPU 结果确认改善收款方且未伤害其他字段后，换新目录做最终 CPU 可运行性验证。
+$unifiedEvalV10Cpu = "$teacherRoot\unified-eval-v10-120k-r1-test-cpu"
+python -m transfer_receipt_ai.ocr_unified evaluate `
+  --model $unifiedModelV10 `
+  --records "$unifiedManifestV10\unified_fields.jsonl" `
+  --dataset-root $teacherLabels5 `
+  --split test `
+  --output $unifiedEvalV10Cpu `
+  --device cpu
+```
+
+对于 v10 的 `recipient_field`，`comparisons.jsonl` 中：`ctc_reference_text` / `ctc_candidate_text` 用于检查整行
+OCR 是否准确，`reference_text` / `candidate_text` 则用于检查提取后的商户值。先比较两种指标，才能区分“读错文字”
+和“标题/商户值提取规则有误”。不要用 v9 的 38.8% 与 v10 的整行 CTC 精确率直接横比；应比较相同的
+`recipient_field.reference_text` / `candidate_text` 业务值指标。
+
+`transfer_status` 目前教师集几乎只有 `success`，所以该头会继续标记为 `review_only`；这不是 v10 失败，而是安全地
+拒绝把单一类别伪装成三分类器。即使 v10 的 teacher-parity 通过，最终交付仍需要：独立人工真值保留集、CPU 验证，
+以及把 unified v10 reader 作为独立 `--ocr unified` 路径接入 .NET CLI。当前 `.NET` CLI 只能运行 PP-OCR ONNX
+bundle，不能直接接收这个统一 reader。
+
 ### 可选人工复核候选差异（不修改原图）
 
 当 `comparisons.jsonl` 中出现 Paddle 参考文字与学生候选不一致时，不要直接认定任意一方为真。下面的
@@ -944,9 +1027,11 @@ contract JSON 交付给 .NET。
 
 上面的 `--ocr onnx --ocr-bundle` 仅适用于冻结的 PP-OCR bundle，**不能**把单模型
 `receipt_unified_field_reader_v3`、`receipt_unified_field_reader_v4` 或
-`receipt_unified_field_reader_v5`、`receipt_unified_field_reader_v6` 或 `receipt_unified_field_reader_v7` 传给它。统一 reader 目前仍未接入 .NET CLI；只有 v7 同时通过 Python 的
-保留集 delivery gate 和人工真值验收后，才会以独立的 `--ocr unified` 路径接入，并复用同一份 `[4,1,H,W]`
-预处理、slot 顺序、结构化解码规则和 `status_head_policy`。
+`receipt_unified_field_reader_v5`、`receipt_unified_field_reader_v6`、`receipt_unified_field_reader_v7`、
+`receipt_unified_field_reader_v8`、`receipt_unified_field_reader_v9` 或 `receipt_unified_field_reader_v10` 传给它。
+统一 reader 目前仍未接入 .NET CLI；只有候选同时通过 Python 的保留集 teacher-parity、独立人工真值和 CPU
+验收后，才会以独立的 `--ocr unified` 路径接入。该路径会按 artifact contract 复用 `[4,1,H,W]`（v3–v8）
+或 `[5,1,H,W]`（v9/v10）的预处理、slot 顺序、结构化解码规则和 `status_head_policy`。
 
 该项目覆盖**模型层**：EXIF 摆正、letterbox、检测框坐标还原、阈值/每类最佳框、设备识别规则，
 并写出 JSON / manifest / 标注 JPG。默认 `--annotate all`，每张会输出与 Python 相同命名的

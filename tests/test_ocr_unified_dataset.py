@@ -6,7 +6,12 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from transfer_receipt_ai.ocr_unified_dataset import SLOT_ORDER, build_unified_dataset
+from transfer_receipt_ai.ocr_unified_dataset import (
+    KIND_V10,
+    SLOT_ORDER,
+    V10_SLOT_ORDER,
+    build_unified_dataset,
+)
 
 
 def _write_image(path: Path, shade: int) -> None:
@@ -243,3 +248,100 @@ def test_build_unified_dataset_does_not_use_truth_payment_category_as_visible_te
     rejected = [json.loads(line) for line in (output / "rejected.jsonl").read_text(encoding="utf-8").splitlines()]
     assert rejected[0]["id"] == "sample-2"
     assert rejected[0]["reason"] == "invalid_unified_target"
+
+
+def test_v10_recipient_ctc_target_retains_visible_line_and_keeps_value_separately(tmp_path: Path) -> None:
+    """v10 aligns recipient CTC text with the full detector crop line.
+
+    The data source deliberately carries an unrelated semantic value so this
+    test verifies the v10 manifest derives the right-side recipient value from
+    the visible teacher line rather than trusting a stale flat-record field.
+    It also builds v9 from the same source to prove its value-only payload is
+    unchanged.
+    """
+    source = tmp_path / "recipient-pseudo"
+    source_rows = [
+        _record(
+            index=1,
+            field="recipient_field",
+            text="收款方   商户甲",
+            semantic_value="legacy-semantic-value",
+            result_json="D:/results/train.json",
+            group_id="receipt:train",
+            split="train",
+        ),
+        _record(
+            index=2,
+            field="recipient_field",
+            text="收款方 商户丙",
+            semantic_value="legacy-semantic-value",
+            result_json="D:/results/val.json",
+            group_id="receipt:val",
+            split="val",
+        ),
+        _record(
+            index=3,
+            field="recipient_field",
+            text="收款方 商户丁",
+            semantic_value="legacy-semantic-value",
+            result_json="D:/results/test.json",
+            group_id="receipt:test",
+            split="test",
+        ),
+    ]
+    for index, record in enumerate(source_rows):
+        _write_image(source / str(record["image"]), 60 + index)
+    records_path = source / "pseudo_labels.jsonl"
+    records_path.write_text(
+        "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in source_rows),
+        encoding="utf-8",
+    )
+
+    v10_output = tmp_path / "unified-v10"
+    summary = build_unified_dataset(
+        records_path=records_path,
+        output_dir=v10_output,
+        architecture="v10",
+    )
+    v10_rows = [
+        json.loads(line)
+        for line in (v10_output / "unified_fields.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    train_v10 = next(row for row in v10_rows if row["split"] == "train")
+    recipient_v10 = train_v10["slots"]["recipient_field"]
+
+    assert summary["kind"] == KIND_V10
+    assert summary["architecture"] == "v10"
+    assert summary["slot_order"] == list(V10_SLOT_ORDER)
+    assert summary["recipient_target"] == "visible_recipient_line_then_extract_value"
+    assert summary["recipient_charset_source"] == "train_only_visible_recipient_line"
+    assert train_v10["slot_order"] == list(V10_SLOT_ORDER)
+    assert recipient_v10["text"] == "收款方 商户甲"
+    assert recipient_v10["recipient_visible_text"] == "收款方 商户甲"
+    assert recipient_v10["recipient_value"] == "商户甲"
+    assert recipient_v10["semantic_value"] == "商户甲"
+    assert set(summary["recipient_charset"]) == set("收款方 商户甲")
+    assert summary["recipient_oov_by_split"]["train"]["oov_records"] == 0
+    assert summary["recipient_oov_by_split"]["val"]["oov_records"] == 1
+    assert summary["recipient_oov_by_split"]["test"]["oov_records"] == 1
+    assert (v10_output / "recipient_charset.txt").read_text(encoding="utf-8") == (
+        "".join(summary["recipient_charset"]) + "\n"
+    )
+
+    v9_output = tmp_path / "unified-v9"
+    v9_summary = build_unified_dataset(
+        records_path=records_path,
+        output_dir=v9_output,
+        architecture="v9",
+    )
+    v9_rows = [
+        json.loads(line)
+        for line in (v9_output / "unified_fields.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    recipient_v9 = next(row for row in v9_rows if row["split"] == "train")["slots"]["recipient_field"]
+    assert v9_summary["recipient_target"] == "visible_recipient_value"
+    assert v9_summary["recipient_charset_source"] == "train_only_visible_recipient_text"
+    assert recipient_v9["text"] == "商户甲"
+    assert recipient_v9["semantic_value"] == "legacy-semantic-value"
+    assert "recipient_visible_text" not in recipient_v9
+    assert "recipient_value" not in recipient_v9

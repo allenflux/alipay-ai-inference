@@ -16,6 +16,12 @@ manifest.  Its recipient CTC alphabet is generated from *train only* and the
 contract records validation/test OOV evidence rather than leaking those
 characters into the deployable charset.
 
+The v10 contract retains the same five input slots but changes only recipient
+CTC supervision: it reads the entire visible crop line (for example
+``收款方 商户甲``), then stores the extracted business value separately.  This
+keeps the target geometrically aligned with a detector crop that includes the
+left-side field label while preserving the value used by downstream review.
+
 The payment slot deliberately retains the visible payment-method value (for
 example ``建设银行储蓄卡(3667)``) as a CTC target.  Its normalised business
 category remains provenance only; reducing it to ``bank_card`` would make a
@@ -50,11 +56,14 @@ SCHEMA_VERSION = 1
 # must remain byte-for-byte compatible with the four-slot protocol.
 KIND_V8 = "receipt_unified_field_dataset_v1"
 KIND_V9 = "receipt_unified_field_dataset_v2"
+KIND_V10 = "receipt_unified_field_dataset_v3"
 KIND = KIND_V8
 SLOT_ORDER = ("amount", "time", "transfer_status", "payment_method_field")
 V9_SLOT_ORDER = (*SLOT_ORDER, "recipient_field")
+V10_SLOT_ORDER = V9_SLOT_ORDER
 ARCHITECTURE_V8 = "v8"
 ARCHITECTURE_V9 = "v9"
+ARCHITECTURE_V10 = "v10"
 STATUS_CLASSES = ("success", "pending", "failed")
 
 
@@ -66,13 +75,15 @@ def _dataset_spec(architecture: str) -> tuple[str, str, tuple[str, ...]]:
     five-slot artifact be fed to an incompatible runtime.
     """
     if not isinstance(architecture, str):
-        raise ValueError("architecture must be v8 or v9")
+        raise ValueError("architecture must be v8, v9, or v10")
     normalized = architecture.strip().casefold()
     if normalized == ARCHITECTURE_V8:
         return ARCHITECTURE_V8, KIND_V8, SLOT_ORDER
     if normalized == ARCHITECTURE_V9:
         return ARCHITECTURE_V9, KIND_V9, V9_SLOT_ORDER
-    raise ValueError("architecture must be v8 or v9")
+    if normalized == ARCHITECTURE_V10:
+        return ARCHITECTURE_V10, KIND_V10, V10_SLOT_ORDER
+    raise ValueError("architecture must be v8, v9, or v10")
 
 
 def slot_order_for_architecture(architecture: str) -> tuple[str, ...]:
@@ -234,7 +245,11 @@ def _read_flat_records(
     return dataset_root, accepted, rejected
 
 
-def _slot_payload(record: Mapping[str, object]) -> dict[str, object] | None:
+def _slot_payload(
+    record: Mapping[str, object],
+    *,
+    architecture: str,
+) -> dict[str, object] | None:
     field = str(record["field"])
     semantic_value = str(record["semantic_value"])
     if field in {"amount", "time"}:
@@ -329,23 +344,40 @@ def _slot_payload(record: Mapping[str, object]) -> dict[str, object] | None:
             payload["payment_bank_prefix"] = payment_bank_prefix
         return payload
     if field == "recipient_field":
-        # v9 keeps the visible recipient/business name as free-text CTC
-        # supervision.  It must not be reduced to an observed-name
-        # classifier: unseen merchants are precisely the cases a recipient
-        # reader needs to surface for review.  The source crop can include a
-        # left-side label such as ``收款方``; retain only the value just as the
-        # Python/Paddle output does.
+        # v9 keeps the recipient/business value as free-text CTC supervision.
+        # v10 instead keeps the entire visible crop line as the CTC target,
+        # because detector crops often contain a left-side label such as
+        # ``收款方``.  Both variants retain the extracted business value for
+        # semantic comparison and downstream review; neither turns merchant
+        # names into a finite classifier.
         source_text = clean_text(str(record["text"]))
-        text = clean_text(extract_field_value(source_text, "recipient"))
-        if text in {"收款方", "收款人", "收款账户", "收款账号"}:
+        recipient_value = clean_text(extract_field_value(source_text, "recipient"))
+        if recipient_value in {"收款方", "收款人", "收款账户", "收款账号"}:
             # A row consisting of the label alone is not a readable recipient
             # value.  Do not teach that label as a merchant name.
             return None
-        if not text or any(not character.isprintable() for character in text):
+        if not recipient_value or any(not character.isprintable() for character in recipient_value):
             return None
+        if architecture == ARCHITECTURE_V10:
+            if any(not character.isprintable() for character in source_text):
+                return None
+            return {
+                "image": str(record["image"]),
+                # ``text`` stays the canonical CTC target for all slot
+                # payloads.  For v10 it is deliberately the complete visible
+                # line, not just the right-side recipient value.
+                "text": source_text,
+                "recipient_visible_text": source_text,
+                "recipient_value": recipient_value,
+                "semantic_value": recipient_value,
+                "paddle_text": record.get("paddle_text"),
+                "paddle_confidence": record.get("paddle_confidence"),
+                "detector_score": record.get("detector_score"),
+                "crop_sha256": record.get("crop_sha256"),
+            }
         return {
             "image": str(record["image"]),
-            "text": text,
+            "text": recipient_value,
             "semantic_value": semantic_value,
             "paddle_text": record.get("paddle_text"),
             "paddle_confidence": record.get("paddle_confidence"),
@@ -362,8 +394,12 @@ def _target_signature(field: str, slot: Mapping[str, object]) -> str:
     return str(slot["text"])
 
 
-def _recipient_charset_payload(records: Iterable[Mapping[str, object]]) -> dict[str, object]:
-    """Build a v9 recipient alphabet from train labels and audit held-out OOVs.
+def _recipient_charset_payload(
+    records: Iterable[Mapping[str, object]],
+    *,
+    source: str,
+) -> dict[str, object]:
+    """Build a v9/v10 recipient alphabet from train labels and audit held-out OOVs.
 
     The recipient CTC output is deliberately open text, not a finite merchant
     catalog.  Its vocabulary must therefore be frozen from train only.  A
@@ -409,7 +445,7 @@ def _recipient_charset_payload(records: Iterable[Mapping[str, object]]) -> dict[
                     }
                 )
     return {
-        "source": "train_only_visible_recipient_text",
+        "source": source,
         "characters": charset,
         "sha256": hashlib.sha256("".join(charset).encode("utf-8")).hexdigest(),
         "oov_by_split": {
@@ -451,7 +487,7 @@ def build_unified_dataset(
     for record in records:
         receipt_key = _receipt_key(record)
         field = str(record["field"])
-        slot = _slot_payload(record)
+        slot = _slot_payload(record, architecture=architecture)
         if slot is None:
             rejected.append(
                 {
@@ -639,15 +675,26 @@ def build_unified_dataset(
         ),
     }
     recipient_charset_characters: list[str] | None = None
-    if architecture == ARCHITECTURE_V9:
-        recipient_charset = _recipient_charset_payload(unified_records)
+    if architecture in {ARCHITECTURE_V9, ARCHITECTURE_V10}:
+        recipient_charset = _recipient_charset_payload(
+            unified_records,
+            source=(
+                "train_only_visible_recipient_line"
+                if architecture == ARCHITECTURE_V10
+                else "train_only_visible_recipient_text"
+            ),
+        )
         # Keep the full audit in the contract and a tiny deterministic text
         # sidecar for training scripts that accept a character list directly.
         # The newline is a file terminator, not a trainable character.
         # Keep a v8 contract byte-for-byte shaped like the established one;
-        # v9 is a separate kind and carries its explicit architecture marker.
+        # v9/v10 are separate kinds and carry explicit architecture markers.
         summary["architecture"] = architecture
-        summary["recipient_target"] = "visible_recipient_value"
+        summary["recipient_target"] = (
+            "visible_recipient_line_then_extract_value"
+            if architecture == ARCHITECTURE_V10
+            else "visible_recipient_value"
+        )
         recipient_charset_characters = list(recipient_charset["characters"])
         summary["recipient_charset"] = recipient_charset_characters
         summary["recipient_charset_sha256"] = recipient_charset["sha256"]
@@ -655,9 +702,9 @@ def build_unified_dataset(
         summary["recipient_oov_by_split"] = recipient_charset["oov_by_split"]
     _atomic_write_jsonl(output_dir / "unified_fields.jsonl", unified_records)
     _atomic_write_jsonl(output_dir / "rejected.jsonl", rejected)
-    if architecture == ARCHITECTURE_V9:
+    if architecture in {ARCHITECTURE_V9, ARCHITECTURE_V10}:
         if recipient_charset_characters is None:  # Internal construction invariant.
-            raise AssertionError("v9 recipient charset was not initialized")
+            raise AssertionError("v9/v10 recipient charset was not initialized")
         _atomic_write_text(
             output_dir / "recipient_charset.txt",
             "".join(recipient_charset_characters) + "\n",
@@ -674,9 +721,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", type=Path, required=True, help="New empty output directory")
     parser.add_argument(
         "--architecture",
-        choices=(ARCHITECTURE_V8, ARCHITECTURE_V9),
+        choices=(ARCHITECTURE_V8, ARCHITECTURE_V9, ARCHITECTURE_V10),
         default=ARCHITECTURE_V8,
-        help="v8 keeps four slots; v9 appends recipient_field as a fifth slot",
+        help=(
+            "v8 keeps four slots; v9 appends recipient_field with a value-only CTC target; "
+            "v10 keeps five slots but trains recipient CTC on the visible full line"
+        ),
     )
     return parser
 

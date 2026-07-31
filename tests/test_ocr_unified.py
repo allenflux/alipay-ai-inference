@@ -918,7 +918,7 @@ def test_v8_amount_format_override_is_validated_and_rejected_for_non_v8_artifact
         "_load_onnx_artifacts",
         lambda _path: (_tiny_config(architecture_version=7), ["x"], {}),
     )
-    with pytest.raises(ValueError, match="supported only by v8/v9 ONNX artifacts"):
+    with pytest.raises(ValueError, match="supported only by v8-v10 ONNX artifacts"):
         evaluate_unified_onnx(
             model_path=tmp_path / "ignored-v7.onnx",
             records_path=tmp_path / "ignored-v7.jsonl",
@@ -1034,7 +1034,7 @@ def test_export_amount_format_threshold_rejects_non_v8_before_writing(
     monkeypatch.setattr(ocr_unified, "_require_torch", lambda: (object(), object()))
     monkeypatch.setattr(ocr_unified, "_load_checkpoint", lambda _path, *, torch: checkpoint_payload)
 
-    with pytest.raises(ValueError, match="export override is supported only by v8/v9 checkpoints"):
+    with pytest.raises(ValueError, match="export override is supported only by v8-v10 checkpoints"):
         export_unified_onnx(
             checkpoint_path=checkpoint_path,
             output_path=output_path,
