@@ -191,11 +191,12 @@ CTC_ONNX_BLANK_INDICES = {
 ONNX_EXPORT_RTOL = 1e-3
 ONNX_EXPORT_ATOL = 1e-3
 # ORT's CPU GRU kernel can differ from Torch by just under 0.002 logit on the
-# exported raw payment CTC head.  Keep the relaxation scoped to that observed
-# output; every other output retains the project-wide 1e-3 absolute tolerance.
-# The exact per-position argmax check below still rejects a changed character
-# or class decision.
+# exported raw payment or time CTC heads.  Keep the relaxation scoped to those
+# observed outputs; every other output retains the project-wide 1e-3 absolute
+# tolerance.  The exact per-position argmax check below still rejects a changed
+# character or class decision.
 ONNX_EXPORT_PAYMENT_LOGITS_ATOL = 2e-3
+ONNX_EXPORT_TIME_LOGITS_ATOL = 2e-3
 
 # A v5 CTC prediction and its structural prediction are deliberately exposed
 # together for diagnostics, but they are not independent evidence: both are
@@ -334,8 +335,12 @@ def _onnx_output_names(config: "UnifiedReaderConfig") -> tuple[str, ...]:
 
 
 def _onnx_export_atol(output_name: str) -> float:
-    """Use the narrowly validated ORT tolerance for the raw payment CTC head."""
-    return ONNX_EXPORT_PAYMENT_LOGITS_ATOL if output_name == "payment_logits" else ONNX_EXPORT_ATOL
+    """Use narrowly validated ORT tolerances for raw CTC heads only."""
+    if output_name == "payment_logits":
+        return ONNX_EXPORT_PAYMENT_LOGITS_ATOL
+    if output_name == "time_logits":
+        return ONNX_EXPORT_TIME_LOGITS_ATOL
+    return ONNX_EXPORT_ATOL
 
 
 def _kind_for_architecture(architecture_version: int) -> str:

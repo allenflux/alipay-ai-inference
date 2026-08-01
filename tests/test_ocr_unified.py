@@ -21,6 +21,7 @@ from transfer_receipt_ai.ocr_unified import (
     ONNX_EXPORT_ATOL,
     ONNX_EXPORT_PAYMENT_LOGITS_ATOL,
     ONNX_EXPORT_RTOL,
+    ONNX_EXPORT_TIME_LOGITS_ATOL,
     PAYMENT_BANK_OTHER_CLASS,
     V6_AMOUNT_CHARACTERS,
     V6_ONNX_OUTPUT_NAMES,
@@ -479,18 +480,26 @@ def test_optional_exact_metric_formats_as_na_without_status_labels() -> None:
     assert _format_exact_match(0.5) == "50.00%"
 
 
-def test_payment_onnx_export_tolerance_allows_bounded_gru_drift_without_argmax_change(
+def test_ctc_onnx_export_tolerances_allow_bounded_gru_drift_without_argmax_change(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Permit bounded payment-GRU round-off, never a changed greedy decision."""
+    """Permit scoped CTC GRU round-off, never a changed greedy decision."""
     expected = np.asarray([[0.0, 0.5, -0.4]], dtype=np.float32)
-    actual = expected.copy()
-    actual[0, 0] += np.float32(0.001765964)
-    assert np.argmax(actual, axis=-1).tolist() == np.argmax(expected, axis=-1).tolist()
-    assert not np.allclose(actual, expected, rtol=ONNX_EXPORT_RTOL, atol=ONNX_EXPORT_ATOL)
-    assert np.allclose(actual, expected, rtol=ONNX_EXPORT_RTOL, atol=ONNX_EXPORT_PAYMENT_LOGITS_ATOL)
+    payment_actual = expected.copy()
+    payment_actual[0, 0] += np.float32(0.001765964)
+    time_actual = expected.copy()
+    # This is the v10 server-export drift that previously stopped a completed
+    # training run.  Its per-position CTC decision did not change.
+    time_actual[0, 0] += np.float32(0.0014093737)
+    assert np.argmax(payment_actual, axis=-1).tolist() == np.argmax(expected, axis=-1).tolist()
+    assert np.argmax(time_actual, axis=-1).tolist() == np.argmax(expected, axis=-1).tolist()
+    assert not np.allclose(payment_actual, expected, rtol=ONNX_EXPORT_RTOL, atol=ONNX_EXPORT_ATOL)
+    assert not np.allclose(time_actual, expected, rtol=ONNX_EXPORT_RTOL, atol=ONNX_EXPORT_ATOL)
+    assert np.allclose(payment_actual, expected, rtol=ONNX_EXPORT_RTOL, atol=ONNX_EXPORT_PAYMENT_LOGITS_ATOL)
+    assert np.allclose(time_actual, expected, rtol=ONNX_EXPORT_RTOL, atol=ONNX_EXPORT_TIME_LOGITS_ATOL)
     assert _onnx_export_atol("payment_logits") == ONNX_EXPORT_PAYMENT_LOGITS_ATOL
-    assert _onnx_export_atol("time_logits") == ONNX_EXPORT_ATOL
+    assert _onnx_export_atol("time_logits") == ONNX_EXPORT_TIME_LOGITS_ATOL
+    assert _onnx_export_atol("amount_logits") == ONNX_EXPORT_ATOL
 
     def validate(output_name: str, runtime_output: np.ndarray, torch_output: np.ndarray) -> None:
         class NamedItem:
@@ -522,15 +531,21 @@ def test_payment_onnx_export_tolerance_allows_bounded_gru_drift_without_argmax_c
             expected_outputs=[torch.as_tensor(torch_output)],
         )
 
-    validate("payment_logits", actual, expected)
+    validate("payment_logits", payment_actual, expected)
+    validate("time_logits", time_actual, expected)
 
     changed_decision = np.asarray([[0.0018, 0.0005]], dtype=np.float32)
     expected_decision = np.asarray([[0.0, 0.0005]], dtype=np.float32)
     with pytest.raises(ValueError, match=r"argmax_mismatches=1/1"):
-        validate("payment_logits", changed_decision, expected_decision)
+        validate("time_logits", changed_decision, expected_decision)
 
     with pytest.raises(ValueError, match=r"amount_logits.*atol=0.001"):
-        validate("amount_logits", actual, expected)
+        validate("amount_logits", time_actual, expected)
+
+    time_over_cap = expected.copy()
+    time_over_cap[0, 0] += np.float32(0.0021)
+    with pytest.raises(ValueError, match=r"time_logits.*atol=0.002"):
+        validate("time_logits", time_over_cap, expected)
 
 
 def test_unified_ctc_decoder_collapses_repeats_and_blanks() -> None:
