@@ -34,6 +34,31 @@ _FIELD_LABELS = {
 }
 
 
+def parse_anchored_recipient_row(raw_text: str) -> tuple[str, str] | None:
+    """Parse a recipient row only when its label is at the visible left edge.
+
+    ``extract_field_value`` intentionally has a forgiving fallback for legacy
+    Paddle output (it can find a label in the middle of a line or accept a
+    value that appears before it).  That is useful for display, but it is too
+    permissive when building v11 training targets: a contaminated detector
+    crop such as ``商户甲 收款方`` must not teach a recipient reader.
+
+    This helper is deliberately small and side-effect free.  It verifies the
+    row starts with one of the fixed recipient labels and returns the label
+    plus the right-side value after ordinary row punctuation.  Dataset-level
+    quality policy performs the stricter repeated-label/context checks.
+    """
+    text = clean_text(raw_text)
+    for label in _FIELD_LABELS["recipient"]:
+        if not text.startswith(label):
+            continue
+        value = text[len(label) :].lstrip(" :：-—")
+        if not value:
+            return None
+        return label, value
+    return None
+
+
 def extract_field_value(raw_text: str, field: str) -> str:
     """Extract the right-side value from OCR of a complete receipt row.
 

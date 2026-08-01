@@ -22,6 +22,13 @@ CTC supervision: it reads the entire visible crop line (for example
 keeps the target geometrically aligned with a detector crop that includes the
 left-side field label while preserving the value used by downstream review.
 
+The v11 contract keeps five slots but makes the recipient data policy explicit:
+only a row anchored by a recipient label and free of obvious neighbouring-row
+pollution is eligible.  It stores the full visible row for audit and trains the
+recipient target on the right-side value.  The paired reader contract applies a
+documented value-view crop before its fifth input is resized; this is a new,
+incompatible protocol rather than a silent change to v9/v10.
+
 The payment slot deliberately retains the visible payment-method value (for
 example ``建设银行储蓄卡(3667)``) as a CTC target.  Its normalised business
 category remains provenance only; reducing it to ``bank_card`` would make a
@@ -33,12 +40,13 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 from collections import Counter
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
-from .ocr import clean_text, extract_field_value
+from .ocr import clean_text, extract_field_value, parse_anchored_recipient_row
 from .ocr_unified_targets import (
     parse_amount_aux_target,
     parse_amount_display_target,
@@ -57,14 +65,32 @@ SCHEMA_VERSION = 1
 KIND_V8 = "receipt_unified_field_dataset_v1"
 KIND_V9 = "receipt_unified_field_dataset_v2"
 KIND_V10 = "receipt_unified_field_dataset_v3"
+KIND_V11 = "receipt_unified_field_dataset_v4"
 KIND = KIND_V8
 SLOT_ORDER = ("amount", "time", "transfer_status", "payment_method_field")
 V9_SLOT_ORDER = (*SLOT_ORDER, "recipient_field")
 V10_SLOT_ORDER = V9_SLOT_ORDER
+V11_SLOT_ORDER = V9_SLOT_ORDER
 ARCHITECTURE_V8 = "v8"
 ARCHITECTURE_V9 = "v9"
 ARCHITECTURE_V10 = "v10"
+ARCHITECTURE_V11 = "v11"
 STATUS_CLASSES = ("success", "pending", "failed")
+
+# These are deliberately narrow, high-signal markers of a detector crop that
+# reached into the adjacent payment/balance row.  Merchant names remain open
+# text: v11 does not use a bank/merchant allow-list.
+RECIPIENT_POLLUTION_TOKENS = (
+    "付款方式",
+    "交易方式",
+    "付款渠道",
+    "支付方式",
+    "账户余额",
+    "￥",
+    "¥",
+)
+RECIPIENT_LABELS = ("收款方", "收款人", "收款账户", "收款账号")
+RECIPIENT_QUALITY_POLICY_VERSION = "anchored_value_right_crop_v1"
 
 
 def _dataset_spec(architecture: str) -> tuple[str, str, tuple[str, ...]]:
@@ -75,7 +101,7 @@ def _dataset_spec(architecture: str) -> tuple[str, str, tuple[str, ...]]:
     five-slot artifact be fed to an incompatible runtime.
     """
     if not isinstance(architecture, str):
-        raise ValueError("architecture must be v8, v9, or v10")
+        raise ValueError("architecture must be v8, v9, v10, or v11")
     normalized = architecture.strip().casefold()
     if normalized == ARCHITECTURE_V8:
         return ARCHITECTURE_V8, KIND_V8, SLOT_ORDER
@@ -83,7 +109,9 @@ def _dataset_spec(architecture: str) -> tuple[str, str, tuple[str, ...]]:
         return ARCHITECTURE_V9, KIND_V9, V9_SLOT_ORDER
     if normalized == ARCHITECTURE_V10:
         return ARCHITECTURE_V10, KIND_V10, V10_SLOT_ORDER
-    raise ValueError("architecture must be v8, v9, or v10")
+    if normalized == ARCHITECTURE_V11:
+        return ARCHITECTURE_V11, KIND_V11, V11_SLOT_ORDER
+    raise ValueError("architecture must be v8, v9, v10, or v11")
 
 
 def slot_order_for_architecture(architecture: str) -> tuple[str, ...]:
@@ -243,6 +271,155 @@ def _read_flat_records(
     if not accepted:
         raise ValueError("No valid unified-reader slot records found")
     return dataset_root, accepted, rejected
+
+
+def _recipient_crop_aspect(record: Mapping[str, object]) -> float | None:
+    """Return the source crop width/height only for an opted-in geometry gate.
+
+    The normal v11 path must remain cheap for a 120k manifest: it does not
+    open every image merely to construct a JSONL file.  When a caller elects a
+    non-zero aspect threshold, inspect the source crop and make an unavailable
+    geometry value visible in the audit rather than guessing.
+    """
+    image_path = record.get("image_path")
+    if not isinstance(image_path, Path):
+        return None
+    try:
+        from PIL import Image
+
+        with Image.open(image_path) as image:
+            width, height = image.size
+    except (ImportError, OSError, ValueError):
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    return float(width) / float(height)
+
+
+def _recipient_quality_policy_payload(
+    *,
+    min_crop_aspect: float,
+    max_visible_chars: int,
+) -> dict[str, object]:
+    """Return the frozen v11 recipient-label acceptance policy."""
+    return {
+        "version": RECIPIENT_QUALITY_POLICY_VERSION,
+        "requires_leading_recipient_label": True,
+        "rejects_repeated_recipient_label": True,
+        "rejects_context_tokens": list(RECIPIENT_POLLUTION_TOKENS),
+        "min_crop_aspect": min_crop_aspect,
+        "max_visible_chars": max_visible_chars,
+        "geometry_disabled_when_zero": True,
+        "target": "anchored_recipient_value",
+        "input_preprocess": "recipient_value_right_crop_configured_by_reader_contract",
+    }
+
+
+def _recipient_v11_slot_payload(
+    record: Mapping[str, object],
+    *,
+    min_crop_aspect: float,
+    max_visible_chars: int,
+) -> tuple[dict[str, object] | None, dict[str, object]]:
+    """Create one v11 recipient slot and an auditable quality decision.
+
+    The old v9/v10 contracts deliberately accept a permissive recipient
+    extraction because they preserve legacy training data.  V11 is opt-in:
+    this strict policy is intended to remove examples where the detector crop
+    contains a neighbouring payment/balance line or a recipient label in an
+    unsupported position.  A rejected fifth slot does *not* reject the other
+    fields from that receipt.
+    """
+    source_text = clean_text(str(record["text"]))
+    audit: dict[str, object] = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "receipt_recipient_quality_audit_v1",
+        "policy_version": RECIPIENT_QUALITY_POLICY_VERSION,
+        "id": str(record["id"]),
+        "field": "recipient_field",
+        "split": str(record["split"]),
+        "group_id": str(record["group_id"]),
+        "image": str(record["image"]),
+        "source_text": source_text,
+        "source_bbox_rectified": record.get("bbox_rectified"),
+        "paddle_text": record.get("paddle_text"),
+        "paddle_confidence": record.get("paddle_confidence"),
+        "detector_score": record.get("detector_score"),
+        "crop_sha256": record.get("crop_sha256"),
+        "quality_decision": "rejected",
+        "quality_reason": None,
+        "recipient_label": None,
+        "recipient_value": None,
+        "observed_crop_aspect": None,
+        "retained_in_unified_manifest": False,
+    }
+
+    parsed = parse_anchored_recipient_row(source_text)
+    if parsed is None:
+        audit["quality_reason"] = "missing_leading_recipient_label_or_value"
+        return None, audit
+    recipient_label, recipient_value = parsed
+    audit["recipient_label"] = recipient_label
+    audit["recipient_value"] = recipient_value
+
+    if any(label in recipient_value for label in RECIPIENT_LABELS):
+        audit["quality_reason"] = "repeated_or_malformed_recipient_label"
+        return None, audit
+    pollution = next((token for token in RECIPIENT_POLLUTION_TOKENS if token in recipient_value), None)
+    if pollution is not None:
+        audit["quality_reason"] = f"context_or_currency_pollution:{pollution}"
+        return None, audit
+    if any(not character.isprintable() for character in recipient_value):
+        audit["quality_reason"] = "non_printable_recipient_value"
+        return None, audit
+    if max_visible_chars > 0 and len(source_text) > max_visible_chars:
+        audit["quality_reason"] = "visible_row_exceeds_configured_max_chars"
+        return None, audit
+    if min_crop_aspect > 0.0:
+        aspect = _recipient_crop_aspect(record)
+        audit["observed_crop_aspect"] = aspect
+        if aspect is None:
+            audit["quality_reason"] = "crop_aspect_unavailable"
+            return None, audit
+        if aspect < min_crop_aspect:
+            audit["quality_reason"] = "crop_aspect_below_configured_min"
+            return None, audit
+
+    quality_metadata = {
+        "policy_version": RECIPIENT_QUALITY_POLICY_VERSION,
+        "anchored_label": recipient_label,
+        "visible_text": source_text,
+        "value": recipient_value,
+        "source_bbox_rectified": record.get("bbox_rectified"),
+        "input_preprocess": "recipient_value_right_crop_configured_by_reader_contract",
+    }
+    audit["quality_decision"] = "accepted"
+    audit["quality_reason"] = "accepted"
+    return (
+        {
+            "image": str(record["image"]),
+            # V11 deliberately makes both pixels and target value-aligned: the
+            # v11 reader crops the static left label region before resizing the
+            # fifth channel.  The unmodified row remains provenance only.
+            "text": recipient_value,
+            "recipient_visible_text": source_text,
+            "recipient_value": recipient_value,
+            "recipient_label": recipient_label,
+            "recipient_quality_policy": RECIPIENT_QUALITY_POLICY_VERSION,
+            "recipient_quality": quality_metadata,
+            "source_record_id": str(record["id"]),
+            # Preserve the source geometry under its original field name so
+            # downstream diagnostics and a .NET crop implementation do not
+            # need to know about the flat-manifest source record.
+            "bbox_rectified": record.get("bbox_rectified"),
+            "semantic_value": recipient_value,
+            "paddle_text": record.get("paddle_text"),
+            "paddle_confidence": record.get("paddle_confidence"),
+            "detector_score": record.get("detector_score"),
+            "crop_sha256": record.get("crop_sha256"),
+        },
+        audit,
+    )
 
 
 def _slot_payload(
@@ -465,18 +642,36 @@ def build_unified_dataset(
     records_path: Path,
     output_dir: Path,
     architecture: str = ARCHITECTURE_V8,
+    recipient_min_crop_aspect: float = 0.0,
+    recipient_max_visible_chars: int = 0,
 ) -> dict[str, object]:
     """Create ``unified_fields.jsonl`` from flat Paddle/truth crop records.
 
     The default ``v8`` keeps the established four-slot protocol.  Select
     ``v9`` only with a flat manifest containing all five field labels from one
-    pseudo-label export; its fifth channel is ``recipient_field``.  A unified
-    record may omit a slot.  The training model uses a white placeholder for
-    missing images and masks its loss, preserving good labels rather than
-    discarding an entire receipt because one field was below the teacher
-    confidence threshold.
+    pseudo-label export; its fifth channel is ``recipient_field``.  ``v11``
+    is the strict successor for recipient data: it requires a leading
+    recipient label and records every accepted/rejected source crop in a
+    sidecar audit.  A unified record may omit a slot.  The training model uses
+    a white placeholder for missing images and masks its loss, preserving good
+    labels rather than discarding an entire receipt because one field was
+    below the teacher confidence threshold.
     """
     architecture, dataset_kind, slot_order = _dataset_spec(architecture)
+    try:
+        recipient_min_crop_aspect = float(recipient_min_crop_aspect)
+    except (TypeError, ValueError):
+        raise ValueError("recipient_min_crop_aspect must be a finite number >= 0") from None
+    if not math.isfinite(recipient_min_crop_aspect) or recipient_min_crop_aspect < 0.0:
+        raise ValueError("recipient_min_crop_aspect must be >= 0")
+    if isinstance(recipient_max_visible_chars, bool) or not isinstance(recipient_max_visible_chars, int):
+        raise ValueError("recipient_max_visible_chars must be an integer >= 0")
+    if recipient_max_visible_chars < 0:
+        raise ValueError("recipient_max_visible_chars must be >= 0")
+    if architecture != ARCHITECTURE_V11 and (
+        recipient_min_crop_aspect != 0.0 or recipient_max_visible_chars != 0
+    ):
+        raise ValueError("recipient geometry options are supported only by architecture v11")
     dataset_root, records, rejected = _read_flat_records(records_path, slot_order=slot_order)
     output_dir = output_dir.resolve()
     if output_dir.exists() and any(output_dir.iterdir()):
@@ -484,18 +679,33 @@ def build_unified_dataset(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     grouped: dict[str, dict[str, object]] = {}
+    recipient_audits: list[dict[str, object]] = []
     for record in records:
         receipt_key = _receipt_key(record)
         field = str(record["field"])
-        slot = _slot_payload(record, architecture=architecture)
+        recipient_audit: dict[str, object] | None = None
+        if architecture == ARCHITECTURE_V11 and field == "recipient_field":
+            slot, recipient_audit = _recipient_v11_slot_payload(
+                record,
+                min_crop_aspect=recipient_min_crop_aspect,
+                max_visible_chars=recipient_max_visible_chars,
+            )
+            recipient_audits.append(recipient_audit)
+        else:
+            slot = _slot_payload(record, architecture=architecture)
         if slot is None:
+            reason = "invalid_unified_target"
+            detail = str(record.get("semantic_value", ""))
+            if recipient_audit is not None:
+                reason = "recipient_quality_rejected"
+                detail = str(recipient_audit.get("quality_reason", "unspecified"))
             rejected.append(
                 {
                     "schema_version": SCHEMA_VERSION,
                     "id": str(record["id"]),
                     "field": field,
-                    "reason": "invalid_unified_target",
-                    "detail": str(record.get("semantic_value", "")),
+                    "reason": reason,
+                    "detail": detail,
                 }
             )
             continue
@@ -584,12 +794,19 @@ def build_unified_dataset(
         selected[field] = record
 
     unified_records: list[dict[str, object]] = []
+    retained_recipient_ids: set[str] = set()
     for receipt_key, entry in grouped.items():
         slots = dict(entry["slots"])
         if not slots:
             continue
         digest = hashlib.sha256(receipt_key.encode("utf-8")).hexdigest()
-        entry.pop("_selected", None)
+        selected = entry.pop("_selected", None)
+        if architecture == ARCHITECTURE_V11 and isinstance(selected, Mapping):
+            selected_recipient = selected.get("recipient_field")
+            if isinstance(selected_recipient, Mapping):
+                selected_id = selected_recipient.get("id")
+                if isinstance(selected_id, str):
+                    retained_recipient_ids.add(selected_id)
         ambiguous = entry.pop("_ambiguous", set())
         if ambiguous:
             entry["ambiguous_slots"] = sorted(ambiguous)
@@ -675,14 +892,16 @@ def build_unified_dataset(
         ),
     }
     recipient_charset_characters: list[str] | None = None
-    if architecture in {ARCHITECTURE_V9, ARCHITECTURE_V10}:
+    if architecture in {ARCHITECTURE_V9, ARCHITECTURE_V10, ARCHITECTURE_V11}:
+        if architecture == ARCHITECTURE_V10:
+            recipient_charset_source = "train_only_visible_recipient_line"
+        elif architecture == ARCHITECTURE_V11:
+            recipient_charset_source = "train_only_anchored_recipient_value"
+        else:
+            recipient_charset_source = "train_only_visible_recipient_text"
         recipient_charset = _recipient_charset_payload(
             unified_records,
-            source=(
-                "train_only_visible_recipient_line"
-                if architecture == ARCHITECTURE_V10
-                else "train_only_visible_recipient_text"
-            ),
+            source=recipient_charset_source,
         )
         # Keep the full audit in the contract and a tiny deterministic text
         # sidecar for training scripts that accept a character list directly.
@@ -690,21 +909,59 @@ def build_unified_dataset(
         # Keep a v8 contract byte-for-byte shaped like the established one;
         # v9/v10 are separate kinds and carry explicit architecture markers.
         summary["architecture"] = architecture
-        summary["recipient_target"] = (
-            "visible_recipient_line_then_extract_value"
-            if architecture == ARCHITECTURE_V10
-            else "visible_recipient_value"
-        )
+        summary["recipient_target"] = {
+            ARCHITECTURE_V9: "visible_recipient_value",
+            ARCHITECTURE_V10: "visible_recipient_line_then_extract_value",
+            ARCHITECTURE_V11: "anchored_recipient_value_with_value_view_crop",
+        }[architecture]
         recipient_charset_characters = list(recipient_charset["characters"])
         summary["recipient_charset"] = recipient_charset_characters
         summary["recipient_charset_sha256"] = recipient_charset["sha256"]
         summary["recipient_charset_source"] = recipient_charset["source"]
         summary["recipient_oov_by_split"] = recipient_charset["oov_by_split"]
+    if architecture == ARCHITECTURE_V11:
+        for audit in recipient_audits:
+            if audit["quality_decision"] == "accepted":
+                retained = str(audit["id"]) in retained_recipient_ids
+                audit["retained_in_unified_manifest"] = retained
+                audit["manifest_decision"] = "selected" if retained else "not_selected_after_duplicate_resolution"
+            else:
+                audit["manifest_decision"] = "quality_rejected"
+        quality_by_split: dict[str, dict[str, int]] = {}
+        for split in ("train", "val", "test"):
+            split_audits = [audit for audit in recipient_audits if audit["split"] == split]
+            quality_by_split[split] = {
+                "source_records": len(split_audits),
+                "quality_accepted": sum(audit["quality_decision"] == "accepted" for audit in split_audits),
+                "quality_rejected": sum(audit["quality_decision"] == "rejected" for audit in split_audits),
+                "retained_slot_records": sum(bool(audit["retained_in_unified_manifest"]) for audit in split_audits),
+            }
+        rejection_counts = Counter(
+            str(audit["quality_reason"])
+            for audit in recipient_audits
+            if audit["quality_decision"] == "rejected"
+        )
+        summary["recipient_quality_policy"] = _recipient_quality_policy_payload(
+            min_crop_aspect=recipient_min_crop_aspect,
+            max_visible_chars=recipient_max_visible_chars,
+        )
+        summary["recipient_quality_audit"] = {
+            "path": "recipient_quality_audit.jsonl",
+            "source_records": len(recipient_audits),
+            "quality_accepted": sum(audit["quality_decision"] == "accepted" for audit in recipient_audits),
+            "quality_rejected": sum(audit["quality_decision"] == "rejected" for audit in recipient_audits),
+            "retained_slot_records": sum(bool(audit["retained_in_unified_manifest"]) for audit in recipient_audits),
+            "rejected_by_reason": dict(sorted(rejection_counts.items())),
+            "by_split": quality_by_split,
+            "scope": "valid flat recipient_field records read from the source manifest",
+        }
     _atomic_write_jsonl(output_dir / "unified_fields.jsonl", unified_records)
     _atomic_write_jsonl(output_dir / "rejected.jsonl", rejected)
-    if architecture in {ARCHITECTURE_V9, ARCHITECTURE_V10}:
+    if architecture == ARCHITECTURE_V11:
+        _atomic_write_jsonl(output_dir / "recipient_quality_audit.jsonl", recipient_audits)
+    if architecture in {ARCHITECTURE_V9, ARCHITECTURE_V10, ARCHITECTURE_V11}:
         if recipient_charset_characters is None:  # Internal construction invariant.
-            raise AssertionError("v9/v10 recipient charset was not initialized")
+            raise AssertionError("v9/v10/v11 recipient charset was not initialized")
         _atomic_write_text(
             output_dir / "recipient_charset.txt",
             "".join(recipient_charset_characters) + "\n",
@@ -721,11 +978,30 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", type=Path, required=True, help="New empty output directory")
     parser.add_argument(
         "--architecture",
-        choices=(ARCHITECTURE_V8, ARCHITECTURE_V9, ARCHITECTURE_V10),
+        choices=(ARCHITECTURE_V8, ARCHITECTURE_V9, ARCHITECTURE_V10, ARCHITECTURE_V11),
         default=ARCHITECTURE_V8,
         help=(
             "v8 keeps four slots; v9 appends recipient_field with a value-only CTC target; "
-            "v10 keeps five slots but trains recipient CTC on the visible full line"
+            "v10 keeps five slots but trains recipient CTC on the visible full line; "
+            "v11 filters recipient rows to an anchored clean value-view contract"
+        ),
+    )
+    parser.add_argument(
+        "--recipient-min-crop-aspect",
+        type=float,
+        default=0.0,
+        help=(
+            "v11 only: reject recipient crops whose width/height is below this value; "
+            "0 disables the optional geometry gate"
+        ),
+    )
+    parser.add_argument(
+        "--recipient-max-visible-chars",
+        type=int,
+        default=0,
+        help=(
+            "v11 only: reject recipient rows longer than this cleaned visible-text length; "
+            "0 disables the optional length gate"
         ),
     )
     return parser
@@ -738,6 +1014,8 @@ def main(argv: list[str] | None = None) -> None:
             records_path=args.records,
             output_dir=args.output,
             architecture=args.architecture,
+            recipient_min_crop_aspect=args.recipient_min_crop_aspect,
+            recipient_max_visible_chars=args.recipient_max_visible_chars,
         )
     except (OSError, ValueError) as error:
         raise SystemExit(f"Unified OCR dataset build failed:\n{error}") from error

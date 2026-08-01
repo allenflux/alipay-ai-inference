@@ -608,7 +608,92 @@ python -m transfer_receipt_ai.ocr_unified evaluate `
 
 v8 可以直接在已生成的 12 万张 manifest 上训练和评估；教师一致性并不等于真实业务准确率。
 
-### v10 五字段收款方修正（当前推荐的候选训练）
+### v11 五字段收款方专项训练（当前推荐）
+
+v11 仍然是**一个** `[5,1,80,512]` 输入、15 个输出的统一 ONNX；不会增加第二个 OCR
+模型，也不需要运行时安装 Paddle。它针对 v10 的收款方问题做了三件事：
+
+- 只保留以“收款方/收款人/收款账户/收款账号”开头、且没有付款方式/余额/货币符号串入的教师行；
+- 第五槽输入在缩放前稳定裁掉左侧 `30%` 标题区域，CTC 只学习右侧的收款方值；
+- 收款方使用独立的 192 宽 GRU 分支，并通过 `--recipient-sampling-weight 2.0` 提高其训练采样占比，
+  但仍与金额、时间、状态、付款方式共享 CNN 并只导出一个 ONNX。
+
+下面命令读取已完成的五字段 Paddle 教师结果；**不会重新跑 Paddle，也不需要人工逐张标注**。所有输出目录和
+ONNX 文件必须是新的、尚不存在的路径。
+
+```powershell
+$teacherRoot = "D:\alipay-ai-data\receipt-lite-teacher-120k-v1"
+$teacherLabels5 = "$teacherRoot\paddle-teacher-labels-5field-v1"
+$unifiedManifestV11 = "$teacherRoot\unified-manifest-v11-r1"
+$unifiedRunV11 = "$teacherRoot\unified-run-v11-120k-r1"
+$unifiedModelV11 = "$teacherRoot\models\receipt_unified_field_reader_v11_120k_r1.onnx"
+
+# 1) 重建 v11 的五字段回单级 manifest。
+#    只做本地 JSONL/裁图审计，不重新推理 Paddle；recipient_quality_audit.jsonl
+#    会列出每条收款方记录是接受还是因相邻字段污染而排除。
+python -m transfer_receipt_ai.ocr_unified_dataset `
+  --records "$teacherLabels5\pseudo_labels.jsonl" `
+  --output $unifiedManifestV11 `
+  --architecture v11
+
+# 2) GPU 训练一个共享五槽 ONNX。recipient-hidden-size=192 不会放大共享 CNN；
+#    sampling-weight=2.0 是收款方优先的第一组受控实验。
+python -m transfer_receipt_ai.ocr_unified train `
+  --records "$unifiedManifestV11\unified_fields.jsonl" `
+  --dataset-root $teacherLabels5 `
+  --output $unifiedRunV11 `
+  --device cuda:0 `
+  --architecture v11 `
+  --image-height 80 `
+  --image-width 512 `
+  --base-channels 32 `
+  --numeric-hidden-size 96 `
+  --payment-hidden-size 128 `
+  --recipient-hidden-size 192 `
+  --recipient-value-left-trim 0.30 `
+  --pooled-width 8 `
+  --epochs 80 `
+  --batch-size 24 `
+  --learning-rate 0.001 `
+  --weight-decay 0.0001 `
+  --payment-loss-weight 1.0 `
+  --recipient-loss-weight 3.0 `
+  --recipient-sampling-weight 2.0 `
+  --ctc-loss-weight 0.75 `
+  --structured-loss-weight 1.0 `
+  --amount-format-min-confidence 0.80 `
+  --payment-bank-prefix-min-support 3 `
+  --seed 42 `
+  --num-workers 0 `
+  --onnx-output $unifiedModelV11
+
+# 3) 先用 GPU 做 teacher-parity 回归；调参期间优先用它节省时间。
+$unifiedEvalV11Gpu = "$teacherRoot\unified-eval-v11-120k-r1-test-gpu"
+python -m transfer_receipt_ai.ocr_unified evaluate `
+  --model $unifiedModelV11 `
+  --records "$unifiedManifestV11\unified_fields.jsonl" `
+  --dataset-root $teacherLabels5 `
+  --split test `
+  --output $unifiedEvalV11Gpu `
+  --device cuda:0
+
+# 4) 只有 GPU 结果确认五个字段都没有回退后，使用全新的目录跑最终 CPU 可运行性验证。
+$unifiedEvalV11Cpu = "$teacherRoot\unified-eval-v11-120k-r1-test-cpu"
+python -m transfer_receipt_ai.ocr_unified evaluate `
+  --model $unifiedModelV11 `
+  --records "$unifiedManifestV11\unified_fields.jsonl" `
+  --dataset-root $teacherLabels5 `
+  --split test `
+  --output $unifiedEvalV11Cpu `
+  --device cpu
+```
+
+重点查看 `$unifiedEvalV11Gpu\summary.json` 的五个 `by_field` 指标，以及
+`$unifiedManifestV11\recipient_quality_audit.jsonl`。收款方的 `raw_exact_match` 是严格逐字一致；
+`semantic_exact_match` 只有在业务清洗规则确实等价时才可辅助解释，不能掩盖真实读字错误。所有指标目前仍是
+**Paddle 教师一致性**，最终交付前仍需保留独立人工真值集和 CPU 验证。
+
+### v10 五字段收款方修正（历史基线）
 
 v9 的 `recipient_field` 把教师文字中的“收款方”标题从 CTC 目标中删除，却仍把**包含标题的整行裁图**送入模型；
 这会造成输入像素和监督文本不一致，并表现为大量 `normal OCR mismatch`。v10 不新增第二个模型、不重跑
@@ -1029,9 +1114,10 @@ contract JSON 交付给 .NET。
 `receipt_unified_field_reader_v3`、`receipt_unified_field_reader_v4` 或
 `receipt_unified_field_reader_v5`、`receipt_unified_field_reader_v6`、`receipt_unified_field_reader_v7`、
 `receipt_unified_field_reader_v8`、`receipt_unified_field_reader_v9` 或 `receipt_unified_field_reader_v10` 传给它。
+（v11 也同样不能传给当前的 `--ocr onnx`。）
 统一 reader 目前仍未接入 .NET CLI；只有候选同时通过 Python 的保留集 teacher-parity、独立人工真值和 CPU
 验收后，才会以独立的 `--ocr unified` 路径接入。该路径会按 artifact contract 复用 `[4,1,H,W]`（v3–v8）
-或 `[5,1,H,W]`（v9/v10）的预处理、slot 顺序、结构化解码规则和 `status_head_policy`。
+或 `[5,1,H,W]`（v9/v10/v11）的预处理、slot 顺序、结构化解码规则和 `status_head_policy`。
 
 该项目覆盖**模型层**：EXIF 摆正、letterbox、检测框坐标还原、阈值/每类最佳框、设备识别规则，
 并写出 JSON / manifest / 标注 JPG。默认 `--annotate all`，每张会输出与 Python 相同命名的
