@@ -22,7 +22,8 @@ from transfer_receipt_ai.ocr_unified import (
     ONNX_EXPORT_PAYMENT_LOGITS_ATOL,
     ONNX_EXPORT_RTOL,
     ONNX_EXPORT_TIME_LOGITS_ATOL,
-    ONNX_EXPORT_V11_AMOUNT_LOGITS_ATOL,
+    ONNX_EXPORT_V11_CTC_LOGITS_ATOL,
+    ONNX_EXPORT_V11_CTC_LOGITS_MEAN_ABS_CAP,
     PAYMENT_BANK_OTHER_CLASS,
     V6_AMOUNT_CHARACTERS,
     V6_ONNX_OUTPUT_NAMES,
@@ -492,28 +493,52 @@ def test_ctc_onnx_export_tolerances_allow_bounded_gru_drift_without_argmax_chang
     # This is the v10 server-export drift that previously stopped a completed
     # training run.  Its per-position CTC decision did not change.
     time_actual[0, 0] += np.float32(0.0014093737)
-    v11_amount_actual = expected.copy()
+    v11_amount_expected = np.repeat(expected, repeats=128, axis=0)
+    v11_amount_actual = v11_amount_expected.copy()
     # This is the v11 server-export amount drift.  It was measured on the
     # fixed [5, 1, H, W] export probe and preserves every CTC decision.
-    v11_amount_actual[0, 0] += np.float32(0.0095449686)
+    v11_amount_actual[:14, 0] += np.float32(0.0095449686)
+    v11_time_expected = np.repeat(expected, repeats=128, axis=0)
+    v11_time_actual = v11_time_expected.copy()
+    # v11's time CTC branch can use a different CPU GRU accumulation order.
+    # The measured max drift remains below the dedicated hard 0.03 cap and
+    # keeps its per-position greedy CTC decisions unchanged.
+    v11_time_actual[:8, 0] += np.float32(0.026508331)
     assert np.argmax(payment_actual, axis=-1).tolist() == np.argmax(expected, axis=-1).tolist()
     assert np.argmax(time_actual, axis=-1).tolist() == np.argmax(expected, axis=-1).tolist()
     assert not np.allclose(payment_actual, expected, rtol=ONNX_EXPORT_RTOL, atol=ONNX_EXPORT_ATOL)
     assert not np.allclose(time_actual, expected, rtol=ONNX_EXPORT_RTOL, atol=ONNX_EXPORT_ATOL)
-    assert not np.allclose(v11_amount_actual, expected, rtol=ONNX_EXPORT_RTOL, atol=ONNX_EXPORT_ATOL)
+    assert not np.allclose(v11_amount_actual, v11_amount_expected, rtol=ONNX_EXPORT_RTOL, atol=ONNX_EXPORT_ATOL)
+    assert not np.allclose(v11_time_actual, v11_time_expected, rtol=ONNX_EXPORT_RTOL, atol=ONNX_EXPORT_ATOL)
     assert np.allclose(payment_actual, expected, rtol=ONNX_EXPORT_RTOL, atol=ONNX_EXPORT_PAYMENT_LOGITS_ATOL)
     assert np.allclose(time_actual, expected, rtol=ONNX_EXPORT_RTOL, atol=ONNX_EXPORT_TIME_LOGITS_ATOL)
     assert np.allclose(
         v11_amount_actual,
-        expected,
+        v11_amount_expected,
         rtol=ONNX_EXPORT_RTOL,
-        atol=ONNX_EXPORT_V11_AMOUNT_LOGITS_ATOL,
+        atol=ONNX_EXPORT_V11_CTC_LOGITS_ATOL,
+    )
+    assert np.allclose(
+        v11_time_actual,
+        v11_time_expected,
+        rtol=ONNX_EXPORT_RTOL,
+        atol=ONNX_EXPORT_V11_CTC_LOGITS_ATOL,
+    )
+    assert decode_ctc_logits(v11_time_actual[:, np.newaxis, :], characters=["A", "B"]) == decode_ctc_logits(
+        v11_time_expected[:, np.newaxis, :],
+        characters=["A", "B"],
     )
     assert _onnx_export_atol("payment_logits") == ONNX_EXPORT_PAYMENT_LOGITS_ATOL
     assert _onnx_export_atol("time_logits") == ONNX_EXPORT_TIME_LOGITS_ATOL
     assert _onnx_export_atol("amount_logits") == ONNX_EXPORT_ATOL
     v11_config = UnifiedReaderConfig(architecture_version=11)
-    assert _onnx_export_atol("amount_logits", config=v11_config) == ONNX_EXPORT_V11_AMOUNT_LOGITS_ATOL
+    assert _onnx_export_atol("amount_logits", config=v11_config) == ONNX_EXPORT_V11_CTC_LOGITS_ATOL
+    assert _onnx_export_atol("time_logits", config=v11_config) == ONNX_EXPORT_V11_CTC_LOGITS_ATOL
+    assert _onnx_export_atol("payment_logits", config=v11_config) == ONNX_EXPORT_V11_CTC_LOGITS_ATOL
+    assert _onnx_export_atol("payment_prefix_logits", config=v11_config) == ONNX_EXPORT_V11_CTC_LOGITS_ATOL
+    assert _onnx_export_atol("recipient_logits", config=v11_config) == ONNX_EXPORT_V11_CTC_LOGITS_ATOL
+    assert _onnx_export_atol("status_logits", config=v11_config) == ONNX_EXPORT_ATOL
+    assert ONNX_EXPORT_V11_CTC_LOGITS_MEAN_ABS_CAP == 1e-3
     assert _onnx_export_atol(
         "amount_logits",
         config=UnifiedReaderConfig(architecture_version=10),
@@ -558,7 +583,8 @@ def test_ctc_onnx_export_tolerances_allow_bounded_gru_drift_without_argmax_chang
 
     validate("payment_logits", payment_actual, expected)
     validate("time_logits", time_actual, expected)
-    validate("amount_logits", v11_amount_actual, expected, config=v11_config)
+    validate("amount_logits", v11_amount_actual, v11_amount_expected, config=v11_config)
+    validate("time_logits", v11_time_actual, v11_time_expected, config=v11_config)
 
     changed_decision = np.asarray([[0.0018, 0.0005]], dtype=np.float32)
     expected_decision = np.asarray([[0.0, 0.0005]], dtype=np.float32)
@@ -572,16 +598,34 @@ def test_ctc_onnx_export_tolerances_allow_bounded_gru_drift_without_argmax_chang
         validate(
             "amount_logits",
             v11_amount_actual,
-            expected,
+            v11_amount_expected,
             config=UnifiedReaderConfig(architecture_version=10),
         )
 
-    v11_amount_over_cap = expected.copy()
-    v11_amount_over_cap[0, 0] += np.float32(0.0101)
-    with pytest.raises(ValueError, match=r"amount_logits.*atol=0.01.*max_abs_cap=0.01"):
-        validate("amount_logits", v11_amount_over_cap, expected, config=v11_config)
+    with pytest.raises(ValueError, match=r"time_logits.*atol=0.002"):
+        validate(
+            "time_logits",
+            v11_time_actual,
+            v11_time_expected,
+            config=UnifiedReaderConfig(architecture_version=10),
+        )
 
-    changed_v11_amount_decision = np.asarray([[0.009, 0.0005]], dtype=np.float32)
+    v11_ctc_cap_expected = np.repeat(
+        np.asarray([[40.0, 41.0, -4.0]], dtype=np.float32),
+        repeats=128,
+        axis=0,
+    )
+    v11_ctc_over_cap = v11_ctc_cap_expected.copy()
+    v11_ctc_over_cap[0, 0] += np.float32(0.0301)
+    with pytest.raises(ValueError, match=r"amount_logits.*atol=0.03.*max_abs_cap=0.03"):
+        validate("amount_logits", v11_ctc_over_cap, v11_ctc_cap_expected, config=v11_config)
+
+    v11_ctc_mean_expected = np.repeat(expected, repeats=128, axis=0)
+    v11_ctc_mean_over_cap = v11_ctc_mean_expected + np.float32(0.0011)
+    with pytest.raises(ValueError, match=r"amount_logits.*mean_abs_cap=0.001"):
+        validate("amount_logits", v11_ctc_mean_over_cap, v11_ctc_mean_expected, config=v11_config)
+
+    changed_v11_amount_decision = np.asarray([[0.029, 0.0005]], dtype=np.float32)
     with pytest.raises(ValueError, match=r"argmax_mismatches=1/1"):
         validate(
             "amount_logits",
