@@ -6,7 +6,9 @@ import json
 from dataclasses import asdict
 from pathlib import Path
 
+import numpy as np
 import pytest
+from PIL import Image
 
 from transfer_receipt_ai.ocr import parse_anchored_recipient_row
 from transfer_receipt_ai.ocr_unified import (
@@ -15,10 +17,14 @@ from transfer_receipt_ai.ocr_unified import (
     UnifiedReaderConfig,
     _checkpoint_config,
     _input_tensor,
+    _recipient_audit_preprocess_gray,
+    audit_recipient_trims_onnx,
+    build_parser,
     build_unified_reader,
     evaluate_unified_onnx,
     export_unified_onnx,
     load_records,
+    preprocess_image,
     train_unified_reader,
 )
 from transfer_receipt_ai.ocr_unified_dataset import (
@@ -216,6 +222,25 @@ def test_v11_config_freezes_recipient_branch_and_value_crop() -> None:
     assert _checkpoint_config({"kind": READER_KIND_V11, "config": asdict(config)}).architecture_version == 11
     with pytest.raises(ValueError, match="recipient_hidden_size is supported only by architecture v11"):
         UnifiedReaderConfig(architecture_version=10, recipient_hidden_size=24).validate()
+
+
+def test_v11_recipient_audit_preprocessor_matches_delivery_preprocessor(tmp_path: Path) -> None:
+    config = _tiny_v11_config()
+    pixels = np.full((13, 31), 245, dtype=np.uint8)
+    pixels[3:10, 9:22] = 17
+    image_path = tmp_path / "recipient.png"
+    Image.fromarray(pixels, mode="L").save(image_path)
+
+    trim_px = int(round(pixels.shape[1] * config.recipient_value_left_trim))
+    expected = preprocess_image(
+        image_path,
+        config=config,
+        horizontal_alignment="center",
+        left_crop_fraction=config.recipient_value_left_trim,
+    )
+    actual = _recipient_audit_preprocess_gray(pixels, config=config, trim_px=trim_px)
+
+    np.testing.assert_array_equal(actual, expected)
     with pytest.raises(ValueError, match="recipient_value_left_trim is supported only by architecture v11"):
         UnifiedReaderConfig(architecture_version=10, recipient_value_left_trim=0.25).validate()
 
@@ -296,6 +321,29 @@ def test_v11_train_export_load_and_evaluate_when_onnx_is_available(tmp_path: Pat
     assert failures == []
     assert summary["by_field"]["recipient_field"]["records"] == 1
 
+    artifact_bytes = model_path.read_bytes()
+    audit = audit_recipient_trims_onnx(
+        model_path=model_path,
+        records_path=records_path,
+        dataset_root=flat_manifest.parent,
+        output_dir=tmp_path / "recipient-trim-audit-v11",
+        split="test",
+        device="cpu",
+        left_trim_ratios=(0.0, 0.30),
+    )
+    assert audit["artifact_left_trim_fraction"] == pytest.approx(0.30)
+    assert audit["trial_left_trim_fractions"] == [0.0, 0.30]
+    assert len(audit["trials"]) == 2
+    assert audit["recipient_records"] == 1
+    assert model_path.read_bytes() == artifact_bytes
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "recipient-trim-audit-v11" / "comparisons.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert len(rows) == 2
+    assert {row["left_trim_fraction"] for row in rows} == {0.0, 0.30}
+    assert all("geometry" in row and "cut_window_has_ink" in row["geometry"] for row in rows)
+
 
 def test_v11_rejects_nonfinite_optional_geometry_gate(tmp_path: Path) -> None:
     manifest = _write_complete_source_manifest(tmp_path)
@@ -311,3 +359,23 @@ def test_v11_rejects_nonfinite_optional_geometry_gate(tmp_path: Path) -> None:
 def test_anchored_recipient_parser_is_not_the_legacy_loose_parser() -> None:
     assert parse_anchored_recipient_row("收款方  商户甲") == ("收款方", "商户甲")
     assert parse_anchored_recipient_row("商户甲 收款方") is None
+
+
+def test_v11_recipient_trim_audit_parser_accepts_multiple_ratios() -> None:
+    args = build_parser().parse_args(
+        [
+            "audit-recipient",
+            "--model",
+            "reader.onnx",
+            "--records",
+            "unified_fields.jsonl",
+            "--output",
+            "audit",
+            "--left-trims",
+            "0",
+            "0.20",
+            "0.30",
+        ]
+    )
+    assert args.command == "audit-recipient"
+    assert args.left_trims == [0.0, 0.20, 0.30]

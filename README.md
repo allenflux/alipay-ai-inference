@@ -688,6 +688,33 @@ python -m transfer_receipt_ai.ocr_unified evaluate `
   --device cpu
 ```
 
+如果 v11 的 `recipient_field` 严格逐字一致率明显低于金额、时间、付款方式，先不要盲目重训或手动改
+Paddle 标签。运行下面的**裁图比例审计**：同一 ONNX、同一保留集会测试多个“去掉左侧标题”的比例，并记录
+裁线附近是否仍有前景文字、最近空白间隔、字符覆盖、长度和严格/CER 指标。它只在内存中替换第五槽的输入像素；
+**不会**修改 ONNX、labels、contract 或任何交付行为。建议先用 GPU；它是诊断而不是最终 CPU 验收。
+
+```powershell
+$recipientTrimAudit = "$teacherRoot\recipient-trim-audit-v11-r1-test-gpu"
+
+python -m transfer_receipt_ai.ocr_unified audit-recipient `
+  --model $unifiedModelV11 `
+  --records "$unifiedManifestV11\unified_fields.jsonl" `
+  --dataset-root $teacherLabels5 `
+  --output $recipientTrimAudit `
+  --split test `
+  --device cuda:0 `
+  --left-trims 0 0.15 0.20 0.25 0.30 0.35 0.40 0.45
+```
+
+查看 `$recipientTrimAudit\summary.json` 的 `trials`：
+
+- 若某个比例同时提高严格准确率，并显著降低 `cut_window_ink_rate`，说明固定 30% 裁切很可能截到了文字或保留了标题；
+  该比例只能作为下一版重新训练/导出的候选，不能直接替换当前 v11 的交付预处理。
+- 若所有比例都接近约 49%，且大多数失败仍在 `normal OCR mismatch` 桶，则瓶颈是自由中文收款方的分辨率/模型能力，下一步应
+  在保持一个 ONNX 的前提下做收款方专用高水平分辨率分支，而不是继续调裁切数值。
+- `foreground_contrast_threshold` 默认按每张图的主背景灰度检测前景，因此同时适用于白底黑字和支付宝蓝底白字；它是图像几何
+  启发式证据，不是真实人工标注。
+
 重点查看 `$unifiedEvalV11Gpu\summary.json` 的五个 `by_field` 指标，以及
 `$unifiedManifestV11\recipient_quality_audit.jsonl`。收款方的 `raw_exact_match` 是严格逐字一致；
 `semantic_exact_match` 只有在业务清洗规则确实等价时才可辅助解释，不能掩盖真实读字错误。所有指标目前仍是

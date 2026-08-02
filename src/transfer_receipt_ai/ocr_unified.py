@@ -39,6 +39,11 @@ from PIL import Image
 
 from .onnx_runtime import _preload_cuda_dlls, onnx_providers
 from .ocr import clean_text, extract_field_value, normalize_payment_method, parse_anchored_recipient_row
+from .recipient_audit import (
+    DEFAULT_CUT_RADIUS as RECIPIENT_AUDIT_DEFAULT_CUT_RADIUS,
+    DEFAULT_FOREGROUND_CONTRAST_THRESHOLD as RECIPIENT_AUDIT_DEFAULT_FOREGROUND_CONTRAST_THRESHOLD,
+    audit_recipient_pixels,
+)
 from .ocr_unified_dataset import KIND as DATASET_KIND_V8
 from .ocr_unified_dataset import KIND_V9 as DATASET_KIND_V9
 from .ocr_unified_dataset import KIND_V10 as DATASET_KIND_V10
@@ -6092,6 +6097,412 @@ def evaluate_unified_onnx(
     return summary, failures
 
 
+def _recipient_audit_trim_ratios(values: Sequence[float]) -> tuple[float, ...]:
+    """Validate and canonicalise an exploratory v11 recipient trim sweep."""
+    if isinstance(values, (str, bytes)):
+        raise ValueError("left_trim_ratios must be a sequence of numeric ratios")
+    ratios: list[float] = []
+    for value in values:
+        if isinstance(value, bool):
+            raise ValueError("left_trim_ratios must contain numeric ratios")
+        try:
+            ratio = float(value)
+        except (TypeError, ValueError):
+            raise ValueError("left_trim_ratios must contain numeric ratios") from None
+        if not math.isfinite(ratio) or not 0.0 <= ratio < 1.0:
+            raise ValueError("left_trim_ratios must be in [0, 1)")
+        ratios.append(ratio)
+    if not ratios:
+        raise ValueError("left_trim_ratios must not be empty")
+    return tuple(sorted(set(ratios)))
+
+
+def _recipient_audit_preprocess_gray(
+    gray: np.ndarray,
+    *,
+    config: UnifiedReaderConfig,
+    trim_px: int,
+) -> np.ndarray:
+    """Reproduce v11's fifth-slot image transform from an already loaded crop.
+
+    The audit loads each source crop once, then produces several candidate
+    value views in memory.  Its resize, centring, and trim arithmetic exactly
+    mirrors :func:`preprocess_image`; it is intentionally private so the
+    delivery preprocessor remains the sole public runtime contract.
+    """
+    source = np.asarray(gray, dtype=np.uint8)
+    if source.ndim != 2 or source.shape[0] <= 0 or source.shape[1] <= 0:
+        raise ValueError("recipient crop must be a non-empty grayscale image")
+    width = int(source.shape[1])
+    if trim_px < 0 or trim_px >= width:
+        raise ValueError("recipient trim pixel is outside the source crop")
+    image = Image.fromarray(source, mode="L").crop((trim_px, 0, width, int(source.shape[0])))
+    scale = min(config.image_width / image.width, config.image_height / image.height)
+    resized_width = max(1, min(config.image_width, int(round(image.width * scale))))
+    resized_height = max(1, min(config.image_height, int(round(image.height * scale))))
+    resampling = getattr(Image, "Resampling", Image).BILINEAR
+    image = image.resize((resized_width, resized_height), resampling)
+    canvas = np.full((config.image_height, config.image_width), 255, dtype=np.uint8)
+    top = (config.image_height - resized_height) // 2
+    left = (config.image_width - resized_width) // 2
+    canvas[top : top + resized_height, left : left + resized_width] = np.asarray(image, dtype=np.uint8)
+    return (canvas.astype(np.float32) / 255.0)[np.newaxis, :, :]
+
+
+def _recipient_audit_rendered_width(
+    *,
+    source_height: int,
+    retained_width: int,
+    config: UnifiedReaderConfig,
+) -> int:
+    """Return the non-letterboxed horizontal pixels visible to v11's CTC head."""
+    if source_height <= 0 or retained_width <= 0:
+        raise ValueError("recipient audit source dimensions must be positive")
+    scale = min(config.image_width / retained_width, config.image_height / source_height)
+    return max(1, min(config.image_width, int(round(retained_width * scale))))
+
+
+def _recipient_audit_bucket(value: float, *, boundaries: Sequence[float], labels: Sequence[str]) -> str:
+    """Assign a numeric diagnostic value to one stable, human-readable bucket."""
+    if len(labels) != len(boundaries) + 1:
+        raise ValueError("recipient audit bucket labels do not match boundaries")
+    for boundary, label in zip(boundaries, labels):
+        if value <= boundary:
+            return label
+    return labels[-1]
+
+
+def _recipient_audit_bucket_metrics(
+    rows: Sequence[Mapping[str, object]],
+    *,
+    bucket_for: Any,
+) -> dict[str, dict[str, object]]:
+    """Group rows into explainable slices while retaining exact/CER evidence."""
+    groups: dict[str, list[Mapping[str, object]]] = {}
+    for row in rows:
+        bucket = str(bucket_for(row))
+        groups.setdefault(bucket, []).append(row)
+    return {bucket: _comparison_metrics(groups[bucket]) for bucket in sorted(groups)}
+
+
+def _recipient_audit_metrics(rows: Sequence[Mapping[str, object]]) -> dict[str, object]:
+    """Add image-geometry and latency evidence to standard CTC comparison metrics."""
+    metrics = _comparison_metrics(rows)
+    if not rows:
+        return {
+            **metrics,
+            "cut_window_ink_records": 0,
+            "cut_window_ink_rate": None,
+            "nearest_blank_gap_touch_records": 0,
+            "nearest_blank_gap_touch_rate": None,
+            "mean_rendered_width_per_character": None,
+            "latency_ms": _latency_metrics(()),
+        }
+    cut_window_ink = 0
+    nearest_blank_gap_touch = 0
+    rendered_widths_per_character: list[float] = []
+    latencies: list[float] = []
+    for row in rows:
+        geometry = row.get("geometry")
+        if not isinstance(geometry, Mapping):
+            raise ValueError("recipient audit row has no geometry")
+        if bool(geometry.get("cut_window_has_ink")):
+            cut_window_ink += 1
+        raw_gap = geometry.get("nearest_blank_gap")
+        if isinstance(raw_gap, Mapping) and bool(raw_gap.get("touches_trim_boundary")):
+            nearest_blank_gap_touch += 1
+        value = row.get("rendered_width_per_character")
+        if isinstance(value, (int, float)) and math.isfinite(float(value)):
+            rendered_widths_per_character.append(float(value))
+        latency = row.get("inference_ms")
+        if isinstance(latency, (int, float)) and math.isfinite(float(latency)):
+            latencies.append(float(latency))
+    records = len(rows)
+    return {
+        **metrics,
+        "cut_window_ink_records": cut_window_ink,
+        "cut_window_ink_rate": cut_window_ink / records,
+        "nearest_blank_gap_touch_records": nearest_blank_gap_touch,
+        "nearest_blank_gap_touch_rate": nearest_blank_gap_touch / records,
+        "mean_rendered_width_per_character": (
+            sum(rendered_widths_per_character) / len(rendered_widths_per_character)
+            if rendered_widths_per_character
+            else None
+        ),
+        "latency_ms": _latency_metrics(latencies),
+    }
+
+
+def _recipient_trim_summary(rows: Sequence[Mapping[str, object]]) -> dict[str, object]:
+    """Build the per-ratio report that decides whether geometry is worth changing."""
+    return {
+        "metrics": _recipient_audit_metrics(rows),
+        "by_reference_length": _recipient_audit_bucket_metrics(
+            rows,
+            bucket_for=lambda row: _recipient_audit_bucket(
+                float(row["reference_length"]),
+                boundaries=(4, 8, 12),
+                labels=("1-4", "5-8", "9-12", "13+"),
+            ),
+        ),
+        "by_min_train_character_support": _recipient_audit_bucket_metrics(
+            rows,
+            bucket_for=lambda row: _recipient_audit_bucket(
+                float(row["min_train_character_support"]),
+                boundaries=(0, 1, 3, 9),
+                labels=("0", "1", "2-3", "4-9", "10+"),
+            ),
+        ),
+        "by_rendered_width_per_character": _recipient_audit_bucket_metrics(
+            rows,
+            bucket_for=lambda row: _recipient_audit_bucket(
+                float(row["rendered_width_per_character"]),
+                boundaries=(20, 35, 50),
+                labels=("<=20", "20-35", "35-50", "50+"),
+            ),
+        ),
+    }
+
+
+def audit_recipient_trims_onnx(
+    *,
+    model_path: Path,
+    records_path: Path,
+    output_dir: Path,
+    left_trim_ratios: Sequence[float],
+    dataset_root: Path | None = None,
+    split: str = "test",
+    device: str = "auto",
+    foreground_contrast_threshold: int = RECIPIENT_AUDIT_DEFAULT_FOREGROUND_CONTRAST_THRESHOLD,
+    cut_radius: int = RECIPIENT_AUDIT_DEFAULT_CUT_RADIUS,
+    blank_column_max_ink: int = 0,
+) -> dict[str, object]:
+    """Diagnose the frozen v11 recipient trim without changing an artifact.
+
+    Every trial uses the same validated ONNX and the same held-out records.
+    Only the fifth input slot's *in-memory* pixel trim differs.  The result is
+    therefore diagnostic evidence for a potential v12 preprocessing contract,
+    never a rewritten or deployable v11 model.
+    """
+    if split not in {"val", "test"}:
+        raise ValueError("split must be val or test; train is not an independent teacher-parity audit")
+    ratios = _recipient_audit_trim_ratios(left_trim_ratios)
+    output_dir = output_dir.resolve()
+    if output_dir.exists() and any(output_dir.iterdir()):
+        raise ValueError(f"recipient audit output already contains files: {output_dir}. Choose a new empty directory.")
+
+    # Preserve the ordinary evaluator's sidecar-validation seam.  In
+    # particular, do not accept a plain ONNX file with a hand-edited labels
+    # file, and never write the diagnostic trim into the artifact.
+    config, _payment_characters, contract = _load_onnx_artifacts(model_path)
+    if not _is_v11(config):
+        raise ValueError("audit-recipient supports only v11 ONNX artifacts with a frozen recipient value trim")
+    _, _, recipient_characters, _ = _load_onnx_artifact_details(model_path)
+    if recipient_characters is None:
+        raise AssertionError("v11 recipient characters were validated with the ONNX sidecar")
+
+    records = load_records(records_path, dataset_root=dataset_root, config=config)
+    train_character_support: Counter[str] = Counter()
+    for record in records:
+        if record["split"] != "train":
+            continue
+        text = _ctc_slot_text(record, "recipient_field", config=config)
+        if text is not None:
+            train_character_support.update(text)
+    recipient_records: list[tuple[Mapping[str, object], Mapping[str, object], str]] = []
+    for record in records:
+        if record["split"] != split:
+            continue
+        slot = dict(record["slots"]).get("recipient_field")
+        reference_text = _ctc_slot_text(record, "recipient_field", config=config)
+        if isinstance(slot, Mapping) and reference_text is not None:
+            recipient_records.append((record, slot, reference_text))
+    if not recipient_records:
+        raise ValueError(f"No {split} recipient labels remain for the v11 trim audit")
+
+    onnxruntime = _require_onnxruntime()
+    model_path = model_path.resolve()
+    session, active_providers = _create_onnx_session(onnxruntime, model_path, device=device)
+    input_names = [item.name for item in session.get_inputs()]
+    output_names = [item.name for item in session.get_outputs()]
+    expected_outputs = list(_onnx_output_names(config))
+    if input_names != ["field_images"] or output_names != expected_outputs:
+        raise ValueError(
+            "Unified OCR ONNX input/output names differ from its delivery contract: "
+            f"inputs={input_names}, outputs={output_names}"
+        )
+    expected_input_shape = [len(_slot_order(config)), 1, config.image_height, config.image_width]
+    actual_input_shape = list(session.get_inputs()[0].shape)
+    if actual_input_shape != expected_input_shape:
+        raise ValueError(
+            f"Unified OCR ONNX input shape {actual_input_shape} differs from contract {expected_input_shape}"
+        )
+    recipient_output = next((item for item in session.get_outputs() if item.name == "recipient_logits"), None)
+    expected_recipient_shape = [config.image_width // 4, len(recipient_characters) + 1]
+    if recipient_output is None or list(recipient_output.shape) != expected_recipient_shape:
+        actual_shape = None if recipient_output is None else list(recipient_output.shape)
+        raise ValueError(
+            "Unified OCR ONNX recipient output shape differs from contract: "
+            f"actual={actual_shape}, expected={expected_recipient_shape}"
+        )
+
+    recipient_index = _slot_order(config).index("recipient_field")
+    character_set = set(recipient_characters)
+    rows_by_ratio: dict[float, list[dict[str, object]]] = {ratio: [] for ratio in ratios}
+    total = len(recipient_records)
+    progress_interval = max(1, total // 20)
+    for number, (record, slot, reference_text) in enumerate(recipient_records, start=1):
+        # `_input_tensor` keeps the other four slots exactly as the delivery
+        # preprocessing contract defines them.  Recipient `logits` depend on
+        # only the fifth slot; each trial replaces just that slot in-place.
+        field_images = np.ascontiguousarray(_input_tensor(record, config=config), dtype=np.float32)
+        image_path = Path(slot["image_path"])
+        with Image.open(image_path) as image:
+            gray = np.asarray(image.convert("L"), dtype=np.uint8).copy()
+        reference_semantic = _semantic_value("recipient_field", reference_text)
+        reference_has_oov = any(character not in character_set for character in reference_text)
+        character_support = [int(train_character_support[character]) for character in reference_text]
+        minimum_character_support = min(character_support, default=0)
+        mean_character_support = sum(character_support) / len(character_support) if character_support else 0.0
+        for ratio in ratios:
+            geometry = audit_recipient_pixels(
+                gray,
+                left_trim_ratio=ratio,
+                foreground_contrast_threshold=foreground_contrast_threshold,
+                cut_radius=cut_radius,
+                blank_column_max_ink=blank_column_max_ink,
+            )
+            field_images[recipient_index] = _recipient_audit_preprocess_gray(
+                gray,
+                config=config,
+                trim_px=geometry.trim_px,
+            )
+            started = perf_counter()
+            recipient_logits = session.run(["recipient_logits"], {"field_images": field_images})[0]
+            inference_ms = (perf_counter() - started) * 1000.0
+            candidate_text, confidence = _ctc_single_output(recipient_logits, characters=recipient_characters)
+            candidate_semantic = _semantic_value("recipient_field", candidate_text)
+            raw_exact = candidate_text == reference_text
+            semantic_exact = (
+                reference_semantic is not None
+                and candidate_semantic is not None
+                and candidate_semantic == reference_semantic
+            )
+            rendered_width = _recipient_audit_rendered_width(
+                source_height=geometry.height,
+                retained_width=geometry.retained_width_px,
+                config=config,
+            )
+            rows_by_ratio[ratio].append(
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "kind": "receipt_unified_recipient_trim_audit_row_v1",
+                    "id": str(record["id"]),
+                    "group_id": str(record["group_id"]),
+                    "split": split,
+                    "source": record.get("source"),
+                    "result_json": record.get("result_json"),
+                    "label_source": record.get("label_source"),
+                    "field": "recipient_field",
+                    "image": image_path.as_posix(),
+                    "bbox_rectified": slot.get("bbox_rectified"),
+                    "crop_sha256": slot.get("crop_sha256"),
+                    "paddle_text": slot.get("paddle_text"),
+                    "paddle_confidence": slot.get("paddle_confidence"),
+                    "detector_score": slot.get("detector_score"),
+                    "recipient_label": slot.get("recipient_label"),
+                    "recipient_visible_text": slot.get("recipient_visible_text"),
+                    "reference_text": reference_text,
+                    "candidate_text": candidate_text,
+                    "confidence": confidence,
+                    "reference_semantic": reference_semantic,
+                    "candidate_semantic": candidate_semantic,
+                    "raw_exact": raw_exact,
+                    "semantic_exact": semantic_exact,
+                    "cer_edits": levenshtein_distance(reference_text, candidate_text),
+                    "reference_characters": len(reference_text),
+                    "reference_has_oov_character": reference_has_oov,
+                    "delivery_text": "review",
+                    "delivery_raw_exact": False,
+                    "non_success_to_success": False,
+                    "left_trim_fraction": ratio,
+                    "artifact_left_trim_fraction": config.recipient_value_left_trim,
+                    "reference_length": len(reference_text),
+                    "min_train_character_support": minimum_character_support,
+                    "mean_train_character_support": mean_character_support,
+                    "rendered_width": rendered_width,
+                    "rendered_width_per_character": rendered_width / max(1, len(reference_text)),
+                    "geometry": geometry.as_dict(),
+                    "inference_ms": inference_ms,
+                }
+            )
+        if number == 1 or number == total or number % progress_interval == 0:
+            print(
+                f"Recipient trim audit: {number}/{total} receipts, {len(ratios)} trim variants each",
+                flush=True,
+            )
+
+    trial_summaries: list[dict[str, object]] = []
+    flattened_rows: list[dict[str, object]] = []
+    for ratio in ratios:
+        rows = rows_by_ratio[ratio]
+        flattened_rows.extend(rows)
+        trial_summaries.append(
+            {
+                "left_trim_fraction": ratio,
+                **_recipient_trim_summary(rows),
+            }
+        )
+    best_trial = max(
+        trial_summaries,
+        key=lambda trial: (
+            float(dict(trial["metrics"])["raw_exact_match"]),
+            -float(dict(trial["metrics"])["micro_cer"]),
+            -abs(float(trial["left_trim_fraction"]) - config.recipient_value_left_trim),
+        ),
+    )
+    summary: dict[str, object] = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "receipt_unified_recipient_trim_audit_v1",
+        "model": model_path.as_posix(),
+        "model_sha256": _sha256(model_path),
+        "records": records_path.resolve().as_posix(),
+        "evaluation_split": split,
+        "providers": active_providers,
+        "artifact_kind": contract.get("kind"),
+        "architecture_version": config.architecture_version,
+        "artifact_left_trim_fraction": config.recipient_value_left_trim,
+        "trial_left_trim_fractions": list(ratios),
+        "foreground_contrast_threshold": foreground_contrast_threshold,
+        "cut_radius": cut_radius,
+        "blank_column_max_ink": blank_column_max_ink,
+        "recipient_records": total,
+        "train_recipient_character_count": len(train_character_support),
+        "trials": trial_summaries,
+        "best_strict_exact_trial": {
+            "left_trim_fraction": best_trial["left_trim_fraction"],
+            "metrics": best_trial["metrics"],
+        },
+        "warning": (
+            "This is an exploratory in-memory v11 recipient pixel-preprocessing sweep. It does not rewrite the "
+            "ONNX model, labels, contract, or deployment trim. It compares with held-out Paddle-derived teacher "
+            "labels, not independently verified business truth; use it only to decide whether a new preprocessing "
+            "contract is justified before retraining."
+        ),
+    }
+    output_dir.mkdir(parents=True, exist_ok=True)
+    _atomic_write_jsonl(output_dir / "comparisons.jsonl", flattened_rows)
+    # Keep disagreements as JSONL so large audits can be inspected without
+    # loading every trial. `_atomic_write_jsonl` also preserves a valid empty
+    # file when every candidate happens to match.
+    _atomic_write_jsonl(
+        output_dir / "disagreements.jsonl",
+        [row for row in flattened_rows if not bool(row["raw_exact"])],
+    )
+    _atomic_write_json(output_dir / "summary.json", summary)
+    return summary
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Train, export, and evaluate one offline ONNX reader for amount/time/status/payment/recipient fields"
@@ -6250,6 +6661,46 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="Maximum incorrect non-review v5-v11 deliveries allowed per text field",
     )
+
+    audit_recipient = commands.add_parser(
+        "audit-recipient",
+        help="diagnose the frozen v11 recipient value crop with in-memory trim trials",
+    )
+    audit_recipient.add_argument("--model", type=Path, required=True)
+    audit_recipient.add_argument("--records", type=Path, required=True, help="v11 unified_fields.jsonl")
+    audit_recipient.add_argument(
+        "--dataset-root",
+        type=Path,
+        help="Root that owns crop paths in the original pseudo-label manifest; defaults to --records directory",
+    )
+    audit_recipient.add_argument("--output", type=Path, required=True, help="New empty diagnostic output directory")
+    audit_recipient.add_argument("--split", choices=("val", "test"), default="test")
+    audit_recipient.add_argument("--device", default="auto")
+    audit_recipient.add_argument(
+        "--left-trims",
+        type=float,
+        nargs="+",
+        required=True,
+        help="One or more exploratory v11 left-crop fractions, such as 0 0.20 0.30 0.40",
+    )
+    audit_recipient.add_argument(
+        "--foreground-contrast-threshold",
+        type=int,
+        default=RECIPIENT_AUDIT_DEFAULT_FOREGROUND_CONTRAST_THRESHOLD,
+        help="Image-only ink detection contrast against the dominant grayscale background (default: 24)",
+    )
+    audit_recipient.add_argument(
+        "--cut-radius",
+        type=int,
+        default=RECIPIENT_AUDIT_DEFAULT_CUT_RADIUS,
+        help="Number of source columns inspected on each side of a trim boundary (default: 2)",
+    )
+    audit_recipient.add_argument(
+        "--blank-column-max-ink",
+        type=int,
+        default=0,
+        help="Maximum foreground pixels allowed in a source column treated as blank (default: 0)",
+    )
     return parser
 
 
@@ -6346,6 +6797,29 @@ def main(argv: list[str] | None = None) -> None:
             )
             if failures:
                 raise SystemExit("Unified OCR candidate did not meet the requested acceptance gate:\n- " + "\n- ".join(failures))
+            return
+        if args.command == "audit-recipient":
+            summary = audit_recipient_trims_onnx(
+                model_path=args.model,
+                records_path=args.records,
+                output_dir=args.output,
+                dataset_root=args.dataset_root,
+                split=args.split,
+                device=args.device,
+                left_trim_ratios=args.left_trims,
+                foreground_contrast_threshold=args.foreground_contrast_threshold,
+                cut_radius=args.cut_radius,
+                blank_column_max_ink=args.blank_column_max_ink,
+            )
+            best = summary["best_strict_exact_trial"]
+            if not isinstance(best, Mapping) or not isinstance(best.get("metrics"), Mapping):
+                raise AssertionError("recipient trim audit summary has no best trial")
+            print(
+                f"Wrote recipient trim audit to {args.output} "
+                f"(best_diagnostic_trim={best['left_trim_fraction']}, "
+                f"recipient={_format_exact_match(best['metrics'].get('raw_exact_match'))}; "
+                "diagnostic only, not a delivery artifact)"
+            )
             return
         raise AssertionError(f"Unhandled command {args.command!r}")
     except (OSError, RuntimeError, ValueError) as error:
