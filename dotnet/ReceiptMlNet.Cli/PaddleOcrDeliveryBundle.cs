@@ -21,6 +21,7 @@ internal sealed class PaddleOcrDeliveryBundle
     private PaddleOcrDeliveryBundle(
         string directoryPath,
         string contractPath,
+        string contractSha256,
         string sourceAuditContractSha256,
         PaddleOcrModelInfo detector,
         PaddleOcrModelInfo recognizer,
@@ -33,6 +34,7 @@ internal sealed class PaddleOcrDeliveryBundle
     {
         BundleDirectory = directoryPath;
         ContractPath = contractPath;
+        ContractSha256 = contractSha256;
         SourceAuditContractSha256 = sourceAuditContractSha256;
         DetModel = detector;
         RecModel = recognizer;
@@ -47,6 +49,7 @@ internal sealed class PaddleOcrDeliveryBundle
     public string BundleDirectory { get; }
     public string DirectoryPath => BundleDirectory;
     public string ContractPath { get; }
+    public string ContractSha256 { get; }
     public string SourceAuditContractSha256 { get; }
     public PaddleOcrModelInfo DetModel { get; }
     public PaddleOcrModelInfo RecModel { get; }
@@ -90,6 +93,7 @@ internal sealed class PaddleOcrDeliveryBundle
         {
             throw new UsageException($"Paddle OCR delivery contract does not exist: {contractPath}");
         }
+        var contractSha256 = Sha256(contractPath);
 
         try
         {
@@ -140,6 +144,7 @@ internal sealed class PaddleOcrDeliveryBundle
             return new PaddleOcrDeliveryBundle(
                 directory,
                 contractPath,
+                contractSha256,
                 sourceAuditHash.ToLowerInvariant(),
                 models["det"],
                 models["rec"],

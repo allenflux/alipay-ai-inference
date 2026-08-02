@@ -51,6 +51,9 @@ internal static class ReceiptMlNetProgram
         var ocrBundle = options.OcrMode == "onnx"
             ? PaddleOcrDeliveryBundle.LoadAndVerify(options.OcrBundlePath!)
             : null;
+        var unifiedOcrBundle = options.OcrMode == "unified"
+            ? UnifiedOcrBundle.LoadAndVerify(options.OcrModelPath!)
+            : null;
 
         var inputFiles = EnumerateInputFiles(options.InputPath).ToList();
         if (inputFiles.Count == 0)
@@ -77,16 +80,26 @@ internal static class ReceiptMlNetProgram
             : new DeviceModel(options.DeviceModelPath, device);
         Console.WriteLine($"Requested ONNX device: {device.Requested} (receipt detector{(deviceClassifier is null ? string.Empty : "/device model")})");
         using var ocrEngine = ocrBundle is null ? null : new PaddleOcrEngine(ocrBundle, device);
+        using var unifiedOcrEngine = unifiedOcrBundle is null ? null : new UnifiedOcrEngine(unifiedOcrBundle, device);
         if (ocrEngine is not null)
         {
             Console.WriteLine($"OCR ONNX execution provider: {ocrEngine.ExecutionProvider} (det/cls/rec)");
+        }
+        if (unifiedOcrEngine is not null)
+        {
+            Console.WriteLine($"Unified OCR ONNX execution provider: {unifiedOcrEngine.ExecutionProvider} (one v12 session/run per receipt)");
         }
 
         foreach (var inputFile in inputFiles)
         {
             var outputFile = OutputPathFor(options.OutputDirectory, sourceRoot, inputFile);
             var annotationPaths = AnnotationPaths.ForResultJson(outputFile);
-            if (options.SkipExisting && ExistingResultSatisfiesRequestedMode(outputFile, options.OcrMode))
+            if (options.SkipExisting && ExistingResultSatisfiesRequestedMode(
+                    outputFile,
+                    detectorContract,
+                    deviceContract,
+                    ocrBundle,
+                    unifiedOcrBundle))
             {
                 manifest.Add(new ManifestRecord(
                     Path.GetFullPath(inputFile),
@@ -99,7 +112,7 @@ internal static class ReceiptMlNetProgram
 
             try
             {
-                var result = InferImage(inputFile, detector, deviceClassifier, ocrEngine, options.ScoreThreshold);
+                var result = InferImage(inputFile, detector, deviceClassifier, ocrEngine, unifiedOcrEngine, options.ScoreThreshold);
                 if (options.RequireComplete)
                 {
                     EnsureCoreFields(result.Detections);
@@ -107,9 +120,19 @@ internal static class ReceiptMlNetProgram
                 result = result with
                 {
                     ModelContracts = new ContractReferences(
-                        detectorContract.FileName,
-                        deviceContract?.FileName,
-                        ocrBundle is null ? null : Path.GetFileName(ocrBundle.ContractPath)),
+                        Detector: detectorContract.FileName,
+                        Device: deviceContract?.FileName,
+                        DetectorSha256: detectorContract.ModelSha256,
+                        DetectorContractSha256: detectorContract.ContractSha256,
+                        DeviceSha256: deviceContract?.ModelSha256,
+                        DeviceContractSha256: deviceContract?.ContractSha256,
+                        OcrBundle: ocrBundle is null ? null : Path.GetFileName(ocrBundle.ContractPath),
+                        OcrBundleContractSha256: ocrBundle?.ContractSha256,
+                        UnifiedOcrModel: unifiedOcrBundle is null ? null : Path.GetFileName(unifiedOcrBundle.ModelPath),
+                        UnifiedOcrContract: unifiedOcrBundle is null ? null : Path.GetFileName(unifiedOcrBundle.ContractPath),
+                        UnifiedOcrModelSha256: unifiedOcrBundle?.ModelSha256,
+                        UnifiedOcrLabelsSha256: unifiedOcrBundle?.LabelsSha256,
+                        UnifiedOcrContractSha256: unifiedOcrBundle?.ContractSha256),
                 };
                 if (ShouldAnnotate(result.Detections, options.AnnotationMode))
                 {
@@ -143,6 +166,7 @@ internal static class ReceiptMlNetProgram
         DetectorModel detector,
         DeviceModel? deviceClassifier,
         PaddleOcrEngine? ocrEngine,
+        UnifiedOcrEngine? unifiedOcrEngine,
         float scoreThreshold)
     {
         using var source = ImagePipeline.LoadUprightRgb(inputFile);
@@ -155,7 +179,17 @@ internal static class ReceiptMlNetProgram
         {
             detections = EnrichWithOcr(source, detections, ocrEngine);
         }
-        var fields = ocrEngine is null ? null : BuildFields(detections);
+        UnifiedOcrReadResult? unifiedOcr = null;
+        if (unifiedOcrEngine is not null)
+        {
+            unifiedOcr = unifiedOcrEngine.RecognizeReceipt(source, detections);
+            detections = EnrichWithUnifiedOcr(detections, unifiedOcr);
+        }
+        var fields = ocrEngine is not null
+            ? BuildFields(detections)
+            : unifiedOcr is not null
+                ? BuildUnifiedFields(detections, unifiedOcr)
+                : null;
 
         return new ReceiptResult(
             Path.GetFullPath(inputFile),
@@ -174,9 +208,11 @@ internal static class ReceiptMlNetProgram
                 "This .NET CLI performs ONNX model inference.",
                 "Input must already be an upright, rectified receipt image when perspective correction is needed.",
                 "Annotated JPGs use upright source coordinates. Their original/rectified pair is identical until perspective rectification is ported to .NET.",
-                ocrEngine is null
-                    ? "PaddleOCR ONNX field extraction is disabled; pass --ocr onnx --ocr-bundle <delivery-directory> to enable it."
-                    : "OCR uses the verified PP-OCR ONNX delivery bundle; source-image perspective rectification is not yet ported to .NET.",
+                ocrEngine is not null
+                    ? "OCR uses the verified PP-OCR ONNX delivery bundle; source-image perspective rectification is not yet ported to .NET."
+                    : unifiedOcrEngine is not null
+                        ? "OCR uses the verified architecture-v12 unified ONNX reader in one session/run per receipt. Its current text/status contract is review-only: candidates are diagnostic and delivered values fail closed to review."
+                        : "OCR field extraction is disabled; use --ocr onnx --ocr-bundle <delivery-directory> or --ocr unified --ocr-model <v12-reader.onnx> to enable it.",
             });
     }
 
@@ -218,7 +254,7 @@ internal static class ReceiptMlNetProgram
         var enriched = new List<DetectionResult>(detections.Count);
         foreach (var detection in detections)
         {
-            var crop = CropFieldWithMargin(source, detection.BboxImage);
+            var crop = UnifiedOcrImageOps.CropFieldWithMargin(source, detection.BboxImage);
             if (crop is null)
             {
                 enriched.Add(detection with { Ocr = new OcrResult(string.Empty, null) });
@@ -231,25 +267,6 @@ internal static class ReceiptMlNetProgram
             }
         }
         return enriched;
-    }
-
-    private static Image<Rgb24>? CropFieldWithMargin(Image<Rgb24> source, float[] box)
-    {
-        if (box.Length < 4)
-        {
-            return null;
-        }
-        var marginX = Math.Max(2.0f, (box[2] - box[0]) * 0.08f);
-        var marginY = Math.Max(2.0f, (box[3] - box[1]) * 0.08f);
-        var left = Math.Clamp((int)MathF.Floor(box[0] - marginX), 0, source.Width);
-        var top = Math.Clamp((int)MathF.Floor(box[1] - marginY), 0, source.Height);
-        var right = Math.Clamp((int)MathF.Ceiling(box[2] + marginX), 0, source.Width);
-        var bottom = Math.Clamp((int)MathF.Ceiling(box[3] + marginY), 0, source.Height);
-        if (right <= left || bottom <= top)
-        {
-            return null;
-        }
-        return source.Clone(context => context.Crop(new Rectangle(left, top, right - left, bottom - top)));
     }
 
     private static ReceiptFields BuildFields(IReadOnlyList<DetectionResult> detections)
@@ -322,22 +339,230 @@ internal static class ReceiptMlNetProgram
             null);
     }
 
-    private static bool ExistingResultSatisfiesRequestedMode(string outputPath, string ocrMode)
+    private static List<DetectionResult> EnrichWithUnifiedOcr(
+        IReadOnlyList<DetectionResult> detections,
+        UnifiedOcrReadResult unifiedOcr)
     {
-        if (!File.Exists(outputPath) || ocrMode == "none")
+        var enriched = new List<DetectionResult>(detections.Count);
+        foreach (var detection in detections)
         {
-            return File.Exists(outputPath);
+            var candidate = detection.Label == "transfer_status"
+                ? unifiedOcr.StatusCandidate is null
+                    ? null
+                    : new OcrResult(unifiedOcr.StatusCandidate, unifiedOcr.StatusConfidence)
+                : unifiedOcr.Candidates.TryGetValue(detection.Label, out var fieldCandidate)
+                    ? new OcrResult(fieldCandidate.Candidate, fieldCandidate.Confidence)
+                    : null;
+            enriched.Add(detection with { Ocr = candidate ?? new OcrResult(string.Empty, null) });
         }
+        return enriched;
+    }
+
+    /// <summary>
+    /// Keep v12 candidate diagnostics in the JSON, but do not promote
+    /// Paddle-derived pseudo-label text into a business value.  The persisted
+    /// v12 contract decides delivery policy, which is currently review-only.
+    /// </summary>
+    private static ReceiptFields BuildUnifiedFields(
+        IReadOnlyList<DetectionResult> detections,
+        UnifiedOcrReadResult unifiedOcr)
+    {
+        var byLabel = detections.ToDictionary(item => item.Label, StringComparer.Ordinal);
+        return new ReceiptFields(
+            UnifiedTextField(
+                byLabel.GetValueOrDefault("time"),
+                unifiedOcr.Candidates.GetValueOrDefault("time"),
+                unifiedOcr.TextRuntimePolicy,
+                unifiedOcr.TextDeliveryValue),
+            UnifiedTextField(
+                byLabel.GetValueOrDefault("amount"),
+                unifiedOcr.Candidates.GetValueOrDefault("amount"),
+                unifiedOcr.TextRuntimePolicy,
+                unifiedOcr.TextDeliveryValue),
+            UnifiedStatusField(byLabel.GetValueOrDefault("transfer_status"), unifiedOcr),
+            UnifiedTextField(
+                byLabel.GetValueOrDefault("recipient_field"),
+                unifiedOcr.Candidates.GetValueOrDefault("recipient_field"),
+                unifiedOcr.TextRuntimePolicy,
+                unifiedOcr.TextDeliveryValue),
+            UnifiedTextField(
+                byLabel.GetValueOrDefault("payment_method_field"),
+                unifiedOcr.Candidates.GetValueOrDefault("payment_method_field"),
+                unifiedOcr.TextRuntimePolicy,
+                unifiedOcr.TextDeliveryValue));
+    }
+
+    private static ReceiptFieldResult UnifiedTextField(
+        DetectionResult? detection,
+        UnifiedOcrCandidate? candidate,
+        string policy,
+        string deliveryValue)
+    {
+        if (detection is null)
+        {
+            return new ReceiptFieldResult("absent", null, null, null, null, null, null, null, null, DeliveryPolicy: policy);
+        }
+        if (candidate is null || string.IsNullOrWhiteSpace(candidate.Candidate))
+        {
+            return new ReceiptFieldResult(
+                "unreadable",
+                null,
+                null,
+                null,
+                MathF.Round(detection.Score, 6),
+                deliveryValue,
+                null,
+                null,
+                null,
+                DeliveryPolicy: policy,
+                DeliveryValue: deliveryValue);
+        }
+        return new ReceiptFieldResult(
+            deliveryValue == "review" ? "review" : "read",
+            candidate.Candidate,
+            MathF.Round(candidate.Confidence, 6),
+            MathF.Round(detection.Score, 6),
+            null,
+            candidate.DeliveryValue,
+            null,
+            null,
+            null,
+            Candidate: candidate.Candidate,
+            CtcCandidate: candidate.CtcCandidate,
+            CtcConfidence: MathF.Round(candidate.CtcConfidence, 6),
+            StructuredCandidate: candidate.StructuredCandidate,
+            StructuredConfidence: candidate.StructuredConfidence is null ? null : MathF.Round(candidate.StructuredConfidence.Value, 6),
+            DeliveryPolicy: policy,
+            DeliveryValue: candidate.DeliveryValue);
+    }
+
+    private static ReceiptFieldResult UnifiedStatusField(DetectionResult? detection, UnifiedOcrReadResult unifiedOcr)
+    {
+        if (detection is null)
+        {
+            return new ReceiptFieldResult("absent", null, null, null, null, null, null, null, null, DeliveryPolicy: unifiedOcr.StatusRuntimePolicy);
+        }
+        if (string.IsNullOrWhiteSpace(unifiedOcr.StatusCandidate))
+        {
+            return new ReceiptFieldResult(
+                "unreadable",
+                null,
+                null,
+                null,
+                MathF.Round(detection.Score, 6),
+                unifiedOcr.StatusDeliveryValue,
+                null,
+                null,
+                null,
+                DeliveryPolicy: unifiedOcr.StatusRuntimePolicy,
+                DeliveryValue: unifiedOcr.StatusDeliveryValue);
+        }
+        return new ReceiptFieldResult(
+            unifiedOcr.StatusDeliveryValue == "review" ? "review" : "read",
+            unifiedOcr.StatusCandidate,
+            unifiedOcr.StatusConfidence is null ? null : MathF.Round(unifiedOcr.StatusConfidence.Value, 6),
+            MathF.Round(detection.Score, 6),
+            null,
+            unifiedOcr.StatusDeliveryValue,
+            unifiedOcr.StatusRuntimePolicy == "classify" ? unifiedOcr.StatusCandidate : null,
+            null,
+            null,
+            Candidate: unifiedOcr.StatusCandidate,
+            DeliveryPolicy: unifiedOcr.StatusRuntimePolicy,
+            DeliveryValue: unifiedOcr.StatusDeliveryValue);
+    }
+
+    private static bool ExistingResultSatisfiesRequestedMode(
+        string outputPath,
+        ModelContract detector,
+        ModelContract? device,
+        PaddleOcrDeliveryBundle? paddleOcr,
+        UnifiedOcrBundle? unifiedOcr)
+    {
+        if (!File.Exists(outputPath))
+        {
+            return false;
+        }
+        // Re-run unless the existing JSON proves that every current model
+        // artifact is byte-identical.  This prevents --skip-existing from
+        // silently retaining detector/device/OCR output after a same-name
+        // ONNX, labels, contract, or policy swap.
         try
         {
             using var document = JsonDocument.Parse(File.ReadAllBytes(outputPath));
-            return document.RootElement.TryGetProperty("fields", out var fields)
-                && fields.ValueKind == JsonValueKind.Object;
+            var requiresOcrFields = paddleOcr is not null || unifiedOcr is not null;
+            if ((requiresOcrFields
+                    && (!document.RootElement.TryGetProperty("fields", out var fields)
+                        || fields.ValueKind != JsonValueKind.Object))
+                || !document.RootElement.TryGetProperty("model_contracts", out var contracts)
+                || contracts.ValueKind != JsonValueKind.Object)
+            {
+                return false;
+            }
+            return HasJsonString(contracts, "detector", detector.FileName)
+                && HasJsonString(contracts, "detector_sha256", detector.ModelSha256)
+                && HasJsonString(contracts, "detector_contract_sha256", detector.ContractSha256)
+                && HasOptionalJsonString(contracts, "device", device?.FileName)
+                && HasOptionalJsonString(contracts, "device_sha256", device?.ModelSha256)
+                && HasOptionalJsonString(contracts, "device_contract_sha256", device?.ContractSha256)
+                && HasOptionalJsonString(
+                    contracts,
+                    "ocr_bundle",
+                    paddleOcr is null ? null : Path.GetFileName(paddleOcr.ContractPath))
+                && HasOptionalJsonString(
+                    contracts,
+                    "ocr_bundle_contract_sha256",
+                    paddleOcr?.ContractSha256)
+                && HasOptionalJsonString(
+                    contracts,
+                    "unified_ocr_model",
+                    unifiedOcr is null ? null : Path.GetFileName(unifiedOcr.ModelPath))
+                && HasOptionalJsonString(
+                    contracts,
+                    "unified_ocr_contract",
+                    unifiedOcr is null ? null : Path.GetFileName(unifiedOcr.ContractPath))
+                && HasOptionalJsonString(
+                    contracts,
+                    "unified_ocr_model_sha256",
+                    unifiedOcr?.ModelSha256)
+                && HasOptionalJsonString(
+                    contracts,
+                    "unified_ocr_labels_sha256",
+                    unifiedOcr?.LabelsSha256)
+                && HasOptionalJsonString(
+                    contracts,
+                    "unified_ocr_contract_sha256",
+                    unifiedOcr?.ContractSha256);
         }
         catch (JsonException)
         {
             return false;
         }
+        catch (IOException)
+        {
+            return false;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
+    private static bool HasJsonString(JsonElement source, string propertyName, string expected)
+    {
+        return source.TryGetProperty(propertyName, out var property)
+            && property.ValueKind == JsonValueKind.String
+            && string.Equals(property.GetString(), expected, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool HasOptionalJsonString(JsonElement source, string propertyName, string? expected)
+    {
+        if (expected is null)
+        {
+            return !source.TryGetProperty(propertyName, out var property)
+                || property.ValueKind == JsonValueKind.Null;
+        }
+        return HasJsonString(source, propertyName, expected);
     }
 
     private static void EnsureCoreFields(IEnumerable<DetectionResult> detections)
@@ -683,7 +908,7 @@ internal sealed record DeviceSetting(int? GpuDeviceId, bool FallbackToCpu, strin
     }
 }
 
-internal sealed record ModelContract(string FileName)
+internal sealed record ModelContract(string FileName, string ModelSha256, string ContractSha256)
 {
     public static ModelContract LoadAndVerify(string modelPath, string expectedKind)
     {
@@ -710,7 +935,10 @@ internal sealed record ModelContract(string FileName)
         {
             throw new UsageException($"ONNX SHA-256 does not match contract: {fullModelPath}");
         }
-        return new ModelContract(Path.GetFileName(contractPath));
+        return new ModelContract(
+            Path.GetFileName(contractPath),
+            actualHash,
+            Sha256(contractPath));
     }
 
     private static string Sha256(string path)
@@ -726,6 +954,7 @@ internal sealed record CliOptions(
     string? DeviceModelPath,
     string OcrMode,
     string? OcrBundlePath,
+    string? OcrModelPath,
     string InputPath,
     string OutputDirectory,
     string Device,
@@ -741,15 +970,20 @@ Usage:
   dotnet run --project dotnet/ReceiptMlNet.Cli/ReceiptMlNet.Cli.csproj -- \
     --detector <receipt_lrcnn_v1.onnx> \
     [--device-model <statusbar_device_v1.onnx>] \
-    [--ocr none|onnx] [--ocr-bundle <paddle-ocr-delivery-directory>] \
+    [--ocr none|onnx|unified] \
+    [--ocr-bundle <paddle-ocr-delivery-directory>] \
+    [--ocr-model <receipt_unified_field_reader_v12.onnx>] \
     --input <image-or-directory> --output <directory> \
     [--device auto|cpu|cuda:0] [--score-threshold 0.50] [--annotate all|flagged|none] \
     [--require-complete] [--continue-on-error] [--skip-existing] [--limit 100]
 
 This .NET CLI runs the receipt/device ONNX models and can optionally run a
-verified PP-OCR ONNX delivery bundle. It writes JSON and, by default, two
-annotated JPGs. It does not yet include perspective rectification; use an
-already rectified image when needed.
+verified PP-OCR delivery bundle (--ocr onnx) or a v12 unified five-field OCR
+reader (--ocr unified). The two OCR modes are mutually exclusive. Unified OCR
+requires its adjacent .labels.json and .contract.json sidecars and emits
+review-only delivery values until independently human-calibrated. It writes
+JSON and, by default, two annotated JPGs. It does not yet include perspective
+rectification; use an already rectified image when needed.
 """;
 
     public static CliOptions Parse(string[] args)
@@ -758,6 +992,7 @@ already rectified image when needed.
         string? deviceModel = null;
         var ocrMode = "none";
         string? ocrBundle = null;
+        string? ocrModel = null;
         string? input = null;
         string? output = null;
         var device = "auto";
@@ -776,6 +1011,7 @@ already rectified image when needed.
                 case "--device-model": deviceModel = NextValue(args, ref index); break;
                 case "--ocr": ocrMode = ParseOcrMode(NextValue(args, ref index)); break;
                 case "--ocr-bundle": ocrBundle = NextValue(args, ref index); break;
+                case "--ocr-model": ocrModel = NextValue(args, ref index); break;
                 case "--input": input = NextValue(args, ref index); break;
                 case "--output": output = NextValue(args, ref index); break;
                 case "--device": device = NextValue(args, ref index); break;
@@ -808,22 +1044,30 @@ already rectified image when needed.
         {
             throw new UsageException("--ocr-bundle is required when --ocr onnx");
         }
-        if (ocrMode == "none" && !string.IsNullOrWhiteSpace(ocrBundle))
+        if (ocrMode == "unified" && string.IsNullOrWhiteSpace(ocrModel))
+        {
+            throw new UsageException("--ocr-model is required when --ocr unified");
+        }
+        if (ocrMode != "onnx" && !string.IsNullOrWhiteSpace(ocrBundle))
         {
             throw new UsageException("--ocr-bundle requires --ocr onnx");
         }
+        if (ocrMode != "unified" && !string.IsNullOrWhiteSpace(ocrModel))
+        {
+            throw new UsageException("--ocr-model requires --ocr unified");
+        }
         _ = DeviceSetting.Parse(device);
-        return new CliOptions(detector, deviceModel, ocrMode, ocrBundle, input, output, device, scoreThreshold, annotationMode, requireComplete, continueOnError, skipExisting, limit);
+        return new CliOptions(detector, deviceModel, ocrMode, ocrBundle, ocrModel, input, output, device, scoreThreshold, annotationMode, requireComplete, continueOnError, skipExisting, limit);
     }
 
     private static string ParseOcrMode(string value)
     {
         var mode = value.ToLowerInvariant();
-        if (mode is "none" or "onnx")
+        if (mode is "none" or "onnx" or "unified")
         {
             return mode;
         }
-        throw new UsageException("--ocr must be none or onnx");
+        throw new UsageException("--ocr must be none, onnx, or unified");
     }
 
     private static string ParseAnnotationMode(string value)
@@ -882,7 +1126,14 @@ internal sealed record ReceiptFieldResult(
     string? Value,
     string? Normalized,
     long? AmountFen,
-    string? Currency);
+    string? Currency,
+    string? Candidate = null,
+    string? CtcCandidate = null,
+    float? CtcConfidence = null,
+    string? StructuredCandidate = null,
+    float? StructuredConfidence = null,
+    string? DeliveryPolicy = null,
+    string? DeliveryValue = null);
 internal sealed record DeviceResult(
     string Platform,
     string PlatformCn,
@@ -892,7 +1143,20 @@ internal sealed record DeviceResult(
     float? PIos,
     string? CnnPlatform,
     string? ConflictDetail);
-internal sealed record ContractReferences(string Detector, string? Device, string? OcrBundle);
+internal sealed record ContractReferences(
+    string Detector,
+    string? Device,
+    string? OcrBundle,
+    string? DetectorSha256 = null,
+    string? DetectorContractSha256 = null,
+    string? DeviceSha256 = null,
+    string? DeviceContractSha256 = null,
+    string? OcrBundleContractSha256 = null,
+    string? UnifiedOcrModel = null,
+    string? UnifiedOcrContract = null,
+    string? UnifiedOcrModelSha256 = null,
+    string? UnifiedOcrLabelsSha256 = null,
+    string? UnifiedOcrContractSha256 = null);
 internal sealed record ManifestRecord(
     string Source,
     string Result,

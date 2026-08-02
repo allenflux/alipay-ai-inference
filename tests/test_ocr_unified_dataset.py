@@ -8,9 +8,13 @@ from PIL import Image
 
 from transfer_receipt_ai.ocr_unified_dataset import (
     KIND_V10,
+    KIND_V12,
     SLOT_ORDER,
     V10_SLOT_ORDER,
+    V12_SLOT_ORDER,
+    build_parser,
     build_unified_dataset,
+    slot_order_for_architecture,
 )
 
 
@@ -345,3 +349,83 @@ def test_v10_recipient_ctc_target_retains_visible_line_and_keeps_value_separatel
     assert recipient_v9["semantic_value"] == "legacy-semantic-value"
     assert "recipient_visible_text" not in recipient_v9
     assert "recipient_value" not in recipient_v9
+
+
+def test_v12_reuses_v11_anchored_recipient_labels_with_a_distinct_manifest_kind(tmp_path: Path) -> None:
+    source = tmp_path / "recipient-pseudo"
+    source_rows = [
+        _record(
+            index=1,
+            field="recipient_field",
+            text="收款方 商户甲",
+            semantic_value="legacy-semantic-value",
+            result_json="D:/results/train.json",
+            group_id="receipt:train",
+            split="train",
+        ),
+        _record(
+            index=2,
+            field="recipient_field",
+            text="收款方 商户乙",
+            semantic_value="legacy-semantic-value",
+            result_json="D:/results/val.json",
+            group_id="receipt:val",
+            split="val",
+        ),
+        _record(
+            index=3,
+            field="recipient_field",
+            text="收款方 商户丙",
+            semantic_value="legacy-semantic-value",
+            result_json="D:/results/test.json",
+            group_id="receipt:test",
+            split="test",
+        ),
+        _record(
+            index=4,
+            field="recipient_field",
+            text="收款方 商户污染 付款方式 建设银行储蓄卡(3667)",
+            semantic_value="商户污染",
+            result_json="D:/results/polluted.json",
+            group_id="receipt:polluted",
+            split="train",
+        ),
+    ]
+    for index, record in enumerate(source_rows):
+        _write_image(source / str(record["image"]), 60 + index)
+    records_path = source / "pseudo_labels.jsonl"
+    records_path.write_text(
+        "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in source_rows),
+        encoding="utf-8",
+    )
+
+    output = tmp_path / "unified-v12"
+    summary = build_unified_dataset(
+        records_path=records_path,
+        output_dir=output,
+        architecture="v12",
+        recipient_max_visible_chars=80,
+    )
+    rows = [
+        json.loads(line)
+        for line in (output / "unified_fields.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    train_slot = next(row for row in rows if row["split"] == "train")["slots"]["recipient_field"]
+
+    assert summary["kind"] == KIND_V12
+    assert summary["architecture"] == "v12"
+    assert summary["slot_order"] == list(V12_SLOT_ORDER)
+    assert slot_order_for_architecture("v12") == V12_SLOT_ORDER
+    assert summary["recipient_target"] == "anchored_recipient_value_with_dedicated_high_resolution_value_view"
+    assert summary["recipient_charset_source"] == "train_only_anchored_recipient_value"
+    assert train_slot["text"] == "商户甲"
+    assert train_slot["recipient_visible_text"] == "收款方 商户甲"
+    assert train_slot["recipient_quality_policy"] == "anchored_value_right_crop_v1"
+    assert summary["recipient_quality_audit"]["quality_rejected"] == 1
+    assert (output / "recipient_quality_audit.jsonl").is_file()
+    assert (output / "recipient_charset.txt").is_file()
+
+    args = build_parser().parse_args(
+        ["--records", "flat.jsonl", "--output", "out", "--architecture", "v12"]
+    )
+    assert args.architecture == "v12"

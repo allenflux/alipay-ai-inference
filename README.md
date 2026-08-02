@@ -426,8 +426,9 @@ artifacts\receipt_ocr_ctc_v1.contract.json
 ```
 
 模型固定输入为灰度白底 letterbox 的 `[1, 1, 48, 768]`，输出为 CTC logits；字符表和 contract
-必须与 ONNX 一起交付。当前 .NET CLI 接入的是冻结的 PP-OCR `det + cls + rec` 交付包，**尚未接入这一份
-自训练 CTC ONNX**；只有当该候选通过下方严格验收后，才应单独接入并替换 Paddle OCR 阶段。
+必须与 ONNX 一起交付。这里描述的是**历史的单字段 CTC 候选**：.NET CLI 接入的是冻结的 PP-OCR
+`det + cls + rec` 交付包，尚未接入这一份旧单字段 ONNX。不要把它与后文已经接入的 v12 unified
+双输入五字段 reader 混为一谈；只有当该旧候选通过下方严格验收后，才应单独接入并替换 Paddle OCR 阶段。
 
 训练命令只会用 train/val；`--test-ratio 0.10` 留出的 test 不参与训练或调参。导出后必须运行
 ONNX 实际推理，与同一张字段裁图的 Paddle OCR 结果逐项对比：
@@ -451,7 +452,7 @@ python -m transfer_receipt_ai.ocr_evaluate `
 测试字符、训练中见过/未见过的文本，以及 ONNX 实际 provider 和延迟。这个比较证明的是“对保留的
 Paddle 输出的一致性”；要证明真实业务准确率仍需一批人工标注的独立回单。
 
-## 单模型轻量字段识别 v8（当前实验路线；v3–v7 只保留兼容）
+## 单模型轻量字段识别（v12 当前实验路线；v3–v11 只保留兼容或历史基线）
 
 最终交付目标不是四个小模型，而是 **一个 OCR ONNX、一个 ONNX Runtime Session、每张回单一次 `Run`**。
 检测器 `receipt_lrcnn_v1.onnx` 和设备识别器仍是独立模型；本节只替代字段 OCR。
@@ -608,7 +609,95 @@ python -m transfer_receipt_ai.ocr_unified evaluate `
 
 v8 可以直接在已生成的 12 万张 manifest 上训练和评估；教师一致性并不等于真实业务准确率。
 
-### v11 五字段收款方专项训练（当前推荐）
+### v12 五字段高分辨率收款方（当前推荐）
+
+v12 解决的是 v11 的收款方自由中文分辨率不足问题，但**不是**再增加一个 OCR 模型。交付物仍是一个
+`receipt_unified_field_reader_v12_*.onnx`：每次 CLI 运行创建并复用一个 ONNX Runtime `InferenceSession`，每张
+回单只调用一次 `session.run`；区别是这一次调用会同时传入两个固定输入：
+
+| 输入名 | contract 静态形状 | 用途 |
+| --- | --- | --- |
+| `field_images` | `[5,1,80,512]` | 金额、时间、状态、付款方式；第五低分辨率槽固定为白色 placeholder，仅为 ABI 连续性保留，绝不参与收款方解码。 |
+| `recipient_value_image` | `[1,1,128,1024]` | 对已锚定的收款方裁图先去掉左侧标题、再以更高分辨率送入收款方私有轻量 CNN + GRU 分支。 |
+
+第五个低分辨率槽不会再承担收款方读字；v12 只以 `recipient_value_image` 训练/推理收款方，从而避免把
+`收款方` 标题、低分辨率缩放和自由中文商户名混在同一输入中。两个输入、15 个既有输出都写入同一 ONNX graph 和
+同一个 `.contract.json`；它不是两个 ONNX 文件、两个 Session 或两次推理。运行端必须按 contract 一次性喂入
+两个张量，不能只传旧的五槽 `field_images`。
+
+下面是使用现有 12 万张五字段 Paddle 教师标签的 v12 起点。不会重新跑 Paddle，也不需要人工逐张标注；每个输出
+路径必须是新的空路径。高分辨率输入会增加显存占用，若 `--batch-size 16` 显存不足，先改为 `8`，不要缩小
+`recipient-input-width` 后直接拿同一产物做对比。
+
+```powershell
+$teacherRoot = "D:\alipay-ai-data\receipt-lite-teacher-120k-v1"
+$teacherLabels5 = "$teacherRoot\paddle-teacher-labels-5field-v1"
+$unifiedManifestV12 = "$teacherRoot\unified-manifest-v12-r1"
+$unifiedRunV12 = "$teacherRoot\unified-run-v12-120k-r1"
+$unifiedModelV12 = "$teacherRoot\models\receipt_unified_field_reader_v12_120k_r1.onnx"
+
+# 1) 由既有五字段教师标签建立 v12 回单级 manifest；这里沿用 v11 的干净、锚定收款方标签规则。
+python -m transfer_receipt_ai.ocr_unified_dataset `
+  --records "$teacherLabels5\pseudo_labels.jsonl" `
+  --output $unifiedManifestV12 `
+  --architecture v12
+
+# 2) 一个模型、一个 ONNX graph 的 GPU 训练；收款方使用 v12 专用高分辨率输入分支。
+python -m transfer_receipt_ai.ocr_unified train `
+  --records "$unifiedManifestV12\unified_fields.jsonl" `
+  --dataset-root $teacherLabels5 `
+  --output $unifiedRunV12 `
+  --device cuda:0 `
+  --architecture v12 `
+  --image-height 80 `
+  --image-width 512 `
+  --recipient-input-height 128 `
+  --recipient-input-width 1024 `
+  --recipient-branch-channels 16 `
+  --base-channels 32 `
+  --numeric-hidden-size 96 `
+  --payment-hidden-size 128 `
+  --recipient-hidden-size 192 `
+  --recipient-value-left-trim 0.30 `
+  --epochs 80 `
+  --batch-size 16 `
+  --learning-rate 0.0005 `
+  --payment-loss-weight 1.0 `
+  --recipient-loss-weight 3.0 `
+  --recipient-sampling-weight 2.0 `
+  --ctc-loss-weight 0.75 `
+  --structured-loss-weight 1.0 `
+  --amount-format-min-confidence 0.80 `
+  --payment-bank-prefix-min-support 3 `
+  --seed 42 `
+  --num-workers 0 `
+  --onnx-output $unifiedModelV12
+
+# 3) 先用 GPU 做 teacher-parity；调参确认后，再以新目录跑同一模型的 CPU 验收。
+$unifiedEvalV12Gpu = "$teacherRoot\unified-eval-v12-120k-r1-test-gpu"
+python -m transfer_receipt_ai.ocr_unified evaluate `
+  --model $unifiedModelV12 `
+  --records "$unifiedManifestV12\unified_fields.jsonl" `
+  --dataset-root $teacherLabels5 `
+  --split test `
+  --output $unifiedEvalV12Gpu `
+  --device cuda:0
+
+$unifiedEvalV12Cpu = "$teacherRoot\unified-eval-v12-120k-r1-test-cpu"
+python -m transfer_receipt_ai.ocr_unified evaluate `
+  --model $unifiedModelV12 `
+  --records "$unifiedManifestV12\unified_fields.jsonl" `
+  --dataset-root $teacherLabels5 `
+  --split test `
+  --output $unifiedEvalV12Cpu `
+  --device cpu
+```
+
+先看 GPU `summary.json` 的五个 `by_field` 指标，再看 CPU 的结果是否一致；它们仍是对 Paddle 教师标签的
+teacher-parity，不能替代按回单分组隔离的人工真值验收。`transfer_status` 仍只有 `success` 教师类时，必须保持
+`review_only`，不能因为 v12 改善了文本识别就自动放行状态。
+
+### v11 五字段收款方专项训练（历史基线）
 
 v11 仍然是**一个** `[5,1,80,512]` 输入、15 个输出的统一 ONNX；不会增加第二个 OCR
 模型，也不需要运行时安装 Paddle。它针对 v10 的收款方问题做了三件事：
@@ -799,9 +888,8 @@ OCR 是否准确，`reference_text` / `candidate_text` 则用于检查提取后�
 `recipient_field.reference_text` / `candidate_text` 业务值指标。
 
 `transfer_status` 目前教师集几乎只有 `success`，所以该头会继续标记为 `review_only`；这不是 v10 失败，而是安全地
-拒绝把单一类别伪装成三分类器。即使 v10 的 teacher-parity 通过，最终交付仍需要：独立人工真值保留集、CPU 验证，
-以及把 unified v10 reader 作为独立 `--ocr unified` 路径接入 .NET CLI。当前 `.NET` CLI 只能运行 PP-OCR ONNX
-bundle，不能直接接收这个统一 reader。
+拒绝把单一类别伪装成三分类器。v10 本身仍是历史基线，不能传给 .NET CLI；当前 .NET CLI 仅为 **v12**
+提供独立的 `--ocr unified --ocr-model` 路径。无论版本，最终交付仍需要独立人工真值保留集和 CPU 验证。
 
 ### 可选人工复核候选差异（不修改原图）
 
@@ -1040,8 +1128,9 @@ python -m transfer_receipt_ai.ocr_lite_classifier evaluate `
   --min-confidence 0.99
 ```
 
-当前 .NET CLI 尚未加载这些 v2 小模型；先以以上 CPU test 的真实精度、p50/p95、ONNX 文件大小为准。
-通过后再新增 `--ocr lite`，不会改坏既有 `--ocr onnx` 的 PP-OCR 命令。
+当前 .NET CLI 尚未加载这些**历史 v2 小模型**；先以以上 CPU test 的真实精度、p50/p95、ONNX 文件大小为准。
+通过后若仍有必要，再新增独立的 `--ocr lite`，不会改坏既有 `--ocr onnx` 的 PP-OCR 命令或当前已接入的
+`--ocr unified` v12 命令。
 
 ## ONNX 交付与推理
 
@@ -1132,28 +1221,39 @@ contract JSON 交付给 .NET。
 运行时交付目标是 **Windows x64**（OpenCvSharp Windows 原生库）。
 它实际使用 ML.NET 的 `ApplyOnnxModel` 加载当前 ONNX：主检测模型输出动态长度的
 `boxes / labels / scores`，设备模型输出 Android/iOS 概率。它会校验两个 `.contract.json` 的
-模型 SHA-256，防止模型和交付说明混用。传入 `--ocr onnx --ocr-bundle <交付目录>` 后，它还会
-直接用 ONNX Runtime 加载冻结的 PP-OCR `det + cls + rec` 三个模型；OCR 不依赖 Python、Paddle
-或网络下载。OCR 交付目录必须是前文 `package-delivery` 产生的目录，CLI 会校验三份 ONNX、字符表和
-`paddle_ocr_delivery.contract.json` 的 SHA-256。
+模型 SHA-256，防止模型和交付说明混用。`--ocr onnx --ocr-bundle <交付目录>` 会直接用 ONNX Runtime
+加载冻结的 PP-OCR `det + cls + rec` 三个模型；OCR 不依赖 Python、Paddle 或网络下载。OCR 交付目录必须是前文
+`package-delivery` 产生的目录，CLI 会校验三份 ONNX、字符表和 `paddle_ocr_delivery.contract.json` 的 SHA-256。
 
-上面的 `--ocr onnx --ocr-bundle` 仅适用于冻结的 PP-OCR bundle，**不能**把单模型
-`receipt_unified_field_reader_v3`、`receipt_unified_field_reader_v4` 或
-`receipt_unified_field_reader_v5`、`receipt_unified_field_reader_v6`、`receipt_unified_field_reader_v7`、
-`receipt_unified_field_reader_v8`、`receipt_unified_field_reader_v9` 或 `receipt_unified_field_reader_v10` 传给它。
-（v11 也同样不能传给当前的 `--ocr onnx`。）
-统一 reader 目前仍未接入 .NET CLI；只有候选同时通过 Python 的保留集 teacher-parity、独立人工真值和 CPU
-验收后，才会以独立的 `--ocr unified` 路径接入。该路径会按 artifact contract 复用 `[4,1,H,W]`（v3–v8）
-或 `[5,1,H,W]`（v9/v10/v11）的预处理、slot 顺序、结构化解码规则和 `status_head_policy`。
+`--ocr unified --ocr-model <receipt_unified_field_reader_v12.onnx>` 是另一条、只支持 **v12** 的轻量字段 OCR
+路径。它要求 ONNX 旁边同时交付同名 `.labels.json` 和 `.contract.json`，并校验 ONNX/labels SHA-256、双输入静态
+形状、15 个有序输出、字符表、收款方预处理和 review-only 策略。一次 CLI 运行只创建并复用一个 v12
+`InferenceSession`；每张回单只进行同一次 `Run`，同时传入 `field_images [5,1,H,W]` 与
+`recipient_value_image [1,1,H2,W2]`；不是两个 OCR 模型或两次推理。
+
+上面的 `--ocr onnx --ocr-bundle` **仅**适用于冻结的 PP-OCR bundle，不能把任何 unified reader 伪装成它的
+`--ocr-bundle`。`--ocr unified --ocr-model` 当前也**仅**接受 architecture v12；v3–v11 是兼容/历史产物，必须使用
+各自的 Python 工具，不能假定与 v12 的双输入 ABI 兼容。
+
+v12 的 .NET 接入会使用与 Python 相同的冻结检测框裁图几何，并按 contract 的预处理生成输入：金额、时间、状态、
+付款方式写进四个正常低分辨率槽；第五槽保持全白；收款方裁图按冻结的左侧标题裁除比例生成高分辨率
+`recipient_value_image`。候选文本会写进
+`detections[].ocr` 和字段的 `candidate`/`ctc_candidate`/`structured_candidate` 诊断属性。当前全部文本与状态仍
+按 artifact policy **review-only** 交付：JSON 的业务 `value` 为 `review`，不能把 Paddle 伪标签的一致性直接当作
+自动放行资格。只有通过分组隔离的人工真值、CPU 验证和预先确定的 delivery gate 后，才可改交付策略。
+
+`--require-complete` 只检查检测器是否找齐核心字段框；它不会改变 v12 的 review-only 策略，也不会把候选文本
+自动提升为业务 `value`。
 
 该项目覆盖**模型层**：EXIF 摆正、letterbox、检测框坐标还原、阈值/每类最佳框、设备识别规则，
 并写出 JSON / manifest / 标注 JPG。默认 `--annotate all`，每张会输出与 Python 相同命名的
 `*_rectified_annotated.jpg` 和 `*_original_annotated.jpg`，使用同一套字段颜色、椭圆框、分数侧栏
 与设备识别红色行；还可传 `--annotate flagged`（只标缺核心字段的图）或 `--annotate none`。
 
-启用 OCR 时，每个检测字段会按 Python 相同的 8% 边距裁图，执行完整 DB 文本检测、方向分类、CTC
+启用 `--ocr onnx` 时，每个检测字段会按 Python 相同的 8% 边距裁图，执行完整 DB 文本检测、方向分类、CTC
 识别，并写入 `detections[].ocr` 与 `fields.time/amount/transfer_status/recipient/payment_method`；标注图侧栏
-也会显示 OCR 文本。OCR 的 `det/cls/rec` Session 每批只创建一次。
+也会显示 OCR 文本。PP-OCR 的 `det/cls/rec` Session 每批只创建一次。`--ocr unified` 同样从检测框裁图，但直接
+运行单个 v12 字段 reader，不运行 PP-OCR 的 DB/cls/rec 流水线。
 
 目前仍未移植 OpenCV 透视矫正、单应矩阵回投。因此输入需要是已纠正的回单图/截图；两张兼容命名的 JPG
 仍基于 EXIF 摆正后的输入坐标绘制，内容相同。照片类原图要获得与 Python 完全相同的几何结果，需要后续
@@ -1217,6 +1317,49 @@ dotnet run --no-build --project .\dotnet\ReceiptMlNet.Cli\ReceiptMlNet.Cli.cspro
 同一块 CUDA 设备；任一个 CUDA Session 不能创建时，该命令会失败。ONNX Runtime 可能将少量 shape/metadata
 节点保留在 CPU，这是正常的，不影响神经网络计算优先走 GPU。`--device auto` 则允许整套 OCR 回退 CPU，不应用作
 GPU 验收。
+
+### .NET v12 unified 单图 smoke（CPU / GPU）
+
+v12 不使用 `--ocr-bundle`。将同名三件套放在同一目录：`receipt_unified_field_reader_v12_*.onnx`、
+`.labels.json`、`.contract.json`。下面命令只会创建一个 unified OCR Session 并对该回单执行一次 `Run`；检测器和
+可选设备模型仍各自使用自己的 ONNX Session。
+
+```powershell
+$unifiedModelV12 = "D:\alipay-ai-data\receipt-lite-teacher-120k-v1\models\receipt_unified_field_reader_v12_120k_r1.onnx"
+$sample = "D:\download\TempFakeImages\s3_voucher_GWCZ2071991511234514944_20260701001815.png"
+
+dotnet build .\dotnet\ReceiptMlNet.Cli\ReceiptMlNet.Cli.csproj -p:OnnxRuntimeFlavor=cpu
+dotnet run --no-build --project .\dotnet\ReceiptMlNet.Cli\ReceiptMlNet.Cli.csproj -p:OnnxRuntimeFlavor=cpu -- `
+  --detector ".\artifacts\receipt_lrcnn_v1.onnx" `
+  --device-model ".\artifacts\statusbar_device_v1.onnx" `
+  --ocr unified `
+  --ocr-model $unifiedModelV12 `
+  --input $sample `
+  --output "D:\download\TempFakeResults_mlnet_unified_v12_cpu_1" `
+  --device cpu `
+  --annotate all `
+  --require-complete
+```
+
+GPU 前先执行上方的 `$torchLib` / `PATH` 检查，再使用 GPU flavor：
+
+```powershell
+dotnet build .\dotnet\ReceiptMlNet.Cli\ReceiptMlNet.Cli.csproj -p:OnnxRuntimeFlavor=gpu
+dotnet run --no-build --project .\dotnet\ReceiptMlNet.Cli\ReceiptMlNet.Cli.csproj -p:OnnxRuntimeFlavor=gpu -- `
+  --detector ".\artifacts\receipt_lrcnn_v1.onnx" `
+  --device-model ".\artifacts\statusbar_device_v1.onnx" `
+  --ocr unified `
+  --ocr-model $unifiedModelV12 `
+  --input $sample `
+  --output "D:\download\TempFakeResults_mlnet_unified_v12_gpu_1" `
+  --device cuda:0 `
+  --annotate all `
+  --require-complete
+```
+
+此 GPU 命令会让检测器、设备模型和 unified OCR Session 都请求 `cuda:0`；少量 ONNX shape/metadata 节点仍可在
+CPU 上执行。GPU 命令成功后，再以新的输出目录复跑同一命令并把 `--device cuda:0` 改为 `--device cpu`，完成最终
+CPU 交付验收。
 
 不要混用 CPU/GPU 的输出目录。下面命名中的最后一段是本次验证上限：`_1`、`_100`、`_10000`。
 
