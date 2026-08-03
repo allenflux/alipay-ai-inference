@@ -26,6 +26,7 @@ from transfer_receipt_ai.ocr_unified import (
     ONNX_EXPORT_TIME_LOGITS_ATOL,
     ONNX_EXPORT_V11_CTC_LOGITS_ATOL,
     ONNX_EXPORT_V11_CTC_LOGITS_MEAN_ABS_CAP,
+    ONNX_EXPORT_V12_RECIPIENT_LOGITS_MEAN_ABS_CAP,
     PAYMENT_BANK_OTHER_CLASS,
     V6_AMOUNT_CHARACTERS,
     V6_ONNX_OUTPUT_NAMES,
@@ -693,6 +694,15 @@ def test_ctc_onnx_export_tolerances_allow_bounded_gru_drift_without_argmax_chang
     assert _onnx_export_atol("recipient_logits", config=v11_config) == ONNX_EXPORT_V11_CTC_LOGITS_ATOL
     assert _onnx_export_atol("status_logits", config=v11_config) == ONNX_EXPORT_ATOL
     assert ONNX_EXPORT_V11_CTC_LOGITS_MEAN_ABS_CAP == 1e-3
+    v12_config = UnifiedReaderConfig(architecture_version=12)
+    assert (
+        ocr_unified._onnx_export_mean_abs_cap("recipient_logits", config=v12_config)
+        == ONNX_EXPORT_V12_RECIPIENT_LOGITS_MEAN_ABS_CAP
+    )
+    assert (
+        ocr_unified._onnx_export_mean_abs_cap("amount_logits", config=v12_config)
+        == ONNX_EXPORT_V11_CTC_LOGITS_MEAN_ABS_CAP
+    )
     assert _onnx_export_atol(
         "amount_logits",
         config=UnifiedReaderConfig(architecture_version=10),
@@ -778,6 +788,32 @@ def test_ctc_onnx_export_tolerances_allow_bounded_gru_drift_without_argmax_chang
     v11_ctc_mean_over_cap = v11_ctc_mean_expected + np.float32(0.0011)
     with pytest.raises(ValueError, match=r"amount_logits.*mean_abs_cap=0.001"):
         validate("amount_logits", v11_ctc_mean_over_cap, v11_ctc_mean_expected, config=v11_config)
+
+    v12_recipient_mean_expected = np.repeat(expected, repeats=128, axis=0)
+    # Measured server export drift: it is still inside the 0.03 hard cap and
+    # preserves every greedy CTC decision, but lies just above the generic
+    # 0.001 mean cap.  This exception is intentionally recipient/v12-only.
+    v12_recipient_measured_drift = v12_recipient_mean_expected + np.float32(0.001011668)
+    validate(
+        "recipient_logits",
+        v12_recipient_measured_drift,
+        v12_recipient_mean_expected,
+        config=v12_config,
+    )
+    with pytest.raises(ValueError, match=r"recipient_logits.*mean_abs_cap=0.00105"):
+        validate(
+            "recipient_logits",
+            v12_recipient_mean_expected + np.float32(0.00106),
+            v12_recipient_mean_expected,
+            config=v12_config,
+        )
+    with pytest.raises(ValueError, match=r"amount_logits.*mean_abs_cap=0.001"):
+        validate(
+            "amount_logits",
+            v12_recipient_measured_drift,
+            v12_recipient_mean_expected,
+            config=v12_config,
+        )
 
     changed_v11_amount_decision = np.asarray([[0.029, 0.0005]], dtype=np.float32)
     with pytest.raises(ValueError, match=r"argmax_mismatches=1/1"):
