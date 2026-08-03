@@ -18,6 +18,8 @@ from transfer_receipt_ai.ocr_unified import (
     KIND_V6,
     KIND_V7,
     KIND_V8,
+    CHECKPOINT_SELECTION_BALANCED,
+    CHECKPOINT_SELECTION_RECIPIENT_PRIORITY,
     ONNX_EXPORT_ATOL,
     ONNX_EXPORT_PAYMENT_LOGITS_ATOL,
     ONNX_EXPORT_RTOL,
@@ -33,6 +35,8 @@ from transfer_receipt_ai.ocr_unified import (
     V5_ONNX_OUTPUT_NAMES,
     UnifiedReaderConfig,
     _checkpoint_config,
+    _checkpoint_selection_policy,
+    _checkpoint_selection_score,
     _delivery_text,
     _format_exact_match,
     _load_onnx_artifacts,
@@ -212,6 +216,156 @@ def _tiny_config(*, architecture_version: int) -> UnifiedReaderConfig:
         payment_hidden_size=16,
         pooled_width=2,
     )
+
+
+def _checkpoint_selection_validation(
+    *,
+    amount: float = 0.84,
+    time: float = 0.99,
+    payment: float = 0.95,
+    recipient: float = 0.54,
+    macro: float = 0.83,
+    exact: float = 0.82,
+    verifier: float = 0.90,
+    loss: float = 0.20,
+    unsafe_status_to_success: int = 0,
+) -> dict[str, object]:
+    """Minimal validation metrics for pure best-checkpoint selection tests."""
+    return {
+        "loss": loss,
+        "exact_match": exact,
+        "delivery_exact_overall": exact,
+        "candidate_text_macro_exact_match": macro,
+        "candidate_text_exact_match": exact,
+        "verifier_macro_exact_match": verifier,
+        "status_non_success_to_success": unsafe_status_to_success,
+        "candidate_text_by_field": {
+            field: {"records": 10, "exact_match": score}
+            for field, score in {
+                "amount": amount,
+                "time": time,
+                "payment_method_field": payment,
+                "recipient_field": recipient,
+            }.items()
+        },
+    }
+
+
+def test_balanced_checkpoint_selection_preserves_the_legacy_v12_score() -> None:
+    config = _tiny_config(architecture_version=12)
+    policy = _checkpoint_selection_policy(
+        config=config,
+        checkpoint_selection=CHECKPOINT_SELECTION_BALANCED,
+        checkpoint_min_amount_candidate_exact=None,
+        checkpoint_min_time_candidate_exact=None,
+        checkpoint_min_payment_candidate_exact=None,
+    )
+    validation = _checkpoint_selection_validation(
+        macro=0.83,
+        exact=0.82,
+        verifier=0.90,
+        loss=0.20,
+        unsafe_status_to_success=2,
+    )
+    score, failures = _checkpoint_selection_score(
+        validation,
+        config=config,
+        status_policy={"training_enabled": True},
+        policy=policy,
+    )
+
+    assert policy["mode"] == CHECKPOINT_SELECTION_BALANCED
+    assert failures == []
+    assert score == (-2.0, 0.83, 0.82, 0.90, -0.20)
+
+
+def test_recipient_priority_checkpoint_selection_prefers_recipient_after_protection() -> None:
+    config = _tiny_config(architecture_version=12)
+    policy = _checkpoint_selection_policy(
+        config=config,
+        checkpoint_selection=CHECKPOINT_SELECTION_RECIPIENT_PRIORITY,
+        checkpoint_min_amount_candidate_exact=0.80,
+        checkpoint_min_time_candidate_exact=0.98,
+        checkpoint_min_payment_candidate_exact=0.94,
+    )
+    lower_recipient, failures = _checkpoint_selection_score(
+        _checkpoint_selection_validation(recipient=0.54),
+        config=config,
+        status_policy={"training_enabled": False},
+        policy=policy,
+    )
+    higher_recipient, higher_failures = _checkpoint_selection_score(
+        _checkpoint_selection_validation(recipient=0.55),
+        config=config,
+        status_policy={"training_enabled": False},
+        policy=policy,
+    )
+
+    assert failures == higher_failures == []
+    assert lower_recipient == (0.0, 0.54, 0.83, 0.82, 0.90, -0.20)
+    assert higher_recipient is not None and lower_recipient is not None
+    assert higher_recipient > lower_recipient
+
+
+@pytest.mark.parametrize(
+    ("field", "validation_kwargs"),
+    (
+        ("amount", {"amount": 0.799}),
+        ("time", {"time": 0.979}),
+        ("payment_method_field", {"payment": 0.939}),
+    ),
+)
+def test_recipient_priority_rejects_epochs_below_any_protected_floor(
+    field: str,
+    validation_kwargs: dict[str, float],
+) -> None:
+    config = _tiny_config(architecture_version=12)
+    policy = _checkpoint_selection_policy(
+        config=config,
+        checkpoint_selection=CHECKPOINT_SELECTION_RECIPIENT_PRIORITY,
+        checkpoint_min_amount_candidate_exact=0.80,
+        checkpoint_min_time_candidate_exact=0.98,
+        checkpoint_min_payment_candidate_exact=0.94,
+    )
+    score, failures = _checkpoint_selection_score(
+        _checkpoint_selection_validation(**validation_kwargs),
+        config=config,
+        status_policy={"training_enabled": False},
+        policy=policy,
+    )
+
+    assert score is None
+    assert failures and failures[0].startswith(f"{field}=")
+
+
+@pytest.mark.parametrize("invalid_floor", (float("nan"), float("inf"), -0.01, 1.01))
+def test_recipient_priority_requires_a_recipient_protocol_and_complete_valid_floors(
+    invalid_floor: float,
+) -> None:
+    with pytest.raises(ValueError, match="requires architecture v9, v10, v11, or v12"):
+        _checkpoint_selection_policy(
+            config=_tiny_config(architecture_version=8),
+            checkpoint_selection=CHECKPOINT_SELECTION_RECIPIENT_PRIORITY,
+            checkpoint_min_amount_candidate_exact=0.80,
+            checkpoint_min_time_candidate_exact=0.98,
+            checkpoint_min_payment_candidate_exact=0.94,
+        )
+    with pytest.raises(ValueError, match="requires candidate-exact floors"):
+        _checkpoint_selection_policy(
+            config=_tiny_config(architecture_version=12),
+            checkpoint_selection=CHECKPOINT_SELECTION_RECIPIENT_PRIORITY,
+            checkpoint_min_amount_candidate_exact=None,
+            checkpoint_min_time_candidate_exact=0.98,
+            checkpoint_min_payment_candidate_exact=0.94,
+        )
+    with pytest.raises(ValueError, match="must be between 0 and 1"):
+        _checkpoint_selection_policy(
+            config=_tiny_config(architecture_version=12),
+            checkpoint_selection=CHECKPOINT_SELECTION_RECIPIENT_PRIORITY,
+            checkpoint_min_amount_candidate_exact=invalid_floor,
+            checkpoint_min_time_candidate_exact=0.98,
+            checkpoint_min_payment_candidate_exact=0.94,
+        )
 
 
 def _ctc_logits_for_test_text(text: str, characters: tuple[str, ...], *, time_steps: int) -> np.ndarray:
@@ -1049,6 +1203,66 @@ def test_evaluate_parser_exposes_v8_amount_format_confidence_override() -> None:
         ]
     )
     assert args.amount_format_min_confidence_override == 0.25
+
+
+def test_train_parser_and_main_forward_recipient_priority_checkpoint_protection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args = ocr_unified.build_parser().parse_args(
+        [
+            "train",
+            "--records",
+            "records.jsonl",
+            "--output",
+            "run",
+            "--architecture",
+            "v12",
+            "--checkpoint-selection",
+            "recipient_priority",
+            "--checkpoint-min-amount-candidate-exact",
+            "0.80",
+            "--checkpoint-min-time-candidate-exact",
+            "0.98",
+            "--checkpoint-min-payment-candidate-exact",
+            "0.94",
+        ]
+    )
+    assert args.checkpoint_selection == CHECKPOINT_SELECTION_RECIPIENT_PRIORITY
+    assert args.checkpoint_min_amount_candidate_exact == 0.80
+    assert args.checkpoint_min_time_candidate_exact == 0.98
+    assert args.checkpoint_min_payment_candidate_exact == 0.94
+
+    observed: dict[str, object] = {}
+
+    def fake_train(**kwargs: object) -> Path:
+        observed.update(kwargs)
+        return tmp_path / "best.pt"
+
+    monkeypatch.setattr(ocr_unified, "train_unified_reader", fake_train)
+    ocr_unified.main(
+        [
+            "train",
+            "--records",
+            "records.jsonl",
+            "--output",
+            "run",
+            "--architecture",
+            "v12",
+            "--checkpoint-selection",
+            "recipient_priority",
+            "--checkpoint-min-amount-candidate-exact",
+            "0.80",
+            "--checkpoint-min-time-candidate-exact",
+            "0.98",
+            "--checkpoint-min-payment-candidate-exact",
+            "0.94",
+        ]
+    )
+    assert observed["checkpoint_selection"] == CHECKPOINT_SELECTION_RECIPIENT_PRIORITY
+    assert observed["checkpoint_min_amount_candidate_exact"] == 0.80
+    assert observed["checkpoint_min_time_candidate_exact"] == 0.98
+    assert observed["checkpoint_min_payment_candidate_exact"] == 0.94
 
 
 def test_export_parser_and_main_forward_v8_amount_format_confidence_override(

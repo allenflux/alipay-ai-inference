@@ -79,6 +79,15 @@ from .ocr_unified_targets import (
 
 
 SCHEMA_VERSION = 1
+CHECKPOINT_SELECTION_BALANCED = "balanced"
+CHECKPOINT_SELECTION_RECIPIENT_PRIORITY = "recipient_priority"
+CHECKPOINT_SELECTION_MODES = frozenset(
+    (CHECKPOINT_SELECTION_BALANCED, CHECKPOINT_SELECTION_RECIPIENT_PRIORITY)
+)
+# These are the mature text heads that must not silently regress while a
+# recipient-focused experiment chooses its checkpoint.  The values are supplied
+# by the caller from a baseline measured on the same validation split.
+CHECKPOINT_SELECTION_PROTECTED_FIELDS = ("amount", "time", "payment_method_field")
 KIND_V3 = "receipt_unified_field_reader_v3"
 KIND_V4 = "receipt_unified_field_reader_v4"
 KIND_V5 = "receipt_unified_field_reader_v5"
@@ -3824,6 +3833,166 @@ def _write_checkpoint(path: Path, payload: Mapping[str, object], *, torch: Any) 
     temporary.replace(path)
 
 
+def _checkpoint_selection_policy(
+    *,
+    config: UnifiedReaderConfig,
+    checkpoint_selection: str,
+    checkpoint_min_amount_candidate_exact: float | None,
+    checkpoint_min_time_candidate_exact: float | None,
+    checkpoint_min_payment_candidate_exact: float | None,
+) -> dict[str, object]:
+    """Validate and freeze a training-only best-checkpoint policy.
+
+    ``recipient_priority`` deliberately changes only which epoch becomes
+    ``best.pt``.  It does not alter the model graph, preprocessing, decoder,
+    or ONNX/session ABI.  The three mature text fields receive caller-supplied
+    validation floors so an experiment cannot trade them away for a higher
+    recipient score.
+    """
+    if checkpoint_selection not in CHECKPOINT_SELECTION_MODES:
+        allowed = ", ".join(sorted(CHECKPOINT_SELECTION_MODES))
+        raise ValueError(f"checkpoint_selection must be one of: {allowed}")
+    raw_minima = {
+        "amount": checkpoint_min_amount_candidate_exact,
+        "time": checkpoint_min_time_candidate_exact,
+        "payment_method_field": checkpoint_min_payment_candidate_exact,
+    }
+    if checkpoint_selection == CHECKPOINT_SELECTION_BALANCED:
+        supplied = [field for field, value in raw_minima.items() if value is not None]
+        if supplied:
+            raise ValueError(
+                "checkpoint protection floors require checkpoint_selection=recipient_priority"
+            )
+        return {
+            "mode": CHECKPOINT_SELECTION_BALANCED,
+            "protected_minimum_candidate_exact": {},
+            "selection_metric": "legacy_balanced_validation_score",
+        }
+    if not _uses_recipient_protocol(config):
+        raise ValueError("checkpoint_selection=recipient_priority requires architecture v9, v10, v11, or v12")
+    missing = [field for field, value in raw_minima.items() if value is None]
+    if missing:
+        raise ValueError(
+            "checkpoint_selection=recipient_priority requires candidate-exact floors for: "
+            + ", ".join(missing)
+        )
+    minima: dict[str, float] = {}
+    for field, value in raw_minima.items():
+        try:
+            normalized = float(value)
+        except (TypeError, ValueError):
+            raise ValueError(f"checkpoint candidate-exact floor for {field} must be a number") from None
+        if not math.isfinite(normalized) or not 0.0 <= normalized <= 1.0:
+            raise ValueError(f"checkpoint candidate-exact floor for {field} must be between 0 and 1")
+        minima[field] = normalized
+    return {
+        "mode": CHECKPOINT_SELECTION_RECIPIENT_PRIORITY,
+        "protected_minimum_candidate_exact": minima,
+        "selection_metric": "recipient_exact_after_protected_candidate_exact_floors",
+    }
+
+
+def _validation_candidate_exact(validation: Mapping[str, object], field: str) -> float:
+    """Read a finite runtime-candidate exact score from validation metrics."""
+    by_field = validation.get("candidate_text_by_field")
+    if not isinstance(by_field, Mapping):
+        raise ValueError("validation candidate-text metrics are missing")
+    metrics = by_field.get(field)
+    if not isinstance(metrics, Mapping):
+        raise ValueError(f"validation candidate-text metrics are missing for {field}")
+    try:
+        exact_match = float(metrics.get("exact_match"))
+    except (TypeError, ValueError):
+        raise ValueError(f"validation candidate-text exact metric is invalid for {field}") from None
+    if not math.isfinite(exact_match) or not 0.0 <= exact_match <= 1.0:
+        raise ValueError(f"validation candidate-text exact metric is invalid for {field}")
+    return exact_match
+
+
+def _checkpoint_selection_score(
+    validation: Mapping[str, object],
+    *,
+    config: UnifiedReaderConfig,
+    status_policy: Mapping[str, object],
+    policy: Mapping[str, object],
+) -> tuple[tuple[float, ...] | None, list[str]]:
+    """Return an auditable best-checkpoint score or protection failures.
+
+    The balanced branch intentionally preserves the historical score tuple.
+    Recipient priority is available only after the three protected fields pass
+    their independently selected validation floors.
+    """
+    mode = policy.get("mode")
+    if mode not in CHECKPOINT_SELECTION_MODES:
+        raise ValueError("checkpoint selection policy mode is invalid")
+    status_safety = (
+        -float(validation["status_non_success_to_success"])
+        if bool(status_policy.get("training_enabled"))
+        else 0.0
+    )
+    if mode == CHECKPOINT_SELECTION_RECIPIENT_PRIORITY:
+        if not _uses_recipient_protocol(config):
+            raise ValueError("recipient-priority checkpoint policy requires a recipient protocol")
+        raw_minima = policy.get("protected_minimum_candidate_exact")
+        if not isinstance(raw_minima, Mapping):
+            raise ValueError("recipient-priority checkpoint policy has no protected candidate floors")
+        failures: list[str] = []
+        for field in CHECKPOINT_SELECTION_PROTECTED_FIELDS:
+            try:
+                minimum = float(raw_minima[field])
+            except (KeyError, TypeError, ValueError):
+                raise ValueError(f"recipient-priority checkpoint policy has no valid floor for {field}") from None
+            if not math.isfinite(minimum) or not 0.0 <= minimum <= 1.0:
+                raise ValueError(f"recipient-priority checkpoint policy has invalid floor for {field}")
+            observed = _validation_candidate_exact(validation, field)
+            if observed < minimum:
+                failures.append(f"{field}={observed:.6f} < {minimum:.6f}")
+        if failures:
+            return None, failures
+        verifier_score = validation.get("verifier_macro_exact_match")
+        return (
+            (
+                status_safety,
+                _validation_candidate_exact(validation, "recipient_field"),
+                float(validation["candidate_text_macro_exact_match"] or -1.0),
+                float(validation["candidate_text_exact_match"]),
+                float(verifier_score) if verifier_score is not None else -1.0,
+                -float(validation["loss"]),
+            ),
+            [],
+        )
+    # v6+ runtime may choose a valid structured time candidate (and v8 a
+    # digit-preserving rendered amount). Select checkpoints by that exact same
+    # candidate path rather than by a detached verifier-only score. This is the
+    # historical score and must remain byte-for-byte equivalent in semantics.
+    if _uses_modern_protocol(config):
+        verifier_score = (
+            float(validation["verifier_macro_exact_match"])
+            if validation["verifier_macro_exact_match"] is not None
+            else -1.0
+        )
+        return (
+            (
+                status_safety,
+                float(validation["candidate_text_macro_exact_match"] or -1.0),
+                float(validation["candidate_text_exact_match"]),
+                verifier_score,
+                -float(validation["loss"]),
+            ),
+            [],
+        )
+    return (
+        (
+            status_safety,
+            float(validation["delivery_exact_overall"]),
+            float(validation["exact_match"]),
+            -1.0,
+            -float(validation["loss"]),
+        ),
+        [],
+    )
+
+
 def train_unified_reader(
     *,
     records_path: Path,
@@ -3838,6 +4007,10 @@ def train_unified_reader(
     payment_loss_weight: float = 1.0,
     recipient_loss_weight: float = 1.0,
     recipient_sampling_weight: float = 1.0,
+    checkpoint_selection: str = CHECKPOINT_SELECTION_BALANCED,
+    checkpoint_min_amount_candidate_exact: float | None = None,
+    checkpoint_min_time_candidate_exact: float | None = None,
+    checkpoint_min_payment_candidate_exact: float | None = None,
     ctc_loss_weight: float = 0.35,
     structured_loss_weight: float = 1.0,
     payment_bank_prefix_min_support: int = 3,
@@ -3853,6 +4026,13 @@ def train_unified_reader(
     otherwise its final delivery policy is review-only.
     """
     config.validate()
+    checkpoint_selection_policy = _checkpoint_selection_policy(
+        config=config,
+        checkpoint_selection=checkpoint_selection,
+        checkpoint_min_amount_candidate_exact=checkpoint_min_amount_candidate_exact,
+        checkpoint_min_time_candidate_exact=checkpoint_min_time_candidate_exact,
+        checkpoint_min_payment_candidate_exact=checkpoint_min_payment_candidate_exact,
+    )
     if epochs <= 0 or batch_size <= 0:
         raise ValueError("epochs and batch_size must be positive")
     if (
@@ -4050,6 +4230,7 @@ def train_unified_reader(
             "payment_characters": payment_characters,
             "status_classes": list(STATUS_CLASSES),
             "structured_target_counts": structured_counts,
+            "checkpoint_selection_policy": checkpoint_selection_policy,
             "payment_charset_sha256": hashlib.sha256("".join(payment_characters).encode("utf-8")).hexdigest(),
             **(
                 {
@@ -4085,10 +4266,10 @@ def train_unified_reader(
     )
 
     history: list[dict[str, object]] = []
-    # When the status head has full validation coverage, prefer a checkpoint
-    # that never maps pending/failed to success.  In review-only mode that
-    # metric is deliberately excluded and the three text heads choose best.
-    best_score = (float("-inf"), -1.0, -1.0, -1.0, float("-inf"))
+    # ``None`` remains until an epoch passes recipient-priority protection
+    # floors. Balanced mode always produces the historical score on epoch one.
+    best_score: tuple[float, ...] | None = None
+    best_epoch: int | None = None
     best_path = output_dir / "best.pt"
     for epoch in range(1, epochs + 1):
         model.train()
@@ -4180,6 +4361,15 @@ def train_unified_reader(
             "val_by_field": validation["by_field"],
             "val_status_non_success_to_success": validation["status_non_success_to_success"],
         }
+        score, protection_failures = _checkpoint_selection_score(
+            validation,
+            config=config,
+            status_policy=status_policy,
+            policy=checkpoint_selection_policy,
+        )
+        epoch_record["checkpoint_selection_eligible"] = score is not None
+        epoch_record["checkpoint_selection_protection_failures"] = protection_failures
+        epoch_record["checkpoint_selection_score"] = list(score) if score is not None else None
         history.append(epoch_record)
         checkpoint_payload = {
             "schema_version": SCHEMA_VERSION,
@@ -4222,45 +4412,16 @@ def train_unified_reader(
             "payment_bank_prefix_oov_by_split": payment_bank_prefix_oov,
             "payment_loss_weight": payment_loss_weight,
             "recipient_loss_weight": recipient_loss_weight,
+            "checkpoint_selection_policy": checkpoint_selection_policy,
             "ctc_loss_weight": ctc_loss_weight,
             "structured_loss_weight": structured_loss_weight,
             "epoch": epoch,
             "metrics": epoch_record,
         }
         _write_checkpoint(output_dir / "last.pt", checkpoint_payload, torch=torch)
-        # v6+ runtime may choose a valid structured time candidate (and v8 a
-        # digit-preserving rendered amount). Select checkpoints by that exact
-        # same candidate path rather than by a detached verifier-only score.
-        # This prevents validation from rewarding text that the runtime will
-        # never display. v3-v5 retain their historical delivery/exact rule.
-        status_safety = (
-            -float(validation["status_non_success_to_success"])
-            if bool(status_policy["training_enabled"])
-            else 0.0
-        )
-        if _uses_modern_protocol(config):
-            verifier_score = (
-                float(validation["verifier_macro_exact_match"])
-                if validation["verifier_macro_exact_match"] is not None
-                else -1.0
-            )
-            score = (
-                status_safety,
-                float(validation["candidate_text_macro_exact_match"] or -1.0),
-                float(validation["candidate_text_exact_match"]),
-                verifier_score,
-                -float(validation["loss"]),
-            )
-        else:
-            score = (
-                status_safety,
-                float(validation["delivery_exact_overall"]),
-                float(validation["exact_match"]),
-                -1.0,
-                -float(validation["loss"]),
-            )
-        if score > best_score:
+        if score is not None and (best_score is None or score > best_score):
             best_score = score
+            best_epoch = epoch
             _write_checkpoint(best_path, checkpoint_payload, torch=torch)
         _atomic_write_json(
             output_dir / "training_summary.json",
@@ -4282,6 +4443,9 @@ def train_unified_reader(
                 "recipient_oov_by_split": recipient_oov,
                 "recipient_target": _recipient_target_mode(config),
                 "recipient_loss_weight": recipient_loss_weight,
+                "checkpoint_selection_policy": checkpoint_selection_policy,
+                "best_checkpoint_epoch": best_epoch,
+                "best_checkpoint_score": list(best_score) if best_score is not None else None,
                 "records": history,
                 "warning": (
                     "Paddle teacher labels are not independent truth. v5-v12 text candidates remain review-only until "
@@ -4297,7 +4461,13 @@ def train_unified_reader(
             f"val_candidate={float(validation['candidate_text_macro_exact_match'] or 0.0):.2%} "
             f"val_verifier={_format_exact_match(validation['verifier_macro_exact_match'])} "
             f"val_delivery={float(validation['delivery_exact_overall']):.2%} "
-            f"coverage={float(validation['delivery_coverage']):.2%}"
+            f"coverage={float(validation['delivery_coverage']):.2%} "
+            f"checkpoint={'eligible' if score is not None else 'protected'}"
+        )
+    if best_epoch is None:
+        raise ValueError(
+            "No epoch met checkpoint protection floors; best.pt was not written. "
+            "Inspect training_summary.json and recalibrate the validation floors."
         )
     return best_path
 
@@ -4738,6 +4908,7 @@ def export_unified_onnx(
         "payment_blank_index": PAYMENT_BLANK_INDEX,
         "payment_characters": payment_characters,
         "status_classes": status_classes,
+        "checkpoint_selection_policy": payload.get("checkpoint_selection_policy"),
         "payment_charset_sha256": hashlib.sha256("".join(payment_characters).encode("utf-8")).hexdigest(),
         **(
             {
@@ -5124,6 +5295,7 @@ def export_unified_onnx(
             "training_field_counts": field_counts,
             "training_status_class_counts": status_counts,
             "training_structured_target_counts": payload.get("structured_target_counts"),
+            "checkpoint_selection_policy": payload.get("checkpoint_selection_policy"),
             "status_head_policy": status_policy,
             "payment_bank_prefix_classes": payment_bank_prefix_classes,
             "payment_bank_prefix_min_support": payload.get("payment_bank_prefix_min_support"),
@@ -6876,6 +7048,30 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     train.add_argument(
+        "--checkpoint-selection",
+        choices=tuple(sorted(CHECKPOINT_SELECTION_MODES)),
+        default=CHECKPOINT_SELECTION_BALANCED,
+        help=(
+            "How to select best.pt. balanced preserves historical behavior. recipient_priority is v9-v12 only "
+            "and requires all three protected candidate-exact floors; it changes training selection only, not ONNX ABI."
+        ),
+    )
+    train.add_argument(
+        "--checkpoint-min-amount-candidate-exact",
+        type=float,
+        help="recipient_priority only: same-validation-split amount candidate-exact protection floor",
+    )
+    train.add_argument(
+        "--checkpoint-min-time-candidate-exact",
+        type=float,
+        help="recipient_priority only: same-validation-split time candidate-exact protection floor",
+    )
+    train.add_argument(
+        "--checkpoint-min-payment-candidate-exact",
+        type=float,
+        help="recipient_priority only: same-validation-split payment candidate-exact protection floor",
+    )
+    train.add_argument(
         "--ctc-loss-weight",
         type=float,
         default=0.35,
@@ -7088,6 +7284,10 @@ def main(argv: list[str] | None = None) -> None:
                 payment_loss_weight=args.payment_loss_weight,
                 recipient_loss_weight=args.recipient_loss_weight,
                 recipient_sampling_weight=args.recipient_sampling_weight,
+                checkpoint_selection=args.checkpoint_selection,
+                checkpoint_min_amount_candidate_exact=args.checkpoint_min_amount_candidate_exact,
+                checkpoint_min_time_candidate_exact=args.checkpoint_min_time_candidate_exact,
+                checkpoint_min_payment_candidate_exact=args.checkpoint_min_payment_candidate_exact,
                 ctc_loss_weight=args.ctc_loss_weight,
                 structured_loss_weight=args.structured_loss_weight,
                 payment_bank_prefix_min_support=args.payment_bank_prefix_min_support,

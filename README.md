@@ -697,6 +697,82 @@ python -m transfer_receipt_ai.ocr_unified evaluate `
 teacher-parity，不能替代按回单分组隔离的人工真值验收。`transfer_status` 仍只有 `success` 教师类时，必须保持
 `review_only`，不能因为 v12 改善了文本识别就自动放行状态。
 
+### v12-r2 收款方优先候选（保持单 ONNX，不牺牲其余字段）
+
+当 v12 的金额、时间、付款方式已经达到可接受的教师一致性，而收款方仍偏低时，使用下面这个**受保护的收款方专项实验**。
+它仍导出一个 v12 ONNX、一个 Session、一次推理；改变的只是收款方私有分支从 `16 / 192` 增至 `24 / 256`，以及
+训练时 `best.pt` 的选择规则。它不承诺一定提升：只有收款方在 `val` 集提升、且三项已有字段不低于保护线，才值得进入一次
+最终 `test` 与 CPU 验证。
+
+保护线必须从**当前基线模型的同一 `val` split**取得，不能使用已经多轮查看过的 `test` 结果：
+
+```powershell
+$baselineModelV12 = "$teacherRoot\models\receipt_unified_field_reader_v12_120k_r1.onnx"
+$baselineValV12 = "$teacherRoot\unified-eval-v12-120k-r1-val-gpu"
+
+python -m transfer_receipt_ai.ocr_unified evaluate `
+  --model $baselineModelV12 `
+  --records "$unifiedManifestV12\unified_fields.jsonl" `
+  --dataset-root $teacherLabels5 `
+  --split val `
+  --output $baselineValV12 `
+  --device cuda:0
+
+$baseline = Get-Content "$baselineValV12\summary.json" -Raw | ConvertFrom-Json
+# 给金额/付款方式留 1 个百分点、时间留 0.5 个百分点的容忍度；这些值只控制 best.pt 选择，绝不改变推理 ABI。
+$amountFloor = [Math]::Max(0.0, [double]$baseline.by_field.amount.raw_exact_match - 0.01)
+$timeFloor = [Math]::Max(0.0, [double]$baseline.by_field.time.raw_exact_match - 0.005)
+$paymentFloor = [Math]::Max(0.0, [double]$baseline.by_field.payment_method_field.raw_exact_match - 0.01)
+[pscustomobject]@{ Amount = $amountFloor; Time = $timeFloor; Payment = $paymentFloor } | Format-List
+```
+
+然后创建全新的 r2 输出路径并训练。每个 epoch 仍会写 `last.pt` 供诊断；但凡三项保护线有一项未达到，该 epoch 不会覆盖
+`best.pt`。如果全部 80 个 epoch 都没有通过，命令会明确失败而不是悄悄交付退化模型；查看该目录的
+`training_summary.json` 后重新校准保护线或配方。
+
+```powershell
+$unifiedRunV12R2 = "$teacherRoot\unified-run-v12-120k-r2-recipient-priority"
+$unifiedModelV12R2 = "$teacherRoot\models\receipt_unified_field_reader_v12_120k_r2_recipient24_h256.onnx"
+
+python -m transfer_receipt_ai.ocr_unified train `
+  --records "$unifiedManifestV12\unified_fields.jsonl" `
+  --dataset-root $teacherLabels5 `
+  --output $unifiedRunV12R2 `
+  --device cuda:0 `
+  --architecture v12 `
+  --image-height 80 `
+  --image-width 512 `
+  --recipient-input-height 128 `
+  --recipient-input-width 1024 `
+  --recipient-branch-channels 24 `
+  --base-channels 32 `
+  --numeric-hidden-size 96 `
+  --payment-hidden-size 128 `
+  --recipient-hidden-size 256 `
+  --recipient-value-left-trim 0.30 `
+  --epochs 80 `
+  --batch-size 12 `
+  --learning-rate 0.0004 `
+  --payment-loss-weight 1.0 `
+  --recipient-loss-weight 4.0 `
+  --recipient-sampling-weight 3.0 `
+  --checkpoint-selection recipient_priority `
+  --checkpoint-min-amount-candidate-exact $amountFloor `
+  --checkpoint-min-time-candidate-exact $timeFloor `
+  --checkpoint-min-payment-candidate-exact $paymentFloor `
+  --ctc-loss-weight 0.75 `
+  --structured-loss-weight 1.0 `
+  --amount-format-min-confidence 0.80 `
+  --payment-bank-prefix-min-support 3 `
+  --seed 42 `
+  --num-workers 0 `
+  --onnx-output $unifiedModelV12R2
+```
+
+训练日志会显示 `checkpoint=eligible` 或 `checkpoint=protected`，并将策略、三条保护线、每轮得分及淘汰原因写入
+`training_summary.json`、`best.pt` 和最终 ONNX sidecar。仅在验证集确认收款方改善后，才对这个**唯一候选**跑一次 GPU
+`test`，最后再跑一次 CPU `test`；CPU 结果与 GPU 一致才进入 .NET smoke。
+
 ### v11 五字段收款方专项训练（历史基线）
 
 v11 仍然是**一个** `[5,1,80,512]` 输入、15 个输出的统一 ONNX；不会增加第二个 OCR
