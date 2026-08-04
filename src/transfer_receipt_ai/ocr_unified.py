@@ -2459,7 +2459,16 @@ def _augment_recipient_value_input(
 
 
 class _UnifiedReceiptDataset:
-    """A picklable dataset so Windows DataLoader workers remain usable."""
+    """A picklable dataset so Windows DataLoader workers remain usable.
+
+    ``light_v1`` derives its augmentation from the training epoch.  A regular
+    integer would be copied into each Windows-spawned worker, which previously
+    made persistent workers unsafe: they would keep augmenting every epoch as
+    epoch zero.  For ``light_v1`` only, a shared-memory CPU tensor is safely
+    transported by ``torch.utils.data.DataLoader`` across both fork and spawn
+    contexts, so the parent can advance the epoch without recreating workers
+    or changing the per-record RNG formula.
+    """
 
     def __init__(
         self,
@@ -2480,11 +2489,30 @@ class _UnifiedReceiptDataset:
             else recipient_train_augmentation_policy
         )
         self._epoch = 0
+        self._shared_augmentation_epoch: Any | None = None
+        if self._recipient_train_augmentation_policy["mode"] == "light_v1":
+            # Do not use ``multiprocessing.Value`` here: a Value created from
+            # a Linux fork context cannot be sent to an explicitly spawned
+            # worker.  A shared CPU tensor is portable across DataLoader
+            # contexts and its one scalar does not change the dataset/ONNX
+            # input contract.
+            torch, _ = _require_torch()
+            self._shared_augmentation_epoch = torch.zeros(
+                (), dtype=torch.int64, device="cpu"
+            ).share_memory_()
 
     def set_epoch(self, epoch: int) -> None:
         if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 0:
             raise ValueError("dataset epoch must be a non-negative integer")
-        self._epoch = epoch
+        self._epoch = int(epoch)
+        if self._shared_augmentation_epoch is not None:
+            self._shared_augmentation_epoch.fill_(self._epoch)
+
+    def _augmentation_epoch(self) -> int:
+        """Return the worker-visible epoch used only by ``light_v1``."""
+        if self._shared_augmentation_epoch is None:
+            return self._epoch
+        return int(self._shared_augmentation_epoch.item())
 
     def __len__(self) -> int:
         return len(self._records)
@@ -2501,7 +2529,7 @@ class _UnifiedReceiptDataset:
                     recipient_value_image,
                     record=record,
                     policy=self._recipient_train_augmentation_policy,
-                    epoch=self._epoch,
+                    epoch=self._augmentation_epoch(),
                 )
             return torch.from_numpy(recipient_value_image), record
         field_images = torch.from_numpy(_input_tensor(record, config=self._config))
@@ -2515,7 +2543,7 @@ class _UnifiedReceiptDataset:
                     recipient_value_image,
                     record=record,
                     policy=self._recipient_train_augmentation_policy,
-                    epoch=self._epoch,
+                    epoch=self._augmentation_epoch(),
                 )
             return (
                 field_images,
@@ -5493,11 +5521,6 @@ def train_unified_reader(
         raise ValueError("prefetch_factor must be positive")
     if persistent_workers and num_workers <= 0:
         raise ValueError("persistent_workers requires num_workers to be positive")
-    if persistent_workers and recipient_train_augmentation_policy["mode"] != "none":
-        raise ValueError(
-            "persistent_workers is unsafe with recipient train augmentation because worker-local epoch state "
-            "would stop advancing; leave it disabled or use --recipient-train-augmentation none"
-        )
     if payment_bank_prefix_min_support <= 0:
         raise ValueError("payment_bank_prefix_min_support must be positive")
     if not math.isfinite(recipient_sampling_weight):
@@ -5711,9 +5734,11 @@ def train_unified_reader(
         )
     loader_performance_kwargs: dict[str, object] = {}
     if num_workers > 0:
-        # Keep worker processes non-persistent by default.  v12's optional
-        # train augmentation is seeded by the epoch, and Windows-spawned
-        # persistent workers otherwise retain the first epoch's dataset copy.
+        # v12's optional train augmentation reads its epoch from the shared
+        # dataset counter above, so persistent Windows workers receive the
+        # same deterministic (seed, epoch, record-id) perturbation without
+        # respawning every epoch.  The validation dataset has no augmentation
+        # and can safely share the same persistent-worker setting.
         loader_performance_kwargs = {
             "prefetch_factor": prefetch_factor,
             "persistent_workers": persistent_workers,
@@ -9095,8 +9120,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--persistent-workers",
         action="store_true",
         help=(
-            "Keep DataLoader workers alive between epochs. Not supported with v12 recipient train augmentation "
-            "until its epoch state is shared safely."
+            "Keep DataLoader workers alive between epochs. v12 light_v1 recipient augmentation uses a "
+            "process-shared epoch counter, so its deterministic per-record perturbations remain epoch-correct."
         ),
     )
     train.add_argument(

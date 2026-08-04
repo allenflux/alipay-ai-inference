@@ -114,7 +114,8 @@ Write-Host "  seed=$seedCheckpoint"
 Write-Host "  records=$records"
 Write-Host "  output=$output"
 Write-Host ("  floors: amount={0:P2}, time={1:P2}, payment={2:P2}" -f $AmountFloor, $TimeFloor, $PaymentFloor)
-Write-Host ("  recipe: recipient-only, lr={0}, workers={1}, prefetch={2}, validate-every={3}, TF32=on, cuDNN-benchmark=on" -f $LearningRate, $NumWorkers, $PrefetchFactor, $ValidationEvery)
+$persistentWorkers = if ($NumWorkers -gt 0) { "on" } else { "off" }
+Write-Host ("  recipe: recipient-only, lr={0}, workers={1}, persistent-workers={2}, prefetch={3}, validate-every={4}, TF32=on, cuDNN-benchmark=on" -f $LearningRate, $NumWorkers, $persistentWorkers, $PrefetchFactor, $ValidationEvery)
 Write-Host ("  recipient-tail CTC: rare-support<={0} x{1}; long-length>={2} x{3}; max(), no receipt resampling" -f $RecipientTailRareCharacterMaxSupport, $RecipientTailRareCharacterLossWeight, $RecipientTailLongTextMinLength, $RecipientTailLongTextLossWeight)
 Write-Host ("  recipient target: 90.00% strict exact ({0})" -f $(if ($DiagnosticOnly) { "diagnostic only" } else { "required" }))
 try {
@@ -228,6 +229,11 @@ $trainArgs = @(
     "--cuda-tf32",
     "--cudnn-benchmark"
 )
+if ($NumWorkers -gt 0) {
+    # v12 light_v1 keeps its epoch in process-shared dataset state, so this
+    # avoids Windows worker respawn while preserving deterministic augmentation.
+    $trainArgs += "--persistent-workers"
+}
 
 # A successful full run must prove that the exported delivery artifact, not
 # just its in-memory PyTorch checkpoint, clears the same r3 guardrails.
@@ -295,7 +301,7 @@ finally {
             RecipientTailCombinedBoostHits = $tailCombinedHits
             Initialization = $summary.initialization.mode
             FinancialLabelPolicy = $summary.initialization.financial_label_policy.mode
-            Runtime = ("{0}; workers={1}; TF32={2}; cuDNN-benchmark={3}" -f $summary.training_runtime.cuda_device_name, $summary.training_runtime.num_workers, $summary.training_runtime.cuda_tf32_requested, $summary.training_runtime.cudnn_benchmark_requested)
+            Runtime = ("{0}; workers={1}; persistent-workers={2}; TF32={3}; cuDNN-benchmark={4}" -f $summary.training_runtime.cuda_device_name, $summary.training_runtime.num_workers, $summary.training_runtime.persistent_workers, $summary.training_runtime.cuda_tf32_requested, $summary.training_runtime.cudnn_benchmark_requested)
             LastEligible = $last.checkpoint_selection_eligible
             LastFailures = ($last.checkpoint_selection_protection_failures -join "; ")
         } | Format-List

@@ -191,6 +191,65 @@ def test_v12_recipient_only_logits_match_the_full_private_branch() -> None:
     torch.testing.assert_close(full_logits, private_logits, rtol=0.0, atol=0.0)
 
 
+def test_v12_light_augmentation_sees_each_epoch_with_persistent_spawn_workers(tmp_path: Path) -> None:
+    """A persistent Windows-style worker must not keep the first epoch's crop.
+
+    This deliberately uses ``spawn`` even on platforms that default to fork,
+    because Windows DataLoader workers receive a pickled dataset.  The worker
+    output must exactly match the existing deterministic augmentation formula
+    for both epochs; only the epoch transport changes.
+    """
+    torch = pytest.importorskip("torch")
+    config = _tiny_v12_config()
+    image_path = tmp_path / "recipient.png"
+    image_path.write_bytes(_TINY_PNG)
+    record: dict[str, object] = {
+        "id": "persistent-epoch-recipient",
+        "slots": {"recipient_field": {"image_path": str(image_path), "text": "商户甲"}},
+    }
+    policy = ocr_unified._recipient_train_augmentation_policy(mode="light_v1", seed=42)
+    dataset = ocr_unified._UnifiedReceiptDataset(
+        [record],
+        config=config,
+        recipient_train_augmentation_policy=policy,
+        recipient_only=True,
+    )
+    loader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=1,
+        shuffle=False,
+        num_workers=1,
+        collate_fn=ocr_unified._collate_recipient_only,
+        persistent_workers=True,
+        multiprocessing_context="spawn",
+    )
+    try:
+        dataset.set_epoch(1)
+        first_images, first_records = list(loader)[0]
+        dataset.set_epoch(2)
+        second_images, second_records = list(loader)[0]
+    finally:
+        # Persistent workers otherwise outlive the short test iterator until
+        # garbage collection, which is especially slow/flaky on Windows.
+        iterator = getattr(loader, "_iterator", None)
+        if iterator is not None:
+            iterator._shutdown_workers()
+
+    base = ocr_unified._recipient_value_input_tensor(record, config=config)
+    expected_first = torch.from_numpy(
+        ocr_unified._augment_recipient_value_input(base, record=record, policy=policy, epoch=1)
+    ).unsqueeze(0)
+    expected_second = torch.from_numpy(
+        ocr_unified._augment_recipient_value_input(base, record=record, policy=policy, epoch=2)
+    ).unsqueeze(0)
+
+    assert [item["id"] for item in first_records] == [record["id"]]
+    assert [item["id"] for item in second_records] == [record["id"]]
+    torch.testing.assert_close(first_images, expected_first, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(second_images, expected_second, rtol=0.0, atol=0.0)
+    assert not torch.equal(first_images, second_images)
+
+
 def test_v12_sparse_full_validation_schedule_keeps_epoch_one_and_final() -> None:
     """A long recipient-only run may skip only interior non-N epochs."""
     planned = [
