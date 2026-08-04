@@ -5425,7 +5425,7 @@ def train_unified_reader(
         low_confidence_loss_weight=recipient_low_confidence_loss_weight,
         curriculum_epochs=recipient_confidence_curriculum_epochs,
     )
-    recipient_tail_loss_config = _recipient_tail_loss_config(
+    recipient_tail_loss_static_config = _recipient_tail_loss_config(
         rare_character_max_support=recipient_tail_rare_character_max_support,
         rare_character_loss_weight=recipient_tail_rare_character_loss_weight,
         long_text_min_length=recipient_tail_long_text_min_length,
@@ -5456,7 +5456,7 @@ def train_unified_reader(
             )
         )
         or recipient_confidence_policy["mode"] != "none"
-        or recipient_tail_loss_config["mode"] != "none"
+        or recipient_tail_loss_static_config["mode"] != "none"
         or recipient_train_augmentation_policy["mode"] != "none"
     )
     if not (_is_v11(config) or _is_v12(config)) and recipient_training_options_requested:
