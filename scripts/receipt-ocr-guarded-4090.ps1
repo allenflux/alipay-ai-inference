@@ -38,6 +38,8 @@ if ([string]::IsNullOrWhiteSpace($RunName)) {
 }
 $output = Join-Path $TeacherRoot $RunName
 $baselineOutput = Join-Path $TeacherRoot ("unified-eval-v12-r3-4090-warm-baseline-" + (Get-Date -Format "yyyyMMdd-HHmmss"))
+$candidateModel = Join-Path $output "best.onnx"
+$candidateValOutput = Join-Path $output "onnx-val"
 
 foreach ($required in @(
     @{ Name = "r3 records"; Path = $records },
@@ -185,6 +187,16 @@ $trainArgs = @(
     "--cudnn-benchmark"
 )
 
+# A successful full run must prove that the exported delivery artifact, not
+# just its in-memory PyTorch checkpoint, clears the same r3 guardrails.
+# The short diagnostic deliberately skips this second full ONNX pass so it
+# can establish convergence speed before committing to the long run.
+if (-not $DiagnosticOnly) {
+    $trainArgs += @(
+        "--onnx-output", $candidateModel
+    )
+}
+
 $exitCode = 0
 try {
     & python @trainArgs
@@ -202,7 +214,7 @@ finally {
         if ($null -ne $best -and $null -ne $best.val_candidate_text_by_field) {
             $bestRecipientMetric = $best.val_candidate_text_by_field.recipient_field
         }
-        $recipientTargetReached = ($null -ne $bestRecipientMetric -and [double]$bestRecipientMetric.exact_match -ge 0.90)
+        $trainingRecipientTargetReached = ($null -ne $bestRecipientMetric -and [double]$bestRecipientMetric.exact_match -ge 0.90)
 
         Write-Host ""
         Write-Host "guarded_4090_recipient_only final_summary"
@@ -215,7 +227,7 @@ finally {
             BestTime = Get-TrainingExactDisplay $best "time"
             BestPayment = Get-TrainingExactDisplay $best "payment_method_field"
             BestRecipient = Get-TrainingExactDisplay $best "recipient_field"
-            Recipient90Reached = $recipientTargetReached
+            TrainingRecipient90Reached = $trainingRecipientTargetReached
             LastAmount = Get-TrainingExactDisplay $last "amount"
             LastTime = Get-TrainingExactDisplay $last "time"
             LastPayment = Get-TrainingExactDisplay $last "payment_method_field"
@@ -240,13 +252,74 @@ finally {
             @{ n = "payment"; e = { $_.val_candidate_text_by_field.payment_method_field.exact_match } }, `
             @{ n = "recipient"; e = { $_.val_candidate_text_by_field.recipient_field.exact_match } } |
             Format-Table -AutoSize
-        if (-not $DiagnosticOnly -and -not $recipientTargetReached -and $exitCode -eq 0) {
-            Write-Host "Recipient strict-exact target was not reached: best checkpoint remains below 90.00%."
-            $exitCode = 2
-        }
     }
     else {
         Write-Host "guarded_4090_recipient_only final_summary=unavailable (training did not create training_summary.json)"
+    }
+}
+
+if ($DiagnosticOnly) {
+    Write-Host "final ONNX validation skipped: diagnostic-only run"
+}
+elseif ($exitCode -eq 0) {
+    Write-Host ""
+    Write-Host "guarded_4090_recipient_only final_onnx_validation"
+    if (-not (Test-Path -LiteralPath $candidateModel)) {
+        Write-Host "final ONNX validation=unavailable (best.onnx was not exported)"
+        $exitCode = 3
+    }
+    elseif (Test-Path -LiteralPath $candidateValOutput) {
+        Write-Host "final ONNX validation=unavailable (refusing to reuse output: $candidateValOutput)"
+        $exitCode = 3
+    }
+    else {
+        $candidateArgs = @(
+            "-m", "transfer_receipt_ai.ocr_unified", "evaluate",
+            "--model", $candidateModel,
+            "--records", $records,
+            "--dataset-root", $labelsRoot,
+            "--split", "val",
+            "--output", $candidateValOutput,
+            "--device", "cuda:0",
+            "--min-amount-exact-match", "$AmountFloor",
+            "--min-time-exact-match", "$TimeFloor",
+            "--min-payment-exact-match", "$PaymentFloor",
+            "--min-recipient-exact-match", "0.90"
+        )
+        & python @candidateArgs
+        $candidateExitCode = $LASTEXITCODE
+        $candidateSummaryPath = Join-Path $candidateValOutput "summary.json"
+        if (Test-Path -LiteralPath $candidateSummaryPath) {
+            $candidate = Get-Content $candidateSummaryPath -Raw | ConvertFrom-Json
+            $candidateAmount = $candidate.by_field.amount
+            $candidateTime = $candidate.by_field.time
+            $candidatePayment = $candidate.by_field.payment_method_field
+            $candidateRecipient = $candidate.by_field.recipient_field
+            [pscustomobject]@{
+                ExportedModel = $candidateModel
+                Amount = Get-ExactDisplay $candidateAmount
+                Time = Get-ExactDisplay $candidateTime
+                Payment = Get-ExactDisplay $candidatePayment
+                Recipient = Get-ExactDisplay $candidateRecipient
+                Recipient90Reached = ([double]$candidateRecipient.raw_exact_match -ge 0.90)
+                RecipientOov = ("{0}/{1}={2:P2}" -f $candidateRecipient.oov_reference_records, $candidateRecipient.records, $candidateRecipient.oov_reference_rate)
+                Providers = ($candidate.providers -join ", ")
+                Accepted = $candidate.acceptance.passed
+                Failures = ($candidate.acceptance.failures -join "; ")
+                MeanInferenceMs = $candidate.receipt_latency_ms.mean
+            } | Format-List
+            if ($candidate.providers -notcontains "CUDAExecutionProvider") {
+                Write-Host "Exported ONNX validation did not use CUDAExecutionProvider."
+                $candidateExitCode = 3
+            }
+        }
+        else {
+            Write-Host "final ONNX validation=unavailable (summary.json was not written)"
+            $candidateExitCode = 3
+        }
+        if ($candidateExitCode -ne 0) {
+            $exitCode = $candidateExitCode
+        }
     }
 }
 
