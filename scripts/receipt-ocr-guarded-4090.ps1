@@ -119,6 +119,10 @@ Write-Host "same_r3_val_baseline"
     Providers = ($baseline.providers -join ", ")
 } | Format-List
 
+if ($baseline.providers -notcontains "CUDAExecutionProvider") {
+    throw "Baseline evaluation did not use CUDAExecutionProvider; fix the 4090 runtime before starting training."
+}
+
 if ([double]$baselineAmount.raw_exact_match -lt $AmountFloor -or
     [double]$baselineTime.raw_exact_match -lt $TimeFloor -or
     [double]$baselinePayment.raw_exact_match -lt $PaymentFloor) {
