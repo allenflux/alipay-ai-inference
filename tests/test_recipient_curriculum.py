@@ -13,8 +13,13 @@ import math
 import pytest
 
 from transfer_receipt_ai.ocr_unified import (
+    _combine_recipient_loss_weights,
+    _recipient_tail_loss_character_counts,
+    _recipient_tail_loss_policy,
+    _recipient_tail_loss_weights,
     _recipient_teacher_confidence_weights,
     _recipient_training_sample_weights,
+    _validate_recipient_tail_loss_policy,
     build_parser,
 )
 
@@ -216,6 +221,119 @@ def test_recipient_teacher_confidence_weights_require_finite_confidence_when_ena
         )
 
 
+def test_recipient_tail_loss_weights_are_train_only_and_default_to_one() -> None:
+    records = [_record("商户甲"), _record(None), _record("商户乙")]
+    policy = _recipient_tail_loss_policy(
+        rare_character_max_support=0,
+        rare_character_loss_weight=1.0,
+        long_text_min_length=0,
+        long_text_loss_weight=1.0,
+        records=records,
+    )
+
+    assert policy == {
+        "mode": "none",
+        "rare_character_max_support": 0,
+        "rare_character_loss_weight": 1.0,
+        "long_text_min_length": 0,
+        "long_text_loss_weight": 1.0,
+        "recipient_train_records": 2,
+        "rare_character_train_records": 0,
+        "long_text_train_records": 0,
+        "combined_boost_train_records": 0,
+    }
+    assert _recipient_tail_loss_weights(records, policy=policy) == [1.0, 1.0, 1.0]
+
+
+def test_recipient_tail_loss_uses_global_train_counts_and_max_not_product() -> None:
+    """A rare long target gets one bounded CTC boost, never a product."""
+    records = [
+        _record("甲"),  # rare only
+        _record("常常常常"),  # long only
+        _record("乙常常常"),  # rare and long
+        _record("常常"),  # ordinary under complete train-split counts
+        _record(None),
+    ]
+    policy = _recipient_tail_loss_policy(
+        rare_character_max_support=1,
+        rare_character_loss_weight=2.5,
+        long_text_min_length=4,
+        long_text_loss_weight=3.5,
+        records=records,
+    )
+    train_counts = _recipient_tail_loss_character_counts(records)
+
+    assert _recipient_tail_loss_weights(
+        records,
+        policy=policy,
+        character_counts=train_counts,
+    ) == [2.5, 3.5, 3.5, 1.0, 1.0]
+    assert policy["recipient_train_records"] == 4
+    assert policy["rare_character_train_records"] == 2
+    assert policy["long_text_train_records"] == 2
+    assert policy["combined_boost_train_records"] == 3
+    # The same ordinary row must remain ordinary in a shuffled one-row batch;
+    # its rare-character decision comes from the frozen whole-train count.
+    assert _recipient_tail_loss_weights(
+        [records[3]],
+        policy=policy,
+        character_counts=train_counts,
+    ) == [1.0]
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    (
+        ({"rare_character_max_support": -1}, "recipient_tail_rare_character_max_support"),
+        ({"rare_character_loss_weight": 0.99}, "recipient_tail_rare_character_loss_weight"),
+        ({"long_text_min_length": -1}, "recipient_tail_long_text_min_length"),
+        ({"long_text_loss_weight": math.inf}, "recipient_tail_long_text_loss_weight"),
+    ),
+)
+def test_recipient_tail_loss_policy_rejects_invalid_values(
+    kwargs: dict[str, object], message: str
+) -> None:
+    base: dict[str, object] = {
+        "rare_character_max_support": 0,
+        "rare_character_loss_weight": 1.0,
+        "long_text_min_length": 0,
+        "long_text_loss_weight": 1.0,
+    }
+    base.update(kwargs)
+
+    with pytest.raises(ValueError, match=message):
+        _recipient_tail_loss_policy(records=[_record("商户甲")], **base)  # type: ignore[arg-type]
+
+
+def test_recipient_tail_loss_policy_requires_complete_self_consistent_audit() -> None:
+    policy = _recipient_tail_loss_policy(
+        rare_character_max_support=1,
+        rare_character_loss_weight=2.0,
+        long_text_min_length=3,
+        long_text_loss_weight=1.5,
+        records=[_record("甲"), _record("乙常常"), _record("常常")],
+    )
+    assert _validate_recipient_tail_loss_policy(policy) == policy
+
+    partial = dict(policy)
+    partial.pop("combined_boost_train_records")
+    with pytest.raises(ValueError, match="recipient tail loss policy"):
+        _validate_recipient_tail_loss_policy(partial)
+
+    inconsistent = {**policy, "combined_boost_train_records": 0}
+    with pytest.raises(ValueError, match="recipient tail loss policy"):
+        _validate_recipient_tail_loss_policy(inconsistent)
+
+
+def test_recipient_tail_loss_multiplies_teacher_confidence_without_cross_tail_product() -> None:
+    """The two independent loss policies combine per recipient row only."""
+    assert _combine_recipient_loss_weights([0.4, 1.0, 0.7], [2.5, 3.5, 1.0]) == pytest.approx(
+        [1.0, 3.5, 0.7]
+    )
+    assert _combine_recipient_loss_weights(None, [2.5]) == [2.5]
+    assert _combine_recipient_loss_weights([0.5], None) == [0.5]
+
+
 def test_train_cli_forwards_recipient_curriculum_options() -> None:
     args = build_parser().parse_args(
         [
@@ -238,6 +356,14 @@ def test_train_cli_forwards_recipient_curriculum_options() -> None:
             "0.35",
             "--recipient-confidence-curriculum-epochs",
             "8",
+            "--recipient-tail-rare-character-max-support",
+            "4",
+            "--recipient-tail-rare-character-loss-weight",
+            "2.5",
+            "--recipient-tail-long-text-min-length",
+            "10",
+            "--recipient-tail-long-text-loss-weight",
+            "3.5",
             "--recipient-train-augmentation",
             "light_v1",
         ]
@@ -250,4 +376,8 @@ def test_train_cli_forwards_recipient_curriculum_options() -> None:
     assert args.recipient_low_confidence_threshold == 0.95
     assert args.recipient_low_confidence_loss_weight == 0.35
     assert args.recipient_confidence_curriculum_epochs == 8
+    assert args.recipient_tail_rare_character_max_support == 4
+    assert args.recipient_tail_rare_character_loss_weight == 2.5
+    assert args.recipient_tail_long_text_min_length == 10
+    assert args.recipient_tail_long_text_loss_weight == 3.5
     assert args.recipient_train_augmentation == "light_v1"

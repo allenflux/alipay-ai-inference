@@ -855,6 +855,243 @@ def _recipient_teacher_confidence_weights(
     return weights
 
 
+def _recipient_tail_loss_character_counts(records: Sequence[Mapping[str, object]]) -> Counter[str]:
+    """Count recipient characters from the train split only."""
+    counts: Counter[str] = Counter()
+    for record in records:
+        slot = _recipient_slot(record)
+        text = slot.get("text") if slot is not None else None
+        if isinstance(text, str) and text:
+            counts.update(text)
+    return counts
+
+
+def _recipient_tail_loss_config(
+    *,
+    rare_character_max_support: int,
+    rare_character_loss_weight: float,
+    long_text_min_length: int,
+    long_text_loss_weight: float,
+) -> dict[str, object]:
+    """Validate the static controls for bounded recipient-tail CTC boosts."""
+    integer_values = {
+        "recipient_tail_rare_character_max_support": rare_character_max_support,
+        "recipient_tail_long_text_min_length": long_text_min_length,
+    }
+    normalized_integers: dict[str, int] = {}
+    for name, value in integer_values.items():
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"{name} must be a non-negative integer")
+        normalized_integers[name] = int(value)
+    numeric_values = {
+        "recipient_tail_rare_character_loss_weight": rare_character_loss_weight,
+        "recipient_tail_long_text_loss_weight": long_text_loss_weight,
+    }
+    normalized_weights: dict[str, float] = {}
+    for name, raw_value in numeric_values.items():
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError):
+            raise ValueError(f"{name} must be finite and at least 1") from None
+        if not math.isfinite(value) or value < 1.0:
+            raise ValueError(f"{name} must be finite and at least 1")
+        normalized_weights[name] = value
+    rare_enabled = (
+        normalized_integers["recipient_tail_rare_character_max_support"] > 0
+        and normalized_weights["recipient_tail_rare_character_loss_weight"] > 1.0
+    )
+    long_enabled = (
+        normalized_integers["recipient_tail_long_text_min_length"] > 0
+        and normalized_weights["recipient_tail_long_text_loss_weight"] > 1.0
+    )
+    return {
+        "mode": "rare_long_tail_ctc_v1" if rare_enabled or long_enabled else "none",
+        "rare_character_max_support": normalized_integers[
+            "recipient_tail_rare_character_max_support"
+        ],
+        "rare_character_loss_weight": normalized_weights[
+            "recipient_tail_rare_character_loss_weight"
+        ],
+        "long_text_min_length": normalized_integers["recipient_tail_long_text_min_length"],
+        "long_text_loss_weight": normalized_weights["recipient_tail_long_text_loss_weight"],
+    }
+
+
+def _recipient_tail_loss_flags(
+    text: str | None,
+    *,
+    policy: Mapping[str, object],
+    character_counts: Mapping[str, int],
+) -> tuple[bool, bool]:
+    """Return active rare/long tail conditions for one recipient label."""
+    if not isinstance(text, str) or not text:
+        return False, False
+    rare_max_support = int(policy["rare_character_max_support"])
+    rare_weight = float(policy["rare_character_loss_weight"])
+    long_min_length = int(policy["long_text_min_length"])
+    long_weight = float(policy["long_text_loss_weight"])
+    rare = (
+        rare_max_support > 0
+        and rare_weight > 1.0
+        and any(character_counts.get(character, 0) <= rare_max_support for character in text)
+    )
+    long = long_min_length > 0 and long_weight > 1.0 and len(text) >= long_min_length
+    return rare, long
+
+
+def _recipient_tail_loss_policy(
+    *,
+    rare_character_max_support: int,
+    rare_character_loss_weight: float,
+    long_text_min_length: int,
+    long_text_loss_weight: float,
+    records: Sequence[Mapping[str, object]],
+    character_counts: Mapping[str, int] | None = None,
+) -> dict[str, object]:
+    """Freeze a tail-loss recipe plus its exact train-split hit audit.
+
+    The static configuration records the requested loss boosts.  The audit
+    counts prove how many recipient labels actually received each condition
+    on this training split, which makes a later 90% decision reviewable
+    without changing the DataLoader distribution.
+    """
+    config = _recipient_tail_loss_config(
+        rare_character_max_support=rare_character_max_support,
+        rare_character_loss_weight=rare_character_loss_weight,
+        long_text_min_length=long_text_min_length,
+        long_text_loss_weight=long_text_loss_weight,
+    )
+    counts = (
+        _recipient_tail_loss_character_counts(records)
+        if character_counts is None
+        else character_counts
+    )
+    recipient_records = 0
+    rare_hits = 0
+    long_hits = 0
+    combined_hits = 0
+    for record in records:
+        slot = _recipient_slot(record)
+        text = slot.get("text") if slot is not None else None
+        if not isinstance(text, str) or not text:
+            continue
+        recipient_records += 1
+        rare, long = _recipient_tail_loss_flags(text, policy=config, character_counts=counts)
+        rare_hits += int(rare)
+        long_hits += int(long)
+        combined_hits += int(rare or long)
+    return {
+        **config,
+        "recipient_train_records": recipient_records,
+        "rare_character_train_records": rare_hits,
+        "long_text_train_records": long_hits,
+        "combined_boost_train_records": combined_hits,
+    }
+
+
+def _validate_recipient_tail_loss_policy(policy: object) -> dict[str, object]:
+    """Validate persisted recipient-tail loss provenance without an ABI change."""
+    if not isinstance(policy, Mapping):
+        raise ValueError("recipient tail loss policy is missing or invalid")
+    try:
+        config = _recipient_tail_loss_config(
+            rare_character_max_support=policy.get("rare_character_max_support"),
+            rare_character_loss_weight=policy.get("rare_character_loss_weight"),
+            long_text_min_length=policy.get("long_text_min_length"),
+            long_text_loss_weight=policy.get("long_text_loss_weight"),
+        )
+    except ValueError as error:
+        raise ValueError("recipient tail loss policy is invalid") from error
+    audit_keys = (
+        "recipient_train_records",
+        "rare_character_train_records",
+        "long_text_train_records",
+        "combined_boost_train_records",
+    )
+    if policy.get("mode") != config["mode"] or set(policy) != {*config, *audit_keys}:
+        raise ValueError("recipient tail loss policy is invalid")
+    audit: dict[str, int] = {}
+    for key in audit_keys:
+        value = policy.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError("recipient tail loss policy is invalid")
+        audit[key] = value
+    recipient_records = audit["recipient_train_records"]
+    rare_hits = audit["rare_character_train_records"]
+    long_hits = audit["long_text_train_records"]
+    combined_hits = audit["combined_boost_train_records"]
+    rare_enabled = (
+        int(config["rare_character_max_support"]) > 0
+        and float(config["rare_character_loss_weight"]) > 1.0
+    )
+    long_enabled = (
+        int(config["long_text_min_length"]) > 0
+        and float(config["long_text_loss_weight"]) > 1.0
+    )
+    if (
+        rare_hits > recipient_records
+        or long_hits > recipient_records
+        or combined_hits > recipient_records
+        or (not rare_enabled and rare_hits != 0)
+        or (not long_enabled and long_hits != 0)
+        or combined_hits < max(rare_hits, long_hits)
+        or combined_hits > rare_hits + long_hits
+    ):
+        raise ValueError("recipient tail loss policy is invalid")
+    return {**config, **audit}
+
+
+def _recipient_tail_loss_weights(
+    records: Sequence[Mapping[str, object]],
+    *,
+    policy: object,
+    character_counts: Mapping[str, int] | None = None,
+) -> list[float]:
+    """Return bounded recipient-CTC boosts for rows from one train batch.
+
+    ``character_counts`` is normally frozen from the complete training split,
+    then reused for shuffled batches.  The optional all-record fallback keeps
+    this helper pure and straightforward to test.
+    """
+    normalized = _validate_recipient_tail_loss_policy(policy)
+    if normalized["mode"] == "none":
+        return [1.0] * len(records)
+    counts = (
+        _recipient_tail_loss_character_counts(records)
+        if character_counts is None
+        else character_counts
+    )
+    weights: list[float] = []
+    for record in records:
+        slot = _recipient_slot(record)
+        text = slot.get("text") if slot is not None else None
+        rare, long = _recipient_tail_loss_flags(text, policy=normalized, character_counts=counts)
+        weights.append(
+            max(
+                1.0,
+                float(normalized["rare_character_loss_weight"]) if rare else 1.0,
+                float(normalized["long_text_loss_weight"]) if long else 1.0,
+            )
+        )
+    return weights
+
+
+def _combine_recipient_loss_weights(
+    confidence_weights: Sequence[float] | None,
+    tail_weights: Sequence[float] | None,
+) -> list[float] | None:
+    """Combine independent recipient-only loss policies without cross-field effects."""
+    if confidence_weights is None and tail_weights is None:
+        return None
+    if confidence_weights is None:
+        return [float(weight) for weight in tail_weights or ()]
+    if tail_weights is None:
+        return [float(weight) for weight in confidence_weights]
+    if len(confidence_weights) != len(tail_weights):
+        raise ValueError("recipient confidence and tail loss weights must have the same length")
+    return [float(confidence) * float(tail) for confidence, tail in zip(confidence_weights, tail_weights)]
+
+
 def _recipient_train_augmentation_policy(*, mode: str, seed: int) -> dict[str, object]:
     """Freeze the small v12-only recipient perturbation policy used in train."""
     if isinstance(seed, bool) or not isinstance(seed, int):
@@ -983,6 +1220,7 @@ def _recipient_artifact_metadata(
     *,
     recipient_sampling_policy: object | None = None,
     recipient_confidence_policy: object | None = None,
+    recipient_tail_loss_policy: object | None = None,
     recipient_train_augmentation_policy: object | None = None,
 ) -> dict[str, object]:
     """Build frozen fifth-slot metadata for checkpoints and ONNX sidecars."""
@@ -1004,6 +1242,10 @@ def _recipient_artifact_metadata(
         if recipient_confidence_policy is not None:
             metadata["recipient_confidence_policy"] = _validate_recipient_confidence_policy(
                 recipient_confidence_policy
+            )
+        if recipient_tail_loss_policy is not None:
+            metadata["recipient_tail_loss_policy"] = _validate_recipient_tail_loss_policy(
+                recipient_tail_loss_policy
             )
         if recipient_train_augmentation_policy is not None:
             metadata["recipient_train_augmentation_policy"] = _validate_recipient_train_augmentation_policy(
@@ -5114,6 +5356,10 @@ def train_unified_reader(
     recipient_low_confidence_threshold: float | None = None,
     recipient_low_confidence_loss_weight: float = 1.0,
     recipient_confidence_curriculum_epochs: int = 0,
+    recipient_tail_rare_character_max_support: int = 0,
+    recipient_tail_rare_character_loss_weight: float = 1.0,
+    recipient_tail_long_text_min_length: int = 0,
+    recipient_tail_long_text_loss_weight: float = 1.0,
     recipient_train_augmentation: str = "none",
     recipient_only_fine_tune: bool = False,
     validation_every: int = 1,
@@ -5179,6 +5425,12 @@ def train_unified_reader(
         low_confidence_loss_weight=recipient_low_confidence_loss_weight,
         curriculum_epochs=recipient_confidence_curriculum_epochs,
     )
+    recipient_tail_loss_config = _recipient_tail_loss_config(
+        rare_character_max_support=recipient_tail_rare_character_max_support,
+        rare_character_loss_weight=recipient_tail_rare_character_loss_weight,
+        long_text_min_length=recipient_tail_long_text_min_length,
+        long_text_loss_weight=recipient_tail_long_text_loss_weight,
+    )
     recipient_train_augmentation_policy = _recipient_train_augmentation_policy(
         mode=recipient_train_augmentation,
         seed=seed,
@@ -5204,11 +5456,12 @@ def train_unified_reader(
             )
         )
         or recipient_confidence_policy["mode"] != "none"
+        or recipient_tail_loss_config["mode"] != "none"
         or recipient_train_augmentation_policy["mode"] != "none"
     )
     if not (_is_v11(config) or _is_v12(config)) and recipient_training_options_requested:
         raise ValueError(
-            "recipient sampling/confidence curriculum is supported only by architecture v11 or v12"
+            "recipient sampling/confidence/tail-loss curriculum is supported only by architecture v11 or v12"
         )
     if not _is_v12(config) and recipient_train_augmentation_policy["mode"] != "none":
         raise ValueError("recipient_train_augmentation is supported only by architecture v12")
@@ -5348,6 +5601,15 @@ def train_unified_reader(
         ]
         if not training_records:
             raise ValueError("recipient_only_fine_tune requires at least one train receipt with recipient_field")
+    recipient_tail_loss_character_counts = _recipient_tail_loss_character_counts(training_records)
+    recipient_tail_loss_policy = _recipient_tail_loss_policy(
+        rare_character_max_support=recipient_tail_rare_character_max_support,
+        rare_character_loss_weight=recipient_tail_rare_character_loss_weight,
+        long_text_min_length=recipient_tail_long_text_min_length,
+        long_text_loss_weight=recipient_tail_long_text_loss_weight,
+        records=training_records,
+        character_counts=recipient_tail_loss_character_counts,
+    )
     target_device = _resolve_device(torch, device)
     uses_cuda = target_device.startswith("cuda")
     random.seed(seed)
@@ -5586,11 +5848,13 @@ def train_unified_reader(
                     "recipient_oov_by_split": recipient_oov,
                     "recipient_sampling_policy": recipient_sampling_policy,
                     "recipient_confidence_policy": recipient_confidence_policy,
+                    "recipient_tail_loss_policy": recipient_tail_loss_policy,
                     "recipient_train_augmentation_policy": recipient_train_augmentation_policy,
                     **_recipient_artifact_metadata(
                         config,
                         recipient_sampling_policy=recipient_sampling_policy,
                         recipient_confidence_policy=recipient_confidence_policy,
+                        recipient_tail_loss_policy=recipient_tail_loss_policy,
                         recipient_train_augmentation_policy=recipient_train_augmentation_policy,
                     ),
                 }
@@ -5650,7 +5914,7 @@ def train_unified_reader(
                 recipient_logits = outputs.get("recipient_logits")
                 structured_outputs = outputs if _uses_structured_heads(config) else None
             optimizer.zero_grad(set_to_none=True)
-            recipient_sample_weights = (
+            recipient_confidence_weights = (
                 _recipient_teacher_confidence_weights(
                     batch_records,
                     low_confidence_threshold=recipient_low_confidence_threshold,
@@ -5660,6 +5924,19 @@ def train_unified_reader(
                 )
                 if recipient_confidence_policy["mode"] != "none"
                 else None
+            )
+            recipient_tail_weights = (
+                _recipient_tail_loss_weights(
+                    batch_records,
+                    policy=recipient_tail_loss_policy,
+                    character_counts=recipient_tail_loss_character_counts,
+                )
+                if recipient_tail_loss_policy["mode"] != "none"
+                else None
+            )
+            recipient_sample_weights = _combine_recipient_loss_weights(
+                recipient_confidence_weights,
+                recipient_tail_weights,
             )
             loss, _ = _batch_loss(
                 amount_logits,
@@ -5847,11 +6124,13 @@ def train_unified_reader(
                     "recipient_oov_by_split": recipient_oov,
                     "recipient_sampling_policy": recipient_sampling_policy,
                     "recipient_confidence_policy": recipient_confidence_policy,
+                    "recipient_tail_loss_policy": recipient_tail_loss_policy,
                     "recipient_train_augmentation_policy": recipient_train_augmentation_policy,
                     **_recipient_artifact_metadata(
                         config,
                         recipient_sampling_policy=recipient_sampling_policy,
                         recipient_confidence_policy=recipient_confidence_policy,
+                        recipient_tail_loss_policy=recipient_tail_loss_policy,
                         recipient_train_augmentation_policy=recipient_train_augmentation_policy,
                     ),
                 }
@@ -5912,6 +6191,7 @@ def train_unified_reader(
                 "recipient_loss_weight": recipient_loss_weight,
                 "recipient_sampling_policy": recipient_sampling_policy,
                 "recipient_confidence_policy": recipient_confidence_policy,
+                "recipient_tail_loss_policy": recipient_tail_loss_policy,
                 "recipient_train_augmentation_policy": recipient_train_augmentation_policy,
                 "checkpoint_selection_policy": checkpoint_selection_policy,
                 "initialization": initialization,
@@ -6108,6 +6388,7 @@ def _checkpoint_labels(
                     config,
                     recipient_sampling_policy=payload.get("recipient_sampling_policy"),
                     recipient_confidence_policy=payload.get("recipient_confidence_policy"),
+                    recipient_tail_loss_policy=payload.get("recipient_tail_loss_policy"),
                     recipient_train_augmentation_policy=payload.get("recipient_train_augmentation_policy"),
                 )
             recipient = list(raw_recipient)
@@ -6258,6 +6539,7 @@ def export_unified_onnx(
             config,
             recipient_sampling_policy=payload.get("recipient_sampling_policy"),
             recipient_confidence_policy=payload.get("recipient_confidence_policy"),
+            recipient_tail_loss_policy=payload.get("recipient_tail_loss_policy"),
             recipient_train_augmentation_policy=payload.get("recipient_train_augmentation_policy"),
         )
         if recipient_characters is not None
@@ -6986,6 +7268,7 @@ def _load_onnx_artifact_details(
                     config,
                     recipient_sampling_policy=labels.get("recipient_sampling_policy"),
                     recipient_confidence_policy=labels.get("recipient_confidence_policy"),
+                    recipient_tail_loss_policy=labels.get("recipient_tail_loss_policy"),
                     recipient_train_augmentation_policy=labels.get("recipient_train_augmentation_policy"),
                 )
                 for key, expected_value in expected_recipient_metadata.items():
@@ -8618,6 +8901,42 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     train.add_argument(
+        "--recipient-tail-rare-character-max-support",
+        type=int,
+        default=0,
+        help=(
+            "v11/v12 only: recipient CTC loss boost applies when a target contains a character seen at most "
+            "this many times in the train split; 0 disables the rare-character tail boost"
+        ),
+    )
+    train.add_argument(
+        "--recipient-tail-rare-character-loss-weight",
+        type=float,
+        default=1.0,
+        help=(
+            "v11/v12 only: bounded recipient CTC loss weight (at least 1) for a rare-character tail target; "
+            "this does not change receipt sampling"
+        ),
+    )
+    train.add_argument(
+        "--recipient-tail-long-text-min-length",
+        type=int,
+        default=0,
+        help=(
+            "v11/v12 only: recipient CTC loss boost applies to values with at least this many Unicode code points; "
+            "0 disables the long-text tail boost"
+        ),
+    )
+    train.add_argument(
+        "--recipient-tail-long-text-loss-weight",
+        type=float,
+        default=1.0,
+        help=(
+            "v11/v12 only: bounded recipient CTC loss weight (at least 1) for a long-text tail target; "
+            "rare and long boosts use max(), never a product"
+        ),
+    )
+    train.add_argument(
         "--recipient-train-augmentation",
         choices=("none", "light_v1"),
         default="none",
@@ -8928,6 +9247,10 @@ def main(argv: list[str] | None = None) -> None:
                 recipient_low_confidence_threshold=args.recipient_low_confidence_threshold,
                 recipient_low_confidence_loss_weight=args.recipient_low_confidence_loss_weight,
                 recipient_confidence_curriculum_epochs=args.recipient_confidence_curriculum_epochs,
+                recipient_tail_rare_character_max_support=args.recipient_tail_rare_character_max_support,
+                recipient_tail_rare_character_loss_weight=args.recipient_tail_rare_character_loss_weight,
+                recipient_tail_long_text_min_length=args.recipient_tail_long_text_min_length,
+                recipient_tail_long_text_loss_weight=args.recipient_tail_long_text_loss_weight,
                 recipient_train_augmentation=args.recipient_train_augmentation,
                 recipient_only_fine_tune=args.recipient_only_fine_tune,
                 validation_every=args.validation_every,

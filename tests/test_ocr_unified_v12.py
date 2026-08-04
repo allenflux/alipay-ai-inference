@@ -32,6 +32,7 @@ from transfer_receipt_ai.ocr_unified import (
     _recipient_charset_source,
     _recipient_only_expansion_label_override,
     _recipient_only_logits,
+    _recipient_tail_loss_policy,
     _recipient_target_mode,
     _recipient_time_steps,
     _slot_order,
@@ -455,6 +456,13 @@ def test_v12_recipient_only_expansion_retains_a_missing_seed_character(tmp_path:
 
 def test_v12_metadata_freezes_the_two_static_input_shapes() -> None:
     config = _tiny_v12_config()
+    tail_policy = _recipient_tail_loss_policy(
+        rare_character_max_support=3,
+        rare_character_loss_weight=2.5,
+        long_text_min_length=10,
+        long_text_loss_weight=3.5,
+        records=[],
+    )
     restored = _checkpoint_config({"kind": KIND_V12, "config": asdict(config)})
     metadata = _recipient_artifact_metadata(
         config,
@@ -465,6 +473,16 @@ def test_v12_metadata_freezes_the_two_static_input_shapes() -> None:
             "train_records": 8,
             "replacement": True,
             "seed": 42,
+        },
+        recipient_tail_loss_policy=tail_policy,
+    )
+    legacy_metadata = _recipient_artifact_metadata(
+        config,
+        recipient_sampling_policy={
+            "mode": "uniform",
+            "recipient_sampling_weight": 1.0,
+            "recipient_train_records": 1,
+            "train_records": 1,
         },
     )
 
@@ -482,6 +500,10 @@ def test_v12_metadata_freezes_the_two_static_input_shapes() -> None:
     assert metadata["recipient_time_steps"] == 32
     assert metadata["recipient_branch_channels"] == 8
     assert metadata["recipient_input_preprocess"] == "left_trim_then_centered_aspect_resize_high_resolution"
+    assert metadata["recipient_tail_loss_policy"] == tail_policy
+    # Published checkpoints/sidecars before this train-only policy do not
+    # contain it.  Missing legacy provenance must remain loadable.
+    assert "recipient_tail_loss_policy" not in legacy_metadata
 
 
 def test_v12_train_export_ort_load_and_evaluate_two_static_inputs_when_onnx_is_available(
@@ -522,6 +544,10 @@ def test_v12_train_export_ort_load_and_evaluate_two_static_inputs_when_onnx_is_a
         payment_bank_prefix_min_support=1,
         recipient_loss_weight=3.0,
         recipient_sampling_weight=2.0,
+        recipient_tail_rare_character_max_support=1,
+        recipient_tail_rare_character_loss_weight=2.5,
+        recipient_tail_long_text_min_length=3,
+        recipient_tail_long_text_loss_weight=3.5,
     )
     model_path, labels_path, contract_path = export_unified_onnx(
         checkpoint_path=checkpoint,
@@ -544,6 +570,7 @@ def test_v12_train_export_ort_load_and_evaluate_two_static_inputs_when_onnx_is_a
         },
     )
     contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    labels = json.loads(labels_path.read_text(encoding="utf-8"))
     assert contract["kind"] == KIND_V12
     assert [item["name"] for item in contract["inputs"]] == ["field_images", "recipient_value_image"]
     assert [item["shape"] for item in contract["inputs"]] == [[5, 1, 32, 64], [1, 1, 32, 128]]
@@ -556,6 +583,15 @@ def test_v12_train_export_ort_load_and_evaluate_two_static_inputs_when_onnx_is_a
     assert loaded_config == config
     assert loaded_contract["kind"] == KIND_V12
     assert loaded_contract["recipient_input_name"] == "recipient_value_image"
+    expected_tail_policy = _recipient_tail_loss_policy(
+        rare_character_max_support=1,
+        rare_character_loss_weight=2.5,
+        long_text_min_length=3,
+        long_text_loss_weight=3.5,
+        records=[{"slots": {"recipient_field": {"text": "商户甲"}}}],
+    )
+    assert labels["recipient_tail_loss_policy"] == expected_tail_policy
+    assert contract["recipient_tail_loss_policy"] == expected_tail_policy
 
     summary, failures = evaluate_unified_onnx(
         model_path=model_path,

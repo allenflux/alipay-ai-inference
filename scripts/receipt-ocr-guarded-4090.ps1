@@ -15,6 +15,14 @@ param(
     [double]$PaymentFloor = 0.9325,
     [ValidateRange(0.0, 16.0)]
     [double]$RecipientLossWeight = 4.0,
+    [ValidateRange(0, 1000000)]
+    [int]$RecipientTailRareCharacterMaxSupport = 0,
+    [ValidateRange(1.0, 16.0)]
+    [double]$RecipientTailRareCharacterLossWeight = 1.0,
+    [ValidateRange(0, 1000000)]
+    [int]$RecipientTailLongTextMinLength = 0,
+    [ValidateRange(1.0, 16.0)]
+    [double]$RecipientTailLongTextLossWeight = 1.0,
     [ValidateRange(0.000001, 1.0)]
     [double]$LearningRate = 0.0001,
     [ValidateRange(0, 16)]
@@ -107,6 +115,7 @@ Write-Host "  records=$records"
 Write-Host "  output=$output"
 Write-Host ("  floors: amount={0:P2}, time={1:P2}, payment={2:P2}" -f $AmountFloor, $TimeFloor, $PaymentFloor)
 Write-Host ("  recipe: recipient-only, lr={0}, workers={1}, prefetch={2}, validate-every={3}, TF32=on, cuDNN-benchmark=on" -f $LearningRate, $NumWorkers, $PrefetchFactor, $ValidationEvery)
+Write-Host ("  recipient-tail CTC: rare-support<={0} x{1}; long-length>={2} x{3}; max(), no receipt resampling" -f $RecipientTailRareCharacterMaxSupport, $RecipientTailRareCharacterLossWeight, $RecipientTailLongTextMinLength, $RecipientTailLongTextLossWeight)
 Write-Host ("  recipient target: 90.00% strict exact ({0})" -f $(if ($DiagnosticOnly) { "diagnostic only" } else { "required" }))
 try {
     & nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
@@ -196,6 +205,10 @@ $trainArgs = @(
     "--recipient-low-confidence-threshold", "0.98",
     "--recipient-low-confidence-loss-weight", "0.35",
     "--recipient-confidence-curriculum-epochs", "10",
+    "--recipient-tail-rare-character-max-support", "$RecipientTailRareCharacterMaxSupport",
+    "--recipient-tail-rare-character-loss-weight", "$RecipientTailRareCharacterLossWeight",
+    "--recipient-tail-long-text-min-length", "$RecipientTailLongTextMinLength",
+    "--recipient-tail-long-text-loss-weight", "$RecipientTailLongTextLossWeight",
     "--recipient-train-augmentation", "light_v1",
     "--recipient-only-fine-tune",
     "--checkpoint-selection", "recipient_priority",
@@ -240,6 +253,12 @@ finally {
         $validatedRecords = @($summary.records | Where-Object { $_.validation_performed -ne $false })
         $eligible = @($summary.records | Where-Object checkpoint_selection_eligible).Count
         $recipientOov = $summary.recipient_oov_by_split.val
+        $tailPolicy = $summary.recipient_tail_loss_policy
+        $tailMode = if ($null -eq $tailPolicy) { "legacy/absent" } else { $tailPolicy.mode }
+        $tailRecipientRecords = if ($null -eq $tailPolicy) { "n/a" } else { $tailPolicy.recipient_train_records }
+        $tailRareHits = if ($null -eq $tailPolicy) { "n/a" } else { $tailPolicy.rare_character_train_records }
+        $tailLongHits = if ($null -eq $tailPolicy) { "n/a" } else { $tailPolicy.long_text_train_records }
+        $tailCombinedHits = if ($null -eq $tailPolicy) { "n/a" } else { $tailPolicy.combined_boost_train_records }
         $bestRecipientMetric = $null
         if ($null -ne $best -and $null -ne $best.val_candidate_text_by_field) {
             $bestRecipientMetric = $best.val_candidate_text_by_field.recipient_field
@@ -269,6 +288,11 @@ finally {
             FineTune = $summary.fine_tune_policy.mode
             TrainForward = $summary.fine_tune_policy.training_forward
             RecipientTrainRecords = $summary.fine_tune_policy.recipient_train_records
+            RecipientTailMode = $tailMode
+            RecipientTailTrainRecords = $tailRecipientRecords
+            RecipientTailRareHits = $tailRareHits
+            RecipientTailLongHits = $tailLongHits
+            RecipientTailCombinedBoostHits = $tailCombinedHits
             Initialization = $summary.initialization.mode
             FinancialLabelPolicy = $summary.initialization.financial_label_policy.mode
             Runtime = ("{0}; workers={1}; TF32={2}; cuDNN-benchmark={3}" -f $summary.training_runtime.cuda_device_name, $summary.training_runtime.num_workers, $summary.training_runtime.cuda_tf32_requested, $summary.training_runtime.cudnn_benchmark_requested)
