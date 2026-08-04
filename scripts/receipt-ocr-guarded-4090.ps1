@@ -15,6 +15,16 @@ param(
     [double]$PaymentFloor = 0.9325,
     [ValidateRange(0.0, 16.0)]
     [double]$RecipientLossWeight = 4.0,
+    # Keep the established teacher-confidence recipe as the default, but make
+    # it explicit for a later, evidence-led recipient-tail pilot.  The held-out
+    # slice report decides whether these values should move; ordinary runs do
+    # not silently change their label-noise policy.
+    [ValidateRange(0.0, 1.0)]
+    [double]$RecipientLowConfidenceThreshold = 0.98,
+    [ValidateRange(0.000001, 1.0)]
+    [double]$RecipientLowConfidenceLossWeight = 0.35,
+    [ValidateRange(0, 80)]
+    [int]$RecipientConfidenceCurriculumEpochs = 10,
     [ValidateRange(0, 1000000)]
     [int]$RecipientTailRareCharacterMaxSupport = 0,
     [ValidateRange(1.0, 16.0)]
@@ -116,6 +126,7 @@ Write-Host "  output=$output"
 Write-Host ("  floors: amount={0:P2}, time={1:P2}, payment={2:P2}" -f $AmountFloor, $TimeFloor, $PaymentFloor)
 $persistentWorkers = if ($NumWorkers -gt 0) { "on" } else { "off" }
 Write-Host ("  recipe: recipient-only, lr={0}, workers={1}, persistent-workers={2}, prefetch={3}, validate-every={4}, TF32=on, cuDNN-benchmark=on" -f $LearningRate, $NumWorkers, $persistentWorkers, $PrefetchFactor, $ValidationEvery)
+Write-Host ("  recipient teacher confidence: below {0} x{1}, curriculum-epochs={2}" -f $RecipientLowConfidenceThreshold, $RecipientLowConfidenceLossWeight, $RecipientConfidenceCurriculumEpochs)
 Write-Host ("  recipient-tail CTC: rare-support<={0} x{1}; long-length>={2} x{3}; max(), no receipt resampling" -f $RecipientTailRareCharacterMaxSupport, $RecipientTailRareCharacterLossWeight, $RecipientTailLongTextMinLength, $RecipientTailLongTextLossWeight)
 Write-Host ("  recipient target: 90.00% strict exact ({0})" -f $(if ($DiagnosticOnly) { "diagnostic only" } else { "required" }))
 try {
@@ -203,9 +214,9 @@ $trainArgs = @(
     "--recipient-sampling-weight", "1.0",
     "--recipient-rare-character-max-support", "0",
     "--recipient-long-text-min-length", "0",
-    "--recipient-low-confidence-threshold", "0.98",
-    "--recipient-low-confidence-loss-weight", "0.35",
-    "--recipient-confidence-curriculum-epochs", "10",
+    "--recipient-low-confidence-threshold", "$RecipientLowConfidenceThreshold",
+    "--recipient-low-confidence-loss-weight", "$RecipientLowConfidenceLossWeight",
+    "--recipient-confidence-curriculum-epochs", "$RecipientConfidenceCurriculumEpochs",
     "--recipient-tail-rare-character-max-support", "$RecipientTailRareCharacterMaxSupport",
     "--recipient-tail-rare-character-loss-weight", "$RecipientTailRareCharacterLossWeight",
     "--recipient-tail-long-text-min-length", "$RecipientTailLongTextMinLength",
