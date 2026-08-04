@@ -84,6 +84,11 @@ CHECKPOINT_SELECTION_RECIPIENT_PRIORITY = "recipient_priority"
 CHECKPOINT_SELECTION_MODES = frozenset(
     (CHECKPOINT_SELECTION_BALANCED, CHECKPOINT_SELECTION_RECIPIENT_PRIORITY)
 )
+INIT_CHECKPOINT_MODE_STRICT = "strict"
+INIT_CHECKPOINT_MODE_RECIPIENT_ONLY_EXPANSION = "recipient_only_expansion"
+INIT_CHECKPOINT_MODES = frozenset(
+    (INIT_CHECKPOINT_MODE_STRICT, INIT_CHECKPOINT_MODE_RECIPIENT_ONLY_EXPANSION)
+)
 # These are the mature text heads that must not silently regress while a
 # recipient-focused experiment chooses its checkpoint.  The values are supplied
 # by the caller from a baseline measured on the same validation split.
@@ -1930,6 +1935,19 @@ def _payment_bank_prefix_classes(
     return classes, {prefix: int(counts[prefix]) for prefix in retained}
 
 
+def _payment_bank_prefix_retained_counts(
+    records: Iterable[Mapping[str, object]], *, classes: Sequence[str]
+) -> dict[str, int]:
+    """Count the effective non-``__other__`` bank labels in a train split."""
+    counts = Counter(
+        target
+        for record in records
+        for target in [_payment_bank_prefix_target(record)]
+        if target is not None
+    )
+    return {prefix: int(counts[prefix]) for prefix in list(classes)[1:]}
+
+
 def _payment_bank_prefix_class_target(
     record: Mapping[str, object], *, classes: Sequence[str]
 ) -> int | None:
@@ -2193,9 +2211,13 @@ class _UnifiedReceiptDataset:
         *,
         config: UnifiedReaderConfig,
         recipient_train_augmentation_policy: Mapping[str, object] | None = None,
+        recipient_only: bool = False,
     ) -> None:
+        if recipient_only and not _is_v12(config):
+            raise ValueError("recipient_only dataset is supported only by architecture v12")
         self._records = list(records)
         self._config = config
+        self._recipient_only = recipient_only
         self._recipient_train_augmentation_policy = _validate_recipient_train_augmentation_policy(
             {"mode": "none"}
             if recipient_train_augmentation_policy is None
@@ -2214,6 +2236,18 @@ class _UnifiedReceiptDataset:
     def __getitem__(self, index: int) -> tuple[Any, ...]:
         record = self._records[index]
         torch, _ = _require_torch()
+        if self._recipient_only:
+            if _recipient_slot(record) is None:
+                raise ValueError("recipient_only dataset received a record without recipient_field")
+            recipient_value_image = _recipient_value_input_tensor(record, config=self._config)
+            if self._recipient_train_augmentation_policy["mode"] != "none":
+                recipient_value_image = _augment_recipient_value_input(
+                    recipient_value_image,
+                    record=record,
+                    policy=self._recipient_train_augmentation_policy,
+                    epoch=self._epoch,
+                )
+            return torch.from_numpy(recipient_value_image), record
         field_images = torch.from_numpy(_input_tensor(record, config=self._config))
         if _uses_high_resolution_recipient_input(self._config):
             recipient_value_image = _recipient_value_input_tensor(record, config=self._config)
@@ -2244,6 +2278,36 @@ def _collate_receipts(samples: Sequence[tuple[Any, ...]]) -> tuple[Any, ...]:
     return torch.stack(list(field_images)), list(records)
 
 
+def _collate_recipient_only(samples: Sequence[tuple[Any, Any]]) -> tuple[Any, list[Mapping[str, object]]]:
+    """Collate v12's private recipient input without loading financial slots."""
+    torch, _ = _require_torch()
+    recipient_value_images, records = zip(*samples)
+    return torch.stack(list(recipient_value_images)), list(records)
+
+
+def _recipient_only_logits(model: Any, recipient_value_images: Any, *, config: UnifiedReaderConfig) -> Any:
+    """Run only v12's private recipient branch during guarded fine-tuning.
+
+    The financial trunk and all of its heads are frozen in this mode.  Skipping
+    them is mathematically identical for recipient logits and avoids four
+    unnecessary crop decodes plus shared-trunk GPU work per training receipt.
+    Full five-field inference still runs for every validation epoch, where the
+    protection floors are measured.
+    """
+    if not _is_v12(config):
+        raise ValueError("recipient-only logits are supported only by architecture v12")
+    expected_shape = [recipient_value_images.shape[0], 1, config.recipient_input_height, config.recipient_input_width]
+    if list(recipient_value_images.shape) != expected_shape:
+        raise ValueError(
+            "recipient_value_images must have shape "
+            f"[batch,1,{config.recipient_input_height},{config.recipient_input_width}]"
+        )
+    encoded = model.recipient_encoder(model.recipient_stem(recipient_value_images))
+    features = model.recipient_ctc_vertical_reducer(encoded)
+    sequence, _ = model.recipient_ctc_sequence(features.permute(2, 0, 1))
+    return model.recipient_classifier(sequence)
+
+
 def _unpack_receipt_batch(
     batch: tuple[Any, ...], *, config: UnifiedReaderConfig
 ) -> tuple[Any, Any | None, list[Mapping[str, object]]]:
@@ -2265,12 +2329,14 @@ def _make_dataset(
     config: UnifiedReaderConfig,
     torch: Any,
     recipient_train_augmentation_policy: Mapping[str, object] | None = None,
+    recipient_only: bool = False,
 ) -> Any:
     del torch  # Kept in the signature so callers make the dependency explicit.
     return _UnifiedReceiptDataset(
         records,
         config=config,
         recipient_train_augmentation_policy=recipient_train_augmentation_policy,
+        recipient_only=recipient_only,
     )
 
 
@@ -4523,9 +4589,32 @@ def _checkpoint_selection_score(
     )
 
 
-def _parameter_only_initialization(
+def _label_map_sha256(values: Sequence[str]) -> str:
+    """Return an unambiguous provenance digest for an ordered label map."""
+    return hashlib.sha256("\0".join(values).encode("utf-8")).hexdigest()
+
+
+def _label_map_provenance(
+    source_values: Sequence[str], *, data_derived_values: Sequence[str]
+) -> dict[str, object]:
+    """Describe a frozen checkpoint map without serialising another full map.
+
+    The deployed checkpoint already persists the effective labels.  This small
+    record makes a recipient-only warm start auditable when the fresh r3
+    manifest would otherwise generate a different payment or bank map.
+    """
+    return {
+        "checkpoint_count": len(source_values),
+        "checkpoint_sha256": _label_map_sha256(source_values),
+        "data_derived_count": len(data_derived_values),
+        "data_derived_sha256": _label_map_sha256(data_derived_values),
+        "identical": list(source_values) == list(data_derived_values),
+    }
+
+
+def _recipient_only_expansion_label_override(
     *,
-    init_checkpoint: Path | None,
+    init_checkpoint: Path,
     config: UnifiedReaderConfig,
     amount_characters: Sequence[str],
     time_characters: Sequence[str],
@@ -4533,6 +4622,166 @@ def _parameter_only_initialization(
     recipient_characters: Sequence[str] | None,
     payment_bank_prefix_classes: Sequence[str] | None,
     torch: Any,
+) -> tuple[list[str], list[str], dict[str, object]]:
+    """Lock financial label semantics to a v12 seed for a recipient-only run.
+
+    A receipt manifest can gain/reorder payment text or bank-prefix labels
+    between r2 and r3.  Rebuilding those output maps would reinterpret frozen
+    financial classifier rows, even though recipient-only fine-tuning never
+    updates them.  This narrow preflight instead keeps the seed's financial
+    maps exactly, while permitting only an additive recipient Unicode charset.
+    """
+    if not _is_v12(config):
+        raise ValueError("recipient_only_expansion is supported only by architecture v12")
+    if recipient_characters is None or payment_bank_prefix_classes is None:
+        raise ValueError("recipient_only_expansion requires v12 recipient and payment bank label maps")
+    checkpoint_path = Path(init_checkpoint).resolve()
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(checkpoint_path)
+    payload = _load_checkpoint(checkpoint_path, torch=torch)
+    source_config = _checkpoint_config(payload)
+    if source_config != config:
+        raise ValueError(
+            "init checkpoint model config does not match the requested training config; "
+            "use the same architecture, input sizes, head widths, and decoder policy"
+        )
+    (
+        source_amount_characters,
+        source_time_characters,
+        source_payment_characters,
+        source_recipient_characters,
+        source_status_classes,
+        source_payment_bank_prefix_classes,
+    ) = _checkpoint_labels(payload, config=source_config)
+    for label, source_values, current_values in (
+        ("amount character map", source_amount_characters, amount_characters),
+        ("time character map", source_time_characters, time_characters),
+        ("status class map", source_status_classes, STATUS_CLASSES),
+    ):
+        if list(source_values) != list(current_values):
+            raise ValueError(f"init checkpoint {label} does not match the current training data")
+    if source_recipient_characters is None:
+        raise ValueError("init checkpoint recipient character map does not match the current training data")
+    missing_source_characters = sorted(set(source_recipient_characters) - set(recipient_characters))
+    if missing_source_characters:
+        raise ValueError(
+            "recipient_only_expansion cannot discard characters from the init checkpoint recipient map; "
+            f"missing={''.join(missing_source_characters)!r}"
+        )
+    if source_payment_bank_prefix_classes is None:
+        raise ValueError("init checkpoint payment bank-prefix class map does not match the current training data")
+    return (
+        list(source_payment_characters),
+        list(source_payment_bank_prefix_classes),
+        {
+            "mode": "checkpoint_financial_label_maps_v1",
+            "reason": (
+                "recipient-only v12 fine-tune freezes every non-recipient parameter, so payment and bank "
+                "classifier row semantics remain locked to the compatible seed checkpoint"
+            ),
+            "payment_character_map": _label_map_provenance(
+                source_payment_characters,
+                data_derived_values=payment_characters,
+            ),
+            "payment_bank_prefix_class_map": _label_map_provenance(
+                source_payment_bank_prefix_classes,
+                data_derived_values=payment_bank_prefix_classes,
+            ),
+            "recipient_character_map": {
+                "checkpoint_count": len(source_recipient_characters),
+                "checkpoint_sha256": _label_map_sha256(source_recipient_characters),
+                "data_derived_count": len(recipient_characters),
+                "data_derived_sha256": _label_map_sha256(recipient_characters),
+                "checkpoint_is_subset_of_data_derived": True,
+                "new_data_derived_character_count": len(
+                    set(recipient_characters) - set(source_recipient_characters)
+                ),
+            },
+        },
+    )
+
+
+def _recipient_classifier_unicode_expansion_state(
+    *,
+    source_state_dict: Mapping[str, object],
+    target_state_dict: Mapping[str, object],
+    source_recipient_characters: Sequence[str],
+    target_recipient_characters: Sequence[str],
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Map a compatible v12 recipient classifier by Unicode rather than row.
+
+    Only ``recipient_classifier`` depends on the recipient Unicode table.
+    Every other tensor must retain the seed's exact shape and value.  New
+    target characters intentionally keep the deterministically seeded target
+    initialisation until training observes them.
+    """
+    source_keys = set(source_state_dict)
+    target_keys = set(target_state_dict)
+    if source_keys != target_keys:
+        missing = sorted(str(key) for key in target_keys - source_keys)
+        unexpected = sorted(str(key) for key in source_keys - target_keys)
+        raise ValueError(
+            "init checkpoint model parameters do not match the recipient-only target model; "
+            f"missing={missing}, unexpected={unexpected}"
+        )
+    missing_source_characters = sorted(set(source_recipient_characters) - set(target_recipient_characters))
+    if missing_source_characters:
+        raise ValueError(
+            "recipient_only_expansion cannot discard characters from the init checkpoint recipient map; "
+            f"missing={''.join(missing_source_characters)!r}"
+        )
+    target_indices = {character: index + 1 for index, character in enumerate(target_recipient_characters)}
+    classifier_keys = ("recipient_classifier.weight", "recipient_classifier.bias")
+    adapted: dict[str, object] = dict(source_state_dict)
+    for key in source_keys:
+        source_value = source_state_dict[key]
+        target_value = target_state_dict[key]
+        source_shape = tuple(getattr(source_value, "shape", ()))
+        target_shape = tuple(getattr(target_value, "shape", ()))
+        if key not in classifier_keys:
+            if source_shape != target_shape:
+                raise ValueError(
+                    "init checkpoint model parameters do not match the recipient-only target model: "
+                    f"{key} has source shape {source_shape} but target shape {target_shape}"
+                )
+            continue
+        if not source_shape or not target_shape or source_shape[0] != len(source_recipient_characters) + 1:
+            raise ValueError(f"init checkpoint {key} does not match its recipient character map")
+        if target_shape[0] != len(target_recipient_characters) + 1 or source_shape[1:] != target_shape[1:]:
+            raise ValueError(f"recipient-only target {key} does not match its recipient character map")
+        if not hasattr(target_value, "detach") or not hasattr(source_value, "__getitem__"):
+            raise ValueError(f"init checkpoint {key} is not a tensor")
+        remapped = target_value.detach().clone()
+        remapped[0].copy_(source_value[0])
+        for source_index, character in enumerate(source_recipient_characters, start=1):
+            remapped[target_indices[character]].copy_(source_value[source_index])
+        adapted[key] = remapped
+    new_target_characters = [
+        character for character in target_recipient_characters if character not in set(source_recipient_characters)
+    ]
+    return adapted, {
+        "blank_row_copied": True,
+        "shared_character_rows_copied": len(source_recipient_characters),
+        "new_target_character_rows_kept_at_seed": len(new_target_characters),
+        "checkpoint_character_count": len(source_recipient_characters),
+        "target_character_count": len(target_recipient_characters),
+        "checkpoint_charset_sha256": _label_map_sha256(source_recipient_characters),
+        "target_charset_sha256": _label_map_sha256(target_recipient_characters),
+    }
+
+
+def _parameter_only_initialization(
+    *,
+    init_checkpoint: Path | None,
+    init_checkpoint_mode: str = INIT_CHECKPOINT_MODE_STRICT,
+    config: UnifiedReaderConfig,
+    amount_characters: Sequence[str],
+    time_characters: Sequence[str],
+    payment_characters: Sequence[str],
+    recipient_characters: Sequence[str] | None,
+    payment_bank_prefix_classes: Sequence[str] | None,
+    torch: Any,
+    target_state_dict: Mapping[str, object] | None = None,
 ) -> tuple[Mapping[str, object] | None, dict[str, object]]:
     """Load a compatible checkpoint as parameters only, never as a resume.
 
@@ -4542,7 +4791,14 @@ def _parameter_only_initialization(
     The caller gets a fresh optimiser, epoch counter, sampler state, and
     best-checkpoint history in every case.
     """
+    if init_checkpoint_mode not in INIT_CHECKPOINT_MODES:
+        raise ValueError(
+            "init_checkpoint_mode must be one of "
+            f"{', '.join(sorted(INIT_CHECKPOINT_MODES))}"
+        )
     if init_checkpoint is None:
+        if init_checkpoint_mode != INIT_CHECKPOINT_MODE_STRICT:
+            raise ValueError("recipient_only_expansion requires a compatible --init-checkpoint")
         return None, {
             "mode": "random",
             "optimizer_restored": False,
@@ -4570,7 +4826,6 @@ def _parameter_only_initialization(
         ("amount character map", source_amount_characters, amount_characters),
         ("time character map", source_time_characters, time_characters),
         ("payment character map", source_payment_characters, payment_characters),
-        ("recipient character map", source_recipient_characters, recipient_characters),
         ("status class map", source_status_classes, STATUS_CLASSES),
         (
             "payment bank-prefix class map",
@@ -4587,7 +4842,7 @@ def _parameter_only_initialization(
     state_dict = payload.get("state_dict")
     if not isinstance(state_dict, Mapping):
         raise ValueError("init checkpoint is missing model parameters")
-    return state_dict, {
+    initialization: dict[str, object] = {
         "mode": "parameter_only",
         "checkpoint_path": str(checkpoint_path),
         "checkpoint_sha256": _sha256(checkpoint_path),
@@ -4597,6 +4852,34 @@ def _parameter_only_initialization(
         "optimizer_restored": False,
         "epoch_reset": True,
     }
+    if init_checkpoint_mode == INIT_CHECKPOINT_MODE_STRICT:
+        if source_recipient_characters is None or recipient_characters is None:
+            if source_recipient_characters is not recipient_characters:
+                raise ValueError("init checkpoint recipient character map does not match the current training data")
+        elif list(source_recipient_characters) != list(recipient_characters):
+            raise ValueError("init checkpoint recipient character map does not match the current training data")
+        return state_dict, initialization
+
+    if not _is_v12(config):
+        raise ValueError("recipient_only_expansion is supported only by architecture v12")
+    if source_recipient_characters is None or recipient_characters is None:
+        raise ValueError("init checkpoint recipient character map does not match the current training data")
+    if target_state_dict is None:
+        raise ValueError("recipient_only_expansion requires a freshly initialised v12 target state")
+    remapped_state, row_mapping = _recipient_classifier_unicode_expansion_state(
+        source_state_dict=state_dict,
+        target_state_dict=target_state_dict,
+        source_recipient_characters=source_recipient_characters,
+        target_recipient_characters=recipient_characters,
+    )
+    initialization.update(
+        {
+            "mode": "parameter_only_recipient_unicode_expansion",
+            "init_checkpoint_mode": INIT_CHECKPOINT_MODE_RECIPIENT_ONLY_EXPANSION,
+            "recipient_classifier_row_mapping": row_mapping,
+        }
+    )
+    return remapped_state, initialization
 
 
 def _checkpoint_protection_report(
@@ -4717,6 +5000,7 @@ def train_unified_reader(
     checkpoint_min_time_candidate_exact: float | None = None,
     checkpoint_min_payment_candidate_exact: float | None = None,
     init_checkpoint: Path | None = None,
+    init_checkpoint_mode: str = INIT_CHECKPOINT_MODE_STRICT,
     ctc_loss_weight: float = 0.35,
     structured_loss_weight: float = 1.0,
     payment_bank_prefix_min_support: int = 3,
@@ -4741,6 +5025,18 @@ def train_unified_reader(
             raise ValueError("recipient_only_fine_tune is supported only by architecture v12")
         if init_checkpoint is None:
             raise ValueError("recipient_only_fine_tune requires a compatible --init-checkpoint")
+    if init_checkpoint_mode not in INIT_CHECKPOINT_MODES:
+        raise ValueError(
+            "init_checkpoint_mode must be one of "
+            f"{', '.join(sorted(INIT_CHECKPOINT_MODES))}"
+        )
+    if init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_ONLY_EXPANSION:
+        if not recipient_only_fine_tune or not _is_v12(config):
+            raise ValueError(
+                "recipient_only_expansion requires architecture v12 with recipient_only_fine_tune enabled"
+            )
+        if init_checkpoint is None:
+            raise ValueError("recipient_only_expansion requires a compatible --init-checkpoint")
     recipient_sampling_weights, recipient_sampling_policy = _recipient_training_sample_weights(
         (),
         recipient_sampling_weight=recipient_sampling_weight,
@@ -4849,8 +5145,7 @@ def train_unified_reader(
         _require_v8_structured_coverage(structured_counts)
     elif _uses_v6_protocol(config):
         _require_v6_structured_coverage(structured_counts)
-    payment_characters = _payment_charset(train_records)
-    payment_to_id = {character: index for index, character in enumerate(payment_characters, start=1)}
+    data_derived_payment_characters = _payment_charset(train_records)
     amount_characters = list(_amount_characters(config))
     amount_to_id = {character: index for index, character in enumerate(amount_characters, start=1)}
     time_characters = list(_time_characters(config))
@@ -4863,6 +5158,46 @@ def train_unified_reader(
     else:
         recipient_characters = None
         recipient_to_id = None
+    if _uses_modern_protocol(config):
+        data_derived_payment_bank_prefix_classes, data_derived_payment_bank_prefix_counts = _payment_bank_prefix_classes(
+            train_records,
+            min_support=payment_bank_prefix_min_support,
+        )
+    else:
+        data_derived_payment_bank_prefix_classes = None
+        data_derived_payment_bank_prefix_counts: dict[str, int] = {}
+
+    torch, _ = _require_torch()
+    payment_characters = list(data_derived_payment_characters)
+    payment_bank_prefix_classes = (
+        list(data_derived_payment_bank_prefix_classes)
+        if data_derived_payment_bank_prefix_classes is not None
+        else None
+    )
+    payment_bank_prefix_counts = dict(data_derived_payment_bank_prefix_counts)
+    financial_label_policy: dict[str, object] | None = None
+    if init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_ONLY_EXPANSION:
+        assert init_checkpoint is not None
+        assert payment_bank_prefix_classes is not None
+        (
+            payment_characters,
+            payment_bank_prefix_classes,
+            financial_label_policy,
+        ) = _recipient_only_expansion_label_override(
+            init_checkpoint=init_checkpoint,
+            config=config,
+            amount_characters=amount_characters,
+            time_characters=time_characters,
+            payment_characters=data_derived_payment_characters,
+            recipient_characters=recipient_characters,
+            payment_bank_prefix_classes=data_derived_payment_bank_prefix_classes,
+            torch=torch,
+        )
+        payment_bank_prefix_counts = _payment_bank_prefix_retained_counts(
+            train_records,
+            classes=payment_bank_prefix_classes,
+        )
+    payment_to_id = {character: index for index, character in enumerate(payment_characters, start=1)}
     _validate_ctc_capacity(records, config=config, recipient_characters=recipient_characters)
     status_to_id = {name: index for index, name in enumerate(STATUS_CLASSES)}
     payment_oov = _payment_oov_by_split(records, payment_characters=set(payment_characters))
@@ -4871,21 +5206,18 @@ def train_unified_reader(
         if recipient_characters is not None
         else None
     )
-    if _uses_modern_protocol(config):
-        payment_bank_prefix_classes, payment_bank_prefix_counts = _payment_bank_prefix_classes(
-            train_records,
-            min_support=payment_bank_prefix_min_support,
-        )
-        payment_bank_prefix_oov = _payment_bank_prefix_oov_by_split(
-            records,
-            classes=payment_bank_prefix_classes,
-        )
-    else:
-        payment_bank_prefix_classes = None
-        payment_bank_prefix_counts: dict[str, int] = {}
-        payment_bank_prefix_oov: dict[str, dict[str, int]] = {}
-
-    torch, _ = _require_torch()
+    payment_bank_prefix_oov = (
+        _payment_bank_prefix_oov_by_split(records, classes=payment_bank_prefix_classes)
+        if payment_bank_prefix_classes is not None
+        else {}
+    )
+    training_records = train_records
+    if recipient_only_fine_tune:
+        training_records = [
+            record for record in train_records if _slot_text(record, "recipient_field") is not None
+        ]
+        if not training_records:
+            raise ValueError("recipient_only_fine_tune requires at least one train receipt with recipient_field")
     target_device = _resolve_device(torch, device)
     uses_cuda = target_device.startswith("cuda")
     random.seed(seed)
@@ -4919,6 +5251,7 @@ def train_unified_reader(
         "persistent_workers": persistent_workers,
         "cuda_tf32_requested": cuda_tf32,
         "cudnn_benchmark_requested": cudnn_benchmark,
+        "recipient_only_private_branch_training": recipient_only_fine_tune,
     }
     if uses_cuda:
         try:
@@ -4926,7 +5259,7 @@ def train_unified_reader(
         except (AttributeError, RuntimeError):
             training_runtime["cuda_device_name"] = "unavailable"
 
-    if payment_bank_prefix_classes is not None:
+    if payment_bank_prefix_classes is not None and not recipient_only_fine_tune:
         payment_bank_train_weights, payment_bank_train_counts = _payment_bank_prefix_class_weights(
             train_records,
             classes=payment_bank_prefix_classes,
@@ -4935,19 +5268,24 @@ def train_unified_reader(
         )
     else:
         payment_bank_train_weights = None
-        payment_bank_train_counts: dict[str, int] = {}
+        payment_bank_train_counts = (
+            _payment_bank_prefix_retained_counts(train_records, classes=payment_bank_prefix_classes)
+            if payment_bank_prefix_classes is not None
+            else {}
+        )
 
     train_dataset = _make_dataset(
-        train_records,
+        training_records,
         config=config,
         torch=torch,
         recipient_train_augmentation_policy=(
             recipient_train_augmentation_policy if _is_v12(config) else None
         ),
+        recipient_only=recipient_only_fine_tune,
     )
     validation_dataset = _make_dataset(validation_records, config=config, torch=torch)
     sample_weights, recipient_sampling_policy = _recipient_training_sample_weights(
-        train_records,
+        training_records,
         recipient_sampling_weight=recipient_sampling_weight,
         recipient_rare_character_max_support=recipient_rare_character_max_support,
         recipient_rare_character_sampling_weight=recipient_rare_character_sampling_weight,
@@ -4963,7 +5301,7 @@ def train_unified_reader(
         generator.manual_seed(seed)
         train_sampler = torch.utils.data.WeightedRandomSampler(
             sample_weights_tensor,
-            num_samples=len(train_records),
+            num_samples=len(training_records),
             replacement=True,
             generator=generator,
         )
@@ -4992,7 +5330,7 @@ def train_unified_reader(
         shuffle=train_sampler is None,
         sampler=train_sampler,
         num_workers=num_workers,
-        collate_fn=_collate_receipts,
+        collate_fn=_collate_recipient_only if recipient_only_fine_tune else _collate_receipts,
         pin_memory=uses_cuda,
         **loader_performance_kwargs,
     )
@@ -5010,9 +5348,10 @@ def train_unified_reader(
         config=config,
         payment_bank_prefix_vocab_size=(len(payment_bank_prefix_classes) if payment_bank_prefix_classes is not None else None),
         recipient_vocab_size=(len(recipient_characters) + 1 if recipient_characters is not None else None),
-    ).to(target_device)
+    )
     initialization_state, initialization = _parameter_only_initialization(
         init_checkpoint=init_checkpoint,
+        init_checkpoint_mode=init_checkpoint_mode,
         config=config,
         amount_characters=amount_characters,
         time_characters=time_characters,
@@ -5020,11 +5359,18 @@ def train_unified_reader(
         recipient_characters=recipient_characters,
         payment_bank_prefix_classes=payment_bank_prefix_classes,
         torch=torch,
+        target_state_dict=model.state_dict(),
     )
     if initialization_state is not None:
         # This is intentionally strict: equal tensor shapes are insufficient
         # when a CTC character or classifier-class ordering has changed.
         model.load_state_dict(initialization_state, strict=True)
+    if financial_label_policy is not None:
+        initialization = {
+            **initialization,
+            "financial_label_policy": financial_label_policy,
+        }
+    model = model.to(target_device)
     fine_tune_policy: dict[str, object] = {
         "mode": "all_parameters",
         "trainable_parameter_count": sum(parameter.numel() for parameter in model.parameters()),
@@ -5044,6 +5390,9 @@ def train_unified_reader(
                 parameter.numel() for parameter in model.parameters() if not parameter.requires_grad
             ),
             "frozen_parameter_prefix_exclusion": "recipient_",
+            "training_forward": "private_recipient_branch_only_v12",
+            "source_train_records": len(train_records),
+            "recipient_train_records": len(training_records),
         }
     if bool(status_policy["training_enabled"]):
         total_status = sum(status_counts["train"].values())
@@ -5060,8 +5409,9 @@ def train_unified_reader(
         # to review by delivery code.
         status_train_criterion = None
         status_validation_criterion = None
+    trainable_parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
     optimizer = torch.optim.AdamW(
-        (parameter for parameter in model.parameters() if parameter.requires_grad),
+        trainable_parameters,
         lr=learning_rate,
         weight_decay=weight_decay,
     )
@@ -5134,19 +5484,32 @@ def train_unified_reader(
         total_loss_tensor: Any | None = None
         total_receipts = 0
         for batch in train_loader:
-            field_images, recipient_value_images, batch_records = _unpack_receipt_batch(batch, config=config)
-            field_images = field_images.to(target_device, non_blocking=uses_cuda)
-            if recipient_value_images is not None:
+            if recipient_only_fine_tune:
+                recipient_value_images, batch_records = batch
                 recipient_value_images = recipient_value_images.to(target_device, non_blocking=uses_cuda)
+                recipient_logits = _recipient_only_logits(
+                    model,
+                    recipient_value_images,
+                    config=config,
+                )
+                amount_logits = time_logits = payment_logits = status_logits = None
+                structured_outputs = None
+            else:
+                field_images, recipient_value_images, batch_records = _unpack_receipt_batch(batch, config=config)
+                field_images = field_images.to(target_device, non_blocking=uses_cuda)
+                if recipient_value_images is not None:
+                    recipient_value_images = recipient_value_images.to(target_device, non_blocking=uses_cuda)
+                outputs = _unpack_reader_outputs(
+                    model(field_images, recipient_value_images),
+                    config=config,
+                )
+                amount_logits = outputs["amount_logits"]
+                time_logits = outputs["time_logits"]
+                payment_logits = outputs["payment_logits"]
+                status_logits = outputs["status_logits"]
+                recipient_logits = outputs.get("recipient_logits")
+                structured_outputs = outputs if _uses_structured_heads(config) else None
             optimizer.zero_grad(set_to_none=True)
-            outputs = _unpack_reader_outputs(
-                model(field_images, recipient_value_images),
-                config=config,
-            )
-            amount_logits = outputs["amount_logits"]
-            time_logits = outputs["time_logits"]
-            payment_logits = outputs["payment_logits"]
-            status_logits = outputs["status_logits"]
             recipient_sample_weights = (
                 _recipient_teacher_confidence_weights(
                     batch_records,
@@ -5167,7 +5530,7 @@ def train_unified_reader(
                 amount_to_id=amount_to_id,
                 time_to_id=time_to_id,
                 payment_to_id=payment_to_id,
-                recipient_logits=outputs.get("recipient_logits"),
+                recipient_logits=recipient_logits,
                 recipient_to_id=recipient_to_id,
                 payment_bank_prefix_classes=payment_bank_prefix_classes,
                 payment_bank_class_weights=payment_bank_train_weights,
@@ -5177,7 +5540,7 @@ def train_unified_reader(
                 payment_loss_weight=payment_loss_weight,
                 recipient_loss_weight=recipient_loss_weight,
                 config=config,
-                structured_outputs=outputs if _uses_structured_heads(config) else None,
+                structured_outputs=structured_outputs,
                 ctc_loss_weight=ctc_loss_weight,
                 structured_loss_weight=structured_loss_weight,
                 torch=torch,
@@ -5188,7 +5551,7 @@ def train_unified_reader(
             if loss is None:
                 raise AssertionError("a training batch must produce a loss")
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+            torch.nn.utils.clip_grad_norm_(trainable_parameters, max_norm=5.0)
             optimizer.step()
             weighted_loss = loss.detach() * len(batch_records)
             if total_loss_tensor is None:
@@ -8093,6 +8456,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     train.add_argument(
+        "--init-checkpoint-mode",
+        choices=tuple(sorted(INIT_CHECKPOINT_MODES)),
+        default=INIT_CHECKPOINT_MODE_STRICT,
+        help=(
+            "strict requires every label map to match the seed. recipient_only_expansion is v12 recipient-only "
+            "only: it locks payment/bank maps to the seed and maps additive recipient Unicode rows by character."
+        ),
+    )
+    train.add_argument(
         "--ctc-loss-weight",
         type=float,
         default=0.35,
@@ -8343,6 +8715,7 @@ def main(argv: list[str] | None = None) -> None:
                 checkpoint_min_time_candidate_exact=args.checkpoint_min_time_candidate_exact,
                 checkpoint_min_payment_candidate_exact=args.checkpoint_min_payment_candidate_exact,
                 init_checkpoint=args.init_checkpoint,
+                init_checkpoint_mode=args.init_checkpoint_mode,
                 ctc_loss_weight=args.ctc_loss_weight,
                 structured_loss_weight=args.structured_loss_weight,
                 payment_bank_prefix_min_support=args.payment_bank_prefix_min_support,

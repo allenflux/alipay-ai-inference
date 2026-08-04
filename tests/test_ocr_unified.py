@@ -1361,6 +1361,8 @@ def test_train_parser_and_main_forward_4090_and_recipient_only_options(
             "--architecture",
             "v12",
             "--recipient-only-fine-tune",
+            "--init-checkpoint-mode",
+            "recipient_only_expansion",
             "--num-workers",
             "4",
             "--prefetch-factor",
@@ -1370,6 +1372,7 @@ def test_train_parser_and_main_forward_4090_and_recipient_only_options(
         ]
     )
     assert args.recipient_only_fine_tune is True
+    assert args.init_checkpoint_mode == "recipient_only_expansion"
     assert args.num_workers == 4
     assert args.prefetch_factor == 2
     assert args.cuda_tf32 is True
@@ -1392,6 +1395,8 @@ def test_train_parser_and_main_forward_4090_and_recipient_only_options(
             "--architecture",
             "v12",
             "--recipient-only-fine-tune",
+            "--init-checkpoint-mode",
+            "recipient_only_expansion",
             "--num-workers",
             "4",
             "--prefetch-factor",
@@ -1402,6 +1407,7 @@ def test_train_parser_and_main_forward_4090_and_recipient_only_options(
     )
 
     assert observed["recipient_only_fine_tune"] is True
+    assert observed["init_checkpoint_mode"] == "recipient_only_expansion"
     assert observed["num_workers"] == 4
     assert observed["prefetch_factor"] == 2
     assert observed["cuda_tf32"] is True

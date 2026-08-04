@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import asdict
 from pathlib import Path
@@ -10,12 +11,22 @@ import numpy as np
 import pytest
 
 from transfer_receipt_ai.ocr_unified import (
+    INIT_CHECKPOINT_MODE_RECIPIENT_ONLY_EXPANSION,
     KIND_V12,
+    PAYMENT_BANK_OTHER_CLASS,
+    STATUS_CLASSES,
+    V6_TIME_CHARACTERS,
+    V8_AMOUNT_CHARACTERS,
     V12_ONNX_OUTPUT_NAMES,
     UnifiedReaderConfig,
     _checkpoint_config,
     _load_onnx_artifacts,
+    _parameter_only_initialization,
     _recipient_artifact_metadata,
+    _recipient_charset_source,
+    _recipient_only_expansion_label_override,
+    _recipient_only_logits,
+    _recipient_target_mode,
     _recipient_time_steps,
     _slot_order,
     build_unified_reader,
@@ -157,6 +168,165 @@ def test_v12_recipient_logits_ignore_reserved_fifth_slot_but_use_private_input()
     # Conversely, the dedicated high-resolution value view is a real model
     # input, rather than sidecar-only metadata.
     assert not torch.equal(original, private_input_changed)
+
+
+def test_v12_recipient_only_logits_match_the_full_private_branch() -> None:
+    """The accelerated training path must preserve recipient CTC logits exactly."""
+    config = _tiny_v12_config()
+    torch, model = _tiny_v12_model(config)
+    field_images = torch.randn((2, len(_slot_order(config)), 1, 32, 64), dtype=torch.float32)
+    recipient_value = torch.randn((2, 1, 32, 128), dtype=torch.float32)
+
+    with torch.no_grad():
+        full_logits = model(field_images, recipient_value)[-1]
+        private_logits = _recipient_only_logits(model, recipient_value, config=config)
+
+    torch.testing.assert_close(full_logits, private_logits, rtol=0.0, atol=0.0)
+
+
+def _write_v12_expansion_seed(
+    tmp_path: Path,
+    *,
+    config: UnifiedReaderConfig,
+    torch: object,
+) -> tuple[Path, dict[str, object], list[str], list[str]]:
+    """Persist a minimal valid seed whose new recipient rows must be remapped."""
+    source_payment = ["余"]
+    source_recipient = ["乙", "甲"]
+    source_bank = [PAYMENT_BANK_OTHER_CLASS, "建设银行"]
+    model = build_unified_reader(
+        payment_vocab_size=len(source_payment) + 1,
+        payment_bank_prefix_vocab_size=len(source_bank),
+        recipient_vocab_size=len(source_recipient) + 1,
+        config=config,
+    )
+    source_state = {key: value.detach().clone() for key, value in model.state_dict().items()}
+    for index, value in enumerate(source_state.values(), start=1):
+        value.fill_(float(index))
+    payload = {
+        "schema_version": 1,
+        "kind": KIND_V12,
+        "state_dict": source_state,
+        "config": asdict(config),
+        "amount_characters": list(V8_AMOUNT_CHARACTERS),
+        "time_characters": list(V6_TIME_CHARACTERS),
+        "payment_characters": source_payment,
+        "recipient_characters": source_recipient,
+        "recipient_blank_index": 0,
+        "recipient_charset_sha256": hashlib.sha256("".join(source_recipient).encode("utf-8")).hexdigest(),
+        "recipient_charset_source": _recipient_charset_source(config),
+        "recipient_target": _recipient_target_mode(config),
+        "recipient_sampling_policy": {
+            "mode": "uniform",
+            "recipient_sampling_weight": 1.0,
+            "recipient_train_records": 1,
+            "train_records": 1,
+        },
+        "recipient_confidence_policy": {
+            "mode": "none",
+            "low_confidence_threshold": None,
+            "low_confidence_loss_weight": 1.0,
+            "curriculum_epochs": 0,
+        },
+        "recipient_train_augmentation_policy": {"mode": "none"},
+        "status_classes": list(STATUS_CLASSES),
+        "payment_bank_prefix_classes": source_bank,
+    }
+    path = tmp_path / "v12-expansion-seed.pt"
+    torch.save(payload, path)
+    return path, source_state, source_payment, source_bank
+
+
+def test_v12_recipient_only_expansion_maps_unicode_rows_and_locks_financial_maps(tmp_path: Path) -> None:
+    """Inserted recipient characters must not shift old classifier row semantics."""
+    torch = pytest.importorskip("torch")
+    config = _tiny_v12_config()
+    seed, source_state, source_payment, source_bank = _write_v12_expansion_seed(
+        tmp_path,
+        config=config,
+        torch=torch,
+    )
+    target_recipient = ["丙", "乙", "甲"]
+    effective_payment, effective_bank, label_policy = _recipient_only_expansion_label_override(
+        init_checkpoint=seed,
+        config=config,
+        amount_characters=list(V8_AMOUNT_CHARACTERS),
+        time_characters=list(V6_TIME_CHARACTERS),
+        payment_characters=["余", "额"],
+        recipient_characters=target_recipient,
+        payment_bank_prefix_classes=[PAYMENT_BANK_OTHER_CLASS, "交通银行", "建设银行"],
+        torch=torch,
+    )
+    assert effective_payment == source_payment
+    assert effective_bank == source_bank
+    assert label_policy["payment_character_map"]["identical"] is False
+    assert label_policy["payment_bank_prefix_class_map"]["identical"] is False
+
+    target_model = build_unified_reader(
+        payment_vocab_size=len(effective_payment) + 1,
+        payment_bank_prefix_vocab_size=len(effective_bank),
+        recipient_vocab_size=len(target_recipient) + 1,
+        config=config,
+    )
+    target_state = {key: value.detach().clone() for key, value in target_model.state_dict().items()}
+    initial_new_row = target_state["recipient_classifier.weight"][1].clone()
+    with pytest.raises(ValueError, match="recipient character map"):
+        _parameter_only_initialization(
+            init_checkpoint=seed,
+            config=config,
+            amount_characters=list(V8_AMOUNT_CHARACTERS),
+            time_characters=list(V6_TIME_CHARACTERS),
+            payment_characters=effective_payment,
+            recipient_characters=target_recipient,
+            payment_bank_prefix_classes=effective_bank,
+            torch=torch,
+        )
+    mapped_state, initialization = _parameter_only_initialization(
+        init_checkpoint=seed,
+        init_checkpoint_mode=INIT_CHECKPOINT_MODE_RECIPIENT_ONLY_EXPANSION,
+        config=config,
+        amount_characters=list(V8_AMOUNT_CHARACTERS),
+        time_characters=list(V6_TIME_CHARACTERS),
+        payment_characters=effective_payment,
+        recipient_characters=target_recipient,
+        payment_bank_prefix_classes=effective_bank,
+        torch=torch,
+        target_state_dict=target_state,
+    )
+
+    assert initialization["mode"] == "parameter_only_recipient_unicode_expansion"
+    assert initialization["recipient_classifier_row_mapping"]["shared_character_rows_copied"] == 2
+    assert initialization["recipient_classifier_row_mapping"]["new_target_character_rows_kept_at_seed"] == 1
+    assert mapped_state is not None
+    # Blank, 乙, and 甲 come from their semantic source rows, not their
+    # old numeric positions. 丙 is new and remains deterministic target init.
+    torch.testing.assert_close(mapped_state["recipient_classifier.weight"][0], source_state["recipient_classifier.weight"][0])
+    torch.testing.assert_close(mapped_state["recipient_classifier.weight"][2], source_state["recipient_classifier.weight"][1])
+    torch.testing.assert_close(mapped_state["recipient_classifier.weight"][3], source_state["recipient_classifier.weight"][2])
+    torch.testing.assert_close(mapped_state["recipient_classifier.weight"][1], initial_new_row)
+    torch.testing.assert_close(mapped_state["recipient_classifier.bias"][2], source_state["recipient_classifier.bias"][1])
+    for key, source_value in source_state.items():
+        if key not in {"recipient_classifier.weight", "recipient_classifier.bias"}:
+            torch.testing.assert_close(mapped_state[key], source_value, rtol=0.0, atol=0.0)
+    target_model.load_state_dict(mapped_state, strict=True)
+
+
+def test_v12_recipient_only_expansion_rejects_a_missing_seed_character(tmp_path: Path) -> None:
+    torch = pytest.importorskip("torch")
+    config = _tiny_v12_config()
+    seed, _, _, _ = _write_v12_expansion_seed(tmp_path, config=config, torch=torch)
+
+    with pytest.raises(ValueError, match="cannot discard characters"):
+        _recipient_only_expansion_label_override(
+            init_checkpoint=seed,
+            config=config,
+            amount_characters=list(V8_AMOUNT_CHARACTERS),
+            time_characters=list(V6_TIME_CHARACTERS),
+            payment_characters=["余"],
+            recipient_characters=["丙", "甲"],
+            payment_bank_prefix_classes=[PAYMENT_BANK_OTHER_CLASS, "建设银行"],
+            torch=torch,
+        )
 
 
 def test_v12_metadata_freezes_the_two_static_input_shapes() -> None:

@@ -18,6 +18,7 @@ param(
     [int]$NumWorkers = 4,
     [ValidateRange(1, 16)]
     [int]$PrefetchFactor = 2,
+    [switch]$RequireRecipientTarget,
     [switch]$CheckOnly
 )
 
@@ -171,6 +172,7 @@ $trainArgs = @(
     "--checkpoint-min-time-candidate-exact", "$TimeFloor",
     "--checkpoint-min-payment-candidate-exact", "$PaymentFloor",
     "--init-checkpoint", $seedCheckpoint,
+    "--init-checkpoint-mode", "recipient_only_expansion",
     "--ctc-loss-weight", "0.75",
     "--structured-loss-weight", "1.0",
     "--amount-format-min-confidence", "0.80",
@@ -195,6 +197,11 @@ finally {
         $best = @($summary.records | Where-Object { $_.epoch -eq $summary.best_checkpoint_epoch })[0]
         $eligible = @($summary.records | Where-Object checkpoint_selection_eligible).Count
         $recipientOov = $summary.recipient_oov_by_split.val
+        $bestRecipientMetric = $null
+        if ($null -ne $best -and $null -ne $best.val_candidate_text_by_field) {
+            $bestRecipientMetric = $best.val_candidate_text_by_field.recipient_field
+        }
+        $recipientTargetReached = ($null -ne $bestRecipientMetric -and [double]$bestRecipientMetric.exact_match -ge 0.90)
 
         Write-Host ""
         Write-Host "guarded_4090_recipient_only final_summary"
@@ -207,6 +214,7 @@ finally {
             BestTime = Get-TrainingExactDisplay $best "time"
             BestPayment = Get-TrainingExactDisplay $best "payment_method_field"
             BestRecipient = Get-TrainingExactDisplay $best "recipient_field"
+            Recipient90Reached = $recipientTargetReached
             LastAmount = Get-TrainingExactDisplay $last "amount"
             LastTime = Get-TrainingExactDisplay $last "time"
             LastPayment = Get-TrainingExactDisplay $last "payment_method_field"
@@ -216,6 +224,10 @@ finally {
             TimeFloor = $TimeFloor
             PaymentFloor = $PaymentFloor
             FineTune = $summary.fine_tune_policy.mode
+            TrainForward = $summary.fine_tune_policy.training_forward
+            RecipientTrainRecords = $summary.fine_tune_policy.recipient_train_records
+            Initialization = $summary.initialization.mode
+            FinancialLabelPolicy = $summary.initialization.financial_label_policy.mode
             Runtime = ("{0}; workers={1}; TF32={2}; cuDNN-benchmark={3}" -f $summary.training_runtime.cuda_device_name, $summary.training_runtime.num_workers, $summary.training_runtime.cuda_tf32_requested, $summary.training_runtime.cudnn_benchmark_requested)
             LastEligible = $last.checkpoint_selection_eligible
             LastFailures = ($last.checkpoint_selection_protection_failures -join "; ")
@@ -227,6 +239,10 @@ finally {
             @{ n = "payment"; e = { $_.val_candidate_text_by_field.payment_method_field.exact_match } }, `
             @{ n = "recipient"; e = { $_.val_candidate_text_by_field.recipient_field.exact_match } } |
             Format-Table -AutoSize
+        if ($RequireRecipientTarget -and -not $recipientTargetReached -and $exitCode -eq 0) {
+            Write-Host "Recipient strict-exact target was not reached: best checkpoint remains below 90.00%."
+            $exitCode = 2
+        }
     }
     else {
         Write-Host "guarded_4090_recipient_only final_summary=unavailable (training did not create training_summary.json)"
