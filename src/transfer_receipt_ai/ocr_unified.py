@@ -3550,7 +3550,49 @@ def _batch_loss(
     torch: Any,
     recipient_sample_weights: Sequence[float] | None = None,
     allow_empty: bool = False,
-) -> tuple[Any | None, dict[str, dict[str, float | int]]]:
+    collect_metrics: bool = True,
+    recipient_only: bool = False,
+) -> tuple[Any | None, dict[str, dict[str, float | int]] | None]:
+    """Return one batch loss and, when requested, detached diagnostics.
+
+    The training loop only needs the scalar loss.  Materialising every
+    diagnostic by calling ``.cpu()`` per batch forces a CUDA synchronization,
+    which prevents pinned-memory transfers and GPU work from overlapping.  The
+    validation/audit paths may still request the exact historical diagnostics;
+    the hot training path deliberately opts out.
+    """
+    if recipient_only:
+        if not _is_v12(config):
+            raise ValueError("recipient_only loss is supported only by architecture v12")
+        if recipient_logits is None or recipient_to_id is None:
+            raise ValueError("recipient_only loss requires recipient logits and a train-only recipient charset")
+        recipient_loss, recipient_used, recipient_oov = _ctc_loss(
+            recipient_logits,
+            labels=[_slot_text(record, "recipient_field") for record in records],
+            character_to_id=recipient_to_id,
+            torch=torch,
+            sample_weights=recipient_sample_weights,
+        )
+        if recipient_loss is None:
+            if not allow_empty:
+                raise ValueError("A recipient-only training batch has no labelled recipient task")
+            return None, None if not collect_metrics else {
+                "recipient_field": {"loss": math.nan, "used": recipient_used, "oov": recipient_oov}
+            }
+        # v12 normally applies its CTC multiplier alongside finite structured
+        # heads.  Preserve that scalar so recipient-only fine-tuning has the
+        # same effective recipient-loss scale as the guarded full recipe.
+        loss = recipient_loss * recipient_loss_weight * ctc_loss_weight
+        if not collect_metrics:
+            return loss, None
+        return loss, {
+            "recipient_field": {
+                "loss": float(recipient_loss.detach().cpu()),
+                "used": recipient_used,
+                "oov": recipient_oov,
+            }
+        }
+
     amount_loss, amount_used, amount_oov = _ctc_loss(
         amount_logits,
         labels=[_ctc_slot_text(record, "amount", config=config) for record in records],
@@ -3860,6 +3902,8 @@ def _batch_loss(
         loss: Any | None = None
     else:
         loss = torch.stack(pieces).mean()
+    if not collect_metrics:
+        return loss, None
     return loss, {
         "amount": {"loss": float(amount_loss.detach().cpu()) if amount_loss is not None else math.nan, "used": amount_used, "oov": amount_oov},
         "time": {"loss": float(time_loss.detach().cpu()) if time_loss is not None else math.nan, "used": time_used, "oov": time_oov},
@@ -3939,6 +3983,7 @@ def _evaluate_model(
 ) -> dict[str, object]:
     """Evaluate every available reader head without discarding held-out OOV labels."""
     model.eval()
+    uses_cuda = device.startswith("cuda")
     total_loss = 0.0
     loss_receipts = 0
     exact_total = 0
@@ -3959,9 +4004,9 @@ def _evaluate_model(
     with torch.no_grad():
         for batch in loader:
             field_images, recipient_value_images, records = _unpack_receipt_batch(batch, config=config)
-            field_images = field_images.to(device)
+            field_images = field_images.to(device, non_blocking=uses_cuda)
             if recipient_value_images is not None:
-                recipient_value_images = recipient_value_images.to(device)
+                recipient_value_images = recipient_value_images.to(device, non_blocking=uses_cuda)
             outputs = _unpack_reader_outputs(
                 model(field_images, recipient_value_images),
                 config=config,
@@ -3995,6 +4040,7 @@ def _evaluate_model(
                 structured_loss_weight=structured_loss_weight,
                 torch=torch,
                 allow_empty=True,
+                collect_metrics=False,
             )
             if loss is not None:
                 total_loss += float(loss.detach().cpu()) * len(records)
@@ -4665,6 +4711,7 @@ def train_unified_reader(
     recipient_low_confidence_loss_weight: float = 1.0,
     recipient_confidence_curriculum_epochs: int = 0,
     recipient_train_augmentation: str = "none",
+    recipient_only_fine_tune: bool = False,
     checkpoint_selection: str = CHECKPOINT_SELECTION_BALANCED,
     checkpoint_min_amount_candidate_exact: float | None = None,
     checkpoint_min_time_candidate_exact: float | None = None,
@@ -4675,6 +4722,10 @@ def train_unified_reader(
     payment_bank_prefix_min_support: int = 3,
     seed: int = 42,
     num_workers: int = 0,
+    prefetch_factor: int = 2,
+    persistent_workers: bool = False,
+    cuda_tf32: bool = False,
+    cudnn_benchmark: bool = False,
 ) -> Path:
     """Train one shared-trunk reader and return the best validation checkpoint.
 
@@ -4685,6 +4736,11 @@ def train_unified_reader(
     otherwise its final delivery policy is review-only.
     """
     config.validate()
+    if recipient_only_fine_tune:
+        if not _is_v12(config):
+            raise ValueError("recipient_only_fine_tune is supported only by architecture v12")
+        if init_checkpoint is None:
+            raise ValueError("recipient_only_fine_tune requires a compatible --init-checkpoint")
     recipient_sampling_weights, recipient_sampling_policy = _recipient_training_sample_weights(
         (),
         recipient_sampling_weight=recipient_sampling_weight,
@@ -4756,6 +4812,15 @@ def train_unified_reader(
         )
     if num_workers < 0:
         raise ValueError("num_workers cannot be negative")
+    if prefetch_factor <= 0:
+        raise ValueError("prefetch_factor must be positive")
+    if persistent_workers and num_workers <= 0:
+        raise ValueError("persistent_workers requires num_workers to be positive")
+    if persistent_workers and recipient_train_augmentation_policy["mode"] != "none":
+        raise ValueError(
+            "persistent_workers is unsafe with recipient train augmentation because worker-local epoch state "
+            "would stop advancing; leave it disabled or use --recipient-train-augmentation none"
+        )
     if payment_bank_prefix_min_support <= 0:
         raise ValueError("payment_bank_prefix_min_support must be positive")
     if not math.isfinite(recipient_sampling_weight):
@@ -4822,11 +4887,44 @@ def train_unified_reader(
 
     torch, _ = _require_torch()
     target_device = _resolve_device(torch, device)
+    uses_cuda = target_device.startswith("cuda")
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    if target_device.startswith("cuda"):
+    if uses_cuda:
         torch.cuda.manual_seed_all(seed)
+        if cuda_tf32:
+            # Ada GPUs such as the RTX 4090 can accelerate static convolution
+            # and matrix kernels with TF32.  It is opt-in because it changes
+            # internal multiplication precision, while guard evaluation and
+            # export remain full FP32.
+            if hasattr(torch, "set_float32_matmul_precision"):
+                torch.set_float32_matmul_precision("high")
+            cuda_backend = getattr(getattr(torch, "backends", None), "cuda", None)
+            if cuda_backend is not None and hasattr(cuda_backend, "matmul"):
+                cuda_backend.matmul.allow_tf32 = True
+            cudnn_backend = getattr(getattr(torch, "backends", None), "cudnn", None)
+            if cudnn_backend is not None and hasattr(cudnn_backend, "allow_tf32"):
+                cudnn_backend.allow_tf32 = True
+        if cudnn_benchmark:
+            cudnn_backend = getattr(getattr(torch, "backends", None), "cudnn", None)
+            if cudnn_backend is not None and hasattr(cudnn_backend, "benchmark"):
+                cudnn_backend.benchmark = True
+    training_runtime: dict[str, object] = {
+        "device": target_device,
+        "uses_cuda": uses_cuda,
+        "torch_version": str(getattr(torch, "__version__", "unknown")),
+        "num_workers": num_workers,
+        "prefetch_factor": prefetch_factor if num_workers > 0 else None,
+        "persistent_workers": persistent_workers,
+        "cuda_tf32_requested": cuda_tf32,
+        "cudnn_benchmark_requested": cudnn_benchmark,
+    }
+    if uses_cuda:
+        try:
+            training_runtime["cuda_device_name"] = str(torch.cuda.get_device_name())
+        except (AttributeError, RuntimeError):
+            training_runtime["cuda_device_name"] = "unavailable"
 
     if payment_bank_prefix_classes is not None:
         payment_bank_train_weights, payment_bank_train_counts = _payment_bank_prefix_class_weights(
@@ -4874,6 +4972,20 @@ def train_unified_reader(
             "replacement": True,
             "seed": int(seed),
         }
+    if recipient_only_fine_tune and recipient_sampling_policy["mode"] != "uniform":
+        raise ValueError(
+            "recipient_only_fine_tune requires uniform receipt sampling; use recipient loss weighting rather "
+            "than resampling whole receipts so protected fields remain frozen"
+        )
+    loader_performance_kwargs: dict[str, object] = {}
+    if num_workers > 0:
+        # Keep worker processes non-persistent by default.  v12's optional
+        # train augmentation is seeded by the epoch, and Windows-spawned
+        # persistent workers otherwise retain the first epoch's dataset copy.
+        loader_performance_kwargs = {
+            "prefetch_factor": prefetch_factor,
+            "persistent_workers": persistent_workers,
+        }
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=batch_size,
@@ -4881,7 +4993,8 @@ def train_unified_reader(
         sampler=train_sampler,
         num_workers=num_workers,
         collate_fn=_collate_receipts,
-        pin_memory=target_device.startswith("cuda"),
+        pin_memory=uses_cuda,
+        **loader_performance_kwargs,
     )
     validation_loader = torch.utils.data.DataLoader(
         validation_dataset,
@@ -4889,7 +5002,8 @@ def train_unified_reader(
         shuffle=False,
         num_workers=num_workers,
         collate_fn=_collate_receipts,
-        pin_memory=target_device.startswith("cuda"),
+        pin_memory=uses_cuda,
+        **loader_performance_kwargs,
     )
     model = build_unified_reader(
         payment_vocab_size=len(payment_characters) + 1,
@@ -4911,6 +5025,26 @@ def train_unified_reader(
         # This is intentionally strict: equal tensor shapes are insufficient
         # when a CTC character or classifier-class ordering has changed.
         model.load_state_dict(initialization_state, strict=True)
+    fine_tune_policy: dict[str, object] = {
+        "mode": "all_parameters",
+        "trainable_parameter_count": sum(parameter.numel() for parameter in model.parameters()),
+    }
+    if recipient_only_fine_tune:
+        for name, parameter in model.named_parameters():
+            parameter.requires_grad_(name.startswith("recipient_"))
+        trainable_parameter_count = sum(
+            parameter.numel() for parameter in model.parameters() if parameter.requires_grad
+        )
+        if trainable_parameter_count == 0:
+            raise AssertionError("v12 recipient-only fine-tune found no recipient parameters")
+        fine_tune_policy = {
+            "mode": "recipient_only_v12",
+            "trainable_parameter_count": trainable_parameter_count,
+            "frozen_parameter_count": sum(
+                parameter.numel() for parameter in model.parameters() if not parameter.requires_grad
+            ),
+            "frozen_parameter_prefix_exclusion": "recipient_",
+        }
     if bool(status_policy["training_enabled"]):
         total_status = sum(status_counts["train"].values())
         status_weights = torch.tensor(
@@ -4926,7 +5060,11 @@ def train_unified_reader(
         # to review by delivery code.
         status_train_criterion = None
         status_validation_criterion = None
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    optimizer = torch.optim.AdamW(
+        (parameter for parameter in model.parameters() if parameter.requires_grad),
+        lr=learning_rate,
+        weight_decay=weight_decay,
+    )
 
     output_dir.mkdir(parents=True, exist_ok=True)
     _atomic_write_json(
@@ -4943,6 +5081,8 @@ def train_unified_reader(
             "structured_target_counts": structured_counts,
             "checkpoint_selection_policy": checkpoint_selection_policy,
             "initialization": initialization,
+            "training_runtime": training_runtime,
+            "fine_tune_policy": fine_tune_policy,
             "payment_charset_sha256": hashlib.sha256("".join(payment_characters).encode("utf-8")).hexdigest(),
             **(
                 {
@@ -4990,13 +5130,13 @@ def train_unified_reader(
     for epoch in range(1, epochs + 1):
         model.train()
         train_dataset.set_epoch(epoch)
-        total_loss = 0.0
+        total_loss_tensor: Any | None = None
         total_receipts = 0
         for batch in train_loader:
             field_images, recipient_value_images, batch_records = _unpack_receipt_batch(batch, config=config)
-            field_images = field_images.to(target_device)
+            field_images = field_images.to(target_device, non_blocking=uses_cuda)
             if recipient_value_images is not None:
-                recipient_value_images = recipient_value_images.to(target_device)
+                recipient_value_images = recipient_value_images.to(target_device, non_blocking=uses_cuda)
             optimizer.zero_grad(set_to_none=True)
             outputs = _unpack_reader_outputs(
                 model(field_images, recipient_value_images),
@@ -5041,11 +5181,19 @@ def train_unified_reader(
                 structured_loss_weight=structured_loss_weight,
                 torch=torch,
                 recipient_sample_weights=recipient_sample_weights,
+                collect_metrics=False,
+                recipient_only=recipient_only_fine_tune,
             )
+            if loss is None:
+                raise AssertionError("a training batch must produce a loss")
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             optimizer.step()
-            total_loss += float(loss.detach().cpu()) * len(batch_records)
+            weighted_loss = loss.detach() * len(batch_records)
+            if total_loss_tensor is None:
+                total_loss_tensor = weighted_loss
+            else:
+                total_loss_tensor.add_(weighted_loss)
             total_receipts += len(batch_records)
         validation = _evaluate_model(
             model,
@@ -5073,7 +5221,11 @@ def train_unified_reader(
         )
         epoch_record: dict[str, object] = {
             "epoch": epoch,
-            "train_loss": total_loss / max(total_receipts, 1),
+            "train_loss": (
+                float((total_loss_tensor / total_receipts).cpu())
+                if total_loss_tensor is not None and total_receipts > 0
+                else math.nan
+            ),
             "val_loss": validation["loss"],
             "val_exact_match": validation["exact_match"],
             "val_delivery_coverage": validation["delivery_coverage"],
@@ -5153,6 +5305,8 @@ def train_unified_reader(
             "recipient_loss_weight": recipient_loss_weight,
             "checkpoint_selection_policy": checkpoint_selection_policy,
             "initialization": initialization,
+            "training_runtime": training_runtime,
+            "fine_tune_policy": fine_tune_policy,
             "ctc_loss_weight": ctc_loss_weight,
             "structured_loss_weight": structured_loss_weight,
             "epoch": epoch,
@@ -5189,6 +5343,8 @@ def train_unified_reader(
                 "recipient_train_augmentation_policy": recipient_train_augmentation_policy,
                 "checkpoint_selection_policy": checkpoint_selection_policy,
                 "initialization": initialization,
+                "training_runtime": training_runtime,
+                "fine_tune_policy": fine_tune_policy,
                 "best_checkpoint_epoch": best_epoch,
                 "best_checkpoint_score": list(best_score) if best_score is not None else None,
                 "records": history,
@@ -7889,6 +8045,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     train.add_argument(
+        "--recipient-only-fine-tune",
+        action="store_true",
+        help=(
+            "v12 only: require a compatible warm checkpoint, freeze every non-recipient parameter, and optimize "
+            "only the private recipient branch. Whole-receipt oversampling is rejected."
+        ),
+    )
+    train.add_argument(
         "--checkpoint-selection",
         choices=tuple(sorted(CHECKPOINT_SELECTION_MODES)),
         default=CHECKPOINT_SELECTION_BALANCED,
@@ -8001,6 +8165,30 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=0,
         help="DataLoader workers; keep 0 on Windows until the training environment is verified",
+    )
+    train.add_argument(
+        "--prefetch-factor",
+        type=int,
+        default=2,
+        help="Batches prefetched per DataLoader worker; used only when --num-workers is positive",
+    )
+    train.add_argument(
+        "--persistent-workers",
+        action="store_true",
+        help=(
+            "Keep DataLoader workers alive between epochs. Not supported with v12 recipient train augmentation "
+            "until its epoch state is shared safely."
+        ),
+    )
+    train.add_argument(
+        "--cuda-tf32",
+        action="store_true",
+        help="Opt in to high-precision TF32 CUDA matmul/convolution kernels (for example RTX 4090)",
+    )
+    train.add_argument(
+        "--cudnn-benchmark",
+        action="store_true",
+        help="Opt in to cuDNN autotuning for the fixed training input shapes",
     )
     train.add_argument("--onnx-output", type=Path, help="Optionally export best.pt to this new ONNX path")
 
@@ -8141,6 +8329,7 @@ def main(argv: list[str] | None = None) -> None:
                 recipient_low_confidence_loss_weight=args.recipient_low_confidence_loss_weight,
                 recipient_confidence_curriculum_epochs=args.recipient_confidence_curriculum_epochs,
                 recipient_train_augmentation=args.recipient_train_augmentation,
+                recipient_only_fine_tune=args.recipient_only_fine_tune,
                 checkpoint_selection=args.checkpoint_selection,
                 checkpoint_min_amount_candidate_exact=args.checkpoint_min_amount_candidate_exact,
                 checkpoint_min_time_candidate_exact=args.checkpoint_min_time_candidate_exact,
@@ -8151,6 +8340,10 @@ def main(argv: list[str] | None = None) -> None:
                 payment_bank_prefix_min_support=args.payment_bank_prefix_min_support,
                 seed=args.seed,
                 num_workers=args.num_workers,
+                prefetch_factor=args.prefetch_factor,
+                persistent_workers=args.persistent_workers,
+                cuda_tf32=args.cuda_tf32,
+                cudnn_benchmark=args.cudnn_benchmark,
             )
             print(f"Best unified OCR checkpoint: {checkpoint}")
             if args.onnx_output is not None:

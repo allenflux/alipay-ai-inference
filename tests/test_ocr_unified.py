@@ -1346,6 +1346,88 @@ def test_train_parser_and_main_forward_parameter_only_init_checkpoint(
     assert observed["init_checkpoint"] == Path("seed.pt")
 
 
+def test_train_parser_and_main_forward_4090_and_recipient_only_options(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep the guarded 4090/recipient-only CLI route from silently dropping flags."""
+    args = ocr_unified.build_parser().parse_args(
+        [
+            "train",
+            "--records",
+            "records.jsonl",
+            "--output",
+            "run",
+            "--architecture",
+            "v12",
+            "--recipient-only-fine-tune",
+            "--num-workers",
+            "4",
+            "--prefetch-factor",
+            "2",
+            "--cuda-tf32",
+            "--cudnn-benchmark",
+        ]
+    )
+    assert args.recipient_only_fine_tune is True
+    assert args.num_workers == 4
+    assert args.prefetch_factor == 2
+    assert args.cuda_tf32 is True
+    assert args.cudnn_benchmark is True
+
+    observed: dict[str, object] = {}
+
+    def fake_train(**kwargs: object) -> Path:
+        observed.update(kwargs)
+        return tmp_path / "best.pt"
+
+    monkeypatch.setattr(ocr_unified, "train_unified_reader", fake_train)
+    ocr_unified.main(
+        [
+            "train",
+            "--records",
+            "records.jsonl",
+            "--output",
+            "run",
+            "--architecture",
+            "v12",
+            "--recipient-only-fine-tune",
+            "--num-workers",
+            "4",
+            "--prefetch-factor",
+            "2",
+            "--cuda-tf32",
+            "--cudnn-benchmark",
+        ]
+    )
+
+    assert observed["recipient_only_fine_tune"] is True
+    assert observed["num_workers"] == 4
+    assert observed["prefetch_factor"] == 2
+    assert observed["cuda_tf32"] is True
+    assert observed["cudnn_benchmark"] is True
+
+
+def test_recipient_only_fine_tune_rejects_an_unsafe_configuration(tmp_path: Path) -> None:
+    """The protection route must never silently become an ordinary v4/v12 run."""
+    missing_records = tmp_path / "missing.jsonl"
+    with pytest.raises(ValueError, match="supported only by architecture v12"):
+        train_unified_reader(
+            records_path=missing_records,
+            output_dir=tmp_path / "wrong-architecture",
+            config=_tiny_config(architecture_version=4),
+            recipient_only_fine_tune=True,
+            init_checkpoint=tmp_path / "seed.pt",
+        )
+    with pytest.raises(ValueError, match="requires a compatible --init-checkpoint"):
+        train_unified_reader(
+            records_path=missing_records,
+            output_dir=tmp_path / "missing-seed",
+            config=UnifiedReaderConfig(architecture_version=12),
+            recipient_only_fine_tune=True,
+        )
+
+
 def test_export_parser_and_main_forward_v8_amount_format_confidence_override(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
