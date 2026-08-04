@@ -18,7 +18,7 @@ param(
     [int]$NumWorkers = 4,
     [ValidateRange(1, 16)]
     [int]$PrefetchFactor = 2,
-    [switch]$RequireRecipientTarget,
+    [switch]$DiagnosticOnly,
     [switch]$CheckOnly
 )
 
@@ -77,6 +77,7 @@ Write-Host "  records=$records"
 Write-Host "  output=$output"
 Write-Host ("  floors: amount={0:P2}, time={1:P2}, payment={2:P2}" -f $AmountFloor, $TimeFloor, $PaymentFloor)
 Write-Host ("  recipe: recipient-only, lr={0}, workers={1}, prefetch={2}, TF32=on, cuDNN-benchmark=on" -f $LearningRate, $NumWorkers, $PrefetchFactor)
+Write-Host ("  recipient target: 90.00% strict exact ({0})" -f $(if ($DiagnosticOnly) { "diagnostic only" } else { "required" }))
 try {
     & nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
 }
@@ -239,7 +240,7 @@ finally {
             @{ n = "payment"; e = { $_.val_candidate_text_by_field.payment_method_field.exact_match } }, `
             @{ n = "recipient"; e = { $_.val_candidate_text_by_field.recipient_field.exact_match } } |
             Format-Table -AutoSize
-        if ($RequireRecipientTarget -and -not $recipientTargetReached -and $exitCode -eq 0) {
+        if (-not $DiagnosticOnly -and -not $recipientTargetReached -and $exitCode -eq 0) {
             Write-Host "Recipient strict-exact target was not reached: best checkpoint remains below 90.00%."
             $exitCode = 2
         }

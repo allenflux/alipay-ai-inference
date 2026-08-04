@@ -5559,6 +5559,12 @@ def train_unified_reader(
             else:
                 total_loss_tensor.add_(weighted_loss)
             total_receipts += len(batch_records)
+        # The hot recipient-only path intentionally avoids per-batch CPU
+        # reads.  Synchronise once at the epoch boundary so the recorded
+        # training/validation timings are not misleadingly split across the
+        # asynchronous CUDA queue.
+        if uses_cuda:
+            torch.cuda.synchronize(target_device)
         train_seconds = perf_counter() - epoch_started
         validation_started = perf_counter()
         validation = _evaluate_model(
@@ -5585,6 +5591,8 @@ def train_unified_reader(
             structured_loss_weight=structured_loss_weight,
             torch=torch,
         )
+        if uses_cuda:
+            torch.cuda.synchronize(target_device)
         validation_seconds = perf_counter() - validation_started
         epoch_record: dict[str, object] = {
             "epoch": epoch,
