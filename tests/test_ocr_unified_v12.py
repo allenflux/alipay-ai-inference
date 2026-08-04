@@ -31,7 +31,7 @@ from transfer_receipt_ai.ocr_unified_dataset import V12_SLOT_ORDER, build_unifie
 # preprocessing/training/export path but not meaningful visual content.
 _TINY_PNG = bytes.fromhex(
     "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
-    "0000000d49444154789c6360f8cfc00000030101874f5dc30000000049454e44ae426082"
+    "0000000b49444154789c63f80f040009fb03fdfb5e6b2b0000000049454e44ae426082"
 )
 
 
