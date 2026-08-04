@@ -68,27 +68,11 @@ function Read-GuardedJson([string]$Path) {
     # Python accepts the NaN/Infinity tokens emitted by Python's JSON encoder,
     # whereas Windows PowerShell's ConvertFrom-Json rejects them. Normalize
     # those values to null before PowerShell reads a training/evaluation summary.
-    $pythonProgram = @'
-import json
-import math
-import sys
-
-
-def normalize(value):
-    if isinstance(value, float):
-        return value if math.isfinite(value) else None
-    if isinstance(value, list):
-        return [normalize(item) for item in value]
-    if isinstance(value, dict):
-        return {key: normalize(item) for key, item in value.items()}
-    return value
-
-
-with open(sys.argv[1], "r", encoding="utf-8") as stream:
-    payload = json.load(stream, parse_constant=lambda _value: None)
-print(json.dumps(normalize(payload), ensure_ascii=True, allow_nan=False, separators=(",", ":")))
-'@
-    $normalizedJson = (& python -c $pythonProgram $Path) -join "`n"
+    $normalizer = Join-Path $PSScriptRoot "normalize_json_summary.py"
+    if (-not (Test-Path -LiteralPath $normalizer)) {
+        throw "Missing JSON summary normalizer: $normalizer"
+    }
+    $normalizedJson = (& python $normalizer $Path) -join "`n"
     if ($LASTEXITCODE -ne 0) {
         throw "Unable to normalize JSON summary with Python: $Path (exit code $LASTEXITCODE)"
     }
