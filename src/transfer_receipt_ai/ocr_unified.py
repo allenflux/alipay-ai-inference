@@ -5128,6 +5128,7 @@ def train_unified_reader(
     best_epoch: int | None = None
     best_path = output_dir / "best.pt"
     for epoch in range(1, epochs + 1):
+        epoch_started = perf_counter()
         model.train()
         train_dataset.set_epoch(epoch)
         total_loss_tensor: Any | None = None
@@ -5195,6 +5196,8 @@ def train_unified_reader(
             else:
                 total_loss_tensor.add_(weighted_loss)
             total_receipts += len(batch_records)
+        train_seconds = perf_counter() - epoch_started
+        validation_started = perf_counter()
         validation = _evaluate_model(
             model,
             validation_loader,
@@ -5219,6 +5222,7 @@ def train_unified_reader(
             structured_loss_weight=structured_loss_weight,
             torch=torch,
         )
+        validation_seconds = perf_counter() - validation_started
         epoch_record: dict[str, object] = {
             "epoch": epoch,
             "train_loss": (
@@ -5226,6 +5230,9 @@ def train_unified_reader(
                 if total_loss_tensor is not None and total_receipts > 0
                 else math.nan
             ),
+            "train_seconds": train_seconds,
+            "validation_seconds": validation_seconds,
+            "epoch_seconds": perf_counter() - epoch_started,
             "val_loss": validation["loss"],
             "val_exact_match": validation["exact_match"],
             "val_delivery_coverage": validation["delivery_coverage"],
@@ -5363,6 +5370,7 @@ def train_unified_reader(
             f"val_verifier={_format_exact_match(validation['verifier_macro_exact_match'])} "
             f"val_delivery={float(validation['delivery_exact_overall']):.2%} "
             f"coverage={float(validation['delivery_coverage']):.2%} "
+            f"train_s={train_seconds:.1f} val_s={validation_seconds:.1f} "
             f"{_format_checkpoint_protection_report(protection_report)} "
             f"checkpoint={'eligible' if score is not None else 'protected'}"
         )

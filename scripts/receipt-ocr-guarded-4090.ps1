@@ -221,7 +221,7 @@ finally {
             LastFailures = ($last.checkpoint_selection_protection_failures -join "; ")
         } | Format-List
         $summary.records | Select-Object -Last 10 `
-            epoch, checkpoint_selection_eligible, checkpoint_selection_protection_failures, `
+            epoch, train_seconds, validation_seconds, epoch_seconds, checkpoint_selection_eligible, checkpoint_selection_protection_failures, `
             @{ n = "amount"; e = { $_.val_candidate_text_by_field.amount.exact_match } }, `
             @{ n = "time"; e = { $_.val_candidate_text_by_field.time.exact_match } }, `
             @{ n = "payment"; e = { $_.val_candidate_text_by_field.payment_method_field.exact_match } }, `
