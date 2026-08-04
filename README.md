@@ -773,6 +773,117 @@ python -m transfer_receipt_ai.ocr_unified train `
 `training_summary.json`、`best.pt` 和最终 ONNX sidecar。仅在验证集确认收款方改善后，才对这个**唯一候选**跑一次 GPU
 `test`，最后再跑一次 CPU `test`；CPU 结果与 GPU 一致才进入 .NET smoke。
 
+### v12-r3 收款方长尾课程候选（先扩样本质量，再保持单 ONNX）
+
+当 r2 的收款方仍停在约 60% teacher-parity 时，不能靠继续增加通用 CTC epoch 解决。这个配方仍只交付**一个**
+v12 ONNX / 一个 Session / 一次 `Run`，不在运行时携带 Paddle、词典模型或网络服务；它只改变训练分布：
+
+- 只把 `recipient_field` 的 Paddle 阈值从 `0.98` 放到 `0.95`，金额仍保留 `0.90`、其余字段仍为 `0.98`；
+  因此不会为了补收款方而降低所有字段的教师质量。
+- 收款方低于 `0.98` 的新增教师行会在训练开始时保留完整损失，再在 10 个 epoch 内逐步降到 `0.35`；高置信行始终是
+  全权重。这是抗伪标签噪声，不是手工改标签。
+- 以回单为单位做**有上限**的采样：所有收款方行权重 `3.0`，含 train 内少见字的行最多升到 `4.0`，长名称也最多升到
+  `4.0`。多个条件取最大值，绝不相乘，避免少数噪声商户主导训练。
+- 仅在训练时给高分辨率收款方裁图加入很小的白底平移、对比度和噪声扰动；验证、ONNX 导出与运行时预处理完全不变。
+
+以下第一步只会从已完成的 `$teacherResults` 重新筛选/裁图，**不会重新执行 PaddleOCR**。所有输出路径必须是新的空路径。
+先在 `val` 上保护金额、时间、付款方式，再训练这个候选；不要拿已反复查看的 `test` 去选 `best.pt`。
+
+```powershell
+$teacherRoot = "D:\alipay-ai-data\receipt-lite-teacher-120k-v1"
+$teacherResults = "$teacherRoot\paddle-teacher-results"
+$teacherLabelsV12R3 = "$teacherRoot\paddle-teacher-labels-5field-recipient95-v1"
+$unifiedManifestV12R3 = "$teacherRoot\unified-manifest-v12-r3-recipient-curriculum"
+$baselineModelV12 = "$teacherRoot\models\receipt_unified_field_reader_v12_120k_r2_recipient24_h256.onnx" # 改成当前已通过的 v12 基线文件
+$baselineValV12R3 = "$teacherRoot\unified-eval-v12-r2-on-r3-val-gpu"
+$unifiedRunV12R3 = "$teacherRoot\unified-run-v12-r3-recipient-curriculum"
+$unifiedModelV12R3 = "$teacherRoot\models\receipt_unified_field_reader_v12_120k_r3_recipient_curriculum.onnx"
+
+# 1) 重建五字段教师集。只有 recipient_field 接受 0.95–0.98 的行；没有重新跑 Paddle。
+python -m transfer_receipt_ai.ocr_pseudolabels `
+  --results $teacherResults `
+  --output $teacherLabelsV12R3 `
+  --labels "amount,time,transfer_status,recipient_field,payment_method_field" `
+  --min-detector-score 0.90 `
+  --min-ocr-confidence 0.98 `
+  --min-ocr-confidence-override "amount=0.90" `
+  --min-ocr-confidence-override "recipient_field=0.95" `
+  --validation-ratio 0.10 `
+  --test-ratio 0.10 `
+  --review-ratio 0.10 `
+  --split-seed "receipt-ocr-pseudo-v1" `
+  --continue-on-error
+
+# 2) 将同一批教师裁图组装成 v12 回单 manifest。此处仍使用锚定收款方值的严格规则。
+python -m transfer_receipt_ai.ocr_unified_dataset `
+  --records "$teacherLabelsV12R3\pseudo_labels.jsonl" `
+  --output $unifiedManifestV12R3 `
+  --architecture v12
+
+# 3) 先得到与新 manifest 同一 val split 的基线保护线。
+python -m transfer_receipt_ai.ocr_unified evaluate `
+  --model $baselineModelV12 `
+  --records "$unifiedManifestV12R3\unified_fields.jsonl" `
+  --dataset-root $teacherLabelsV12R3 `
+  --split val `
+  --output $baselineValV12R3 `
+  --device cuda:0
+
+$baseline = Get-Content "$baselineValV12R3\summary.json" -Raw | ConvertFrom-Json
+$amountFloor = [Math]::Max(0.0, [double]$baseline.by_field.amount.raw_exact_match - 0.01)
+$timeFloor = [Math]::Max(0.0, [double]$baseline.by_field.time.raw_exact_match - 0.005)
+$paymentFloor = [Math]::Max(0.0, [double]$baseline.by_field.payment_method_field.raw_exact_match - 0.01)
+```
+
+```powershell
+# 4) 训练 r3。仍是一张 v12 ONNX；新增参数只影响训练期，不改变两输入、15 输出 ABI。
+python -m transfer_receipt_ai.ocr_unified train `
+  --records "$unifiedManifestV12R3\unified_fields.jsonl" `
+  --dataset-root $teacherLabelsV12R3 `
+  --output $unifiedRunV12R3 `
+  --device cuda:0 `
+  --architecture v12 `
+  --image-height 80 `
+  --image-width 512 `
+  --recipient-input-height 128 `
+  --recipient-input-width 1024 `
+  --recipient-branch-channels 24 `
+  --base-channels 32 `
+  --numeric-hidden-size 96 `
+  --payment-hidden-size 128 `
+  --recipient-hidden-size 256 `
+  --recipient-value-left-trim 0.30 `
+  --epochs 80 `
+  --batch-size 12 `
+  --learning-rate 0.0004 `
+  --payment-loss-weight 1.0 `
+  --recipient-loss-weight 4.0 `
+  --recipient-sampling-weight 3.0 `
+  --recipient-rare-character-max-support 3 `
+  --recipient-rare-character-sampling-weight 4.0 `
+  --recipient-long-text-min-length 12 `
+  --recipient-long-text-sampling-weight 4.0 `
+  --recipient-low-confidence-threshold 0.98 `
+  --recipient-low-confidence-loss-weight 0.35 `
+  --recipient-confidence-curriculum-epochs 10 `
+  --recipient-train-augmentation light_v1 `
+  --checkpoint-selection recipient_priority `
+  --checkpoint-min-amount-candidate-exact $amountFloor `
+  --checkpoint-min-time-candidate-exact $timeFloor `
+  --checkpoint-min-payment-candidate-exact $paymentFloor `
+  --ctc-loss-weight 0.75 `
+  --structured-loss-weight 1.0 `
+  --amount-format-min-confidence 0.80 `
+  --payment-bank-prefix-min-support 3 `
+  --seed 42 `
+  --num-workers 0 `
+  --onnx-output $unifiedModelV12R3
+```
+
+训练完成后只先用 GPU 在此前未用于训练选择的 `test` split 上对 r3 做一次比较；只有收款方提高且三项保护字段没有回退，
+才需要再跑同一模型的 CPU parity 和 .NET smoke。该配方会提高长尾样本的学习机会，但不承诺一定越过交付线；是否提升必须以
+保留集结果决定，而不是由训练 loss 判断。
+
 ### v11 五字段收款方专项训练（历史基线）
 
 v11 仍然是**一个** `[5,1,80,512]` 输入、15 个输出的统一 ONNX；不会增加第二个 OCR

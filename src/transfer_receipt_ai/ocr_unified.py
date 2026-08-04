@@ -614,6 +614,277 @@ def _recipient_time_steps(config: UnifiedReaderConfig) -> int:
     return config.recipient_input_width // 4 if _uses_high_resolution_recipient_input(config) else config.image_width // 4
 
 
+def _recipient_slot(record: Mapping[str, object]) -> Mapping[str, object] | None:
+    """Return the optional recipient slot without mutating a manifest row."""
+    slots = record.get("slots")
+    if not isinstance(slots, Mapping):
+        return None
+    slot = slots.get("recipient_field")
+    return slot if isinstance(slot, Mapping) else None
+
+
+def _recipient_training_sample_weights(
+    records: Sequence[Mapping[str, object]],
+    *,
+    recipient_sampling_weight: float,
+    recipient_rare_character_max_support: int = 0,
+    recipient_rare_character_sampling_weight: float = 1.0,
+    recipient_long_text_min_length: int = 0,
+    recipient_long_text_sampling_weight: float = 1.0,
+) -> tuple[list[float], dict[str, object]]:
+    """Build bounded, train-split-only receipt sampling weights.
+
+    The recipient CTC task has a much wider long-tail alphabet than the other
+    four fields.  This helper deliberately takes the *maximum* requested
+    boost instead of multiplying factors: a rare long merchant must be seen
+    more often, but must never dominate an epoch just because it satisfies two
+    conditions.  It is pure so the frozen policy can be tested without Torch
+    or image assets.
+    """
+    numeric_values = {
+        "recipient_sampling_weight": recipient_sampling_weight,
+        "recipient_rare_character_sampling_weight": recipient_rare_character_sampling_weight,
+        "recipient_long_text_sampling_weight": recipient_long_text_sampling_weight,
+    }
+    normalized_weights: dict[str, float] = {}
+    for name, raw_value in numeric_values.items():
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError):
+            raise ValueError(f"{name} must be finite and positive") from None
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError(f"{name} must be finite and positive")
+        normalized_weights[name] = value
+    if isinstance(recipient_rare_character_max_support, bool) or not isinstance(
+        recipient_rare_character_max_support, int
+    ) or recipient_rare_character_max_support < 0:
+        raise ValueError("recipient_rare_character_max_support must be a non-negative integer")
+    if isinstance(recipient_long_text_min_length, bool) or not isinstance(recipient_long_text_min_length, int) or recipient_long_text_min_length < 0:
+        raise ValueError("recipient_long_text_min_length must be a non-negative integer")
+
+    recipient_texts: list[str | None] = []
+    character_counts: Counter[str] = Counter()
+    for record in records:
+        slot = _recipient_slot(record)
+        text = slot.get("text") if slot is not None else None
+        text = text if isinstance(text, str) and text else None
+        recipient_texts.append(text)
+        if text is not None:
+            character_counts.update(text)
+
+    rare_hits = 0
+    long_hits = 0
+    special_boost_applied = False
+    result: list[float] = []
+    for text in recipient_texts:
+        if text is None:
+            result.append(1.0)
+            continue
+        # Preserve the historical v11/v12 behaviour exactly: a value below
+        # one deliberately *downsamples* recipient rows.  The v2 long-tail
+        # options may raise that base weight for a selected row, but they do
+        # not silently clamp an existing downsampling recipe back to one.
+        weight = normalized_weights["recipient_sampling_weight"]
+        rare = (
+            recipient_rare_character_max_support > 0
+            and any(character_counts[character] <= recipient_rare_character_max_support for character in text)
+        )
+        long = recipient_long_text_min_length > 0 and len(text) >= recipient_long_text_min_length
+        if rare:
+            rare_hits += 1
+            rare_weight = normalized_weights["recipient_rare_character_sampling_weight"]
+            if rare_weight > weight:
+                special_boost_applied = True
+            weight = max(weight, rare_weight)
+        if long:
+            long_hits += 1
+            long_weight = normalized_weights["recipient_long_text_sampling_weight"]
+            if long_weight > weight:
+                special_boost_applied = True
+            weight = max(weight, long_weight)
+        result.append(float(weight))
+
+    recipient_records = sum(text is not None for text in recipient_texts)
+    sampling_is_uniform = all(math.isclose(weight, 1.0, rel_tol=0.0, abs_tol=1e-12) for weight in result)
+    if sampling_is_uniform or not special_boost_applied:
+        mode = "uniform" if sampling_is_uniform else "weighted_receipt_sampler_v1"
+        return result, {
+            "mode": mode,
+            "recipient_sampling_weight": normalized_weights["recipient_sampling_weight"],
+            "recipient_train_records": int(recipient_records),
+            "train_records": len(records),
+        }
+    return result, {
+        "mode": "weighted_receipt_sampler_v2",
+        "recipient_sampling_weight": normalized_weights["recipient_sampling_weight"],
+        "recipient_rare_character_max_support": int(recipient_rare_character_max_support),
+        "recipient_rare_character_sampling_weight": normalized_weights[
+            "recipient_rare_character_sampling_weight"
+        ],
+        "recipient_long_text_min_length": int(recipient_long_text_min_length),
+        "recipient_long_text_sampling_weight": normalized_weights["recipient_long_text_sampling_weight"],
+        "recipient_rare_character_train_records": int(rare_hits),
+        "recipient_long_text_train_records": int(long_hits),
+        "recipient_training_character_count": len(character_counts),
+        "recipient_train_records": int(recipient_records),
+        "train_records": len(records),
+    }
+
+
+def _recipient_confidence_policy(
+    *,
+    low_confidence_threshold: float | None,
+    low_confidence_loss_weight: float,
+    curriculum_epochs: int,
+) -> dict[str, object]:
+    """Validate and freeze training-only Paddle-teacher confidence handling."""
+    try:
+        normalized_weight = float(low_confidence_loss_weight)
+    except (TypeError, ValueError):
+        raise ValueError("recipient_low_confidence_loss_weight must be finite and in (0, 1]") from None
+    if not math.isfinite(normalized_weight) or not 0.0 < normalized_weight <= 1.0:
+        raise ValueError("recipient_low_confidence_loss_weight must be finite and in (0, 1]")
+    if isinstance(curriculum_epochs, bool) or not isinstance(curriculum_epochs, int) or curriculum_epochs < 0:
+        raise ValueError("recipient_confidence_curriculum_epochs must be a non-negative integer")
+    if low_confidence_threshold is None:
+        if curriculum_epochs != 0 or not math.isclose(normalized_weight, 1.0, rel_tol=0.0, abs_tol=1e-12):
+            raise ValueError(
+                "recipient_low_confidence_threshold is required when recipient confidence weighting is configured"
+            )
+        return {
+            "mode": "none",
+            "low_confidence_threshold": None,
+            "low_confidence_loss_weight": 1.0,
+            "curriculum_epochs": 0,
+        }
+    try:
+        normalized_threshold = float(low_confidence_threshold)
+    except (TypeError, ValueError):
+        raise ValueError("recipient_low_confidence_threshold must be finite and between 0 and 1") from None
+    if not math.isfinite(normalized_threshold) or not 0.0 <= normalized_threshold <= 1.0:
+        raise ValueError("recipient_low_confidence_threshold must be finite and between 0 and 1")
+    return {
+        "mode": "teacher_confidence_curriculum_v1",
+        "low_confidence_threshold": normalized_threshold,
+        "low_confidence_loss_weight": normalized_weight,
+        "curriculum_epochs": int(curriculum_epochs),
+    }
+
+
+def _validate_recipient_confidence_policy(policy: object) -> dict[str, object]:
+    """Validate a persisted confidence policy without changing model ABI."""
+    if not isinstance(policy, Mapping):
+        raise ValueError("recipient confidence policy is missing or invalid")
+    mode = policy.get("mode")
+    threshold = policy.get("low_confidence_threshold")
+    weight = policy.get("low_confidence_loss_weight")
+    epochs = policy.get("curriculum_epochs")
+    if mode == "none":
+        if threshold is not None:
+            raise ValueError("recipient confidence policy is invalid")
+        return _recipient_confidence_policy(
+            low_confidence_threshold=None,
+            low_confidence_loss_weight=weight,
+            curriculum_epochs=epochs,
+        )
+    if mode != "teacher_confidence_curriculum_v1":
+        raise ValueError("recipient confidence policy is invalid")
+    return _recipient_confidence_policy(
+        low_confidence_threshold=threshold if threshold is not None else None,
+        low_confidence_loss_weight=weight,
+        curriculum_epochs=epochs,
+    )
+
+
+def _recipient_teacher_confidence_weights(
+    records: Sequence[Mapping[str, object]],
+    *,
+    low_confidence_threshold: float | None,
+    low_confidence_loss_weight: float = 1.0,
+    curriculum_epoch: int = 1,
+    curriculum_epochs: int = 0,
+) -> list[float]:
+    """Return one recipient CTC loss weight per receipt.
+
+    A disabled policy is intentionally a cheap all-one fast path.  When
+    enabled, low-confidence Paddle labels begin at weight one and linearly
+    settle at their requested lower influence by the final curriculum epoch.
+    This avoids abruptly changing the CTC loss scale in the first epoch while
+    still letting high-confidence teacher rows dominate the fitted model.
+    """
+    policy = _recipient_confidence_policy(
+        low_confidence_threshold=low_confidence_threshold,
+        low_confidence_loss_weight=low_confidence_loss_weight,
+        curriculum_epochs=curriculum_epochs,
+    )
+    if policy["mode"] == "none":
+        return [1.0] * len(records)
+    if isinstance(curriculum_epoch, bool) or not isinstance(curriculum_epoch, int) or curriculum_epoch <= 0:
+        raise ValueError("recipient confidence curriculum epoch must be a positive integer")
+    threshold = float(policy["low_confidence_threshold"])
+    target_weight = float(policy["low_confidence_loss_weight"])
+    epochs = int(policy["curriculum_epochs"])
+    if epochs == 0:
+        ramp = 1.0
+    elif epochs == 1:
+        ramp = 1.0
+    else:
+        ramp = min(1.0, float(curriculum_epoch - 1) / float(epochs - 1))
+    low_confidence_weight = 1.0 - (1.0 - target_weight) * ramp
+    weights: list[float] = []
+    for record in records:
+        slot = _recipient_slot(record)
+        if slot is None:
+            weights.append(1.0)
+            continue
+        raw_confidence = slot.get("paddle_confidence")
+        try:
+            confidence = float(raw_confidence)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"recipient record {record.get('id', '<unknown>')} has invalid paddle_confidence"
+            ) from None
+        if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
+            raise ValueError(f"recipient record {record.get('id', '<unknown>')} has invalid paddle_confidence")
+        weights.append(low_confidence_weight if confidence < threshold else 1.0)
+    return weights
+
+
+def _recipient_train_augmentation_policy(*, mode: str, seed: int) -> dict[str, object]:
+    """Freeze the small v12-only recipient perturbation policy used in train."""
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise ValueError("recipient train augmentation seed must be an integer")
+    if mode == "none":
+        return {"mode": "none"}
+    if mode != "light_v1":
+        raise ValueError("recipient_train_augmentation must be none or light_v1")
+    return {
+        "mode": "light_v1",
+        "seed": int(seed),
+        "horizontal_shift_px": 8,
+        "vertical_shift_px": 2,
+        "contrast_delta": 0.12,
+        "noise_std": 0.01,
+    }
+
+
+def _validate_recipient_train_augmentation_policy(policy: object) -> dict[str, object]:
+    """Validate a persisted train-only v12 perturbation policy."""
+    if not isinstance(policy, Mapping):
+        raise ValueError("recipient train augmentation policy is missing or invalid")
+    mode = policy.get("mode")
+    if mode == "none":
+        if set(policy) != {"mode"}:
+            raise ValueError("recipient train augmentation policy is invalid")
+        return _recipient_train_augmentation_policy(mode="none", seed=0)
+    if mode != "light_v1":
+        raise ValueError("recipient train augmentation policy is invalid")
+    expected = _recipient_train_augmentation_policy(mode="light_v1", seed=policy.get("seed"))
+    if dict(policy) != expected:
+        raise ValueError("recipient train augmentation policy is invalid")
+    return expected
+
+
 def _validate_recipient_sampling_policy(policy: object) -> dict[str, object]:
     """Validate the provenance of v11's receipt-level oversampling.
 
@@ -632,7 +903,7 @@ def _validate_recipient_sampling_policy(policy: object) -> dict[str, object]:
     recipient_records = policy.get("recipient_train_records")
     train_records = policy.get("train_records")
     if (
-        mode not in {"uniform", "weighted_receipt_sampler_v1"}
+        mode not in {"uniform", "weighted_receipt_sampler_v1", "weighted_receipt_sampler_v2"}
         or not math.isfinite(weight)
         or weight <= 0.0
         or isinstance(recipient_records, bool)
@@ -660,6 +931,45 @@ def _validate_recipient_sampling_policy(policy: object) -> dict[str, object]:
         raise ValueError("v11 weighted recipient sampling seed is invalid")
     normalized["replacement"] = True
     normalized["seed"] = seed
+    if mode == "weighted_receipt_sampler_v2":
+        try:
+            rare_weight = float(policy.get("recipient_rare_character_sampling_weight"))
+            long_weight = float(policy.get("recipient_long_text_sampling_weight"))
+        except (TypeError, ValueError):
+            raise ValueError("v12 recipient sampling policy is invalid") from None
+        integer_keys = (
+            "recipient_rare_character_max_support",
+            "recipient_long_text_min_length",
+            "recipient_rare_character_train_records",
+            "recipient_long_text_train_records",
+            "recipient_training_character_count",
+        )
+        integers: dict[str, int] = {}
+        for key in integer_keys:
+            value = policy.get(key)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError("v12 recipient sampling policy is invalid")
+            integers[key] = value
+        if (
+            not math.isfinite(rare_weight)
+            or rare_weight <= 0.0
+            or not math.isfinite(long_weight)
+            or long_weight <= 0.0
+            or integers["recipient_rare_character_train_records"] > recipient_records
+            or integers["recipient_long_text_train_records"] > recipient_records
+        ):
+            raise ValueError("v12 recipient sampling policy is invalid")
+        normalized.update(
+            {
+                "recipient_rare_character_max_support": integers["recipient_rare_character_max_support"],
+                "recipient_rare_character_sampling_weight": rare_weight,
+                "recipient_long_text_min_length": integers["recipient_long_text_min_length"],
+                "recipient_long_text_sampling_weight": long_weight,
+                "recipient_rare_character_train_records": integers["recipient_rare_character_train_records"],
+                "recipient_long_text_train_records": integers["recipient_long_text_train_records"],
+                "recipient_training_character_count": integers["recipient_training_character_count"],
+            }
+        )
     return normalized
 
 
@@ -667,6 +977,8 @@ def _recipient_artifact_metadata(
     config: UnifiedReaderConfig,
     *,
     recipient_sampling_policy: object | None = None,
+    recipient_confidence_policy: object | None = None,
+    recipient_train_augmentation_policy: object | None = None,
 ) -> dict[str, object]:
     """Build frozen fifth-slot metadata for checkpoints and ONNX sidecars."""
     if not _uses_recipient_protocol(config):
@@ -682,6 +994,16 @@ def _recipient_artifact_metadata(
                 "recipient_sampling_policy": _validate_recipient_sampling_policy(recipient_sampling_policy),
             }
         )
+        # These are explicit training provenance, never runtime decoding
+        # inputs.  Older sidecars omit them and remain loadable.
+        if recipient_confidence_policy is not None:
+            metadata["recipient_confidence_policy"] = _validate_recipient_confidence_policy(
+                recipient_confidence_policy
+            )
+        if recipient_train_augmentation_policy is not None:
+            metadata["recipient_train_augmentation_policy"] = _validate_recipient_train_augmentation_policy(
+                recipient_train_augmentation_policy
+            )
     if _is_v12(config):
         metadata.update(
             {
@@ -1788,12 +2110,103 @@ def _recipient_value_input_tensor(record: Mapping[str, object], *, config: Unifi
     )
 
 
+def _recipient_augmentation_rng(
+    record: Mapping[str, object], *, policy: Mapping[str, object], epoch: int
+) -> np.random.Generator:
+    """Return a stable per-record augmentation RNG.
+
+    DataLoader workers can yield examples in a different order on different
+    machines.  Deriving the generator from the frozen seed, current epoch and
+    record id makes the train-only perturbation reproducible regardless of
+    worker scheduling.
+    """
+    if policy.get("mode") != "light_v1":
+        raise ValueError("recipient augmentation RNG requires light_v1 policy")
+    seed = policy.get("seed")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise ValueError("recipient augmentation policy seed is invalid")
+    if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 0:
+        raise ValueError("recipient augmentation epoch must be a non-negative integer")
+    record_id = record.get("id")
+    if not isinstance(record_id, str) or not record_id:
+        raise ValueError("recipient augmentation record id is invalid")
+    digest = hashlib.sha256(f"{seed}:{epoch}:{record_id}".encode("utf-8")).digest()
+    return np.random.default_rng(int.from_bytes(digest[:8], byteorder="little", signed=False))
+
+
+def _augment_recipient_value_input(
+    image: np.ndarray,
+    *,
+    record: Mapping[str, object],
+    policy: Mapping[str, object],
+    epoch: int,
+) -> np.ndarray:
+    """Apply a deliberately small recipient-only perturbation during train.
+
+    This protects the shared amount/time/payment pathway and keeps the static
+    v12 ONNX input contract unchanged.  White padding is used after shifts so
+    the synthetic crop still resembles the source crop preprocessing.
+    """
+    normalized_policy = _validate_recipient_train_augmentation_policy(policy)
+    if normalized_policy["mode"] == "none":
+        return image
+    if image.ndim != 3 or image.shape[0] != 1:
+        raise ValueError("recipient value input must have shape [1,H,W]")
+    if not np.isfinite(image).all():
+        raise ValueError("recipient value input contains non-finite pixels")
+    rng = _recipient_augmentation_rng(record, policy=normalized_policy, epoch=epoch)
+    _, height, width = image.shape
+    horizontal_limit = int(normalized_policy["horizontal_shift_px"])
+    vertical_limit = int(normalized_policy["vertical_shift_px"])
+    shift_x = int(rng.integers(-horizontal_limit, horizontal_limit + 1))
+    shift_y = int(rng.integers(-vertical_limit, vertical_limit + 1))
+    shifted = np.ones_like(image, dtype=np.float32)
+    source_x_start = max(0, -shift_x)
+    source_x_end = min(width, width - shift_x)
+    source_y_start = max(0, -shift_y)
+    source_y_end = min(height, height - shift_y)
+    destination_x_start = max(0, shift_x)
+    destination_x_end = destination_x_start + max(0, source_x_end - source_x_start)
+    destination_y_start = max(0, shift_y)
+    destination_y_end = destination_y_start + max(0, source_y_end - source_y_start)
+    if source_x_end > source_x_start and source_y_end > source_y_start:
+        shifted[
+            :, destination_y_start:destination_y_end, destination_x_start:destination_x_end
+        ] = image[:, source_y_start:source_y_end, source_x_start:source_x_end]
+    # White remains white under the contrast transform; only ink strength is
+    # altered. This avoids teaching the model a non-existent dark background.
+    contrast_delta = float(normalized_policy["contrast_delta"])
+    contrast = 1.0 + float(rng.uniform(-contrast_delta, contrast_delta))
+    augmented = 1.0 - (1.0 - shifted) * contrast
+    noise_std = float(normalized_policy["noise_std"])
+    if noise_std > 0.0:
+        augmented = augmented + rng.normal(0.0, noise_std, size=augmented.shape).astype(np.float32)
+    return np.clip(augmented, 0.0, 1.0).astype(np.float32, copy=False)
+
+
 class _UnifiedReceiptDataset:
     """A picklable dataset so Windows DataLoader workers remain usable."""
 
-    def __init__(self, records: Sequence[Mapping[str, object]], *, config: UnifiedReaderConfig) -> None:
+    def __init__(
+        self,
+        records: Sequence[Mapping[str, object]],
+        *,
+        config: UnifiedReaderConfig,
+        recipient_train_augmentation_policy: Mapping[str, object] | None = None,
+    ) -> None:
         self._records = list(records)
         self._config = config
+        self._recipient_train_augmentation_policy = _validate_recipient_train_augmentation_policy(
+            {"mode": "none"}
+            if recipient_train_augmentation_policy is None
+            else recipient_train_augmentation_policy
+        )
+        self._epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 0:
+            raise ValueError("dataset epoch must be a non-negative integer")
+        self._epoch = epoch
 
     def __len__(self) -> int:
         return len(self._records)
@@ -1803,9 +2216,20 @@ class _UnifiedReceiptDataset:
         torch, _ = _require_torch()
         field_images = torch.from_numpy(_input_tensor(record, config=self._config))
         if _uses_high_resolution_recipient_input(self._config):
+            recipient_value_image = _recipient_value_input_tensor(record, config=self._config)
+            if (
+                self._recipient_train_augmentation_policy["mode"] != "none"
+                and _recipient_slot(record) is not None
+            ):
+                recipient_value_image = _augment_recipient_value_input(
+                    recipient_value_image,
+                    record=record,
+                    policy=self._recipient_train_augmentation_policy,
+                    epoch=self._epoch,
+                )
             return (
                 field_images,
-                torch.from_numpy(_recipient_value_input_tensor(record, config=self._config)),
+                torch.from_numpy(recipient_value_image),
                 record,
             )
         return field_images, record
@@ -1835,9 +2259,19 @@ def _unpack_receipt_batch(
     return field_images, None, list(records)
 
 
-def _make_dataset(records: Sequence[Mapping[str, object]], *, config: UnifiedReaderConfig, torch: Any) -> Any:
+def _make_dataset(
+    records: Sequence[Mapping[str, object]],
+    *,
+    config: UnifiedReaderConfig,
+    torch: Any,
+    recipient_train_augmentation_policy: Mapping[str, object] | None = None,
+) -> Any:
     del torch  # Kept in the signature so callers make the dependency explicit.
-    return _UnifiedReceiptDataset(records, config=config)
+    return _UnifiedReceiptDataset(
+        records,
+        config=config,
+        recipient_train_augmentation_policy=recipient_train_augmentation_policy,
+    )
 
 
 def _unpack_reader_outputs(outputs: object, *, config: UnifiedReaderConfig) -> dict[str, Any]:
@@ -3000,9 +3434,19 @@ def _ctc_loss(
     labels: Sequence[str | None],
     character_to_id: Mapping[str, int],
     torch: Any,
+    sample_weights: Sequence[float] | None = None,
 ) -> tuple[Any | None, int, int]:
-    """Return CTC loss, used label count, and OOV-skipped label count."""
-    selected: list[tuple[int, str]] = []
+    """Return CTC loss, used label count, and OOV-skipped label count.
+
+    ``sample_weights`` is deliberately optional.  The no-weight path keeps the
+    historical PyTorch ``reduction='mean'`` call exactly, while the weighted
+    path first applies the same per-target-length normalization and then takes
+    a weighted mean.  That makes recipient teacher-confidence weighting a
+    train-only change without perturbing existing amount/time/payment losses.
+    """
+    if sample_weights is not None and len(sample_weights) != len(labels):
+        raise ValueError("CTC sample_weights must match labels length")
+    selected: list[tuple[int, str, float | None]] = []
     skipped = 0
     for index, text in enumerate(labels):
         if text is None:
@@ -3010,27 +3454,57 @@ def _ctc_loss(
         if any(character not in character_to_id for character in text):
             skipped += 1
             continue
-        selected.append((index, text))
+        if sample_weights is None:
+            weight: float | None = None
+        else:
+            try:
+                weight = float(sample_weights[index])
+            except (TypeError, ValueError):
+                raise ValueError("CTC sample weights must be finite and positive") from None
+            if not math.isfinite(weight) or weight <= 0.0:
+                raise ValueError("CTC sample weights must be finite and positive")
+        selected.append((index, text, weight))
     if not selected:
         return None, 0, skipped
-    indices = torch.tensor([index for index, _ in selected], dtype=torch.long, device=logits.device)
+    indices = torch.tensor([index for index, _, _ in selected], dtype=torch.long, device=logits.device)
     selected_logits = logits.index_select(1, indices)
     targets = torch.tensor(
-        [character_to_id[character] for _, text in selected for character in text],
+        [character_to_id[character] for _, text, _ in selected for character in text],
         dtype=torch.long,
         device=logits.device,
     )
     input_lengths = torch.full((len(selected),), selected_logits.shape[0], dtype=torch.long)
-    target_lengths = torch.tensor([len(text) for _, text in selected], dtype=torch.long)
-    loss = torch.nn.functional.ctc_loss(
-        selected_logits.log_softmax(2),
-        targets,
-        input_lengths,
-        target_lengths,
-        blank=NUMERIC_BLANK_INDEX,
-        reduction="mean",
-        zero_infinity=False,
-    )
+    target_lengths = torch.tensor([len(text) for _, text, _ in selected], dtype=torch.long)
+    if sample_weights is None:
+        loss = torch.nn.functional.ctc_loss(
+            selected_logits.log_softmax(2),
+            targets,
+            input_lengths,
+            target_lengths,
+            blank=NUMERIC_BLANK_INDEX,
+            reduction="mean",
+            zero_infinity=False,
+        )
+    else:
+        per_sample_loss = torch.nn.functional.ctc_loss(
+            selected_logits.log_softmax(2),
+            targets,
+            input_lengths,
+            target_lengths,
+            blank=NUMERIC_BLANK_INDEX,
+            reduction="none",
+            zero_infinity=False,
+        )
+        weights = torch.tensor(
+            [float(weight) for _, _, weight in selected],
+            dtype=per_sample_loss.dtype,
+            device=per_sample_loss.device,
+        )
+        normalized_loss = per_sample_loss / target_lengths.to(
+            dtype=per_sample_loss.dtype,
+            device=per_sample_loss.device,
+        )
+        loss = (normalized_loss * weights).sum() / weights.sum()
     return loss, len(selected), skipped
 
 
@@ -3074,6 +3548,7 @@ def _batch_loss(
     ctc_loss_weight: float,
     structured_loss_weight: float,
     torch: Any,
+    recipient_sample_weights: Sequence[float] | None = None,
     allow_empty: bool = False,
 ) -> tuple[Any | None, dict[str, dict[str, float | int]]]:
     amount_loss, amount_used, amount_oov = _ctc_loss(
@@ -3102,6 +3577,7 @@ def _batch_loss(
             labels=[_slot_text(record, "recipient_field") for record in records],
             character_to_id=recipient_to_id,
             torch=torch,
+            sample_weights=recipient_sample_weights,
         )
     else:
         recipient_loss, recipient_used, recipient_oov = None, 0, 0
@@ -4015,6 +4491,14 @@ def train_unified_reader(
     payment_loss_weight: float = 1.0,
     recipient_loss_weight: float = 1.0,
     recipient_sampling_weight: float = 1.0,
+    recipient_rare_character_max_support: int = 0,
+    recipient_rare_character_sampling_weight: float = 1.0,
+    recipient_long_text_min_length: int = 0,
+    recipient_long_text_sampling_weight: float = 1.0,
+    recipient_low_confidence_threshold: float | None = None,
+    recipient_low_confidence_loss_weight: float = 1.0,
+    recipient_confidence_curriculum_epochs: int = 0,
+    recipient_train_augmentation: str = "none",
     checkpoint_selection: str = CHECKPOINT_SELECTION_BALANCED,
     checkpoint_min_amount_candidate_exact: float | None = None,
     checkpoint_min_time_candidate_exact: float | None = None,
@@ -4034,6 +4518,53 @@ def train_unified_reader(
     otherwise its final delivery policy is review-only.
     """
     config.validate()
+    recipient_sampling_weights, recipient_sampling_policy = _recipient_training_sample_weights(
+        (),
+        recipient_sampling_weight=recipient_sampling_weight,
+        recipient_rare_character_max_support=recipient_rare_character_max_support,
+        recipient_rare_character_sampling_weight=recipient_rare_character_sampling_weight,
+        recipient_long_text_min_length=recipient_long_text_min_length,
+        recipient_long_text_sampling_weight=recipient_long_text_sampling_weight,
+    )
+    del recipient_sampling_weights  # Values are rebuilt from the actual train split below.
+    recipient_confidence_policy = _recipient_confidence_policy(
+        low_confidence_threshold=recipient_low_confidence_threshold,
+        low_confidence_loss_weight=recipient_low_confidence_loss_weight,
+        curriculum_epochs=recipient_confidence_curriculum_epochs,
+    )
+    recipient_train_augmentation_policy = _recipient_train_augmentation_policy(
+        mode=recipient_train_augmentation,
+        seed=seed,
+    )
+    # Do not infer whether these options were requested from an empty record
+    # list: ``all([])`` is true, so a pre-data policy probe would otherwise
+    # incorrectly look uniform even when a legacy caller explicitly supplied
+    # ``--recipient-sampling-weight 2``.  The helper above has already
+    # validated every numeric value; this branch merely gives unsupported
+    # architectures an immediate, actionable error before any dataset work.
+    recipient_training_options_requested = (
+        not math.isclose(float(recipient_sampling_weight), 1.0, rel_tol=0.0, abs_tol=1e-12)
+        or (
+            recipient_rare_character_max_support > 0
+            and not math.isclose(
+                float(recipient_rare_character_sampling_weight), 1.0, rel_tol=0.0, abs_tol=1e-12
+            )
+        )
+        or (
+            recipient_long_text_min_length > 0
+            and not math.isclose(
+                float(recipient_long_text_sampling_weight), 1.0, rel_tol=0.0, abs_tol=1e-12
+            )
+        )
+        or recipient_confidence_policy["mode"] != "none"
+        or recipient_train_augmentation_policy["mode"] != "none"
+    )
+    if not (_is_v11(config) or _is_v12(config)) and recipient_training_options_requested:
+        raise ValueError(
+            "recipient sampling/confidence curriculum is supported only by architecture v11 or v12"
+        )
+    if not _is_v12(config) and recipient_train_augmentation_policy["mode"] != "none":
+        raise ValueError("recipient_train_augmentation is supported only by architecture v12")
     checkpoint_selection_policy = _checkpoint_selection_policy(
         config=config,
         checkpoint_selection=checkpoint_selection,
@@ -4062,10 +4593,6 @@ def train_unified_reader(
         raise ValueError("payment_bank_prefix_min_support must be positive")
     if not math.isfinite(recipient_sampling_weight):
         raise ValueError("recipient_sampling_weight must be finite and positive")
-    if not (_is_v11(config) or _is_v12(config)) and not math.isclose(
-        recipient_sampling_weight, 1.0, rel_tol=0.0, abs_tol=1e-12
-    ):
-        raise ValueError("recipient_sampling_weight is supported only by architecture v11 or v12")
     output_dir = output_dir.resolve()
     if output_dir.exists() and any(output_dir.iterdir()):
         raise ValueError(f"training output already contains files: {output_dir}. Choose a new empty directory.")
@@ -4145,43 +4672,38 @@ def train_unified_reader(
         payment_bank_train_weights = None
         payment_bank_train_counts: dict[str, int] = {}
 
-    train_dataset = _make_dataset(train_records, config=config, torch=torch)
-    validation_dataset = _make_dataset(validation_records, config=config, torch=torch)
-    recipient_train_records = sum(
-        isinstance(dict(record["slots"]).get("recipient_field"), Mapping) for record in train_records
+    train_dataset = _make_dataset(
+        train_records,
+        config=config,
+        torch=torch,
+        recipient_train_augmentation_policy=(
+            recipient_train_augmentation_policy if _is_v12(config) else None
+        ),
     )
-    recipient_sampling_policy: dict[str, object] = {
-        "mode": "uniform",
-        "recipient_sampling_weight": 1.0,
-        "recipient_train_records": int(recipient_train_records),
-        "train_records": len(train_records),
-    }
+    validation_dataset = _make_dataset(validation_records, config=config, torch=torch)
+    sample_weights, recipient_sampling_policy = _recipient_training_sample_weights(
+        train_records,
+        recipient_sampling_weight=recipient_sampling_weight,
+        recipient_rare_character_max_support=recipient_rare_character_max_support,
+        recipient_rare_character_sampling_weight=recipient_rare_character_sampling_weight,
+        recipient_long_text_min_length=recipient_long_text_min_length,
+        recipient_long_text_sampling_weight=recipient_long_text_sampling_weight,
+    )
     train_sampler: Any | None = None
-    if (_is_v11(config) or _is_v12(config)) and not math.isclose(
-        recipient_sampling_weight, 1.0, rel_tol=0.0, abs_tol=1e-12
-    ):
-        sample_weights = torch.tensor(
-            [
-                recipient_sampling_weight
-                if isinstance(dict(record["slots"]).get("recipient_field"), Mapping)
-                else 1.0
-                for record in train_records
-            ],
-            dtype=torch.double,
-        )
+    if recipient_sampling_policy["mode"] != "uniform":
+        if not (_is_v11(config) or _is_v12(config)):
+            raise ValueError("recipient sampler is supported only by architecture v11 or v12")
+        sample_weights_tensor = torch.tensor(sample_weights, dtype=torch.double)
         generator = torch.Generator()
         generator.manual_seed(seed)
         train_sampler = torch.utils.data.WeightedRandomSampler(
-            sample_weights,
+            sample_weights_tensor,
             num_samples=len(train_records),
             replacement=True,
             generator=generator,
         )
         recipient_sampling_policy = {
-            "mode": "weighted_receipt_sampler_v1",
-            "recipient_sampling_weight": float(recipient_sampling_weight),
-            "recipient_train_records": int(recipient_train_records),
-            "train_records": len(train_records),
+            **recipient_sampling_policy,
             "replacement": True,
             "seed": int(seed),
         }
@@ -4251,9 +4773,13 @@ def train_unified_reader(
                     "recipient_target": _recipient_target_mode(config),
                     "recipient_oov_by_split": recipient_oov,
                     "recipient_sampling_policy": recipient_sampling_policy,
+                    "recipient_confidence_policy": recipient_confidence_policy,
+                    "recipient_train_augmentation_policy": recipient_train_augmentation_policy,
                     **_recipient_artifact_metadata(
                         config,
                         recipient_sampling_policy=recipient_sampling_policy,
+                        recipient_confidence_policy=recipient_confidence_policy,
+                        recipient_train_augmentation_policy=recipient_train_augmentation_policy,
                     ),
                 }
                 if recipient_characters is not None
@@ -4281,6 +4807,7 @@ def train_unified_reader(
     best_path = output_dir / "best.pt"
     for epoch in range(1, epochs + 1):
         model.train()
+        train_dataset.set_epoch(epoch)
         total_loss = 0.0
         total_receipts = 0
         for batch in train_loader:
@@ -4297,6 +4824,17 @@ def train_unified_reader(
             time_logits = outputs["time_logits"]
             payment_logits = outputs["payment_logits"]
             status_logits = outputs["status_logits"]
+            recipient_sample_weights = (
+                _recipient_teacher_confidence_weights(
+                    batch_records,
+                    low_confidence_threshold=recipient_low_confidence_threshold,
+                    low_confidence_loss_weight=recipient_low_confidence_loss_weight,
+                    curriculum_epoch=epoch,
+                    curriculum_epochs=recipient_confidence_curriculum_epochs,
+                )
+                if recipient_confidence_policy["mode"] != "none"
+                else None
+            )
             loss, _ = _batch_loss(
                 amount_logits,
                 time_logits,
@@ -4320,6 +4858,7 @@ def train_unified_reader(
                 ctc_loss_weight=ctc_loss_weight,
                 structured_loss_weight=structured_loss_weight,
                 torch=torch,
+                recipient_sample_weights=recipient_sample_weights,
             )
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
@@ -4399,9 +4938,13 @@ def train_unified_reader(
                     "recipient_target": _recipient_target_mode(config),
                     "recipient_oov_by_split": recipient_oov,
                     "recipient_sampling_policy": recipient_sampling_policy,
+                    "recipient_confidence_policy": recipient_confidence_policy,
+                    "recipient_train_augmentation_policy": recipient_train_augmentation_policy,
                     **_recipient_artifact_metadata(
                         config,
                         recipient_sampling_policy=recipient_sampling_policy,
+                        recipient_confidence_policy=recipient_confidence_policy,
+                        recipient_train_augmentation_policy=recipient_train_augmentation_policy,
                     ),
                 }
                 if recipient_characters is not None
@@ -4451,6 +4994,9 @@ def train_unified_reader(
                 "recipient_oov_by_split": recipient_oov,
                 "recipient_target": _recipient_target_mode(config),
                 "recipient_loss_weight": recipient_loss_weight,
+                "recipient_sampling_policy": recipient_sampling_policy,
+                "recipient_confidence_policy": recipient_confidence_policy,
+                "recipient_train_augmentation_policy": recipient_train_augmentation_policy,
                 "checkpoint_selection_policy": checkpoint_selection_policy,
                 "best_checkpoint_epoch": best_epoch,
                 "best_checkpoint_score": list(best_score) if best_score is not None else None,
@@ -4612,6 +5158,8 @@ def _checkpoint_labels(
                 _recipient_artifact_metadata(
                     config,
                     recipient_sampling_policy=payload.get("recipient_sampling_policy"),
+                    recipient_confidence_policy=payload.get("recipient_confidence_policy"),
+                    recipient_train_augmentation_policy=payload.get("recipient_train_augmentation_policy"),
                 )
             recipient = list(raw_recipient)
         return list(amount), list(time), list(payment), recipient, list(status), list(bank_classes)
@@ -4760,6 +5308,8 @@ def export_unified_onnx(
         _recipient_artifact_metadata(
             config,
             recipient_sampling_policy=payload.get("recipient_sampling_policy"),
+            recipient_confidence_policy=payload.get("recipient_confidence_policy"),
+            recipient_train_augmentation_policy=payload.get("recipient_train_augmentation_policy"),
         )
         if recipient_characters is not None
         else {}
@@ -5484,6 +6034,8 @@ def _load_onnx_artifact_details(
                 expected_recipient_metadata = _recipient_artifact_metadata(
                     config,
                     recipient_sampling_policy=labels.get("recipient_sampling_policy"),
+                    recipient_confidence_policy=labels.get("recipient_confidence_policy"),
+                    recipient_train_augmentation_policy=labels.get("recipient_train_augmentation_policy"),
                 )
                 for key, expected_value in expected_recipient_metadata.items():
                     if labels.get(key) != expected_value:
@@ -7056,6 +7608,74 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     train.add_argument(
+        "--recipient-rare-character-max-support",
+        type=int,
+        default=0,
+        help=(
+            "v11/v12 only: treat recipient characters seen at most this many times in the train split as rare; "
+            "0 disables rare-character sampling"
+        ),
+    )
+    train.add_argument(
+        "--recipient-rare-character-sampling-weight",
+        type=float,
+        default=1.0,
+        help=(
+            "v11/v12 only: bounded receipt sampling weight for a recipient containing a rare train character; "
+            "uses max(), never multiplicative stacking"
+        ),
+    )
+    train.add_argument(
+        "--recipient-long-text-min-length",
+        type=int,
+        default=0,
+        help=(
+            "v11/v12 only: treat a recipient value with at least this many Unicode code points as long; "
+            "0 disables long-text sampling"
+        ),
+    )
+    train.add_argument(
+        "--recipient-long-text-sampling-weight",
+        type=float,
+        default=1.0,
+        help="v11/v12 only: bounded receipt sampling weight for a long recipient value",
+    )
+    train.add_argument(
+        "--recipient-low-confidence-threshold",
+        type=float,
+        help=(
+            "v11/v12 only: Paddle recipient labels below this confidence receive a lower CTC loss weight; "
+            "omit to preserve historical all-one weighting"
+        ),
+    )
+    train.add_argument(
+        "--recipient-low-confidence-loss-weight",
+        type=float,
+        default=1.0,
+        help=(
+            "v11/v12 only: final CTC loss weight in (0,1] for recipient teacher labels below "
+            "--recipient-low-confidence-threshold"
+        ),
+    )
+    train.add_argument(
+        "--recipient-confidence-curriculum-epochs",
+        type=int,
+        default=0,
+        help=(
+            "v11/v12 only: linearly ramp low-confidence recipient label weighting over this many epochs; "
+            "0 applies the configured weight immediately"
+        ),
+    )
+    train.add_argument(
+        "--recipient-train-augmentation",
+        choices=("none", "light_v1"),
+        default="none",
+        help=(
+            "v12 only: train-only recipient value-crop perturbation; light_v1 uses deterministic small shifts, "
+            "contrast and noise without changing the ONNX input contract"
+        ),
+    )
+    train.add_argument(
         "--checkpoint-selection",
         choices=tuple(sorted(CHECKPOINT_SELECTION_MODES)),
         default=CHECKPOINT_SELECTION_BALANCED,
@@ -7292,6 +7912,14 @@ def main(argv: list[str] | None = None) -> None:
                 payment_loss_weight=args.payment_loss_weight,
                 recipient_loss_weight=args.recipient_loss_weight,
                 recipient_sampling_weight=args.recipient_sampling_weight,
+                recipient_rare_character_max_support=args.recipient_rare_character_max_support,
+                recipient_rare_character_sampling_weight=args.recipient_rare_character_sampling_weight,
+                recipient_long_text_min_length=args.recipient_long_text_min_length,
+                recipient_long_text_sampling_weight=args.recipient_long_text_sampling_weight,
+                recipient_low_confidence_threshold=args.recipient_low_confidence_threshold,
+                recipient_low_confidence_loss_weight=args.recipient_low_confidence_loss_weight,
+                recipient_confidence_curriculum_epochs=args.recipient_confidence_curriculum_epochs,
+                recipient_train_augmentation=args.recipient_train_augmentation,
                 checkpoint_selection=args.checkpoint_selection,
                 checkpoint_min_amount_candidate_exact=args.checkpoint_min_amount_candidate_exact,
                 checkpoint_min_time_candidate_exact=args.checkpoint_min_time_candidate_exact,
