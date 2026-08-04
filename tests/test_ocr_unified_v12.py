@@ -247,7 +247,7 @@ def test_v12_recipient_only_expansion_maps_unicode_rows_and_locks_financial_maps
         torch=torch,
     )
     target_recipient = ["丙", "乙", "甲"]
-    effective_payment, effective_bank, label_policy = _recipient_only_expansion_label_override(
+    effective_payment, effective_bank, effective_recipient, label_policy = _recipient_only_expansion_label_override(
         init_checkpoint=seed,
         config=config,
         amount_characters=list(V8_AMOUNT_CHARACTERS),
@@ -259,13 +259,16 @@ def test_v12_recipient_only_expansion_maps_unicode_rows_and_locks_financial_maps
     )
     assert effective_payment == source_payment
     assert effective_bank == source_bank
+    # The persisted map remains sorted even when old seed-only characters are
+    # retained; the checkpoint loader remaps old rows by Unicode semantics.
+    assert effective_recipient == ["丙", "乙", "甲"]
     assert label_policy["payment_character_map"]["identical"] is False
     assert label_policy["payment_bank_prefix_class_map"]["identical"] is False
 
     target_model = build_unified_reader(
         payment_vocab_size=len(effective_payment) + 1,
         payment_bank_prefix_vocab_size=len(effective_bank),
-        recipient_vocab_size=len(target_recipient) + 1,
+        recipient_vocab_size=len(effective_recipient) + 1,
         config=config,
     )
     target_state = {key: value.detach().clone() for key, value in target_model.state_dict().items()}
@@ -288,7 +291,7 @@ def test_v12_recipient_only_expansion_maps_unicode_rows_and_locks_financial_maps
         amount_characters=list(V8_AMOUNT_CHARACTERS),
         time_characters=list(V6_TIME_CHARACTERS),
         payment_characters=effective_payment,
-        recipient_characters=target_recipient,
+        recipient_characters=effective_recipient,
         payment_bank_prefix_classes=effective_bank,
         torch=torch,
         target_state_dict=target_state,
@@ -298,8 +301,8 @@ def test_v12_recipient_only_expansion_maps_unicode_rows_and_locks_financial_maps
     assert initialization["recipient_classifier_row_mapping"]["shared_character_rows_copied"] == 2
     assert initialization["recipient_classifier_row_mapping"]["new_target_character_rows_kept_at_seed"] == 1
     assert mapped_state is not None
-    # Blank, 乙, and 甲 come from their semantic source rows, not their
-    # old numeric positions. 丙 is new and remains deterministic target init.
+    # Blank, 乙, and 甲 come from their semantic source rows despite their
+    # reordering in the sorted union. 丙 is new and remains deterministic init.
     torch.testing.assert_close(mapped_state["recipient_classifier.weight"][0], source_state["recipient_classifier.weight"][0])
     torch.testing.assert_close(mapped_state["recipient_classifier.weight"][2], source_state["recipient_classifier.weight"][1])
     torch.testing.assert_close(mapped_state["recipient_classifier.weight"][3], source_state["recipient_classifier.weight"][2])
@@ -311,22 +314,24 @@ def test_v12_recipient_only_expansion_maps_unicode_rows_and_locks_financial_maps
     target_model.load_state_dict(mapped_state, strict=True)
 
 
-def test_v12_recipient_only_expansion_rejects_a_missing_seed_character(tmp_path: Path) -> None:
+def test_v12_recipient_only_expansion_retains_a_missing_seed_character(tmp_path: Path) -> None:
     torch = pytest.importorskip("torch")
     config = _tiny_v12_config()
     seed, _, _, _ = _write_v12_expansion_seed(tmp_path, config=config, torch=torch)
 
-    with pytest.raises(ValueError, match="cannot discard characters"):
-        _recipient_only_expansion_label_override(
-            init_checkpoint=seed,
-            config=config,
-            amount_characters=list(V8_AMOUNT_CHARACTERS),
-            time_characters=list(V6_TIME_CHARACTERS),
-            payment_characters=["余"],
-            recipient_characters=["丙", "甲"],
-            payment_bank_prefix_classes=[PAYMENT_BANK_OTHER_CLASS, "建设银行"],
-            torch=torch,
-        )
+    _, _, effective_recipient, label_policy = _recipient_only_expansion_label_override(
+        init_checkpoint=seed,
+        config=config,
+        amount_characters=list(V8_AMOUNT_CHARACTERS),
+        time_characters=list(V6_TIME_CHARACTERS),
+        payment_characters=["余"],
+        recipient_characters=["丙", "甲"],
+        payment_bank_prefix_classes=[PAYMENT_BANK_OTHER_CLASS, "建设银行"],
+        torch=torch,
+    )
+
+    assert effective_recipient == ["丙", "乙", "甲"]
+    assert label_policy["recipient_character_map"]["checkpoint_characters_retained_not_in_current_train_count"] == 1
 
 
 def test_v12_metadata_freezes_the_two_static_input_shapes() -> None:

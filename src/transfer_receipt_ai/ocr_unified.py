@@ -4622,14 +4622,17 @@ def _recipient_only_expansion_label_override(
     recipient_characters: Sequence[str] | None,
     payment_bank_prefix_classes: Sequence[str] | None,
     torch: Any,
-) -> tuple[list[str], list[str], dict[str, object]]:
+) -> tuple[list[str], list[str], list[str], dict[str, object]]:
     """Lock financial label semantics to a v12 seed for a recipient-only run.
 
     A receipt manifest can gain/reorder payment text or bank-prefix labels
     between r2 and r3.  Rebuilding those output maps would reinterpret frozen
     financial classifier rows, even though recipient-only fine-tuning never
     updates them.  This narrow preflight instead keeps the seed's financial
-    maps exactly, while permitting only an additive recipient Unicode charset.
+    maps exactly.  It takes the sorted union of the seed's recipient map and
+    fresh train-only Unicode characters, so a narrower r3 training shard
+    cannot accidentally discard a previously learned output row while the
+    persisted Unicode-map ordering remains valid.
     """
     if not _is_v12(config):
         raise ValueError("recipient_only_expansion is supported only by architecture v12")
@@ -4662,17 +4665,14 @@ def _recipient_only_expansion_label_override(
             raise ValueError(f"init checkpoint {label} does not match the current training data")
     if source_recipient_characters is None:
         raise ValueError("init checkpoint recipient character map does not match the current training data")
-    missing_source_characters = sorted(set(source_recipient_characters) - set(recipient_characters))
-    if missing_source_characters:
-        raise ValueError(
-            "recipient_only_expansion cannot discard characters from the init checkpoint recipient map; "
-            f"missing={''.join(missing_source_characters)!r}"
-        )
+    source_recipient_set = set(source_recipient_characters)
+    effective_recipient_characters = sorted(source_recipient_set | set(recipient_characters))
     if source_payment_bank_prefix_classes is None:
         raise ValueError("init checkpoint payment bank-prefix class map does not match the current training data")
     return (
         list(source_payment_characters),
         list(source_payment_bank_prefix_classes),
+        effective_recipient_characters,
         {
             "mode": "checkpoint_financial_label_maps_v1",
             "reason": (
@@ -4688,13 +4688,18 @@ def _recipient_only_expansion_label_override(
                 data_derived_values=payment_bank_prefix_classes,
             ),
             "recipient_character_map": {
+                "mode": "checkpoint_base_plus_train_only_additions_v1",
                 "checkpoint_count": len(source_recipient_characters),
                 "checkpoint_sha256": _label_map_sha256(source_recipient_characters),
                 "data_derived_count": len(recipient_characters),
                 "data_derived_sha256": _label_map_sha256(recipient_characters),
-                "checkpoint_is_subset_of_data_derived": True,
+                "effective_count": len(effective_recipient_characters),
+                "effective_sha256": _label_map_sha256(effective_recipient_characters),
+                "checkpoint_characters_retained_not_in_current_train_count": len(
+                    source_recipient_set - set(recipient_characters)
+                ),
                 "new_data_derived_character_count": len(
-                    set(recipient_characters) - set(source_recipient_characters)
+                    set(recipient_characters) - source_recipient_set
                 ),
             },
         },
@@ -5152,12 +5157,8 @@ def train_unified_reader(
     time_to_id = {character: index for index, character in enumerate(time_characters, start=1)}
     if _uses_recipient_protocol(config):
         recipient_characters: list[str] | None = _recipient_charset(train_records)
-        recipient_to_id: dict[str, int] | None = {
-            character: index for index, character in enumerate(recipient_characters, start=1)
-        }
     else:
         recipient_characters = None
-        recipient_to_id = None
     if _uses_modern_protocol(config):
         data_derived_payment_bank_prefix_classes, data_derived_payment_bank_prefix_counts = _payment_bank_prefix_classes(
             train_records,
@@ -5182,6 +5183,7 @@ def train_unified_reader(
         (
             payment_characters,
             payment_bank_prefix_classes,
+            recipient_characters,
             financial_label_policy,
         ) = _recipient_only_expansion_label_override(
             init_checkpoint=init_checkpoint,
@@ -5197,6 +5199,11 @@ def train_unified_reader(
             train_records,
             classes=payment_bank_prefix_classes,
         )
+    recipient_to_id: dict[str, int] | None = (
+        {character: index for index, character in enumerate(recipient_characters, start=1)}
+        if recipient_characters is not None
+        else None
+    )
     payment_to_id = {character: index for index, character in enumerate(payment_characters, start=1)}
     _validate_ctc_capacity(records, config=config, recipient_characters=recipient_characters)
     status_to_id = {name: index for index, name in enumerate(STATUS_CLASSES)}
