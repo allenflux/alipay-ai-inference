@@ -4,6 +4,9 @@ param(
     [ValidateRange(1, 80)]
     [int]$Epochs = 80,
     [string]$RunName,
+    # Optional audited recipient-only checkpoint for a controlled follow-up
+    # pilot.  Leaving this blank preserves the known r2 baseline default.
+    [string]$SeedCheckpoint,
     [ValidateRange(0.0, 1.0)]
     [double]$AmountFloor = 0.7885,
     [ValidateRange(0.0, 1.0)]
@@ -32,7 +35,10 @@ $ErrorActionPreference = "Stop"
 $labelsRoot = Join-Path $TeacherRoot "paddle-teacher-labels-5field-recipient95-v12-r3-4090-r1"
 $manifestRoot = Join-Path $TeacherRoot "unified-manifest-v12-r3-4090-r1"
 $records = Join-Path $manifestRoot "unified_fields.jsonl"
-$seedCheckpoint = Join-Path $TeacherRoot "unified-run-v12-120k-r2-recipient-priority\best.pt"
+$seedCheckpoint = $SeedCheckpoint
+if ([string]::IsNullOrWhiteSpace($seedCheckpoint)) {
+    $seedCheckpoint = Join-Path $TeacherRoot "unified-run-v12-120k-r2-recipient-priority\best.pt"
+}
 $baselineModel = Join-Path $TeacherRoot "models\receipt_unified_field_reader_v12_120k_r2_recipient24_h256.onnx"
 
 if ([string]::IsNullOrWhiteSpace($RunName)) {
@@ -46,7 +52,7 @@ $candidateValOutput = Join-Path $output "onnx-val"
 foreach ($required in @(
     @{ Name = "r3 records"; Path = $records },
     @{ Name = "r3 crop root"; Path = $labelsRoot },
-    @{ Name = "r2 baseline checkpoint"; Path = $seedCheckpoint },
+    @{ Name = "recipient-only seed checkpoint"; Path = $seedCheckpoint },
     @{ Name = "r2 baseline ONNX"; Path = $baselineModel }
 )) {
     if (-not (Test-Path -LiteralPath $required.Path)) {
