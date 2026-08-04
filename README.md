@@ -795,6 +795,7 @@ $teacherResults = "$teacherRoot\paddle-teacher-results"
 $teacherLabelsV12R3 = "$teacherRoot\paddle-teacher-labels-5field-recipient95-v1"
 $unifiedManifestV12R3 = "$teacherRoot\unified-manifest-v12-r3-recipient-curriculum"
 $baselineModelV12 = "$teacherRoot\models\receipt_unified_field_reader_v12_120k_r2_recipient24_h256.onnx" # 改成当前已通过的 v12 基线文件
+$baselineCheckpointV12 = "$teacherRoot\unified-run-v12-120k-r2-recipient-priority\best.pt" # 与上面 ONNX 对应的训练 checkpoint
 $baselineValV12R3 = "$teacherRoot\unified-eval-v12-r2-on-r3-val-gpu"
 $unifiedRunV12R3 = "$teacherRoot\unified-run-v12-r3-recipient-curriculum"
 $unifiedModelV12R3 = "$teacherRoot\models\receipt_unified_field_reader_v12_120k_r3_recipient_curriculum.onnx"
@@ -871,6 +872,7 @@ python -m transfer_receipt_ai.ocr_unified train `
   --checkpoint-min-amount-candidate-exact $amountFloor `
   --checkpoint-min-time-candidate-exact $timeFloor `
   --checkpoint-min-payment-candidate-exact $paymentFloor `
+  --init-checkpoint $baselineCheckpointV12 `
   --ctc-loss-weight 0.75 `
   --structured-loss-weight 1.0 `
   --amount-format-min-confidence 0.80 `
@@ -879,6 +881,41 @@ python -m transfer_receipt_ai.ocr_unified train `
   --num-workers 0 `
   --onnx-output $unifiedModelV12R3
 ```
+
+`--init-checkpoint` 只加载匹配 `best.pt` 的模型参数；它**不会**恢复 optimizer、epoch、采样器或此前的 checkpoint
+历史。训练器会在写入新输出目录前严格比较模型 config、金额/时间/付款/收款方字符表顺序和付款银行类别顺序；不匹配会明确失败，
+绝不会用 `strict=False` 偷偷错配输出行。这样可以保留已验证的金额、时间和付款能力，同时让本轮重新从 epoch 1 选择新的
+`best.pt`。
+
+训练末尾终端会逐字段打印 `guards=`：`exact_matches/records`、当前 exact、floor、差值（pp）和失败原因；最后一行同时报告
+`best_epoch` 和 `last_epoch`，不要把可能退化的 `last.pt` 误认为最终候选。截图前可用下面的命令显示同一套证据：
+
+```powershell
+$s = Get-Content "$unifiedRunV12R3\training_summary.json" -Raw | ConvertFrom-Json
+$best = $s.records | Where-Object { $_.epoch -eq $s.best_checkpoint_epoch }
+$last = $s.records | Select-Object -Last 1
+[pscustomobject]@{
+  BestEpoch = $s.best_checkpoint_epoch
+  EligibleEpochs = @($s.records | Where-Object checkpoint_selection_eligible).Count
+  AmountFloor = $s.checkpoint_selection_policy.protected_minimum_candidate_exact.amount
+  TimeFloor = $s.checkpoint_selection_policy.protected_minimum_candidate_exact.time
+  PaymentFloor = $s.checkpoint_selection_policy.protected_minimum_candidate_exact.payment_method_field
+  BestAmount = "$($best.checkpoint_protection.candidate_exact.amount.exact_matches)/$($best.checkpoint_protection.candidate_exact.amount.records)"
+  BestTime = "$($best.checkpoint_protection.candidate_exact.time.exact_matches)/$($best.checkpoint_protection.candidate_exact.time.records)"
+  BestPayment = "$($best.checkpoint_protection.candidate_exact.payment_method_field.exact_matches)/$($best.checkpoint_protection.candidate_exact.payment_method_field.records)"
+  LastEligible = $last.checkpoint_selection_eligible
+  LastFailures = ($last.checkpoint_selection_protection_failures -join '; ')
+  AmountFormatGate = $s.config.amount_format_min_confidence
+} | Format-List
+$s.records | Select-Object -Last 10 epoch, checkpoint_selection_eligible, checkpoint_selection_protection_failures,
+  @{n='amount';e={$_.checkpoint_protection.candidate_exact.amount.exact_match}},
+  @{n='time';e={$_.checkpoint_protection.candidate_exact.time.exact_match}},
+  @{n='payment';e={$_.checkpoint_protection.candidate_exact.payment_method_field.exact_match}} | Format-Table -AutoSize
+```
+
+截图须同时包含基线在相同 `val` split 的三项 raw/candidate exact、上述三条 floor、`best` 与最后 10 轮。若保护字段已经连续
+接近 floor 且仍在上涨，只补少量 epoch；若分母、金额格式 gate 或 ONNX/Torch 候选口径不一致，先校准口径；若某字段早期持续
+落后或平台化，则改配方而不是再烧 80 轮。
 
 训练完成后只先用 GPU 在此前未用于训练选择的 `test` split 上对 r3 做一次比较；只有收款方提高且三项保护字段没有回退，
 才需要再跑同一模型的 CPU parity 和 .NET smoke。该配方会提高长尾样本的学习机会，但不承诺一定越过交付线；是否提升必须以

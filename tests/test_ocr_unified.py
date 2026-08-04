@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import numpy as np
@@ -1301,6 +1301,51 @@ def test_train_parser_and_main_forward_recipient_priority_checkpoint_protection(
     assert observed["checkpoint_min_payment_candidate_exact"] == 0.94
 
 
+def test_train_parser_and_main_forward_parameter_only_init_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Warm starts must be an explicit train-only input, never an implicit resume.
+
+    The detailed compatibility checks live in the training function; this
+    parser/main regression test protects the user-facing route so a supplied
+    checkpoint cannot silently be dropped before those checks run.
+    """
+    args = ocr_unified.build_parser().parse_args(
+        [
+            "train",
+            "--records",
+            "records.jsonl",
+            "--output",
+            "run",
+            "--init-checkpoint",
+            "seed.pt",
+        ]
+    )
+    assert args.init_checkpoint == Path("seed.pt")
+
+    observed: dict[str, object] = {}
+
+    def fake_train(**kwargs: object) -> Path:
+        observed.update(kwargs)
+        return tmp_path / "best.pt"
+
+    monkeypatch.setattr(ocr_unified, "train_unified_reader", fake_train)
+    ocr_unified.main(
+        [
+            "train",
+            "--records",
+            "records.jsonl",
+            "--output",
+            "run",
+            "--init-checkpoint",
+            "seed.pt",
+        ]
+    )
+
+    assert observed["init_checkpoint"] == Path("seed.pt")
+
+
 def test_export_parser_and_main_forward_v8_amount_format_confidence_override(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1518,6 +1563,68 @@ def test_tiny_unified_training_writes_checkpoint(tmp_path: Path) -> None:
     assert summary["status_head_policy"]["training_enabled"] is False
 
 
+def test_tiny_parameter_only_warm_start_records_provenance_and_resets_epoch(tmp_path: Path) -> None:
+    """A compatible seed may initialise weights but never resumes its run state."""
+    records_path = _write_dataset(tmp_path)
+    config = _tiny_config(architecture_version=4)
+    seed = train_unified_reader(
+        records_path=records_path,
+        output_dir=tmp_path / "seed",
+        config=config,
+        device="cpu",
+        epochs=1,
+        batch_size=2,
+    )
+    warmed = train_unified_reader(
+        records_path=records_path,
+        output_dir=tmp_path / "warmed",
+        config=config,
+        device="cpu",
+        epochs=1,
+        batch_size=2,
+        init_checkpoint=seed,
+    )
+
+    summary = json.loads((warmed.parent / "training_summary.json").read_text(encoding="utf-8"))
+    initialization = summary["initialization"]
+    assert initialization["mode"] == "parameter_only"
+    assert initialization["checkpoint_path"] == str(seed.resolve())
+    assert len(initialization["checkpoint_sha256"]) == 64
+    assert initialization["source_epoch"] == 1
+    assert initialization["optimizer_restored"] is False
+    assert initialization["epoch_reset"] is True
+    assert summary["records"][0]["epoch"] == 1
+
+    payload = ocr_unified._load_checkpoint(warmed, torch=torch)
+    assert payload["initialization"] == initialization
+
+
+def test_parameter_only_warm_start_rejects_a_config_mismatch_before_creating_output(tmp_path: Path) -> None:
+    records_path = _write_dataset(tmp_path)
+    seed = train_unified_reader(
+        records_path=records_path,
+        output_dir=tmp_path / "seed",
+        config=_tiny_config(architecture_version=4),
+        device="cpu",
+        epochs=1,
+        batch_size=2,
+    )
+    output = tmp_path / "incompatible-warm-start"
+
+    with pytest.raises(ValueError, match="init checkpoint model config does not match"):
+        train_unified_reader(
+            records_path=records_path,
+            output_dir=output,
+            config=replace(_tiny_config(architecture_version=4), image_width=80),
+            device="cpu",
+            epochs=1,
+            batch_size=2,
+            init_checkpoint=seed,
+        )
+
+    assert not output.exists()
+
+
 def test_tiny_v6_training_writes_train_only_bank_classes_and_visible_charsets(tmp_path: Path) -> None:
     checkpoint = train_unified_reader(
         records_path=_write_v6_dataset(tmp_path),
@@ -1584,6 +1691,11 @@ def test_tiny_v8_training_writes_compact_amount_charset_and_candidate_metrics(tm
         "payment_method_field",
     }
     assert epoch["val_candidate_text_by_field"]["amount"]["records"] > 0
+    assert epoch["checkpoint_protection"]["candidate_exact"]["amount"] == epoch[
+        "val_candidate_text_by_field"
+    ]["amount"]
+    assert epoch["checkpoint_protection"]["minimum_candidate_exact"] == {}
+    assert summary["config"]["amount_format_min_confidence"] == 0.90
 
 
 def test_unified_export_has_one_fixed_receipt_input_when_onnx_is_available(tmp_path: Path) -> None:

@@ -4477,6 +4477,172 @@ def _checkpoint_selection_score(
     )
 
 
+def _parameter_only_initialization(
+    *,
+    init_checkpoint: Path | None,
+    config: UnifiedReaderConfig,
+    amount_characters: Sequence[str],
+    time_characters: Sequence[str],
+    payment_characters: Sequence[str],
+    recipient_characters: Sequence[str] | None,
+    payment_bank_prefix_classes: Sequence[str] | None,
+    torch: Any,
+) -> tuple[Mapping[str, object] | None, dict[str, object]]:
+    """Load a compatible checkpoint as parameters only, never as a resume.
+
+    A warm start is deliberately stricter than a shape-only ``state_dict``
+    load.  CTC character rows and finite classifier rows are semantic indices;
+    accepting an equal-size but reordered map would silently corrupt a field.
+    The caller gets a fresh optimiser, epoch counter, sampler state, and
+    best-checkpoint history in every case.
+    """
+    if init_checkpoint is None:
+        return None, {
+            "mode": "random",
+            "optimizer_restored": False,
+            "epoch_reset": True,
+        }
+    checkpoint_path = Path(init_checkpoint).resolve()
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(checkpoint_path)
+    payload = _load_checkpoint(checkpoint_path, torch=torch)
+    source_config = _checkpoint_config(payload)
+    if source_config != config:
+        raise ValueError(
+            "init checkpoint model config does not match the requested training config; "
+            "use the same architecture, input sizes, head widths, and decoder policy"
+        )
+    (
+        source_amount_characters,
+        source_time_characters,
+        source_payment_characters,
+        source_recipient_characters,
+        source_status_classes,
+        source_payment_bank_prefix_classes,
+    ) = _checkpoint_labels(payload, config=source_config)
+    label_maps: tuple[tuple[str, Sequence[str] | None, Sequence[str] | None], ...] = (
+        ("amount character map", source_amount_characters, amount_characters),
+        ("time character map", source_time_characters, time_characters),
+        ("payment character map", source_payment_characters, payment_characters),
+        ("recipient character map", source_recipient_characters, recipient_characters),
+        ("status class map", source_status_classes, STATUS_CLASSES),
+        (
+            "payment bank-prefix class map",
+            source_payment_bank_prefix_classes,
+            payment_bank_prefix_classes,
+        ),
+    )
+    for label, source_values, current_values in label_maps:
+        if source_values is None or current_values is None:
+            if source_values is not current_values:
+                raise ValueError(f"init checkpoint {label} does not match the current training data")
+        elif list(source_values) != list(current_values):
+            raise ValueError(f"init checkpoint {label} does not match the current training data")
+    state_dict = payload.get("state_dict")
+    if not isinstance(state_dict, Mapping):
+        raise ValueError("init checkpoint is missing model parameters")
+    return state_dict, {
+        "mode": "parameter_only",
+        "checkpoint_path": str(checkpoint_path),
+        "checkpoint_sha256": _sha256(checkpoint_path),
+        "source_kind": payload.get("kind"),
+        "source_epoch": payload.get("epoch"),
+        "source_config": asdict(source_config),
+        "optimizer_restored": False,
+        "epoch_reset": True,
+    }
+
+
+def _checkpoint_protection_report(
+    validation: Mapping[str, object],
+    *,
+    policy: Mapping[str, object],
+    failures: Sequence[str],
+) -> dict[str, object]:
+    """Capture the exact per-field evidence used by checkpoint protection."""
+    by_field = validation.get("candidate_text_by_field")
+    if not isinstance(by_field, Mapping):
+        raise ValueError("validation candidate-text metrics are missing")
+    observed: dict[str, dict[str, int | float]] = {}
+    for field in CHECKPOINT_SELECTION_PROTECTED_FIELDS:
+        metric = by_field.get(field)
+        if not isinstance(metric, Mapping):
+            raise ValueError(f"validation candidate-text metrics are missing for {field}")
+        exact_match = _validation_candidate_exact(validation, field)
+        records = metric.get("records")
+        exact_matches = metric.get("exact_matches")
+        if (
+            isinstance(records, bool)
+            or not isinstance(records, int)
+            or records <= 0
+            or isinstance(exact_matches, bool)
+            or not isinstance(exact_matches, int)
+            or not 0 <= exact_matches <= records
+        ):
+            raise ValueError(f"validation candidate-text counts are invalid for {field}")
+        observed[field] = {
+            "exact_matches": exact_matches,
+            "records": records,
+            "exact_match": exact_match,
+        }
+    raw_minima = policy.get("protected_minimum_candidate_exact")
+    if not isinstance(raw_minima, Mapping):
+        raise ValueError("checkpoint selection policy has invalid protected candidate floors")
+    minima: dict[str, float] = {}
+    for field in CHECKPOINT_SELECTION_PROTECTED_FIELDS:
+        if field not in raw_minima:
+            continue
+        try:
+            minimum = float(raw_minima[field])
+        except (TypeError, ValueError):
+            raise ValueError(f"checkpoint selection policy has invalid floor for {field}") from None
+        if not math.isfinite(minimum) or not 0.0 <= minimum <= 1.0:
+            raise ValueError(f"checkpoint selection policy has invalid floor for {field}")
+        minima[field] = minimum
+    return {
+        "candidate_exact": observed,
+        "minimum_candidate_exact": minima,
+        "margin": {
+            field: observed[field]["exact_match"] - minimum
+            for field, minimum in minima.items()
+        },
+        "failures": list(failures),
+    }
+
+
+def _format_checkpoint_protection_report(report: Mapping[str, object]) -> str:
+    """Render a compact, screenshot-friendly guardrail line for training logs."""
+    observed = report.get("candidate_exact")
+    minima = report.get("minimum_candidate_exact")
+    margins = report.get("margin")
+    failures = report.get("failures")
+    if not isinstance(observed, Mapping) or not isinstance(minima, Mapping) or not isinstance(margins, Mapping):
+        raise ValueError("checkpoint protection report is invalid")
+    labels = {"amount": "amount", "time": "time", "payment_method_field": "payment"}
+    fields: list[str] = []
+    for field in CHECKPOINT_SELECTION_PROTECTED_FIELDS:
+        metric = observed.get(field)
+        if not isinstance(metric, Mapping):
+            raise ValueError(f"checkpoint protection report is missing {field}")
+        try:
+            exact_matches = int(metric["exact_matches"])
+            records = int(metric["records"])
+            exact_match = float(metric["exact_match"])
+        except (KeyError, TypeError, ValueError):
+            raise ValueError(f"checkpoint protection report is invalid for {field}") from None
+        text = f"{labels[field]}={exact_matches}/{records}={exact_match:.2%}"
+        if field in minima:
+            try:
+                minimum = float(minima[field])
+                margin = float(margins[field])
+            except (KeyError, TypeError, ValueError):
+                raise ValueError(f"checkpoint protection report has no valid floor for {field}") from None
+            text += f"/floor={minimum:.2%} ({margin * 100:+.2f}pp)"
+        fields.append(text)
+    failure_text = "; ".join(str(value) for value in failures) if isinstance(failures, Sequence) and not isinstance(failures, str) and failures else "-"
+    return "guards=" + ", ".join(fields) + f"; failures={failure_text}"
+
+
 def train_unified_reader(
     *,
     records_path: Path,
@@ -4503,6 +4669,7 @@ def train_unified_reader(
     checkpoint_min_amount_candidate_exact: float | None = None,
     checkpoint_min_time_candidate_exact: float | None = None,
     checkpoint_min_payment_candidate_exact: float | None = None,
+    init_checkpoint: Path | None = None,
     ctc_loss_weight: float = 0.35,
     structured_loss_weight: float = 1.0,
     payment_bank_prefix_min_support: int = 3,
@@ -4730,6 +4897,20 @@ def train_unified_reader(
         payment_bank_prefix_vocab_size=(len(payment_bank_prefix_classes) if payment_bank_prefix_classes is not None else None),
         recipient_vocab_size=(len(recipient_characters) + 1 if recipient_characters is not None else None),
     ).to(target_device)
+    initialization_state, initialization = _parameter_only_initialization(
+        init_checkpoint=init_checkpoint,
+        config=config,
+        amount_characters=amount_characters,
+        time_characters=time_characters,
+        payment_characters=payment_characters,
+        recipient_characters=recipient_characters,
+        payment_bank_prefix_classes=payment_bank_prefix_classes,
+        torch=torch,
+    )
+    if initialization_state is not None:
+        # This is intentionally strict: equal tensor shapes are insufficient
+        # when a CTC character or classifier-class ordering has changed.
+        model.load_state_dict(initialization_state, strict=True)
     if bool(status_policy["training_enabled"]):
         total_status = sum(status_counts["train"].values())
         status_weights = torch.tensor(
@@ -4761,6 +4942,7 @@ def train_unified_reader(
             "status_classes": list(STATUS_CLASSES),
             "structured_target_counts": structured_counts,
             "checkpoint_selection_policy": checkpoint_selection_policy,
+            "initialization": initialization,
             "payment_charset_sha256": hashlib.sha256("".join(payment_characters).encode("utf-8")).hexdigest(),
             **(
                 {
@@ -4914,9 +5096,15 @@ def train_unified_reader(
             status_policy=status_policy,
             policy=checkpoint_selection_policy,
         )
+        protection_report = _checkpoint_protection_report(
+            validation,
+            policy=checkpoint_selection_policy,
+            failures=protection_failures,
+        )
         epoch_record["checkpoint_selection_eligible"] = score is not None
         epoch_record["checkpoint_selection_protection_failures"] = protection_failures
         epoch_record["checkpoint_selection_score"] = list(score) if score is not None else None
+        epoch_record["checkpoint_protection"] = protection_report
         history.append(epoch_record)
         checkpoint_payload = {
             "schema_version": SCHEMA_VERSION,
@@ -4964,6 +5152,7 @@ def train_unified_reader(
             "payment_loss_weight": payment_loss_weight,
             "recipient_loss_weight": recipient_loss_weight,
             "checkpoint_selection_policy": checkpoint_selection_policy,
+            "initialization": initialization,
             "ctc_loss_weight": ctc_loss_weight,
             "structured_loss_weight": structured_loss_weight,
             "epoch": epoch,
@@ -4979,6 +5168,7 @@ def train_unified_reader(
             {
                 "schema_version": SCHEMA_VERSION,
                 "kind": _kind_for_config(config),
+                "config": asdict(config),
                 "field_counts": field_counts,
                 "status_class_counts": status_counts,
                 "structured_target_counts": structured_counts,
@@ -4998,6 +5188,7 @@ def train_unified_reader(
                 "recipient_confidence_policy": recipient_confidence_policy,
                 "recipient_train_augmentation_policy": recipient_train_augmentation_policy,
                 "checkpoint_selection_policy": checkpoint_selection_policy,
+                "initialization": initialization,
                 "best_checkpoint_epoch": best_epoch,
                 "best_checkpoint_score": list(best_score) if best_score is not None else None,
                 "records": history,
@@ -5016,13 +5207,33 @@ def train_unified_reader(
             f"val_verifier={_format_exact_match(validation['verifier_macro_exact_match'])} "
             f"val_delivery={float(validation['delivery_exact_overall']):.2%} "
             f"coverage={float(validation['delivery_coverage']):.2%} "
+            f"{_format_checkpoint_protection_report(protection_report)} "
             f"checkpoint={'eligible' if score is not None else 'protected'}"
         )
     if best_epoch is None:
+        final_report = history[-1].get("checkpoint_protection") if history else None
+        if isinstance(final_report, Mapping):
+            print(
+                "training_complete: best_checkpoint=none "
+                f"last_epoch={history[-1]['epoch']}/{epochs} "
+                f"{_format_checkpoint_protection_report(final_report)}"
+            )
         raise ValueError(
             "No epoch met checkpoint protection floors; best.pt was not written. "
             "Inspect training_summary.json and recalibrate the validation floors."
         )
+    best_record = next(record for record in history if record["epoch"] == best_epoch)
+    best_report = best_record.get("checkpoint_protection")
+    last_report = history[-1].get("checkpoint_protection")
+    if not isinstance(best_report, Mapping) or not isinstance(last_report, Mapping):
+        raise AssertionError("training history is missing checkpoint protection evidence")
+    print(
+        "training_complete: "
+        f"best_epoch={best_epoch}/{epochs} "
+        f"best_{_format_checkpoint_protection_report(best_report)} "
+        f"last_epoch={history[-1]['epoch']}/{epochs} "
+        f"last_{_format_checkpoint_protection_report(last_report)}"
+    )
     return best_path
 
 
@@ -5467,6 +5678,7 @@ def export_unified_onnx(
         "payment_characters": payment_characters,
         "status_classes": status_classes,
         "checkpoint_selection_policy": payload.get("checkpoint_selection_policy"),
+        "initialization": payload.get("initialization"),
         "payment_charset_sha256": hashlib.sha256("".join(payment_characters).encode("utf-8")).hexdigest(),
         **(
             {
@@ -5854,6 +6066,7 @@ def export_unified_onnx(
             "training_status_class_counts": status_counts,
             "training_structured_target_counts": payload.get("structured_target_counts"),
             "checkpoint_selection_policy": payload.get("checkpoint_selection_policy"),
+            "training_initialization": payload.get("initialization"),
             "status_head_policy": status_policy,
             "payment_bank_prefix_classes": payment_bank_prefix_classes,
             "payment_bank_prefix_min_support": payload.get("payment_bank_prefix_min_support"),
@@ -7700,6 +7913,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="recipient_priority only: same-validation-split payment candidate-exact protection floor",
     )
     train.add_argument(
+        "--init-checkpoint",
+        type=Path,
+        help=(
+            "Optional parameter-only warm start from a compatible best.pt. "
+            "The optimizer, epoch counter, sampler, and checkpoint history are always reset."
+        ),
+    )
+    train.add_argument(
         "--ctc-loss-weight",
         type=float,
         default=0.35,
@@ -7924,6 +8145,7 @@ def main(argv: list[str] | None = None) -> None:
                 checkpoint_min_amount_candidate_exact=args.checkpoint_min_amount_candidate_exact,
                 checkpoint_min_time_candidate_exact=args.checkpoint_min_time_candidate_exact,
                 checkpoint_min_payment_candidate_exact=args.checkpoint_min_payment_candidate_exact,
+                init_checkpoint=args.init_checkpoint,
                 ctc_loss_weight=args.ctc_loss_weight,
                 structured_loss_weight=args.structured_loss_weight,
                 payment_bank_prefix_min_support=args.payment_bank_prefix_min_support,
