@@ -18,6 +18,8 @@ param(
     [int]$NumWorkers = 4,
     [ValidateRange(1, 16)]
     [int]$PrefetchFactor = 2,
+    [ValidateRange(1, 80)]
+    [int]$ValidationEvery = 5,
     [switch]$DiagnosticOnly,
     [switch]$CheckOnly
 )
@@ -62,6 +64,42 @@ function Get-ExactDisplay([object]$Metric) {
     return ("{0}/{1}={2:P2}" -f $Metric.raw_exact_matches, $Metric.records, $Metric.raw_exact_match)
 }
 
+function Read-GuardedJson([string]$Path) {
+    # Python accepts the NaN/Infinity tokens emitted by Python's JSON encoder,
+    # whereas Windows PowerShell's ConvertFrom-Json rejects them. Normalize
+    # those values to null before PowerShell reads a training/evaluation summary.
+    $pythonProgram = @'
+import json
+import math
+import sys
+
+
+def normalize(value):
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, list):
+        return [normalize(item) for item in value]
+    if isinstance(value, dict):
+        return {key: normalize(item) for key, item in value.items()}
+    return value
+
+
+with open(sys.argv[1], "r", encoding="utf-8") as stream:
+    payload = json.load(stream, parse_constant=lambda _value: None)
+print(json.dumps(normalize(payload), ensure_ascii=True, allow_nan=False, separators=(",", ":")))
+'@
+    $normalizedJson = (& python -c $pythonProgram $Path) -join "`n"
+    if ($LASTEXITCODE -ne 0) {
+        throw "Unable to normalize JSON summary with Python: $Path (exit code $LASTEXITCODE)"
+    }
+    try {
+        return ($normalizedJson | ConvertFrom-Json)
+    }
+    catch {
+        throw "Unable to parse normalized JSON summary: $Path. $($_.Exception.Message)"
+    }
+}
+
 function Get-TrainingExactDisplay([object]$Record, [string]$Field) {
     if ($null -eq $Record -or $null -eq $Record.val_candidate_text_by_field) {
         return "n/a"
@@ -78,7 +116,7 @@ Write-Host "  seed=$seedCheckpoint"
 Write-Host "  records=$records"
 Write-Host "  output=$output"
 Write-Host ("  floors: amount={0:P2}, time={1:P2}, payment={2:P2}" -f $AmountFloor, $TimeFloor, $PaymentFloor)
-Write-Host ("  recipe: recipient-only, lr={0}, workers={1}, prefetch={2}, TF32=on, cuDNN-benchmark=on" -f $LearningRate, $NumWorkers, $PrefetchFactor)
+Write-Host ("  recipe: recipient-only, lr={0}, workers={1}, prefetch={2}, validate-every={3}, TF32=on, cuDNN-benchmark=on" -f $LearningRate, $NumWorkers, $PrefetchFactor, $ValidationEvery)
 Write-Host ("  recipient target: 90.00% strict exact ({0})" -f $(if ($DiagnosticOnly) { "diagnostic only" } else { "required" }))
 try {
     & nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
@@ -106,7 +144,7 @@ $baselineArgs = @(
 if ($LASTEXITCODE -ne 0) {
     throw "Baseline evaluation failed with exit code $LASTEXITCODE"
 }
-$baseline = Get-Content (Join-Path $baselineOutput "summary.json") -Raw | ConvertFrom-Json
+$baseline = Read-GuardedJson (Join-Path $baselineOutput "summary.json")
 $baselineAmount = $baseline.by_field.amount
 $baselineTime = $baseline.by_field.time
 $baselinePayment = $baseline.by_field.payment_method_field
@@ -183,6 +221,7 @@ $trainArgs = @(
     "--seed", "42",
     "--num-workers", "$NumWorkers",
     "--prefetch-factor", "$PrefetchFactor",
+    "--validation-every", "$ValidationEvery",
     "--cuda-tf32",
     "--cudnn-benchmark"
 )
@@ -205,9 +244,10 @@ try {
 finally {
     $summaryPath = Join-Path $output "training_summary.json"
     if (Test-Path -LiteralPath $summaryPath) {
-        $summary = Get-Content $summaryPath -Raw | ConvertFrom-Json
+        $summary = Read-GuardedJson $summaryPath
         $last = @($summary.records | Select-Object -Last 1)[0]
         $best = @($summary.records | Where-Object { $_.epoch -eq $summary.best_checkpoint_epoch })[0]
+        $validatedRecords = @($summary.records | Where-Object { $_.validation_performed -ne $false })
         $eligible = @($summary.records | Where-Object checkpoint_selection_eligible).Count
         $recipientOov = $summary.recipient_oov_by_split.val
         $bestRecipientMetric = $null
@@ -245,7 +285,7 @@ finally {
             LastEligible = $last.checkpoint_selection_eligible
             LastFailures = ($last.checkpoint_selection_protection_failures -join "; ")
         } | Format-List
-        $summary.records | Select-Object -Last 10 `
+        $validatedRecords | Select-Object -Last 10 `
             epoch, train_seconds, validation_seconds, epoch_seconds, checkpoint_selection_eligible, checkpoint_selection_protection_failures, `
             @{ n = "amount"; e = { $_.val_candidate_text_by_field.amount.exact_match } }, `
             @{ n = "time"; e = { $_.val_candidate_text_by_field.time.exact_match } }, `
@@ -290,7 +330,7 @@ elseif ($exitCode -eq 0) {
         $candidateExitCode = $LASTEXITCODE
         $candidateSummaryPath = Join-Path $candidateValOutput "summary.json"
         if (Test-Path -LiteralPath $candidateSummaryPath) {
-            $candidate = Get-Content $candidateSummaryPath -Raw | ConvertFrom-Json
+            $candidate = Read-GuardedJson $candidateSummaryPath
             $candidateAmount = $candidate.by_field.amount
             $candidateTime = $candidate.by_field.time
             $candidatePayment = $candidate.by_field.payment_method_field

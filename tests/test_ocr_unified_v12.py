@@ -10,6 +10,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+import transfer_receipt_ai.ocr_unified as ocr_unified
+
 from transfer_receipt_ai.ocr_unified import (
     INIT_CHECKPOINT_MODE_RECIPIENT_ONLY_EXPANSION,
     KIND_V12,
@@ -20,7 +22,11 @@ from transfer_receipt_ai.ocr_unified import (
     V12_ONNX_OUTPUT_NAMES,
     UnifiedReaderConfig,
     _checkpoint_config,
+    _assert_non_recipient_parameter_bytes,
+    _full_validation_epoch_reason,
+    _is_full_validation_epoch,
     _load_onnx_artifacts,
+    _non_recipient_parameter_bytes,
     _parameter_only_initialization,
     _recipient_artifact_metadata,
     _recipient_charset_source,
@@ -182,6 +188,119 @@ def test_v12_recipient_only_logits_match_the_full_private_branch() -> None:
         private_logits = _recipient_only_logits(model, recipient_value, config=config)
 
     torch.testing.assert_close(full_logits, private_logits, rtol=0.0, atol=0.0)
+
+
+def test_v12_sparse_full_validation_schedule_keeps_epoch_one_and_final() -> None:
+    """A long recipient-only run may skip only interior non-N epochs."""
+    planned = [
+        epoch
+        for epoch in range(1, 9)
+        if _is_full_validation_epoch(epoch=epoch, epochs=8, validation_every=3)
+    ]
+
+    assert planned == [1, 3, 6, 8]
+    assert _full_validation_epoch_reason(epoch=1, epochs=8, validation_every=3) == "epoch_1"
+    assert _full_validation_epoch_reason(epoch=3, epochs=8, validation_every=3) == "every_n"
+    assert _full_validation_epoch_reason(epoch=8, epochs=8, validation_every=3) == "final_epoch"
+    assert _full_validation_epoch_reason(epoch=2, epochs=8, validation_every=3) == "scheduled_skip"
+
+
+def test_v12_frozen_non_recipient_parameter_snapshot_is_byte_exact() -> None:
+    """Guarded sparse validation must fail before evaluating mutated frozen state."""
+    torch, model = _tiny_v12_model(_tiny_v12_config())
+    model.register_buffer("financial_guard_probe", torch.tensor([1.0]))
+    expected = _non_recipient_parameter_bytes(model)
+
+    _assert_non_recipient_parameter_bytes(model, expected)
+    with torch.no_grad():
+        model.financial_guard_probe.add_(1.0)
+
+    with pytest.raises(AssertionError, match="mutated frozen non-recipient parameters"):
+        _assert_non_recipient_parameter_bytes(model, expected)
+
+
+def _scheduled_validation_metrics(score: float) -> dict[str, object]:
+    """Small complete metric payload for checkpoint-selection scheduling tests."""
+    exact = {"records": 1, "exact_matches": 1, "exact_match": 1.0}
+    return {
+        "loss": 1.0 - score,
+        "exact_match": score,
+        "delivery_coverage": 1.0,
+        "delivery_exact_match": score,
+        "delivery_exact_overall": score,
+        "delivery_false_accepts": 0,
+        "verifier_exact_match": score,
+        "verifier_macro_exact_match": score,
+        "verifier_by_field": {},
+        "candidate_text_exact_match": score,
+        "candidate_text_macro_exact_match": score,
+        "candidate_text_by_field": {
+            "amount": dict(exact),
+            "time": dict(exact),
+            "payment_method_field": dict(exact),
+            "recipient_field": dict(exact),
+        },
+        "ctc_by_field": {},
+        "by_field": {},
+        "status_non_success_to_success": 0,
+    }
+
+
+def test_v12_sparse_validation_skips_unvalidated_epochs_from_best_selection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only full-validation epochs may score/select best.pt in guarded v12 mode."""
+    torch = pytest.importorskip("torch")
+    flat_manifest = _write_v12_source_manifest(tmp_path)
+    unified_dir = tmp_path / "unified-v12"
+    build_unified_dataset(
+        records_path=flat_manifest,
+        output_dir=unified_dir,
+        architecture="v12",
+    )
+    config = _tiny_v12_config()
+    seed, _, _, _ = _write_v12_expansion_seed(tmp_path, config=config, torch=torch)
+    calls: list[int] = []
+    checkpoint_writes: list[tuple[str, int]] = []
+    original_write_checkpoint = ocr_unified._write_checkpoint
+
+    def fake_evaluate(*_args: object, **_kwargs: object) -> dict[str, object]:
+        calls.append(len(calls) + 1)
+        return _scheduled_validation_metrics(0.50 + 0.10 * len(calls))
+
+    def record_checkpoint_write(path: Path, payload: dict[str, object], *, torch: object) -> None:
+        checkpoint_writes.append((path.name, int(payload["epoch"])))
+        original_write_checkpoint(path, payload, torch=torch)
+
+    monkeypatch.setattr(ocr_unified, "_evaluate_model", fake_evaluate)
+    monkeypatch.setattr(ocr_unified, "_write_checkpoint", record_checkpoint_write)
+    checkpoint = train_unified_reader(
+        records_path=unified_dir / "unified_fields.jsonl",
+        dataset_root=flat_manifest.parent,
+        output_dir=tmp_path / "scheduled-run",
+        config=config,
+        device="cpu",
+        epochs=5,
+        batch_size=1,
+        payment_bank_prefix_min_support=1,
+        recipient_only_fine_tune=True,
+        init_checkpoint=seed,
+        init_checkpoint_mode=INIT_CHECKPOINT_MODE_RECIPIENT_ONLY_EXPANSION,
+        validation_every=3,
+    )
+
+    summary = json.loads((checkpoint.parent / "training_summary.json").read_text(encoding="utf-8"))
+    assert calls == [1, 2, 3]
+    assert [record["validation_performed"] for record in summary["records"]] == [True, False, True, False, True]
+    assert summary["records"][1]["checkpoint_selection_eligible"] is False
+    assert summary["records"][1]["checkpoint_selection_score"] is None
+    assert summary["records"][1]["checkpoint_protection"] is None
+    assert summary["records"][3]["checkpoint_selection_eligible"] is False
+    assert summary["best_checkpoint_epoch"] == 5
+    assert summary["training_runtime"]["validation_every"] == 3
+    assert [epoch for name, epoch in checkpoint_writes if name == "last.pt"] == [1, 3, 5]
+    assert [epoch for name, epoch in checkpoint_writes if name == "best.pt"] == [1, 3, 5]
 
 
 def _write_v12_expansion_seed(

@@ -78,6 +78,28 @@ def _write_image(path: Path, shade: int) -> None:
     Image.fromarray(pixels).save(path)
 
 
+def test_atomic_json_normalizes_nonfinite_metrics(tmp_path: Path) -> None:
+    """Training summaries stay standards-compliant for PowerShell consumers."""
+    destination = tmp_path / "summary.json"
+    ocr_unified._atomic_write_json(
+        destination,
+        {
+            "finite": 1.0,
+            "nonfinite": [float("nan"), float("inf"), float("-inf")],
+            "nested": {"metric": float("nan")},
+        },
+    )
+
+    raw = destination.read_text(encoding="utf-8")
+    assert "NaN" not in raw
+    assert "Infinity" not in raw
+    assert json.loads(raw) == {
+        "finite": 1.0,
+        "nonfinite": [None, None, None],
+        "nested": {"metric": None},
+    }
+
+
 def _receipt(index: int, split: str, status: str) -> dict[str, object]:
     return {
         "schema_version": 1,
@@ -1363,6 +1385,8 @@ def test_train_parser_and_main_forward_4090_and_recipient_only_options(
             "--recipient-only-fine-tune",
             "--init-checkpoint-mode",
             "recipient_only_expansion",
+            "--validation-every",
+            "4",
             "--num-workers",
             "4",
             "--prefetch-factor",
@@ -1373,6 +1397,7 @@ def test_train_parser_and_main_forward_4090_and_recipient_only_options(
     )
     assert args.recipient_only_fine_tune is True
     assert args.init_checkpoint_mode == "recipient_only_expansion"
+    assert args.validation_every == 4
     assert args.num_workers == 4
     assert args.prefetch_factor == 2
     assert args.cuda_tf32 is True
@@ -1397,6 +1422,8 @@ def test_train_parser_and_main_forward_4090_and_recipient_only_options(
             "--recipient-only-fine-tune",
             "--init-checkpoint-mode",
             "recipient_only_expansion",
+            "--validation-every",
+            "4",
             "--num-workers",
             "4",
             "--prefetch-factor",
@@ -1408,6 +1435,7 @@ def test_train_parser_and_main_forward_4090_and_recipient_only_options(
 
     assert observed["recipient_only_fine_tune"] is True
     assert observed["init_checkpoint_mode"] == "recipient_only_expansion"
+    assert observed["validation_every"] == 4
     assert observed["num_workers"] == 4
     assert observed["prefetch_factor"] == 2
     assert observed["cuda_tf32"] is True
@@ -1431,6 +1459,15 @@ def test_recipient_only_fine_tune_rejects_an_unsafe_configuration(tmp_path: Path
             output_dir=tmp_path / "missing-seed",
             config=UnifiedReaderConfig(architecture_version=12),
             recipient_only_fine_tune=True,
+        )
+    with pytest.raises(ValueError, match="validation_every > 1 is supported only"):
+        train_unified_reader(
+            records_path=missing_records,
+            output_dir=tmp_path / "sparse-validation-without-expansion",
+            config=UnifiedReaderConfig(architecture_version=12),
+            recipient_only_fine_tune=True,
+            init_checkpoint=tmp_path / "seed.pt",
+            validation_every=2,
         )
 
 

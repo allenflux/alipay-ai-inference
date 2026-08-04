@@ -1021,10 +1021,24 @@ def _recipient_artifact_metadata(
     return metadata
 
 
+def _json_safe_value(value: object) -> object:
+    """Turn non-finite metrics into standards-compliant JSON ``null`` values."""
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, Mapping):
+        return {str(key): _json_safe_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_value(item) for item in value]
+    return value
+
+
 def _atomic_write_json(path: Path, payload: Mapping[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(dict(payload), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary.write_text(
+        json.dumps(_json_safe_value(dict(payload)), ensure_ascii=False, indent=2, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
     temporary.replace(path)
 
 
@@ -4977,6 +4991,108 @@ def _format_checkpoint_protection_report(report: Mapping[str, object]) -> str:
     return "guards=" + ", ".join(fields) + f"; failures={failure_text}"
 
 
+def _validate_validation_every(
+    validation_every: int,
+    *,
+    config: UnifiedReaderConfig,
+    recipient_only_fine_tune: bool,
+    init_checkpoint_mode: str,
+) -> None:
+    """Validate the deliberately narrow sparse-full-validation escape hatch.
+
+    A full five-field validation is the evidence for the financial guardrails,
+    so ordinary training continues to validate every epoch.  The only safe
+    exception is the v12 recipient-private warm-start route: its non-recipient
+    parameters are frozen and separately byte-checked before every planned
+    full validation.  Keeping the restriction here, before dataset/output
+    work begins, prevents a typo from silently weakening another recipe.
+    """
+    if isinstance(validation_every, bool) or not isinstance(validation_every, int) or validation_every <= 0:
+        raise ValueError("validation_every must be a positive integer")
+    if validation_every == 1:
+        return
+    if not (
+        _is_v12(config)
+        and recipient_only_fine_tune
+        and init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_ONLY_EXPANSION
+    ):
+        raise ValueError(
+            "validation_every > 1 is supported only by v12 recipient_only_fine_tune "
+            "with init_checkpoint_mode=recipient_only_expansion"
+        )
+
+
+def _is_full_validation_epoch(*, epoch: int, epochs: int, validation_every: int) -> bool:
+    """Return whether this epoch must run the complete five-field validator.
+
+    Epoch one establishes early evidence, every Nth epoch provides ongoing
+    guardrail checks, and the final epoch is never allowed to remain
+    unvalidated.  The input checks make this helper safe to test independently
+    from Torch or a dataset.
+    """
+    if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch <= 0:
+        raise ValueError("epoch must be a positive integer")
+    if isinstance(epochs, bool) or not isinstance(epochs, int) or epochs <= 0:
+        raise ValueError("epochs must be a positive integer")
+    if epoch > epochs:
+        raise ValueError("epoch cannot exceed epochs")
+    if isinstance(validation_every, bool) or not isinstance(validation_every, int) or validation_every <= 0:
+        raise ValueError("validation_every must be a positive integer")
+    return epoch == 1 or epoch == epochs or epoch % validation_every == 0
+
+
+def _full_validation_epoch_reason(*, epoch: int, epochs: int, validation_every: int) -> str:
+    """Return an audit-friendly reason for a planned full validation."""
+    if not _is_full_validation_epoch(epoch=epoch, epochs=epochs, validation_every=validation_every):
+        return "scheduled_skip"
+    reasons: list[str] = []
+    if epoch == 1:
+        reasons.append("epoch_1")
+    if epoch % validation_every == 0:
+        reasons.append("every_n")
+    if epoch == epochs:
+        reasons.append("final_epoch")
+    return "+".join(reasons)
+
+
+def _non_recipient_parameter_bytes(model: Any) -> dict[str, bytes]:
+    """Capture exact CPU bytes for the frozen side of a v12 recipient run.
+
+    ``torch.equal`` compares values rather than necessarily their raw bit
+    representation.  A copied contiguous CPU byte payload proves that every
+    non-recipient tensor in the model state has stayed identical, including
+    buffers such as future BatchNorm running statistics and details such as
+    signed zero.  This snapshot is intentionally only used by the narrowly
+    guarded sparse-validation recipient-only expansion route.
+    """
+    snapshots: dict[str, bytes] = {}
+    for name, tensor in model.state_dict().items():
+        if name.startswith("recipient_"):
+            continue
+        if not hasattr(tensor, "detach"):
+            raise AssertionError(f"model state entry {name!r} is not a tensor")
+        tensor = tensor.detach().cpu().contiguous()
+        snapshots[name] = tensor.numpy().tobytes()
+    if not snapshots:
+        raise AssertionError("recipient-only v12 model has no non-recipient parameters to protect")
+    return snapshots
+
+
+def _assert_non_recipient_parameter_bytes(model: Any, expected: Mapping[str, bytes]) -> None:
+    """Fail closed if a frozen financial/shared parameter has changed."""
+    observed = _non_recipient_parameter_bytes(model)
+    if set(observed) != set(expected):
+        raise AssertionError("recipient-only frozen parameter set changed before full validation")
+    changed = [name for name, value in observed.items() if value != expected[name]]
+    if changed:
+        preview = ", ".join(sorted(changed)[:5])
+        suffix = "..." if len(changed) > 5 else ""
+        raise AssertionError(
+            "recipient-only fine-tune mutated frozen non-recipient parameters before full validation: "
+            f"{preview}{suffix}"
+        )
+
+
 def train_unified_reader(
     *,
     records_path: Path,
@@ -5000,6 +5116,7 @@ def train_unified_reader(
     recipient_confidence_curriculum_epochs: int = 0,
     recipient_train_augmentation: str = "none",
     recipient_only_fine_tune: bool = False,
+    validation_every: int = 1,
     checkpoint_selection: str = CHECKPOINT_SELECTION_BALANCED,
     checkpoint_min_amount_candidate_exact: float | None = None,
     checkpoint_min_time_candidate_exact: float | None = None,
@@ -5042,6 +5159,12 @@ def train_unified_reader(
             )
         if init_checkpoint is None:
             raise ValueError("recipient_only_expansion requires a compatible --init-checkpoint")
+    _validate_validation_every(
+        validation_every,
+        config=config,
+        recipient_only_fine_tune=recipient_only_fine_tune,
+        init_checkpoint_mode=init_checkpoint_mode,
+    )
     recipient_sampling_weights, recipient_sampling_policy = _recipient_training_sample_weights(
         (),
         recipient_sampling_weight=recipient_sampling_weight,
@@ -5259,6 +5382,8 @@ def train_unified_reader(
         "cuda_tf32_requested": cuda_tf32,
         "cudnn_benchmark_requested": cudnn_benchmark,
         "recipient_only_private_branch_training": recipient_only_fine_tune,
+        "full_validation_schedule": "epoch_1_every_n_and_final_epoch",
+        "validation_every": validation_every,
     }
     if uses_cuda:
         try:
@@ -5400,6 +5525,8 @@ def train_unified_reader(
             "training_forward": "private_recipient_branch_only_v12",
             "source_train_records": len(train_records),
             "recipient_train_records": len(training_records),
+            "full_validation_schedule": "epoch_1_every_n_and_final_epoch",
+            "validation_every": validation_every,
         }
     if bool(status_policy["training_enabled"]):
         total_status = sum(status_counts["train"].values())
@@ -5422,6 +5549,12 @@ def train_unified_reader(
         lr=learning_rate,
         weight_decay=weight_decay,
     )
+    frozen_non_recipient_parameter_snapshot: dict[str, bytes] | None = None
+    if (
+        validation_every > 1
+        and init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_ONLY_EXPANSION
+    ):
+        frozen_non_recipient_parameter_snapshot = _non_recipient_parameter_bytes(model)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     _atomic_write_json(
@@ -5573,35 +5706,17 @@ def train_unified_reader(
         if uses_cuda:
             torch.cuda.synchronize(target_device)
         train_seconds = perf_counter() - epoch_started
-        validation_started = perf_counter()
-        validation = _evaluate_model(
-            model,
-            validation_loader,
-            config=config,
-            device=target_device,
-            amount_characters=amount_characters,
-            amount_to_id=amount_to_id,
-            time_characters=time_characters,
-            time_to_id=time_to_id,
-            payment_characters=payment_characters,
-            payment_to_id=payment_to_id,
-            recipient_characters=recipient_characters,
-            recipient_to_id=recipient_to_id,
-            payment_bank_prefix_classes=payment_bank_prefix_classes,
-            payment_bank_class_weights=None,
-            status_to_id=status_to_id,
-            status_criterion=status_validation_criterion,
-            status_enabled=bool(status_policy["training_enabled"]),
-            payment_loss_weight=payment_loss_weight,
-            recipient_loss_weight=recipient_loss_weight,
-            ctc_loss_weight=ctc_loss_weight,
-            structured_loss_weight=structured_loss_weight,
-            torch=torch,
+        full_validation_planned = _is_full_validation_epoch(
+            epoch=epoch,
+            epochs=epochs,
+            validation_every=validation_every,
         )
-        if uses_cuda:
-            torch.cuda.synchronize(target_device)
-        validation_seconds = perf_counter() - validation_started
-        epoch_record: dict[str, object] = {
+        validation_reason = _full_validation_epoch_reason(
+            epoch=epoch,
+            epochs=epochs,
+            validation_every=validation_every,
+        )
+        common_epoch_record: dict[str, object] = {
             "epoch": epoch,
             "train_loss": (
                 float((total_loss_tensor / total_receipts).cpu())
@@ -5609,39 +5724,107 @@ def train_unified_reader(
                 else math.nan
             ),
             "train_seconds": train_seconds,
-            "validation_seconds": validation_seconds,
-            "epoch_seconds": perf_counter() - epoch_started,
-            "val_loss": validation["loss"],
-            "val_exact_match": validation["exact_match"],
-            "val_delivery_coverage": validation["delivery_coverage"],
-            "val_delivery_exact_match": validation["delivery_exact_match"],
-            "val_delivery_exact_overall": validation["delivery_exact_overall"],
-            "val_delivery_false_accepts": validation["delivery_false_accepts"],
-            "val_verifier_exact_match": validation["verifier_exact_match"],
-            "val_verifier_macro_exact_match": validation["verifier_macro_exact_match"],
-            "val_verifier_by_field": validation["verifier_by_field"],
-            "val_candidate_text_exact_match": validation["candidate_text_exact_match"],
-            "val_candidate_text_macro_exact_match": validation["candidate_text_macro_exact_match"],
-            "val_candidate_text_by_field": validation["candidate_text_by_field"],
-            "val_ctc_by_field": validation["ctc_by_field"],
-            "val_by_field": validation["by_field"],
-            "val_status_non_success_to_success": validation["status_non_success_to_success"],
+            "validation_performed": full_validation_planned,
+            "validation_schedule_reason": validation_reason,
         }
-        score, protection_failures = _checkpoint_selection_score(
-            validation,
-            config=config,
-            status_policy=status_policy,
-            policy=checkpoint_selection_policy,
-        )
-        protection_report = _checkpoint_protection_report(
-            validation,
-            policy=checkpoint_selection_policy,
-            failures=protection_failures,
-        )
-        epoch_record["checkpoint_selection_eligible"] = score is not None
-        epoch_record["checkpoint_selection_protection_failures"] = protection_failures
-        epoch_record["checkpoint_selection_score"] = list(score) if score is not None else None
-        epoch_record["checkpoint_protection"] = protection_report
+        if full_validation_planned:
+            validation_started = perf_counter()
+            if frozen_non_recipient_parameter_snapshot is not None:
+                _assert_non_recipient_parameter_bytes(model, frozen_non_recipient_parameter_snapshot)
+            validation = _evaluate_model(
+                model,
+                validation_loader,
+                config=config,
+                device=target_device,
+                amount_characters=amount_characters,
+                amount_to_id=amount_to_id,
+                time_characters=time_characters,
+                time_to_id=time_to_id,
+                payment_characters=payment_characters,
+                payment_to_id=payment_to_id,
+                recipient_characters=recipient_characters,
+                recipient_to_id=recipient_to_id,
+                payment_bank_prefix_classes=payment_bank_prefix_classes,
+                payment_bank_class_weights=None,
+                status_to_id=status_to_id,
+                status_criterion=status_validation_criterion,
+                status_enabled=bool(status_policy["training_enabled"]),
+                payment_loss_weight=payment_loss_weight,
+                recipient_loss_weight=recipient_loss_weight,
+                ctc_loss_weight=ctc_loss_weight,
+                structured_loss_weight=structured_loss_weight,
+                torch=torch,
+            )
+            if uses_cuda:
+                torch.cuda.synchronize(target_device)
+            validation_seconds = perf_counter() - validation_started
+            epoch_record = {
+                **common_epoch_record,
+                "validation_seconds": validation_seconds,
+                "epoch_seconds": perf_counter() - epoch_started,
+                "val_loss": validation["loss"],
+                "val_exact_match": validation["exact_match"],
+                "val_delivery_coverage": validation["delivery_coverage"],
+                "val_delivery_exact_match": validation["delivery_exact_match"],
+                "val_delivery_exact_overall": validation["delivery_exact_overall"],
+                "val_delivery_false_accepts": validation["delivery_false_accepts"],
+                "val_verifier_exact_match": validation["verifier_exact_match"],
+                "val_verifier_macro_exact_match": validation["verifier_macro_exact_match"],
+                "val_verifier_by_field": validation["verifier_by_field"],
+                "val_candidate_text_exact_match": validation["candidate_text_exact_match"],
+                "val_candidate_text_macro_exact_match": validation["candidate_text_macro_exact_match"],
+                "val_candidate_text_by_field": validation["candidate_text_by_field"],
+                "val_ctc_by_field": validation["ctc_by_field"],
+                "val_by_field": validation["by_field"],
+                "val_status_non_success_to_success": validation["status_non_success_to_success"],
+            }
+            score, protection_failures = _checkpoint_selection_score(
+                validation,
+                config=config,
+                status_policy=status_policy,
+                policy=checkpoint_selection_policy,
+            )
+            protection_report: Mapping[str, object] | None = _checkpoint_protection_report(
+                validation,
+                policy=checkpoint_selection_policy,
+                failures=protection_failures,
+            )
+            epoch_record["checkpoint_selection_eligible"] = score is not None
+            epoch_record["checkpoint_selection_protection_failures"] = protection_failures
+            epoch_record["checkpoint_selection_score"] = list(score) if score is not None else None
+            epoch_record["checkpoint_protection"] = protection_report
+        else:
+            # A skipped full validation cannot provide financial guardrail
+            # evidence.  It is retained in history for progress visibility
+            # but is categorically ineligible for either checkpoint.
+            validation = None
+            validation_seconds = None
+            score = None
+            protection_report = None
+            epoch_record = {
+                **common_epoch_record,
+                "validation_seconds": None,
+                "epoch_seconds": perf_counter() - epoch_started,
+                "val_loss": None,
+                "val_exact_match": None,
+                "val_delivery_coverage": None,
+                "val_delivery_exact_match": None,
+                "val_delivery_exact_overall": None,
+                "val_delivery_false_accepts": None,
+                "val_verifier_exact_match": None,
+                "val_verifier_macro_exact_match": None,
+                "val_verifier_by_field": None,
+                "val_candidate_text_exact_match": None,
+                "val_candidate_text_macro_exact_match": None,
+                "val_candidate_text_by_field": None,
+                "val_ctc_by_field": None,
+                "val_by_field": None,
+                "val_status_non_success_to_success": None,
+                "checkpoint_selection_eligible": False,
+                "checkpoint_selection_protection_failures": ["full_validation_not_scheduled"],
+                "checkpoint_selection_score": None,
+                "checkpoint_protection": None,
+            }
         history.append(epoch_record)
         checkpoint_payload = {
             "schema_version": SCHEMA_VERSION,
@@ -5697,7 +5880,11 @@ def train_unified_reader(
             "epoch": epoch,
             "metrics": epoch_record,
         }
-        _write_checkpoint(output_dir / "last.pt", checkpoint_payload, torch=torch)
+        # Leave recovery with the most recent audited model, never an
+        # unvalidated interior epoch whose financial guardrail evidence was
+        # intentionally skipped.
+        if full_validation_planned:
+            _write_checkpoint(output_dir / "last.pt", checkpoint_payload, torch=torch)
         if score is not None and (best_score is None or score > best_score):
             best_score = score
             best_epoch = epoch
@@ -5741,17 +5928,26 @@ def train_unified_reader(
                 ),
             },
         )
-        print(
-            f"epoch {epoch}/{epochs}: train_loss={float(epoch_record['train_loss']):.4f} "
-            f"val_loss={float(validation['loss']):.4f} val_exact_match={float(validation['exact_match']):.2%} "
-            f"val_candidate={float(validation['candidate_text_macro_exact_match'] or 0.0):.2%} "
-            f"val_verifier={_format_exact_match(validation['verifier_macro_exact_match'])} "
-            f"val_delivery={float(validation['delivery_exact_overall']):.2%} "
-            f"coverage={float(validation['delivery_coverage']):.2%} "
-            f"train_s={train_seconds:.1f} val_s={validation_seconds:.1f} "
-            f"{_format_checkpoint_protection_report(protection_report)} "
-            f"checkpoint={'eligible' if score is not None else 'protected'}"
-        )
+        if validation is None:
+            print(
+                f"epoch {epoch}/{epochs}: train_loss={float(epoch_record['train_loss']):.4f} "
+                f"validation=scheduled_skip train_s={train_seconds:.1f} "
+                "checkpoint=unvalidated"
+            )
+        else:
+            assert isinstance(protection_report, Mapping)
+            assert validation_seconds is not None
+            print(
+                f"epoch {epoch}/{epochs}: train_loss={float(epoch_record['train_loss']):.4f} "
+                f"val_loss={float(validation['loss']):.4f} val_exact_match={float(validation['exact_match']):.2%} "
+                f"val_candidate={float(validation['candidate_text_macro_exact_match'] or 0.0):.2%} "
+                f"val_verifier={_format_exact_match(validation['verifier_macro_exact_match'])} "
+                f"val_delivery={float(validation['delivery_exact_overall']):.2%} "
+                f"coverage={float(validation['delivery_coverage']):.2%} "
+                f"train_s={train_seconds:.1f} val_s={validation_seconds:.1f} "
+                f"{_format_checkpoint_protection_report(protection_report)} "
+                f"checkpoint={'eligible' if score is not None else 'protected'}"
+            )
     if best_epoch is None:
         final_report = history[-1].get("checkpoint_protection") if history else None
         if isinstance(final_report, Mapping):
@@ -8439,6 +8635,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     train.add_argument(
+        "--validation-every",
+        type=int,
+        default=1,
+        help=(
+            "Run full five-field validation every N epochs, always including epoch 1 and the final epoch. "
+            "Values above 1 are restricted to the guarded v12 recipient-only expansion warm start."
+        ),
+    )
+    train.add_argument(
         "--checkpoint-selection",
         choices=tuple(sorted(CHECKPOINT_SELECTION_MODES)),
         default=CHECKPOINT_SELECTION_BALANCED,
@@ -8725,6 +8930,7 @@ def main(argv: list[str] | None = None) -> None:
                 recipient_confidence_curriculum_epochs=args.recipient_confidence_curriculum_epochs,
                 recipient_train_augmentation=args.recipient_train_augmentation,
                 recipient_only_fine_tune=args.recipient_only_fine_tune,
+                validation_every=args.validation_every,
                 checkpoint_selection=args.checkpoint_selection,
                 checkpoint_min_amount_candidate_exact=args.checkpoint_min_amount_candidate_exact,
                 checkpoint_min_time_candidate_exact=args.checkpoint_min_time_candidate_exact,
