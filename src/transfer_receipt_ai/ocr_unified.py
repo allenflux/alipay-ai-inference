@@ -8448,13 +8448,16 @@ def _recipient_audit_preprocess_gray(
     config: UnifiedReaderConfig,
     trim_px: int,
 ) -> np.ndarray:
-    """Reproduce v11's fifth-slot image transform from an already loaded crop.
+    """Reproduce a v11/v12 recipient value-view transform from loaded pixels.
 
     The audit loads each source crop once, then produces several candidate
     value views in memory.  Its resize, centring, and trim arithmetic exactly
-    mirrors :func:`preprocess_image`; it is intentionally private so the
+    mirrors :func:`preprocess_image`, including v12's independent
+    high-resolution input dimensions.  It is intentionally private so the
     delivery preprocessor remains the sole public runtime contract.
     """
+    if not (_is_v11(config) or _is_v12(config)):
+        raise ValueError("recipient audit preprocessor supports only architecture v11 or v12")
     source = np.asarray(gray, dtype=np.uint8)
     if source.ndim != 2 or source.shape[0] <= 0 or source.shape[1] <= 0:
         raise ValueError("recipient crop must be a non-empty grayscale image")
@@ -8462,14 +8465,20 @@ def _recipient_audit_preprocess_gray(
     if trim_px < 0 or trim_px >= width:
         raise ValueError("recipient trim pixel is outside the source crop")
     image = Image.fromarray(source, mode="L").crop((trim_px, 0, width, int(source.shape[0])))
-    scale = min(config.image_width / image.width, config.image_height / image.height)
-    resized_width = max(1, min(config.image_width, int(round(image.width * scale))))
-    resized_height = max(1, min(config.image_height, int(round(image.height * scale))))
+    output_height = (
+        config.recipient_input_height if _uses_high_resolution_recipient_input(config) else config.image_height
+    )
+    output_width = (
+        config.recipient_input_width if _uses_high_resolution_recipient_input(config) else config.image_width
+    )
+    scale = min(output_width / image.width, output_height / image.height)
+    resized_width = max(1, min(output_width, int(round(image.width * scale))))
+    resized_height = max(1, min(output_height, int(round(image.height * scale))))
     resampling = getattr(Image, "Resampling", Image).BILINEAR
     image = image.resize((resized_width, resized_height), resampling)
-    canvas = np.full((config.image_height, config.image_width), 255, dtype=np.uint8)
-    top = (config.image_height - resized_height) // 2
-    left = (config.image_width - resized_width) // 2
+    canvas = np.full((output_height, output_width), 255, dtype=np.uint8)
+    top = (output_height - resized_height) // 2
+    left = (output_width - resized_width) // 2
     canvas[top : top + resized_height, left : left + resized_width] = np.asarray(image, dtype=np.uint8)
     return (canvas.astype(np.float32) / 255.0)[np.newaxis, :, :]
 
@@ -8480,11 +8489,17 @@ def _recipient_audit_rendered_width(
     retained_width: int,
     config: UnifiedReaderConfig,
 ) -> int:
-    """Return the non-letterboxed horizontal pixels visible to v11's CTC head."""
+    """Return the non-letterboxed width visible to the audited CTC head."""
     if source_height <= 0 or retained_width <= 0:
         raise ValueError("recipient audit source dimensions must be positive")
-    scale = min(config.image_width / retained_width, config.image_height / source_height)
-    return max(1, min(config.image_width, int(round(retained_width * scale))))
+    output_height = (
+        config.recipient_input_height if _uses_high_resolution_recipient_input(config) else config.image_height
+    )
+    output_width = (
+        config.recipient_input_width if _uses_high_resolution_recipient_input(config) else config.image_width
+    )
+    scale = min(output_width / retained_width, output_height / source_height)
+    return max(1, min(output_width, int(round(retained_width * scale))))
 
 
 def _recipient_audit_bucket(value: float, *, boundaries: Sequence[float], labels: Sequence[str]) -> str:
@@ -8601,13 +8616,16 @@ def audit_recipient_trims_onnx(
     foreground_contrast_threshold: int = RECIPIENT_AUDIT_DEFAULT_FOREGROUND_CONTRAST_THRESHOLD,
     cut_radius: int = RECIPIENT_AUDIT_DEFAULT_CUT_RADIUS,
     blank_column_max_ink: int = 0,
+    require_high_resolution_recipient_input: bool = False,
 ) -> dict[str, object]:
-    """Diagnose the frozen v11 recipient trim without changing an artifact.
+    """Diagnose a frozen v11/v12 recipient trim without changing an artifact.
 
     Every trial uses the same validated ONNX and the same held-out records.
-    Only the fifth input slot's *in-memory* pixel trim differs.  The result is
-    therefore diagnostic evidence for a potential v12 preprocessing contract,
-    never a rewritten or deployable v11 model.
+    Only the recipient value view's *in-memory* pixel trim differs.  For v11
+    that view is the fifth field slot; for v12 it is the separate static,
+    high-resolution ``recipient_value_image`` ONNX input.  The result is
+    diagnostic evidence for a possible future preprocessing contract, never a
+    rewritten or deployable model.
     """
     if split not in {"val", "test"}:
         raise ValueError("split must be val or test; train is not an independent teacher-parity audit")
@@ -8620,11 +8638,17 @@ def audit_recipient_trims_onnx(
     # particular, do not accept a plain ONNX file with a hand-edited labels
     # file, and never write the diagnostic trim into the artifact.
     config, _payment_characters, contract = _load_onnx_artifacts(model_path)
-    if not _is_v11(config):
-        raise ValueError("audit-recipient supports only v11 ONNX artifacts with a frozen recipient value trim")
+    if not (_is_v11(config) or _is_v12(config)):
+        raise ValueError(
+            "audit-recipient supports only v11 or v12 ONNX artifacts with a frozen recipient value trim"
+        )
+    if require_high_resolution_recipient_input and not _uses_high_resolution_recipient_input(config):
+        raise ValueError(
+            "audit-recipient requires a v12 ONNX artifact with a high-resolution recipient_value_image input"
+        )
     _, _, recipient_characters, _ = _load_onnx_artifact_details(model_path)
     if recipient_characters is None:
-        raise AssertionError("v11 recipient characters were validated with the ONNX sidecar")
+        raise AssertionError("v11/v12 recipient characters were validated with the ONNX sidecar")
 
     records = load_records(records_path, dataset_root=dataset_root, config=config)
     train_character_support: Counter[str] = Counter()
@@ -8643,7 +8667,7 @@ def audit_recipient_trims_onnx(
         if isinstance(slot, Mapping) and reference_text is not None:
             recipient_records.append((record, slot, reference_text))
     if not recipient_records:
-        raise ValueError(f"No {split} recipient labels remain for the v11 trim audit")
+        raise ValueError(f"No {split} recipient labels remain for the v11/v12 trim audit")
 
     onnxruntime = _require_onnxruntime()
     model_path = model_path.resolve()
@@ -8651,7 +8675,10 @@ def audit_recipient_trims_onnx(
     input_names = [item.name for item in session.get_inputs()]
     output_names = [item.name for item in session.get_outputs()]
     expected_outputs = list(_onnx_output_names(config))
-    if input_names != ["field_images"] or output_names != expected_outputs:
+    expected_input_names = ["field_images"]
+    if _uses_high_resolution_recipient_input(config):
+        expected_input_names.append("recipient_value_image")
+    if input_names != expected_input_names or output_names != expected_outputs:
         raise ValueError(
             "Unified OCR ONNX input/output names differ from its delivery contract: "
             f"inputs={input_names}, outputs={output_names}"
@@ -8662,8 +8689,16 @@ def audit_recipient_trims_onnx(
         raise ValueError(
             f"Unified OCR ONNX input shape {actual_input_shape} differs from contract {expected_input_shape}"
         )
+    if _uses_high_resolution_recipient_input(config):
+        expected_recipient_input_shape = [1, 1, config.recipient_input_height, config.recipient_input_width]
+        actual_recipient_input_shape = list(session.get_inputs()[1].shape)
+        if actual_recipient_input_shape != expected_recipient_input_shape:
+            raise ValueError(
+                "Unified OCR ONNX recipient input shape "
+                f"{actual_recipient_input_shape} differs from contract {expected_recipient_input_shape}"
+            )
     recipient_output = next((item for item in session.get_outputs() if item.name == "recipient_logits"), None)
-    expected_recipient_shape = [config.image_width // 4, len(recipient_characters) + 1]
+    expected_recipient_shape = [_recipient_time_steps(config), len(recipient_characters) + 1]
     if recipient_output is None or list(recipient_output.shape) != expected_recipient_shape:
         actual_shape = None if recipient_output is None else list(recipient_output.shape)
         raise ValueError(
@@ -8672,14 +8707,24 @@ def audit_recipient_trims_onnx(
         )
 
     recipient_index = _slot_order(config).index("recipient_field")
+    recipient_input_name = (
+        "recipient_value_image" if _uses_high_resolution_recipient_input(config) else "field_images[recipient_field]"
+    )
+    recipient_input_shape = (
+        [1, 1, config.recipient_input_height, config.recipient_input_width]
+        if _uses_high_resolution_recipient_input(config)
+        else [1, config.image_height, config.image_width]
+    )
     character_set = set(recipient_characters)
     rows_by_ratio: dict[float, list[dict[str, object]]] = {ratio: [] for ratio in ratios}
     total = len(recipient_records)
     progress_interval = max(1, total // 20)
     for number, (record, slot, reference_text) in enumerate(recipient_records, start=1):
-        # `_input_tensor` keeps the other four slots exactly as the delivery
-        # preprocessing contract defines them.  Recipient `logits` depend on
-        # only the fifth slot; each trial replaces just that slot in-place.
+        # `_input_tensor` keeps the financial slots exactly as the delivery
+        # preprocessing contract defines them.  Every trial replaces only the
+        # dedicated recipient value view in memory: v11's fifth slot or v12's
+        # private high-resolution input.  No model file, labels, contract, or
+        # delivery evaluator input is changed.
         field_images = np.ascontiguousarray(_input_tensor(record, config=config), dtype=np.float32)
         image_path = Path(slot["image_path"])
         with Image.open(image_path) as image:
@@ -8697,13 +8742,20 @@ def audit_recipient_trims_onnx(
                 cut_radius=cut_radius,
                 blank_column_max_ink=blank_column_max_ink,
             )
-            field_images[recipient_index] = _recipient_audit_preprocess_gray(
+            recipient_value_view = _recipient_audit_preprocess_gray(
                 gray,
                 config=config,
                 trim_px=geometry.trim_px,
             )
+            input_feed: dict[str, np.ndarray] = {"field_images": field_images}
+            if _uses_high_resolution_recipient_input(config):
+                input_feed["recipient_value_image"] = np.ascontiguousarray(
+                    recipient_value_view[np.newaxis, ...], dtype=np.float32
+                )
+            else:
+                field_images[recipient_index] = recipient_value_view
             started = perf_counter()
-            recipient_logits = session.run(["recipient_logits"], {"field_images": field_images})[0]
+            recipient_logits = session.run(["recipient_logits"], input_feed)[0]
             inference_ms = (perf_counter() - started) * 1000.0
             candidate_text, confidence = _ctc_single_output(recipient_logits, characters=recipient_characters)
             candidate_semantic = _semantic_value("recipient_field", candidate_text)
@@ -8752,6 +8804,9 @@ def audit_recipient_trims_onnx(
                     "non_success_to_success": False,
                     "left_trim_fraction": ratio,
                     "artifact_left_trim_fraction": config.recipient_value_left_trim,
+                    "recipient_input_name": recipient_input_name,
+                    "recipient_input_shape": recipient_input_shape,
+                    "recipient_input_preprocess": _recipient_input_preprocess(config),
                     "reference_length": len(reference_text),
                     "min_train_character_support": minimum_character_support,
                     "mean_train_character_support": mean_character_support,
@@ -8797,6 +8852,10 @@ def audit_recipient_trims_onnx(
         "artifact_kind": contract.get("kind"),
         "architecture_version": config.architecture_version,
         "artifact_left_trim_fraction": config.recipient_value_left_trim,
+        "recipient_input_name": recipient_input_name,
+        "recipient_input_shape": recipient_input_shape,
+        "recipient_input_preprocess": _recipient_input_preprocess(config),
+        "requires_high_resolution_recipient_input": require_high_resolution_recipient_input,
         "trial_left_trim_fractions": list(ratios),
         "foreground_contrast_threshold": foreground_contrast_threshold,
         "cut_radius": cut_radius,
@@ -8809,8 +8868,9 @@ def audit_recipient_trims_onnx(
             "metrics": best_trial["metrics"],
         },
         "warning": (
-            "This is an exploratory in-memory v11 recipient pixel-preprocessing sweep. It does not rewrite the "
-            "ONNX model, labels, contract, or deployment trim. It compares with held-out Paddle-derived teacher "
+            f"This is an exploratory in-memory v{config.architecture_version} recipient pixel-preprocessing sweep. "
+            "It does not rewrite the ONNX model, labels, contract, deployment trim, checkpoints, or the ordinary "
+            "guarded evaluator. It compares with held-out Paddle-derived teacher "
             "labels, not independently verified business truth; use it only to decide whether a new preprocessing "
             "contract is justified before retraining."
         ),
@@ -9193,10 +9253,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     audit_recipient = commands.add_parser(
         "audit-recipient",
-        help="diagnose the frozen v11 recipient value crop with in-memory trim trials",
+        help="diagnose a frozen v11/v12 recipient value crop with in-memory trim trials",
     )
     audit_recipient.add_argument("--model", type=Path, required=True)
-    audit_recipient.add_argument("--records", type=Path, required=True, help="v11 unified_fields.jsonl")
+    audit_recipient.add_argument("--records", type=Path, required=True, help="v11/v12 unified_fields.jsonl")
     audit_recipient.add_argument(
         "--dataset-root",
         type=Path,
@@ -9210,7 +9270,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         nargs="+",
         required=True,
-        help="One or more exploratory v11 left-crop fractions, such as 0 0.20 0.30 0.40",
+        help="One or more exploratory v11/v12 left-crop fractions, such as 0 0.20 0.30 0.40",
     )
     audit_recipient.add_argument(
         "--foreground-contrast-threshold",
@@ -9229,6 +9289,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=0,
         help="Maximum foreground pixels allowed in a source column treated as blank (default: 0)",
+    )
+    audit_recipient.add_argument(
+        "--require-high-resolution-recipient-input",
+        action="store_true",
+        help="Reject v11 and require v12's dedicated recipient_value_image input",
     )
     return parser
 
@@ -9366,6 +9431,7 @@ def main(argv: list[str] | None = None) -> None:
                 foreground_contrast_threshold=args.foreground_contrast_threshold,
                 cut_radius=args.cut_radius,
                 blank_column_max_ink=args.blank_column_max_ink,
+                require_high_resolution_recipient_input=args.require_high_resolution_recipient_input,
             )
             best = summary["best_strict_exact_trial"]
             if not isinstance(best, Mapping) or not isinstance(best.get("metrics"), Mapping):

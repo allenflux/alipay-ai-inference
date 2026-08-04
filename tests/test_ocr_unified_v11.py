@@ -343,6 +343,17 @@ def test_v11_train_export_load_and_evaluate_when_onnx_is_available(tmp_path: Pat
     assert len(rows) == 2
     assert {row["left_trim_fraction"] for row in rows} == {0.0, 0.30}
     assert all("geometry" in row and "cut_window_has_ink" in row["geometry"] for row in rows)
+    with pytest.raises(ValueError, match="requires a v12 ONNX artifact"):
+        audit_recipient_trims_onnx(
+            model_path=model_path,
+            records_path=records_path,
+            dataset_root=flat_manifest.parent,
+            output_dir=tmp_path / "recipient-trim-audit-v11-rejected",
+            split="test",
+            device="cpu",
+            left_trim_ratios=(0.30,),
+            require_high_resolution_recipient_input=True,
+        )
 
 
 def test_v11_rejects_nonfinite_optional_geometry_gate(tmp_path: Path) -> None:
@@ -379,3 +390,4 @@ def test_v11_recipient_trim_audit_parser_accepts_multiple_ratios() -> None:
     )
     assert args.command == "audit-recipient"
     assert args.left_trims == [0.0, 0.20, 0.30]
+    assert args.require_high_resolution_recipient_input is False

@@ -29,6 +29,7 @@ from transfer_receipt_ai.ocr_unified import (
     _non_recipient_parameter_bytes,
     _parameter_only_initialization,
     _recipient_artifact_metadata,
+    _recipient_audit_preprocess_gray,
     _recipient_charset_source,
     _recipient_only_expansion_label_override,
     _recipient_only_logits,
@@ -36,9 +37,11 @@ from transfer_receipt_ai.ocr_unified import (
     _recipient_target_mode,
     _recipient_time_steps,
     _slot_order,
+    audit_recipient_trims_onnx,
     build_unified_reader,
     evaluate_unified_onnx,
     export_unified_onnx,
+    preprocess_image,
     train_unified_reader,
 )
 from transfer_receipt_ai.ocr_unified_dataset import KIND_V12 as DATASET_KIND_V12
@@ -189,6 +192,32 @@ def test_v12_recipient_only_logits_match_the_full_private_branch() -> None:
         private_logits = _recipient_only_logits(model, recipient_value, config=config)
 
     torch.testing.assert_close(full_logits, private_logits, rtol=0.0, atol=0.0)
+
+
+def test_v12_recipient_audit_preprocessor_matches_high_resolution_delivery_preprocessor(
+    tmp_path: Path,
+) -> None:
+    """Trim trials must reproduce v12's dedicated input, not its blank fifth slot."""
+    Image = pytest.importorskip("PIL.Image")
+    config = _tiny_v12_config()
+    pixels = np.full((13, 31), 245, dtype=np.uint8)
+    pixels[3:10, 9:22] = 17
+    image_path = tmp_path / "recipient.png"
+    Image.fromarray(pixels, mode="L").save(image_path)
+
+    trim_px = int(round(pixels.shape[1] * config.recipient_value_left_trim))
+    expected = preprocess_image(
+        image_path,
+        config=config,
+        horizontal_alignment="center",
+        left_crop_fraction=config.recipient_value_left_trim,
+        output_height=config.recipient_input_height,
+        output_width=config.recipient_input_width,
+    )
+    actual = _recipient_audit_preprocess_gray(pixels, config=config, trim_px=trim_px)
+
+    assert actual.shape == (1, config.recipient_input_height, config.recipient_input_width)
+    np.testing.assert_array_equal(actual, expected)
 
 
 def test_v12_light_augmentation_sees_each_epoch_with_persistent_spawn_workers(tmp_path: Path) -> None:
@@ -663,3 +692,55 @@ def test_v12_train_export_ort_load_and_evaluate_two_static_inputs_when_onnx_is_a
     assert failures == []
     assert summary["providers"] == ["CPUExecutionProvider"]
     assert summary["by_field"]["recipient_field"]["records"] == 1
+
+    # The v12 trim audit reads the same ONNX/manifest but sends trial pixels
+    # only to the dedicated high-resolution input.  It remains diagnostic:
+    # neither the delivery artifact nor ordinary evaluation output is edited.
+    model_bytes = model_path.read_bytes()
+    labels_bytes = labels_path.read_bytes()
+    contract_bytes = contract_path.read_bytes()
+    audit = audit_recipient_trims_onnx(
+        model_path=model_path,
+        records_path=records_path,
+        dataset_root=flat_manifest.parent,
+        output_dir=tmp_path / "recipient-trim-audit-v12",
+        split="test",
+        device="cpu",
+        left_trim_ratios=(0.20, 0.30),
+        require_high_resolution_recipient_input=True,
+    )
+    assert audit["architecture_version"] == 12
+    assert audit["recipient_input_name"] == "recipient_value_image"
+    assert audit["recipient_input_shape"] == [1, 1, 32, 128]
+    assert audit["recipient_input_preprocess"] == "left_trim_then_centered_aspect_resize_high_resolution"
+    assert audit["requires_high_resolution_recipient_input"] is True
+    assert audit["trial_left_trim_fractions"] == [0.20, 0.30]
+    assert audit["recipient_records"] == 1
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "recipient-trim-audit-v12" / "comparisons.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert len(rows) == 2
+    assert {row["recipient_input_name"] for row in rows} == {"recipient_value_image"}
+    assert {tuple(row["recipient_input_shape"]) for row in rows} == {(1, 1, 32, 128)}
+    assert model_path.read_bytes() == model_bytes
+    assert labels_path.read_bytes() == labels_bytes
+    assert contract_path.read_bytes() == contract_bytes
+
+
+def test_v12_recipient_trim_wrapper_is_separate_read_only_diagnostic() -> None:
+    wrapper = Path(__file__).parents[1] / "scripts" / "receipt-ocr-recipient-trim-4090.ps1"
+    content = wrapper.read_text(encoding="utf-8")
+
+    assert "audit-recipient" in content
+    assert "--require-high-resolution-recipient-input" in content
+    assert 'Join-Path $run "best.onnx"' in content
+    assert "recipient-trim-audit-v12-" in content
+    assert "Refusing to reuse recipient trim audit output" in content
+    assert (
+        "diagnostic only; checkpoint, ONNX, labels, contract, manifest, and standard guard evaluation are not modified"
+        in content
+    )
+    assert "--min-recipient-exact-match" not in content
