@@ -12,7 +12,9 @@ param(
     [ValidateRange(0.0, 4.0)]
     [double]$NGramWeight = 0.35,
     [ValidateSet("cuda", "cpu")]
-    [string]$Device = "cuda"
+    [string]$Device = "cuda",
+    [ValidateRange(0, 1000000)]
+    [int]$ProgressEvery = 250
 )
 
 $ErrorActionPreference = "Stop"
@@ -60,7 +62,8 @@ Write-Host "open_text_character_ngram_beam_evaluate"
     --recipient-beam-width $BeamWidth `
     --recipient-beam-token-top-k $TokenTopK `
     --recipient-ngram-order $NGramOrder `
-    --recipient-ngram-weight $NGramWeight
+    --recipient-ngram-weight $NGramWeight `
+    --progress-every $ProgressEvery
 if ($LASTEXITCODE -ne 0) {
     throw "Beam evaluation failed with exit code $LASTEXITCODE"
 }
@@ -73,5 +76,6 @@ foreach ($field in @("amount", "time", "payment_method_field", "recipient_field"
     $metric = $summary.by_field.PSObject.Properties[$field].Value
     Write-Host ("  {0}={1}/{2}={3:P2}" -f $field, $metric.raw_exact_matches, $metric.records, $metric.raw_exact_match)
 }
+Write-Host ("  providers={0}" -f (($summary.providers | ForEach-Object { $_ }) -join ","))
 Write-Host ("  decoder={0}; beam={1}; top-k={2}; order={3}; weight={4}; device={5}" -f $summary.recipient_decoder_policy.mode, $BeamWidth, $TokenTopK, $NGramOrder, $NGramWeight, $Device)
 Write-Host ("  output={0}" -f $evaluation)

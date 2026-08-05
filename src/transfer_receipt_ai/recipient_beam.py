@@ -96,6 +96,17 @@ def decode_ctc_prefix_beam(
     log_probabilities = shifted - np.log(np.exp(shifted).sum(axis=1, keepdims=True))
     # prefix -> (blank score, non-blank score, accumulated LM score)
     beams: dict[str, tuple[float, float, float]] = {"": (0.0, -math.inf, 0.0)}
+    lm_probability_cache: dict[tuple[tuple[str, ...], str], float] = {}
+
+    def cached_lm_log_probability(prefix: str, character: str) -> float:
+        context = tuple(prefix[-(language_model.order - 1) :]) if language_model.order > 1 else ()
+        key = (context, character)
+        cached = lm_probability_cache.get(key)
+        if cached is None:
+            cached = language_model.log_probability(prefix, character)
+            lm_probability_cache[key] = cached
+        return cached
+
     class_count = values.shape[1]
     keep = min(token_top_k, class_count)
     top_by_time = np.argpartition(log_probabilities, class_count - keep, axis=1)[:, class_count - keep :]
@@ -126,11 +137,11 @@ def decode_ctc_prefix_beam(
                     # only a path arriving from blank may append it again.
                     merge(prefix, -math.inf, non_blank_score + acoustic, lm_score)
                     extended = prefix + character
-                    extension_lm = lm_score + language_model.log_probability(prefix, character)
+                    extension_lm = lm_score + cached_lm_log_probability(prefix, character)
                     merge(extended, -math.inf, blank_score + acoustic, extension_lm)
                 else:
                     extended = prefix + character
-                    extension_lm = lm_score + language_model.log_probability(prefix, character)
+                    extension_lm = lm_score + cached_lm_log_probability(prefix, character)
                     merge(extended, -math.inf, total + acoustic, extension_lm)
         ranked = sorted(
             next_beams.items(),
@@ -143,9 +154,9 @@ def decode_ctc_prefix_beam(
         beams.items(),
         key=lambda item: _logaddexp(item[1][0], item[1][1])
         + language_model_weight
-        * (item[1][2] + language_model.finish_log_probability(item[0])),
+        * (item[1][2] + cached_lm_log_probability(item[0], "</s>")),
     )
     score = _logaddexp(best_blank, best_non_blank) + language_model_weight * (
-        best_lm + language_model.finish_log_probability(best_prefix)
+        best_lm + cached_lm_log_probability(best_prefix, "</s>")
     )
     return best_prefix, float(score)

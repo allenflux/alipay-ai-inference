@@ -8490,6 +8490,7 @@ def evaluate_unified_onnx(
     recipient_beam_token_top_k: int = 24,
     recipient_ngram_order: int = 3,
     recipient_ngram_weight: float = 0.35,
+    progress_every: int = 0,
 ) -> tuple[dict[str, object], list[str]]:
     """Compare one ONNX session run per held-out receipt with teacher labels."""
     if split not in {"val", "test"}:
@@ -8546,6 +8547,8 @@ def evaluate_unified_onnx(
     records = load_records(records_path, dataset_root=dataset_root, config=config)
     if recipient_beam_width <= 0 or recipient_beam_token_top_k <= 0:
         raise ValueError("recipient beam width and token top-k must be positive")
+    if progress_every < 0:
+        raise ValueError("progress_every cannot be negative")
     if recipient_beam_width > 1 and not _uses_recipient_protocol(config):
         raise ValueError("recipient n-gram beam decoding requires a v9-v12 recipient model")
     recipient_language_model = None
@@ -8578,6 +8581,8 @@ def evaluate_unified_onnx(
     onnxruntime = _require_onnxruntime()
     model_path = model_path.resolve()
     session, active_providers = _create_onnx_session(onnxruntime, model_path, device=device)
+    if progress_every:
+        print(f"Unified ONNX providers: {', '.join(active_providers)}", flush=True)
     input_names = [item.name for item in session.get_inputs()]
     output_names = [item.name for item in session.get_outputs()]
     expected_outputs = list(_onnx_output_names(config))
@@ -8679,7 +8684,8 @@ def evaluate_unified_onnx(
     recipient_character_set = set(recipient_characters or ())
     status_confusion: Counter[str] = Counter()
     status_reference_counts: Counter[str] = Counter()
-    for record in evaluation_records:
+    total_records = len(evaluation_records)
+    for record_number, record in enumerate(evaluation_records, start=1):
         field_images = np.ascontiguousarray(_input_tensor(record, config=config), dtype=np.float32)
         input_feed: dict[str, np.ndarray] = {"field_images": field_images}
         if _uses_high_resolution_recipient_input(config):
@@ -8955,6 +8961,15 @@ def evaluate_unified_onnx(
                     "non_success_to_success": non_success_to_success,
                     "receipt_latency_ms": round(latency_ms, 4),
                 }
+            )
+        if progress_every and (
+            record_number == 1
+            or record_number == total_records
+            or record_number % progress_every == 0
+        ):
+            print(
+                f"Unified ONNX evaluation: {record_number}/{total_records} receipts",
+                flush=True,
             )
     comparisons.sort(key=lambda row: (str(row["field"]), str(row["id"])))
     by_field = {
@@ -9911,6 +9926,12 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--recipient-beam-token-top-k", type=int, default=24)
     evaluate.add_argument("--recipient-ngram-order", type=int, default=3)
     evaluate.add_argument("--recipient-ngram-weight", type=float, default=0.35)
+    evaluate.add_argument(
+        "--progress-every",
+        type=int,
+        default=0,
+        help="Print ONNX provider and receipt progress every N evaluated receipts; 0 disables progress output",
+    )
     evaluate.add_argument("--min-status-exact-match", type=float)
     evaluate.add_argument("--max-payment-oov-rate", type=float)
     evaluate.add_argument("--max-recipient-oov-rate", type=float)
@@ -10084,6 +10105,7 @@ def main(argv: list[str] | None = None) -> None:
                 recipient_beam_token_top_k=args.recipient_beam_token_top_k,
                 recipient_ngram_order=args.recipient_ngram_order,
                 recipient_ngram_weight=args.recipient_ngram_weight,
+                progress_every=args.progress_every,
             )
             metrics = summary["by_field"]
             status_policy = summary.get("status_head_policy")
