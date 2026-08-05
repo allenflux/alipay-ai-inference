@@ -6896,9 +6896,13 @@ def _config_from_mapping(
                 if raw.get("recipient_branch_channels") is not None
                 else None
             ),
-            recipient_open_text_layers=int(raw.get("recipient_open_text_layers", 0)),
-            recipient_open_text_heads=int(raw.get("recipient_open_text_heads", 8)),
-            recipient_open_text_feedforward=int(raw.get("recipient_open_text_feedforward", 2048)),
+            recipient_open_text_layers=int(raw.get("recipient_open_text_layers") or 0),
+            recipient_open_text_heads=int(raw.get("recipient_open_text_heads") or 8),
+            recipient_open_text_feedforward=(
+                int(raw["recipient_open_text_feedforward"])
+                if raw.get("recipient_open_text_feedforward") is not None
+                else None
+            ),
             pooled_width=int(raw["pooled_width"]),
             amount_format_min_confidence=float(raw.get("amount_format_min_confidence", 0.90)),
         )
