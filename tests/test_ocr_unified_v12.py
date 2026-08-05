@@ -15,6 +15,7 @@ import transfer_receipt_ai.ocr_unified as ocr_unified
 from transfer_receipt_ai.ocr_unified import (
     INIT_CHECKPOINT_MODE_RECIPIENT_CAPACITY_REINIT,
     INIT_CHECKPOINT_MODE_RECIPIENT_INPUT_WIDTH_EXPANSION,
+    INIT_CHECKPOINT_MODE_RECIPIENT_OPEN_TEXT_ADAPTER,
     INIT_CHECKPOINT_MODE_RECIPIENT_ONLY_EXPANSION,
     KIND_V12,
     PAYMENT_BANK_OTHER_CLASS,
@@ -746,6 +747,73 @@ def test_v12_recipient_capacity_reinit_copies_only_frozen_side(tmp_path: Path) -
             payment_bank_prefix_classes=source_bank,
             torch=torch,
         )
+
+
+def test_v12_open_text_adapter_is_identity_gated_and_preserves_seed(tmp_path: Path) -> None:
+    """The contextual open-text route must begin at the audited seed exactly."""
+    torch = pytest.importorskip("torch")
+    source_config = _tiny_v12_config()
+    seed, source_state, source_payment, source_bank = _write_v12_expansion_seed(
+        tmp_path,
+        config=source_config,
+        torch=torch,
+    )
+    target_config = UnifiedReaderConfig(
+        **{
+            **asdict(source_config),
+            "recipient_open_text_layers": 2,
+            "recipient_open_text_heads": 4,
+            "recipient_open_text_feedforward": 64,
+        }
+    )
+    effective_payment, effective_bank, effective_recipient, policy = _recipient_only_expansion_label_override(
+        init_checkpoint=seed,
+        init_checkpoint_mode=INIT_CHECKPOINT_MODE_RECIPIENT_OPEN_TEXT_ADAPTER,
+        config=target_config,
+        amount_characters=list(V8_AMOUNT_CHARACTERS),
+        time_characters=list(V6_TIME_CHARACTERS),
+        payment_characters=source_payment,
+        recipient_characters=["乙", "甲"],
+        payment_bank_prefix_classes=source_bank,
+        torch=torch,
+    )
+    assert policy["mode"] == "checkpoint_financial_label_maps_recipient_open_text_adapter_v1"
+    source_model = build_unified_reader(
+        payment_vocab_size=len(source_payment) + 1,
+        payment_bank_prefix_vocab_size=len(source_bank),
+        recipient_vocab_size=3,
+        config=source_config,
+    )
+    source_model.load_state_dict(source_state, strict=True)
+    target_model = build_unified_reader(
+        payment_vocab_size=len(effective_payment) + 1,
+        payment_bank_prefix_vocab_size=len(effective_bank),
+        recipient_vocab_size=len(effective_recipient) + 1,
+        config=target_config,
+    )
+    mapped_state, initialization = _parameter_only_initialization(
+        init_checkpoint=seed,
+        init_checkpoint_mode=INIT_CHECKPOINT_MODE_RECIPIENT_OPEN_TEXT_ADAPTER,
+        config=target_config,
+        amount_characters=list(V8_AMOUNT_CHARACTERS),
+        time_characters=list(V6_TIME_CHARACTERS),
+        payment_characters=effective_payment,
+        recipient_characters=effective_recipient,
+        payment_bank_prefix_classes=effective_bank,
+        torch=torch,
+        target_state_dict=target_model.state_dict(),
+    )
+    assert mapped_state is not None
+    assert initialization["mode"] == "parameter_only_recipient_open_text_adapter"
+    target_model.load_state_dict(mapped_state, strict=True)
+    assert target_model.recipient_open_text_gate.item() == 0.0
+    recipient_value = torch.randn((2, 1, 32, 128), dtype=torch.float32)
+    source_model.eval()
+    target_model.eval()
+    with torch.no_grad():
+        source_logits = _recipient_only_logits(source_model, recipient_value, config=source_config)
+        target_logits = _recipient_only_logits(target_model, recipient_value, config=target_config)
+    torch.testing.assert_close(target_logits, source_logits, rtol=0.0, atol=0.0)
 
 
 def test_v12_recipient_input_width_expansion_keeps_epoch_zero_when_training_regresses(

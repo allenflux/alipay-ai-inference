@@ -88,12 +88,14 @@ INIT_CHECKPOINT_MODE_STRICT = "strict"
 INIT_CHECKPOINT_MODE_RECIPIENT_ONLY_EXPANSION = "recipient_only_expansion"
 INIT_CHECKPOINT_MODE_RECIPIENT_INPUT_WIDTH_EXPANSION = "recipient_input_width_expansion"
 INIT_CHECKPOINT_MODE_RECIPIENT_CAPACITY_REINIT = "recipient_capacity_reinit"
+INIT_CHECKPOINT_MODE_RECIPIENT_OPEN_TEXT_ADAPTER = "recipient_open_text_adapter"
 INIT_CHECKPOINT_MODES = frozenset(
     (
         INIT_CHECKPOINT_MODE_STRICT,
         INIT_CHECKPOINT_MODE_RECIPIENT_ONLY_EXPANSION,
         INIT_CHECKPOINT_MODE_RECIPIENT_INPUT_WIDTH_EXPANSION,
         INIT_CHECKPOINT_MODE_RECIPIENT_CAPACITY_REINIT,
+        INIT_CHECKPOINT_MODE_RECIPIENT_OPEN_TEXT_ADAPTER,
     )
 )
 RECIPIENT_ONLY_INIT_CHECKPOINT_MODES = frozenset(
@@ -101,6 +103,7 @@ RECIPIENT_ONLY_INIT_CHECKPOINT_MODES = frozenset(
         INIT_CHECKPOINT_MODE_RECIPIENT_ONLY_EXPANSION,
         INIT_CHECKPOINT_MODE_RECIPIENT_INPUT_WIDTH_EXPANSION,
         INIT_CHECKPOINT_MODE_RECIPIENT_CAPACITY_REINIT,
+        INIT_CHECKPOINT_MODE_RECIPIENT_OPEN_TEXT_ADAPTER,
     )
 )
 # These are the mature text heads that must not silently regress while a
@@ -611,6 +614,12 @@ class UnifiedReaderConfig:
     recipient_input_height: int = 128
     recipient_input_width: int = 1024
     recipient_branch_channels: int | None = None
+    # Optional context-only refinement for the v12 character CTC stream.  It
+    # is residual-gated from exactly zero so a warm-started open-text model is
+    # byte/decision identical to its seed before the first optimiser step.
+    recipient_open_text_layers: int = 0
+    recipient_open_text_heads: int = 8
+    recipient_open_text_feedforward: int | None = None
     pooled_width: int = 8
     # v8 applies the display renderer only when every finite format component
     # is confident.  This is a diagnostic-candidate gate, never a business
@@ -653,8 +662,18 @@ class UnifiedReaderConfig:
             self.recipient_input_height != 128
             or self.recipient_input_width != 1024
             or self.recipient_branch_channels is not None
+            or self.recipient_open_text_layers != 0
         ):
             raise ValueError("recipient high-resolution input settings are supported only by architecture v12")
+        if self.recipient_open_text_layers < 0 or self.recipient_open_text_layers > 6:
+            raise ValueError("recipient_open_text_layers must be between 0 and 6")
+        if self.recipient_open_text_heads <= 0:
+            raise ValueError("recipient_open_text_heads must be positive")
+        recipient_width = _recipient_hidden_size(self) * 2
+        if self.recipient_open_text_layers and recipient_width % self.recipient_open_text_heads:
+            raise ValueError("recipient open-text width must be divisible by recipient_open_text_heads")
+        if self.recipient_open_text_feedforward is not None and self.recipient_open_text_feedforward < recipient_width:
+            raise ValueError("recipient_open_text_feedforward must be at least the bidirectional recipient width")
 
 
 def _recipient_hidden_size(config: UnifiedReaderConfig) -> int:
@@ -1315,6 +1334,19 @@ def _recipient_artifact_metadata(
                 "recipient_input_shape": [1, 1, config.recipient_input_height, config.recipient_input_width],
                 "recipient_branch_channels": _recipient_branch_channels(config),
                 "recipient_time_steps": _recipient_time_steps(config),
+                "recipient_open_text_encoder": {
+                    "mode": (
+                        "zero_gated_transformer_context_v1"
+                        if config.recipient_open_text_layers
+                        else "none"
+                    ),
+                    "layers": config.recipient_open_text_layers,
+                    "heads": config.recipient_open_text_heads,
+                    "feedforward": int(
+                        config.recipient_open_text_feedforward
+                        or (_recipient_hidden_size(config) * 2 * 4)
+                    ),
+                },
             }
         )
     return metadata
@@ -1568,6 +1600,28 @@ def build_unified_reader(
                     self.recipient_classifier = nn.Linear(
                         _recipient_hidden_size(config) * 2, int(recipient_vocab_size)
                     )
+                    if config.recipient_open_text_layers:
+                        recipient_model_width = _recipient_hidden_size(config) * 2
+                        recipient_feedforward = int(
+                            config.recipient_open_text_feedforward or recipient_model_width * 4
+                        )
+                        open_text_layer = nn.TransformerEncoderLayer(
+                            d_model=recipient_model_width,
+                            nhead=config.recipient_open_text_heads,
+                            dim_feedforward=recipient_feedforward,
+                            dropout=0.0,
+                            activation="gelu",
+                            batch_first=False,
+                            norm_first=True,
+                        )
+                        self.recipient_open_text_encoder = nn.TransformerEncoder(
+                            open_text_layer,
+                            num_layers=config.recipient_open_text_layers,
+                            enable_nested_tensor=False,
+                        )
+                        # tanh keeps the residual bounded; zero makes the new
+                        # graph exactly reproduce the seed at initialisation.
+                        self.recipient_open_text_gate = nn.Parameter(torch.zeros(()))
 
                 if _uses_v8_protocol(config):
                     # The v8 CTC stream owns signed canonical digits. These
@@ -1730,6 +1784,11 @@ def build_unified_reader(
                     else:
                         recipient_features = self.recipient_ctc_vertical_reducer(encoded[:, 4])
                     recipient_sequence, _ = self.recipient_ctc_sequence(recipient_features.permute(2, 0, 1))
+                    if config.recipient_open_text_layers:
+                        refined_recipient_sequence = self.recipient_open_text_encoder(recipient_sequence)
+                        recipient_sequence = recipient_sequence + torch.tanh(
+                            self.recipient_open_text_gate
+                        ) * (refined_recipient_sequence - recipient_sequence)
                     recipient_logits = self.recipient_classifier(recipient_sequence)
             elif self.architecture_version == 5:
                 payment_features = self.payment_vertical_reducer(encoded[:, 3])  # [batch,C,T]
@@ -2646,6 +2705,11 @@ def _recipient_only_logits(model: Any, recipient_value_images: Any, *, config: U
     encoded = model.recipient_encoder(model.recipient_stem(recipient_value_images))
     features = model.recipient_ctc_vertical_reducer(encoded)
     sequence, _ = model.recipient_ctc_sequence(features.permute(2, 0, 1))
+    if config.recipient_open_text_layers:
+        refined_sequence = model.recipient_open_text_encoder(sequence)
+        sequence = sequence + model.recipient_open_text_gate.tanh() * (
+            refined_sequence - sequence
+        )
     return model.recipient_classifier(sequence)
 
 
@@ -5022,6 +5086,36 @@ def _validate_recipient_capacity_reinit_config(
         )
 
 
+def _validate_recipient_open_text_adapter_config(
+    source_config: UnifiedReaderConfig,
+    target_config: UnifiedReaderConfig,
+) -> None:
+    """Allow only an identity-gated contextual adapter on a v12 seed."""
+    if not (_is_v12(source_config) and _is_v12(target_config)):
+        raise ValueError("recipient_open_text_adapter is supported only by architecture v12")
+    if source_config.recipient_open_text_layers != 0:
+        raise ValueError("recipient_open_text_adapter requires a seed without an existing open-text adapter")
+    if target_config.recipient_open_text_layers <= 0:
+        raise ValueError("recipient_open_text_adapter requires at least one open-text layer")
+    allowed = {
+        "recipient_open_text_layers",
+        "recipient_open_text_heads",
+        "recipient_open_text_feedforward",
+    }
+    source_values = asdict(source_config)
+    target_values = asdict(target_config)
+    changed = [
+        key
+        for key in sorted(source_values)
+        if key not in allowed and source_values[key] != target_values.get(key)
+    ]
+    if changed:
+        raise ValueError(
+            "recipient_open_text_adapter may change only its contextual encoder settings; "
+            f"incompatible config fields: {', '.join(changed)}"
+        )
+
+
 def _recipient_only_expansion_label_override(
     *,
     init_checkpoint: Path,
@@ -5064,6 +5158,8 @@ def _recipient_only_expansion_label_override(
         _validate_recipient_input_width_expansion_config(source_config, config)
     elif init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_CAPACITY_REINIT:
         _validate_recipient_capacity_reinit_config(source_config, config)
+    elif init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_OPEN_TEXT_ADAPTER:
+        _validate_recipient_open_text_adapter_config(source_config, config)
     elif source_config != config:
         raise ValueError(
             "init checkpoint model config does not match the requested training config; "
@@ -5101,7 +5197,11 @@ def _recipient_only_expansion_label_override(
                 else (
                     "checkpoint_financial_label_maps_recipient_capacity_reinit_v1"
                     if init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_CAPACITY_REINIT
-                    else "checkpoint_financial_label_maps_v1"
+                    else (
+                        "checkpoint_financial_label_maps_recipient_open_text_adapter_v1"
+                        if init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_OPEN_TEXT_ADAPTER
+                        else "checkpoint_financial_label_maps_v1"
+                    )
                 )
             ),
             "reason": (
@@ -5252,6 +5352,70 @@ def _recipient_capacity_reinit_state(
     }
 
 
+def _recipient_open_text_adapter_state(
+    *,
+    source_state_dict: Mapping[str, object],
+    target_state_dict: Mapping[str, object],
+    source_recipient_characters: Sequence[str],
+    target_recipient_characters: Sequence[str],
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Copy the complete seed and retain only new adapter tensors at init.
+
+    The recipient classifier is mapped by Unicode so an additive train charset
+    cannot reinterpret an existing row.  Every other legacy tensor must be
+    present with an identical shape.  The scalar adapter gate is freshly zero,
+    making the target's initial logits exactly equal to the source logits.
+    """
+    adapted: dict[str, object] = dict(target_state_dict)
+    adapter_keys = {key for key in target_state_dict if key.startswith("recipient_open_text_")}
+    if not adapter_keys or "recipient_open_text_gate" not in adapter_keys:
+        raise ValueError("recipient_open_text_adapter target has no identity-gated adapter parameters")
+    unexpected = sorted(set(source_state_dict) - set(target_state_dict))
+    if unexpected:
+        raise ValueError(f"recipient_open_text_adapter seed has unexpected tensors: {unexpected}")
+    missing_legacy = sorted(
+        key for key in target_state_dict if key not in adapter_keys and key not in source_state_dict
+    )
+    if missing_legacy:
+        raise ValueError(f"recipient_open_text_adapter seed is missing legacy tensors: {missing_legacy}")
+    target_indices = {character: index + 1 for index, character in enumerate(target_recipient_characters)}
+    missing_characters = sorted(set(source_recipient_characters) - set(target_recipient_characters))
+    if missing_characters:
+        raise ValueError(
+            "recipient_open_text_adapter cannot discard seed characters: "
+            f"{''.join(missing_characters)!r}"
+        )
+    classifier_keys = {"recipient_classifier.weight", "recipient_classifier.bias"}
+    copied = 0
+    for key, source_value in source_state_dict.items():
+        target_value = target_state_dict[key]
+        if key in classifier_keys:
+            remapped = target_value.detach().clone()
+            remapped[0].copy_(source_value[0])
+            for source_index, character in enumerate(source_recipient_characters, start=1):
+                remapped[target_indices[character]].copy_(source_value[source_index])
+            adapted[key] = remapped
+            copied += 1
+            continue
+        source_shape = tuple(getattr(source_value, "shape", ()))
+        target_shape = tuple(getattr(target_value, "shape", ()))
+        if source_shape != target_shape:
+            raise ValueError(
+                "recipient_open_text_adapter changed a legacy tensor shape: "
+                f"{key} has source shape {source_shape} but target shape {target_shape}"
+            )
+        adapted[key] = source_value
+        copied += 1
+    return adapted, {
+        "legacy_tensor_count_copied": copied,
+        "new_adapter_tensor_count": len(adapter_keys),
+        "adapter_parameter_prefix": "recipient_open_text_",
+        "identity_gate_initial_value": 0.0,
+        "checkpoint_character_count": len(source_recipient_characters),
+        "target_character_count": len(target_recipient_characters),
+    }
+
+
 def _parameter_only_initialization(
     *,
     init_checkpoint: Path | None,
@@ -5298,6 +5462,8 @@ def _parameter_only_initialization(
         _validate_recipient_input_width_expansion_config(source_config, config)
     elif init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_CAPACITY_REINIT:
         _validate_recipient_capacity_reinit_config(source_config, config)
+    elif init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_OPEN_TEXT_ADAPTER:
+        _validate_recipient_open_text_adapter_config(source_config, config)
     elif source_config != config:
         raise ValueError(
             "init checkpoint model config does not match the requested training config; "
@@ -5369,6 +5535,21 @@ def _parameter_only_initialization(
                 "target_recipient_branch_channels": _recipient_branch_channels(config),
                 "source_recipient_hidden_size": _recipient_hidden_size(source_config),
                 "target_recipient_hidden_size": _recipient_hidden_size(config),
+            }
+        )
+        return remapped_state, initialization
+    if init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_OPEN_TEXT_ADAPTER:
+        remapped_state, adapter_mapping = _recipient_open_text_adapter_state(
+            source_state_dict=state_dict,
+            target_state_dict=target_state_dict,
+            source_recipient_characters=source_recipient_characters,
+            target_recipient_characters=recipient_characters,
+        )
+        initialization.update(
+            {
+                "mode": "parameter_only_recipient_open_text_adapter",
+                "init_checkpoint_mode": init_checkpoint_mode,
+                "recipient_open_text_adapter_mapping": adapter_mapping,
             }
         )
         return remapped_state, initialization
@@ -6025,8 +6206,13 @@ def train_unified_reader(
         "trainable_parameter_count": sum(parameter.numel() for parameter in model.parameters()),
     }
     if recipient_only_fine_tune:
+        trainable_recipient_prefix = (
+            "recipient_open_text_"
+            if init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_OPEN_TEXT_ADAPTER
+            else "recipient_"
+        )
         for name, parameter in model.named_parameters():
-            parameter.requires_grad_(name.startswith("recipient_"))
+            parameter.requires_grad_(name.startswith(trainable_recipient_prefix))
         trainable_parameter_count = sum(
             parameter.numel() for parameter in model.parameters() if parameter.requires_grad
         )
@@ -6038,7 +6224,7 @@ def train_unified_reader(
             "frozen_parameter_count": sum(
                 parameter.numel() for parameter in model.parameters() if not parameter.requires_grad
             ),
-            "frozen_parameter_prefix_exclusion": "recipient_",
+            "trainable_parameter_prefix": trainable_recipient_prefix,
             "training_forward": "private_recipient_branch_only_v12",
             "source_train_records": len(train_records),
             "recipient_train_records": len(training_records),
@@ -6136,13 +6322,15 @@ def train_unified_reader(
     best_score: tuple[float, ...] | None = None
     best_epoch: int | None = None
     best_path = output_dir / "best.pt"
-    if init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_INPUT_WIDTH_EXPANSION:
-        # The wider view deliberately changes recipient pixels before the
-        # first optimizer step.  Measure and persist that exact transplanted
-        # model as epoch zero so a pilot cannot silently return a checkpoint
-        # worse than its own width-expanded starting point.
+    if init_checkpoint_mode in {
+        INIT_CHECKPOINT_MODE_RECIPIENT_INPUT_WIDTH_EXPANSION,
+        INIT_CHECKPOINT_MODE_RECIPIENT_OPEN_TEXT_ADAPTER,
+    }:
+        # Measure and persist the exact transplanted model as epoch zero so a
+        # pilot cannot silently return a checkpoint worse than its own safe
+        # starting point.  The adapter route must be decision-identical here.
         if init_checkpoint is None:
-            raise AssertionError("recipient input-width expansion has no seed checkpoint")
+            raise AssertionError(f"{init_checkpoint_mode} has no seed checkpoint")
         initialization_started = perf_counter()
         model.eval()
         initialization_validation = _evaluate_model(
@@ -6179,7 +6367,7 @@ def train_unified_reader(
         )
         if initialization_score is None:
             raise ValueError(
-                "recipient_input_width_expansion initialization does not satisfy the protected checkpoint floors: "
+                f"{init_checkpoint_mode} initialization does not satisfy the protected checkpoint floors: "
                 + "; ".join(initialization_failures)
             )
         initialization_record: dict[str, object] = {
@@ -9481,6 +9669,8 @@ def build_parser() -> argparse.ArgumentParser:
             "permits only a strictly wider v12 recipient input while keeping all learned tensor shapes and "
             "financial/shared topology unchanged. recipient_capacity_reinit copies every financial/shared "
             "tensor but deliberately reinitialises a monotonically larger private recipient CNN/GRU."
+            " recipient_open_text_adapter copies the complete seed, adds a zero-gated Transformer context "
+            "encoder, and trains only that adapter."
         ),
     )
     train.add_argument(
@@ -9556,6 +9746,23 @@ def build_parser() -> argparse.ArgumentParser:
         "--recipient-branch-channels",
         type=int,
         help="v12 only: private high-resolution recipient CNN width; defaults to 16",
+    )
+    train.add_argument(
+        "--recipient-open-text-layers",
+        type=int,
+        default=0,
+        help="v12 only: zero-gated Transformer context layers after the warm-started recipient BiGRU",
+    )
+    train.add_argument(
+        "--recipient-open-text-heads",
+        type=int,
+        default=8,
+        help="v12 open-text adapter attention heads (default: 8)",
+    )
+    train.add_argument(
+        "--recipient-open-text-feedforward",
+        type=int,
+        help="v12 open-text adapter feed-forward width; defaults to four times its model width",
     )
     train.add_argument("--pooled-width", type=int, default=8)
     train.add_argument("--seed", type=int, default=42)
@@ -9709,6 +9916,9 @@ def main(argv: list[str] | None = None) -> None:
                 recipient_input_height=args.recipient_input_height,
                 recipient_input_width=args.recipient_input_width,
                 recipient_branch_channels=args.recipient_branch_channels,
+                recipient_open_text_layers=args.recipient_open_text_layers,
+                recipient_open_text_heads=args.recipient_open_text_heads,
+                recipient_open_text_feedforward=args.recipient_open_text_feedforward,
                 pooled_width=args.pooled_width,
                 amount_format_min_confidence=args.amount_format_min_confidence,
             )
