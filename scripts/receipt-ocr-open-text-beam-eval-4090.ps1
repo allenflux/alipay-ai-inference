@@ -10,7 +10,9 @@ param(
     [ValidateRange(1, 5)]
     [int]$NGramOrder = 3,
     [ValidateRange(0.0, 4.0)]
-    [double]$NGramWeight = 0.35
+    [double]$NGramWeight = 0.35,
+    [ValidateSet("cuda", "cpu")]
+    [string]$Device = "cuda"
 )
 
 $ErrorActionPreference = "Stop"
@@ -54,7 +56,7 @@ Write-Host "open_text_character_ngram_beam_evaluate"
     --dataset-root $datasetRoot `
     --output $evaluation `
     --split val `
-    --device cuda `
+    --device $Device `
     --recipient-beam-width $BeamWidth `
     --recipient-beam-token-top-k $TokenTopK `
     --recipient-ngram-order $NGramOrder `
@@ -71,5 +73,5 @@ foreach ($field in @("amount", "time", "payment_method_field", "recipient_field"
     $metric = $summary.by_field.PSObject.Properties[$field].Value
     Write-Host ("  {0}={1}/{2}={3:P2}" -f $field, $metric.raw_exact_matches, $metric.records, $metric.raw_exact_match)
 }
-Write-Host ("  decoder={0}; beam={1}; top-k={2}; order={3}; weight={4}" -f $summary.recipient_decoder_policy.mode, $BeamWidth, $TokenTopK, $NGramOrder, $NGramWeight)
+Write-Host ("  decoder={0}; beam={1}; top-k={2}; order={3}; weight={4}; device={5}" -f $summary.recipient_decoder_policy.mode, $BeamWidth, $TokenTopK, $NGramOrder, $NGramWeight, $Device)
 Write-Host ("  output={0}" -f $evaluation)
