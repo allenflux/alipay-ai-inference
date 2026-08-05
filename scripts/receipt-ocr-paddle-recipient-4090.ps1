@@ -11,7 +11,8 @@ param(
     [ValidateRange(1, 1000000)]
     [int]$ProgressEvery = 25,
     [string]$OutputDirectory,
-    [string]$Bundle
+    [string]$Bundle,
+    [switch]$SkipDetection
 )
 
 $ErrorActionPreference = "Stop"
@@ -48,7 +49,11 @@ Write-Host "  records=$records"
 Write-Host "  crop-root=$labelsRoot"
 Write-Host "  split=$Split; device=$Device; limit=$Limit; target=$Target"
 Write-Host "  output=$OutputDirectory"
-Write-Host "  mode=native PaddleOCR teacher-parity only; no Torch/student model is loaded"
+if ($SkipDetection) {
+    Write-Host "  mode=EXPERIMENTAL skip-det cls+rec; det=False; use only for 4090 speed A/B"
+} else {
+    Write-Host "  mode=full det+cls+rec (default); native PaddleOCR teacher-parity only; no Torch/student model is loaded"
+}
 if (-not [string]::IsNullOrWhiteSpace($Bundle)) {
     Write-Host "  frozen-bundle=$Bundle"
 }
@@ -70,6 +75,9 @@ if ($Limit -gt 0) {
 if (-not [string]::IsNullOrWhiteSpace($Bundle)) {
     $arguments += "--bundle"
     $arguments += $Bundle
+}
+if ($SkipDetection) {
+    $arguments += "--skip-detection"
 }
 
 & python @arguments

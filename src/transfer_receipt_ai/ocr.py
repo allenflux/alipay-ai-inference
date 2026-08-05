@@ -120,6 +120,16 @@ def _extract_paddle_lines(payload: Any) -> list[tuple[str, float]]:
                 visit(value)
             return
         if isinstance(node, (list, tuple)):
+            # PaddleOCR v2 recognition-only mode (``det=False``) returns a
+            # compact ``("text", confidence)`` item rather than a detector
+            # quadrilateral plus result pair.
+            if len(node) >= 2 and isinstance(node[0], str):
+                try:
+                    lines.append((node[0], float(node[1])))
+                except (TypeError, ValueError):
+                    pass
+                else:
+                    return
             # PaddleOCR v2 line: [[x1,y1], ...], ("text", confidence)
             if (
                 len(node) >= 2
@@ -264,11 +274,25 @@ class PaddleOCRReader:
                 self._engine = initialise_v2()
                 self._api_version = 2
 
-    def recognize(self, image_rgb: np.ndarray) -> OCRResult:
+    def recognize(self, image_rgb: np.ndarray, *, det: bool = True) -> OCRResult:
+        """Read text from one RGB image.
+
+        ``det=False`` is deliberately an opt-in PaddleOCR v2 experiment for
+        already-cropped, single-row inputs.  It keeps the angle classifier and
+        recognizer enabled while avoiding the detector.  The ordinary path
+        deliberately preserves the exact historical v2 call shape so callers
+        that do not opt in retain full det+cls+rec behaviour.
+        """
         if self._api_version == 3:
+            if not det:
+                raise RuntimeError("PaddleOCR skip-detection is supported only by the pinned v2 evaluator")
             raw = self._engine.predict(image_rgb)
         else:
-            raw = self._engine.ocr(image_rgb, cls=self._use_angle_cls)
+            raw = (
+                self._engine.ocr(image_rgb, cls=self._use_angle_cls)
+                if det
+                else self._engine.ocr(image_rgb, det=False, cls=self._use_angle_cls)
+            )
         lines = _extract_paddle_lines(raw)
         if not lines:
             return OCRResult(text="", confidence=None)

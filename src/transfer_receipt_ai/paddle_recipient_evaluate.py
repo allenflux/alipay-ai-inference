@@ -38,6 +38,8 @@ EVALUATION_KIND = "receipt_paddle_recipient_teacher_parity_v1"
 EVALUATION_SCHEMA_VERSION = 1
 _RECIPIENT_FIELD = "recipient_field"
 _SPLITS = frozenset(("val", "test"))
+_FULL_DET_CLS_REC_MODE = "full_det_cls_rec"
+_SKIP_DET_CLS_REC_EXPERIMENT_MODE = "experimental_skip_det_cls_rec"
 
 
 def _read_jsonl(path: Path) -> list[dict[str, object]]:
@@ -231,6 +233,38 @@ def _recipient_values(raw_text: str) -> tuple[str | None, str | None]:
     return anchored_value, fallback_value
 
 
+def _inference_mode(*, skip_detection: bool) -> dict[str, object]:
+    """Describe the exact Paddle stages used by this evaluation.
+
+    The experiment is intentionally explicit because skip-detection on a
+    recipient crop is a speed A/B, not a replacement for the standard
+    detector-backed inference path.
+    """
+    return {
+        "name": _SKIP_DET_CLS_REC_EXPERIMENT_MODE if skip_detection else _FULL_DET_CLS_REC_MODE,
+        "experimental": skip_detection,
+        "detection_enabled": not skip_detection,
+        "angle_classifier_enabled": True,
+        "recognizer_enabled": True,
+    }
+
+
+def _recognize_recipient(reader: object, image_rgb: np.ndarray, *, skip_detection: bool) -> OCRResult:
+    """Keep the default reader invocation byte-for-byte conventional.
+
+    Passing ``det=False`` only in the explicit experimental branch matters for
+    both backwards compatibility and for fake-reader tests that deliberately
+    implement only the historical ``recognize(image)`` call.
+    """
+    recognize = getattr(reader, "recognize", None)
+    if not callable(recognize):
+        raise TypeError("Paddle reader must expose recognize(image_rgb)")
+    result = recognize(image_rgb, det=False) if skip_detection else recognize(image_rgb)
+    if not isinstance(result, OCRResult):
+        raise TypeError("Paddle reader must return OCRResult")
+    return result
+
+
 def _percentile(values: Sequence[float], quantile: float) -> float | None:
     if not values:
         return None
@@ -276,6 +310,7 @@ def evaluate_paddle_recipients(
     target_value_exact_match: float = 0.90,
     progress_every: int = 25,
     bundle_dir: Path | None = None,
+    skip_detection: bool = False,
     reader_factory: Callable[[str], object] = _default_reader_factory,
     runtime_probe: Callable[[object], Mapping[str, object]] = _default_runtime_probe,
 ) -> tuple[dict[str, object], bool]:
@@ -292,6 +327,8 @@ def evaluate_paddle_recipients(
         raise ValueError("limit must be a positive integer when present")
     if isinstance(progress_every, bool) or not isinstance(progress_every, int) or progress_every <= 0:
         raise ValueError("progress_every must be a positive integer")
+    if not isinstance(skip_detection, bool):
+        raise ValueError("skip_detection must be a boolean")
     try:
         target = float(target_value_exact_match)
     except (TypeError, ValueError) as error:
@@ -320,6 +357,7 @@ def evaluate_paddle_recipients(
     bundle: dict[str, object] | None = None
     if bundle_dir is not None:
         bundle = _verify_reader_matches_bundle(reader, Path(bundle_dir))
+    inference_mode = _inference_mode(skip_detection=skip_detection)
 
     comparisons: list[dict[str, object]] = []
     latencies_ms: list[float] = []
@@ -330,10 +368,8 @@ def evaluate_paddle_recipients(
         with Image.open(image_path) as image:
             image_rgb = np.asarray(image.convert("RGB")).copy()
         started = perf_counter()
-        result = getattr(reader, "recognize")(image_rgb)
+        result = _recognize_recipient(reader, image_rgb, skip_detection=skip_detection)
         elapsed_ms = (perf_counter() - started) * 1000.0
-        if not isinstance(result, OCRResult):
-            raise TypeError("Paddle reader must return OCRResult")
         candidate_anchored_value, candidate_fallback_value = _recipient_values(result.text)
         reference_text = str(record["reference_text"])
         anchored_exact = candidate_anchored_value == reference_text
@@ -344,6 +380,7 @@ def evaluate_paddle_recipients(
         comparison = {
             "schema_version": EVALUATION_SCHEMA_VERSION,
             "kind": EVALUATION_KIND,
+            "inference_mode": inference_mode["name"],
             **record,
             "raw_paddle_text": result.text,
             "paddle_confidence": result.confidence,
@@ -378,6 +415,7 @@ def evaluate_paddle_recipients(
         "records": len(comparisons),
         "limit": limit,
         "requested_device": normalized_device,
+        "inference_mode": inference_mode,
         "runtime": runtime,
         "frozen_bundle": bundle,
         "raw_visible_exact_matches": raw_visible_exact_matches,
@@ -421,10 +459,19 @@ def format_paddle_recipient_evaluation(summary: Mapping[str, object]) -> str:
     latency = summary.get("latency_ms")
     acceptance = summary.get("acceptance")
     runtime = summary.get("runtime")
-    if not isinstance(latency, Mapping) or not isinstance(acceptance, Mapping) or not isinstance(runtime, Mapping):
+    inference_mode = summary.get("inference_mode")
+    if (
+        not isinstance(latency, Mapping)
+        or not isinstance(acceptance, Mapping)
+        or not isinstance(runtime, Mapping)
+        or not isinstance(inference_mode, Mapping)
+    ):
         raise ValueError("Paddle recipient summary is invalid")
     lines = [
         "paddle_recipient_evaluation",
+        f"  mode={inference_mode.get('name')}; experimental={inference_mode.get('experimental')}; "
+        f"det={inference_mode.get('detection_enabled')}; cls={inference_mode.get('angle_classifier_enabled')}; "
+        f"rec={inference_mode.get('recognizer_enabled')}",
         f"  anchored={summary.get('anchored_value_exact_matches')}/{summary.get('records')}="
         f"{_format_rate(summary.get('anchored_value_exact_match'))}; split={summary.get('evaluation_split')}",
         f"  raw-visible={summary.get('raw_visible_exact_matches')}/{summary.get('records')}="
@@ -458,6 +505,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--target", type=float, default=0.90, help="value-exact acceptance target, default: 0.90")
     parser.add_argument("--progress-every", type=int, default=25)
     parser.add_argument("--bundle", type=Path, help="optional frozen Paddle bundle to hash-verify and match to live assets")
+    parser.add_argument(
+        "--skip-detection",
+        action="store_true",
+        help="EXPERIMENTAL: call pinned PaddleOCR v2 with det=False while retaining cls+rec; use only for speed A/B",
+    )
     parser.add_argument("--json", action="store_true", help="print complete summary JSON instead of compact text")
     return parser
 
@@ -475,6 +527,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             target_value_exact_match=args.target,
             progress_every=args.progress_every,
             bundle_dir=args.bundle,
+            skip_detection=args.skip_detection,
         )
     except (OSError, RuntimeError, TypeError, ValueError) as error:
         raise SystemExit(f"Paddle recipient evaluation failed: {error}") from error
