@@ -935,11 +935,35 @@ def test_v12_metadata_freezes_the_two_static_input_shapes() -> None:
     assert metadata["recipient_input_shape"] == [1, 1, 32, 128]
     assert metadata["recipient_time_steps"] == 32
     assert metadata["recipient_branch_channels"] == 8
+    assert "recipient_open_text_encoder" not in metadata
     assert metadata["recipient_input_preprocess"] == "left_trim_then_centered_aspect_resize_high_resolution"
     assert metadata["recipient_tail_loss_policy"] == tail_policy
     # Published checkpoints/sidecars before this train-only policy do not
     # contain it.  Missing legacy provenance must remain loadable.
     assert "recipient_tail_loss_policy" not in legacy_metadata
+
+    open_text_config = UnifiedReaderConfig(
+        **{
+            **asdict(config),
+            "recipient_open_text_layers": 2,
+            "recipient_open_text_heads": 4,
+            "recipient_open_text_feedforward": 64,
+        }
+    )
+    open_text_metadata = _recipient_artifact_metadata(
+        open_text_config,
+        recipient_sampling_policy={
+            "mode": "uniform",
+            "recipient_sampling_weight": 1.0,
+            "recipient_train_records": 1,
+        },
+    )
+    assert open_text_metadata["recipient_open_text_encoder"] == {
+        "mode": "zero_gated_transformer_context_v1",
+        "layers": 2,
+        "heads": 4,
+        "feedforward": 64,
+    }
 
 
 def test_v12_train_export_ort_load_and_evaluate_two_static_inputs_when_onnx_is_available(

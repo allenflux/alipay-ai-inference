@@ -1334,21 +1334,20 @@ def _recipient_artifact_metadata(
                 "recipient_input_shape": [1, 1, config.recipient_input_height, config.recipient_input_width],
                 "recipient_branch_channels": _recipient_branch_channels(config),
                 "recipient_time_steps": _recipient_time_steps(config),
-                "recipient_open_text_encoder": {
-                    "mode": (
-                        "zero_gated_transformer_context_v1"
-                        if config.recipient_open_text_layers
-                        else "none"
-                    ),
-                    "layers": config.recipient_open_text_layers,
-                    "heads": config.recipient_open_text_heads,
-                    "feedforward": int(
-                        config.recipient_open_text_feedforward
-                        or (_recipient_hidden_size(config) * 2 * 4)
-                    ),
-                },
             }
         )
+        # Keep legacy v12 sidecars loadable: this additive provenance key is
+        # present only when the graph actually contains the new adapter.
+        if config.recipient_open_text_layers:
+            metadata["recipient_open_text_encoder"] = {
+                "mode": "zero_gated_transformer_context_v1",
+                "layers": config.recipient_open_text_layers,
+                "heads": config.recipient_open_text_heads,
+                "feedforward": int(
+                    config.recipient_open_text_feedforward
+                    or (_recipient_hidden_size(config) * 2 * 4)
+                ),
+            }
     return metadata
 
 
