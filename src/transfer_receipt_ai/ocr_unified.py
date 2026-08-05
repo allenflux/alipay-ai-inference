@@ -41,6 +41,7 @@ from PIL import Image
 
 from .onnx_runtime import _preload_cuda_dlls, onnx_providers
 from .ocr import clean_text, extract_field_value, normalize_payment_method, parse_anchored_recipient_row
+from .recipient_beam import CharacterNGramLanguageModel, decode_ctc_prefix_beam
 from .recipient_audit import (
     DEFAULT_CUT_RADIUS as RECIPIENT_AUDIT_DEFAULT_CUT_RADIUS,
     DEFAULT_FOREGROUND_CONTRAST_THRESHOLD as RECIPIENT_AUDIT_DEFAULT_FOREGROUND_CONTRAST_THRESHOLD,
@@ -8478,6 +8479,10 @@ def evaluate_unified_onnx(
     min_delivery_exact_match: float | None = None,
     max_delivery_false_accepts: int | None = None,
     amount_format_min_confidence_override: float | None = None,
+    recipient_beam_width: int = 1,
+    recipient_beam_token_top_k: int = 24,
+    recipient_ngram_order: int = 3,
+    recipient_ngram_weight: float = 0.35,
 ) -> tuple[dict[str, object], list[str]]:
     """Compare one ONNX session run per held-out receipt with teacher labels."""
     if split not in {"val", "test"}:
@@ -8532,6 +8537,22 @@ def evaluate_unified_onnx(
     status_policy = _contract_status_policy(contract)
     status_delivery_allowed = status_policy["runtime_policy"] == "classify"
     records = load_records(records_path, dataset_root=dataset_root, config=config)
+    if recipient_beam_width <= 0 or recipient_beam_token_top_k <= 0:
+        raise ValueError("recipient beam width and token top-k must be positive")
+    if recipient_beam_width > 1 and not _uses_recipient_protocol(config):
+        raise ValueError("recipient n-gram beam decoding requires a v9-v12 recipient model")
+    recipient_language_model = None
+    if recipient_beam_width > 1:
+        recipient_language_model = CharacterNGramLanguageModel.from_texts(
+            (
+                text
+                for record in records
+                if record["split"] == "train"
+                for text in [_ctc_slot_text(record, "recipient_field", config=config)]
+                if text is not None
+            ),
+            order=recipient_ngram_order,
+        )
     evaluation_records = [record for record in records if record["split"] == split]
     if not evaluation_records:
         raise ValueError(f"No {split} receipt records found")
@@ -8674,9 +8695,20 @@ def evaluate_unified_onnx(
         if _uses_recipient_protocol(config):
             if recipient_characters is None:
                 raise AssertionError("v9-v12 recipient characters were validated with the ONNX sidecar")
-            recipient_text, recipient_confidence = _ctc_single_output(
-                runtime_outputs["recipient_logits"], characters=recipient_characters
-            )
+            if recipient_language_model is None:
+                recipient_text, recipient_confidence = _ctc_single_output(
+                    runtime_outputs["recipient_logits"], characters=recipient_characters
+                )
+            else:
+                recipient_text, recipient_score = decode_ctc_prefix_beam(
+                    runtime_outputs["recipient_logits"],
+                    characters=recipient_characters,
+                    language_model=recipient_language_model,
+                    beam_width=recipient_beam_width,
+                    token_top_k=recipient_beam_token_top_k,
+                    language_model_weight=recipient_ngram_weight,
+                )
+                recipient_confidence = 0.0
         status_index, status_confidence = _softmax_confidence(status_logits)
         raw_status_text = STATUS_CLASSES[status_index]
         ctc_predictions: dict[str, tuple[str, float]] = {
@@ -8977,6 +9009,15 @@ def evaluate_unified_onnx(
             "artifact_min_confidence": artifact_amount_format_min_confidence,
             "effective_min_confidence": config.amount_format_min_confidence if _uses_v8_protocol(config) else None,
             "evaluation_override": amount_format_min_confidence_override,
+        },
+        "recipient_decoder_policy": {
+            "mode": "character_ngram_ctc_prefix_beam_v1" if recipient_language_model is not None else "ctc_greedy",
+            "beam_width": recipient_beam_width,
+            "token_top_k": recipient_beam_token_top_k,
+            "ngram_order": recipient_ngram_order if recipient_language_model is not None else None,
+            "ngram_weight": recipient_ngram_weight if recipient_language_model is not None else None,
+            "open_vocabulary": True,
+            "complete_name_lexicon": False,
         },
         "by_field": by_field,
         "status_confusion": dict(sorted(status_confusion.items())),
@@ -9859,6 +9900,10 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--min-time-exact-match", type=float)
     evaluate.add_argument("--min-payment-exact-match", type=float)
     evaluate.add_argument("--min-recipient-exact-match", type=float)
+    evaluate.add_argument("--recipient-beam-width", type=int, default=1)
+    evaluate.add_argument("--recipient-beam-token-top-k", type=int, default=24)
+    evaluate.add_argument("--recipient-ngram-order", type=int, default=3)
+    evaluate.add_argument("--recipient-ngram-weight", type=float, default=0.35)
     evaluate.add_argument("--min-status-exact-match", type=float)
     evaluate.add_argument("--max-payment-oov-rate", type=float)
     evaluate.add_argument("--max-recipient-oov-rate", type=float)
@@ -10028,6 +10073,10 @@ def main(argv: list[str] | None = None) -> None:
                 min_delivery_exact_match=args.min_delivery_exact_match,
                 max_delivery_false_accepts=args.max_delivery_false_accepts,
                 amount_format_min_confidence_override=args.amount_format_min_confidence_override,
+                recipient_beam_width=args.recipient_beam_width,
+                recipient_beam_token_top_k=args.recipient_beam_token_top_k,
+                recipient_ngram_order=args.recipient_ngram_order,
+                recipient_ngram_weight=args.recipient_ngram_weight,
             )
             metrics = summary["by_field"]
             status_policy = summary.get("status_head_policy")
