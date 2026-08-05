@@ -148,8 +148,8 @@ if ($InitCheckpointMode -eq "recipient_capacity_reinit") {
     }
 }
 if ($InitCheckpointMode -eq "recipient_open_text_adapter") {
-    if ($RecipientInputWidth -ne 1024 -or $RecipientBranchChannels -ne 24 -or $RecipientHiddenSize -ne 256) {
-        throw "recipient_open_text_adapter keeps the complete 1024px/24-channel/256-hidden seed branch."
+    if ($RecipientInputWidth -lt 1024 -or $RecipientBranchChannels -ne 24 -or $RecipientHiddenSize -ne 256) {
+        throw "recipient_open_text_adapter keeps the complete 24-channel/256-hidden seed branch and cannot reduce the 1024px seed view."
     }
     if ($RecipientOpenTextLayers -le 0) {
         throw "recipient_open_text_adapter requires RecipientOpenTextLayers greater than zero."

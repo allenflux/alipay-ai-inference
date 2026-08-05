@@ -4,6 +4,8 @@ param(
     [ValidateRange(1, 24)]
     [int]$Epochs = 8,
     [string]$RunName,
+    [ValidateRange(1024, 2048)]
+    [int]$RecipientInputWidth = 1024,
     [switch]$UnfreezeLegacy,
     [switch]$FullOnnxValidation
 )
@@ -18,6 +20,7 @@ $seedModel = Join-Path $seedRun "best.onnx"
 
 if ([string]::IsNullOrWhiteSpace($RunName)) {
     $scope = if ($UnfreezeLegacy) { "joint" } else { "adapter-only" }
+    if ($RecipientInputWidth -gt 1024) { $scope += "-wide$RecipientInputWidth" }
     $RunName = "unified-run-v12-r3-4090-open-text-transformer2-" + $scope + "-pilot-" + (Get-Date -Format "yyyyMMdd-HHmmss")
 }
 foreach ($required in @($pythonExe, $guardedRunner, $seedCheckpoint, $seedModel)) {
@@ -39,7 +42,7 @@ $runnerArgs = @{
     SeedCheckpoint = $seedCheckpoint
     SeedModel = $seedModel
     InitCheckpointMode = "recipient_open_text_adapter"
-    RecipientInputWidth = 1024
+    RecipientInputWidth = $RecipientInputWidth
     RecipientBranchChannels = 24
     RecipientHiddenSize = 256
     RecipientOpenTextLayers = 2

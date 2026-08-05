@@ -816,6 +816,62 @@ def test_v12_open_text_adapter_is_identity_gated_and_preserves_seed(tmp_path: Pa
     torch.testing.assert_close(target_logits, source_logits, rtol=0.0, atol=0.0)
 
 
+def test_v12_open_text_adapter_can_expand_recipient_input_width(tmp_path: Path) -> None:
+    """A wider view retains every seed tensor while adding the contextual adapter."""
+    torch = pytest.importorskip("torch")
+    source_config = _tiny_v12_config()
+    seed, _, source_payment, source_bank = _write_v12_expansion_seed(
+        tmp_path,
+        config=source_config,
+        torch=torch,
+    )
+    target_config = UnifiedReaderConfig(
+        **{
+            **asdict(source_config),
+            "recipient_input_width": source_config.recipient_input_width + 64,
+            "recipient_open_text_layers": 2,
+            "recipient_open_text_heads": 4,
+            "recipient_open_text_feedforward": 64,
+        }
+    )
+    effective_payment, effective_bank, effective_recipient, policy = _recipient_only_expansion_label_override(
+        init_checkpoint=seed,
+        init_checkpoint_mode=INIT_CHECKPOINT_MODE_RECIPIENT_OPEN_TEXT_ADAPTER,
+        config=target_config,
+        amount_characters=list(V8_AMOUNT_CHARACTERS),
+        time_characters=list(V6_TIME_CHARACTERS),
+        payment_characters=source_payment,
+        recipient_characters=["乙", "甲"],
+        payment_bank_prefix_classes=source_bank,
+        torch=torch,
+    )
+    assert policy["source_recipient_input_width"] == source_config.recipient_input_width
+    assert policy["target_recipient_input_width"] == target_config.recipient_input_width
+    target_model = build_unified_reader(
+        payment_vocab_size=len(effective_payment) + 1,
+        payment_bank_prefix_vocab_size=len(effective_bank),
+        recipient_vocab_size=len(effective_recipient) + 1,
+        config=target_config,
+    )
+    mapped_state, initialization = _parameter_only_initialization(
+        init_checkpoint=seed,
+        init_checkpoint_mode=INIT_CHECKPOINT_MODE_RECIPIENT_OPEN_TEXT_ADAPTER,
+        config=target_config,
+        amount_characters=list(V8_AMOUNT_CHARACTERS),
+        time_characters=list(V6_TIME_CHARACTERS),
+        payment_characters=effective_payment,
+        recipient_characters=effective_recipient,
+        payment_bank_prefix_classes=effective_bank,
+        torch=torch,
+        target_state_dict=target_model.state_dict(),
+    )
+    assert mapped_state is not None
+    assert initialization["source_recipient_input_width"] == source_config.recipient_input_width
+    assert initialization["target_recipient_input_width"] == target_config.recipient_input_width
+    target_model.load_state_dict(mapped_state, strict=True)
+    assert target_model.recipient_open_text_gate.item() == 0.0
+
+
 def test_v12_recipient_input_width_expansion_keeps_epoch_zero_when_training_regresses(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

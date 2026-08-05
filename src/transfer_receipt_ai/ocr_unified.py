@@ -5089,17 +5089,20 @@ def _validate_recipient_open_text_adapter_config(
     source_config: UnifiedReaderConfig,
     target_config: UnifiedReaderConfig,
 ) -> None:
-    """Allow only an identity-gated contextual adapter on a v12 seed."""
+    """Allow an identity-gated contextual adapter and an optional wider view."""
     if not (_is_v12(source_config) and _is_v12(target_config)):
         raise ValueError("recipient_open_text_adapter is supported only by architecture v12")
     if source_config.recipient_open_text_layers != 0:
         raise ValueError("recipient_open_text_adapter requires a seed without an existing open-text adapter")
     if target_config.recipient_open_text_layers <= 0:
         raise ValueError("recipient_open_text_adapter requires at least one open-text layer")
+    if target_config.recipient_input_width < source_config.recipient_input_width:
+        raise ValueError("recipient_open_text_adapter cannot reduce recipient_input_width")
     allowed = {
         "recipient_open_text_layers",
         "recipient_open_text_heads",
         "recipient_open_text_feedforward",
+        "recipient_input_width",
     }
     source_values = asdict(source_config)
     target_values = asdict(target_config)
@@ -5110,7 +5113,7 @@ def _validate_recipient_open_text_adapter_config(
     ]
     if changed:
         raise ValueError(
-            "recipient_open_text_adapter may change only its contextual encoder settings; "
+            "recipient_open_text_adapter may change only its contextual encoder settings and input width; "
             f"incompatible config fields: {', '.join(changed)}"
         )
 
@@ -5212,7 +5215,10 @@ def _recipient_only_expansion_label_override(
                     "source_recipient_input_width": source_config.recipient_input_width,
                     "target_recipient_input_width": config.recipient_input_width,
                 }
-                if init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_INPUT_WIDTH_EXPANSION
+                if init_checkpoint_mode in {
+                    INIT_CHECKPOINT_MODE_RECIPIENT_INPUT_WIDTH_EXPANSION,
+                    INIT_CHECKPOINT_MODE_RECIPIENT_OPEN_TEXT_ADAPTER,
+                }
                 else {}
             ),
             "payment_character_map": _label_map_provenance(
@@ -5549,6 +5555,8 @@ def _parameter_only_initialization(
                 "mode": "parameter_only_recipient_open_text_adapter",
                 "init_checkpoint_mode": init_checkpoint_mode,
                 "recipient_open_text_adapter_mapping": adapter_mapping,
+                "source_recipient_input_width": source_config.recipient_input_width,
+                "target_recipient_input_width": config.recipient_input_width,
             }
         )
         return remapped_state, initialization
