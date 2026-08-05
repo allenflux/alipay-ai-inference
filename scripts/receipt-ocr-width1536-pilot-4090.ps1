@@ -8,6 +8,14 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# Keep the contract test in the same CUDA virtual environment as the actual
+# 4090 training command.  Git Bash can put the system Python first on PATH.
+$repoRoot = Split-Path -Parent $PSScriptRoot
+$pythonExe = Join-Path $repoRoot ".venv-cu126\Scripts\python.exe"
+if (-not (Test-Path -LiteralPath $pythonExe)) {
+    throw "Missing CUDA virtual-environment Python: $pythonExe"
+}
+
 # This is intentionally a short, reproducible entry point for the 4090 host.
 # It first checks the v12 contract, then delegates the guarded run to the
 # reusable runner.  The candidate is a new recipient-only input view; the
@@ -22,7 +30,8 @@ if ([string]::IsNullOrWhiteSpace($RunName)) {
 }
 
 Write-Host "width1536_pilot_tests"
-& python -m pytest -q tests/test_ocr_unified.py tests/test_ocr_unified_v12.py
+Write-Host "  python=$pythonExe"
+& $pythonExe -m pytest -q tests/test_ocr_unified.py tests/test_ocr_unified_v12.py
 if ($LASTEXITCODE -ne 0) {
     throw "v12 tests failed with exit code $LASTEXITCODE; refusing to start the Pilot."
 }

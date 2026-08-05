@@ -57,6 +57,16 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# Always use the repository's CUDA-enabled environment.  The host's global
+# Python is deliberately not a training dependency (and does not contain the
+# pinned pytest/torch/onnxruntime stack), so resolving plain `python` here can
+# silently turn a 4090 run into a different environment.
+$repoRoot = Split-Path -Parent $PSScriptRoot
+$pythonExe = Join-Path $repoRoot ".venv-cu126\Scripts\python.exe"
+if (-not (Test-Path -LiteralPath $pythonExe)) {
+    throw "Missing CUDA virtual-environment Python: $pythonExe"
+}
+
 # These are the actual r3/4090 assets, not the old generic r3 directory names.
 # The baseline is evaluated again on exactly this manifest before any training
 # begins, so the historical floors cannot silently cross dataset splits.
@@ -131,7 +141,7 @@ function Read-GuardedJson([string]$Path) {
     if (-not (Test-Path -LiteralPath $normalizer)) {
         throw "Missing JSON summary normalizer: $normalizer"
     }
-    $normalizedJson = (& python $normalizer $Path) -join "`n"
+    $normalizedJson = (& $pythonExe $normalizer $Path) -join "`n"
     if ($LASTEXITCODE -ne 0) {
         throw "Unable to normalize JSON summary with Python: $Path (exit code $LASTEXITCODE)"
     }
@@ -155,6 +165,7 @@ function Get-TrainingExactDisplay([object]$Record, [string]$Field) {
 }
 
 Write-Host "guarded_4090_recipient_only preflight"
+Write-Host "  python=$pythonExe"
 Write-Host "  seed=$seedCheckpoint"
 Write-Host "  seed-model=$seedModel"
 Write-Host "  records=$records"
@@ -190,7 +201,7 @@ $baselineArgs = @(
     "--output", $baselineOutput,
     "--device", "cuda:0"
 )
-& python @baselineArgs
+& $pythonExe @baselineArgs
 if ($LASTEXITCODE -ne 0) {
     throw "Baseline evaluation failed with exit code $LASTEXITCODE"
 }
@@ -297,7 +308,7 @@ if (-not $DiagnosticOnly) {
 
 $exitCode = 0
 try {
-    & python @trainArgs
+    & $pythonExe @trainArgs
     $exitCode = $LASTEXITCODE
 }
 finally {
@@ -396,7 +407,7 @@ elseif ($exitCode -eq 0) {
             "--min-payment-exact-match", "$PaymentFloor",
             "--min-recipient-exact-match", "$RecipientFloor"
         )
-        & python @candidateArgs
+        & $pythonExe @candidateArgs
         $candidateExitCode = $LASTEXITCODE
         $candidateSummaryPath = Join-Path $candidateValOutput "summary.json"
         if (Test-Path -LiteralPath $candidateSummaryPath) {
