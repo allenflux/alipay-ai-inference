@@ -956,6 +956,7 @@ def test_v12_metadata_freezes_the_two_static_input_shapes() -> None:
             "mode": "uniform",
             "recipient_sampling_weight": 1.0,
             "recipient_train_records": 1,
+            "train_records": 1,
         },
     )
     assert open_text_metadata["recipient_open_text_encoder"] == {
