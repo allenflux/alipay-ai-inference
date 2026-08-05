@@ -686,6 +686,7 @@ def test_v12_recipient_capacity_reinit_copies_only_frozen_side(tmp_path: Path) -
             "recipient_hidden_size": int(source_config.recipient_hidden_size or 0) + 8,
         }
     )
+    assert _checkpoint_config({"kind": KIND_V12, "config": asdict(target_config)}) == target_config
     effective_payment, effective_bank, effective_recipient, policy = _recipient_only_expansion_label_override(
         init_checkpoint=seed,
         init_checkpoint_mode=INIT_CHECKPOINT_MODE_RECIPIENT_CAPACITY_REINIT,
@@ -766,6 +767,7 @@ def test_v12_open_text_adapter_is_identity_gated_and_preserves_seed(tmp_path: Pa
             "recipient_open_text_feedforward": 64,
         }
     )
+    assert _checkpoint_config({"kind": KIND_V12, "config": asdict(target_config)}) == target_config
     effective_payment, effective_bank, effective_recipient, policy = _recipient_only_expansion_label_override(
         init_checkpoint=seed,
         init_checkpoint_mode=INIT_CHECKPOINT_MODE_RECIPIENT_OPEN_TEXT_ADAPTER,
