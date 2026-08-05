@@ -5799,6 +5799,7 @@ def train_unified_reader(
     recipient_tail_long_text_loss_weight: float = 1.0,
     recipient_train_augmentation: str = "none",
     recipient_only_fine_tune: bool = False,
+    recipient_open_text_unfreeze_legacy: bool = False,
     validation_every: int = 1,
     checkpoint_selection: str = CHECKPOINT_SELECTION_BALANCED,
     checkpoint_min_amount_candidate_exact: float | None = None,
@@ -5830,6 +5831,14 @@ def train_unified_reader(
             raise ValueError("recipient_only_fine_tune is supported only by architecture v12")
         if init_checkpoint is None:
             raise ValueError("recipient_only_fine_tune requires a compatible --init-checkpoint")
+    if recipient_open_text_unfreeze_legacy and (
+        not recipient_only_fine_tune
+        or init_checkpoint_mode != INIT_CHECKPOINT_MODE_RECIPIENT_OPEN_TEXT_ADAPTER
+    ):
+        raise ValueError(
+            "recipient_open_text_unfreeze_legacy requires recipient-only fine-tuning "
+            "with recipient_open_text_adapter initialisation"
+        )
     if init_checkpoint_mode not in INIT_CHECKPOINT_MODES:
         raise ValueError(
             "init_checkpoint_mode must be one of "
@@ -6208,6 +6217,7 @@ def train_unified_reader(
         trainable_recipient_prefix = (
             "recipient_open_text_"
             if init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_OPEN_TEXT_ADAPTER
+            and not recipient_open_text_unfreeze_legacy
             else "recipient_"
         )
         for name, parameter in model.named_parameters():
@@ -6224,6 +6234,7 @@ def train_unified_reader(
                 parameter.numel() for parameter in model.parameters() if not parameter.requires_grad
             ),
             "trainable_parameter_prefix": trainable_recipient_prefix,
+            "open_text_legacy_recipient_unfrozen": recipient_open_text_unfreeze_legacy,
             "training_forward": "private_recipient_branch_only_v12",
             "source_train_records": len(train_records),
             "recipient_train_records": len(training_records),
@@ -9617,6 +9628,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     train.add_argument(
+        "--recipient-open-text-unfreeze-legacy",
+        action="store_true",
+        help=(
+            "recipient_open_text_adapter only: jointly fine-tune the legacy private recipient CNN/GRU/classifier "
+            "with the new adapter while every financial/shared parameter remains frozen"
+        ),
+    )
+    train.add_argument(
         "--validation-every",
         type=int,
         default=1,
@@ -9947,6 +9966,7 @@ def main(argv: list[str] | None = None) -> None:
                 recipient_tail_long_text_loss_weight=args.recipient_tail_long_text_loss_weight,
                 recipient_train_augmentation=args.recipient_train_augmentation,
                 recipient_only_fine_tune=args.recipient_only_fine_tune,
+                recipient_open_text_unfreeze_legacy=args.recipient_open_text_unfreeze_legacy,
                 validation_every=args.validation_every,
                 checkpoint_selection=args.checkpoint_selection,
                 checkpoint_min_amount_candidate_exact=args.checkpoint_min_amount_candidate_exact,

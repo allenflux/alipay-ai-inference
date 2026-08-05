@@ -4,6 +4,7 @@ param(
     [ValidateRange(1, 24)]
     [int]$Epochs = 8,
     [string]$RunName,
+    [switch]$UnfreezeLegacy,
     [switch]$FullOnnxValidation
 )
 
@@ -16,7 +17,8 @@ $seedCheckpoint = Join-Path $seedRun "best.pt"
 $seedModel = Join-Path $seedRun "best.onnx"
 
 if ([string]::IsNullOrWhiteSpace($RunName)) {
-    $RunName = "unified-run-v12-r3-4090-open-text-transformer2-pilot-" + (Get-Date -Format "yyyyMMdd-HHmmss")
+    $scope = if ($UnfreezeLegacy) { "joint" } else { "adapter-only" }
+    $RunName = "unified-run-v12-r3-4090-open-text-transformer2-" + $scope + "-pilot-" + (Get-Date -Format "yyyyMMdd-HHmmss")
 }
 foreach ($required in @($pythonExe, $guardedRunner, $seedCheckpoint, $seedModel)) {
     if (-not (Test-Path -LiteralPath $required)) {
@@ -44,12 +46,15 @@ $runnerArgs = @{
     RecipientOpenTextHeads = 8
     RecipientOpenTextFeedforward = 2048
     RecipientFloor = 0.80
-    LearningRate = 0.0003
+    LearningRate = $(if ($UnfreezeLegacy) { 0.00005 } else { 0.0003 })
     ValidationEvery = 2
     RecipientTailRareCharacterMaxSupport = 3
     RecipientTailRareCharacterLossWeight = 2.0
     RecipientTailLongTextMinLength = 9
     RecipientTailLongTextLossWeight = 2.0
+}
+if ($UnfreezeLegacy) {
+    $runnerArgs["RecipientOpenTextUnfreezeLegacy"] = $true
 }
 if (-not $FullOnnxValidation) {
     $runnerArgs["DiagnosticOnly"] = $true

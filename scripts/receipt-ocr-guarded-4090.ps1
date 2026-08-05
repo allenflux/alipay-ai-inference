@@ -25,6 +25,7 @@ param(
     [int]$RecipientOpenTextHeads = 8,
     [ValidateRange(512, 8192)]
     [int]$RecipientOpenTextFeedforward = 2048,
+    [switch]$RecipientOpenTextUnfreezeLegacy,
     [ValidateRange(0.0, 1.0)]
     [double]$AmountFloor = 0.7885,
     [ValidateRange(0.0, 1.0)]
@@ -202,6 +203,7 @@ Write-Host "  output=$output"
 Write-Host ("  floors: amount={0:P2}, time={1:P2}, payment={2:P2}" -f $AmountFloor, $TimeFloor, $PaymentFloor)
 Write-Host ("  recipient target={0:P2}; input-width={1}; branch-channels={2}; hidden={3}; init-mode={4}" -f $RecipientFloor, $RecipientInputWidth, $RecipientBranchChannels, $RecipientHiddenSize, $InitCheckpointMode)
 Write-Host ("  open-text adapter: layers={0}; heads={1}; feedforward={2}" -f $RecipientOpenTextLayers, $RecipientOpenTextHeads, $RecipientOpenTextFeedforward)
+Write-Host ("  open-text legacy recipient unfrozen={0}" -f [bool]$RecipientOpenTextUnfreezeLegacy)
 $persistentWorkers = if ($NumWorkers -gt 0) { "on" } else { "off" }
 Write-Host ("  recipe: recipient-only, lr={0}, workers={1}, persistent-workers={2}, prefetch={3}, validate-every={4}, TF32=on, cuDNN-benchmark=on" -f $LearningRate, $NumWorkers, $persistentWorkers, $PrefetchFactor, $ValidationEvery)
 Write-Host ("  recipient teacher confidence: below {0} x{1}, curriculum-epochs={2}" -f $RecipientLowConfidenceThreshold, $RecipientLowConfidenceLossWeight, $RecipientConfidenceCurriculumEpochs)
@@ -326,6 +328,9 @@ if ($InitCheckpointMode -eq "recipient_open_text_adapter") {
         "--recipient-open-text-heads", "$RecipientOpenTextHeads",
         "--recipient-open-text-feedforward", "$RecipientOpenTextFeedforward"
     )
+    if ($RecipientOpenTextUnfreezeLegacy) {
+        $trainArgs += "--recipient-open-text-unfreeze-legacy"
+    }
 }
 if ($NumWorkers -gt 0) {
     # v12 light_v1 keeps its epoch in process-shared dataset state, so this
