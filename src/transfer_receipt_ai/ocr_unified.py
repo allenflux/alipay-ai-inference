@@ -87,17 +87,20 @@ CHECKPOINT_SELECTION_MODES = frozenset(
 INIT_CHECKPOINT_MODE_STRICT = "strict"
 INIT_CHECKPOINT_MODE_RECIPIENT_ONLY_EXPANSION = "recipient_only_expansion"
 INIT_CHECKPOINT_MODE_RECIPIENT_INPUT_WIDTH_EXPANSION = "recipient_input_width_expansion"
+INIT_CHECKPOINT_MODE_RECIPIENT_CAPACITY_REINIT = "recipient_capacity_reinit"
 INIT_CHECKPOINT_MODES = frozenset(
     (
         INIT_CHECKPOINT_MODE_STRICT,
         INIT_CHECKPOINT_MODE_RECIPIENT_ONLY_EXPANSION,
         INIT_CHECKPOINT_MODE_RECIPIENT_INPUT_WIDTH_EXPANSION,
+        INIT_CHECKPOINT_MODE_RECIPIENT_CAPACITY_REINIT,
     )
 )
 RECIPIENT_ONLY_INIT_CHECKPOINT_MODES = frozenset(
     (
         INIT_CHECKPOINT_MODE_RECIPIENT_ONLY_EXPANSION,
         INIT_CHECKPOINT_MODE_RECIPIENT_INPUT_WIDTH_EXPANSION,
+        INIT_CHECKPOINT_MODE_RECIPIENT_CAPACITY_REINIT,
     )
 )
 # These are the mature text heads that must not silently regress while a
@@ -4983,6 +4986,42 @@ def _validate_recipient_input_width_expansion_config(
         )
 
 
+def _validate_recipient_capacity_reinit_config(
+    source_config: UnifiedReaderConfig,
+    target_config: UnifiedReaderConfig,
+) -> None:
+    """Permit a larger private recipient branch while freezing all shared topology.
+
+    Changing a CNN or GRU width changes learned tensor shapes, so those tensors
+    cannot be warm-started honestly.  This mode therefore requires a monotonic
+    capacity increase and reinitialises every ``recipient_`` tensor while
+    retaining every financial/shared tensor byte-for-byte from the seed.
+    """
+    if not (_is_v12(source_config) and _is_v12(target_config)):
+        raise ValueError("recipient_capacity_reinit is supported only by architecture v12")
+    source_channels = _recipient_branch_channels(source_config)
+    target_channels = _recipient_branch_channels(target_config)
+    source_hidden = _recipient_hidden_size(source_config)
+    target_hidden = _recipient_hidden_size(target_config)
+    if target_channels < source_channels or target_hidden < source_hidden:
+        raise ValueError("recipient_capacity_reinit cannot reduce recipient branch capacity")
+    if target_channels == source_channels and target_hidden == source_hidden:
+        raise ValueError("recipient_capacity_reinit requires a larger recipient branch or hidden size")
+    allowed = {"recipient_branch_channels", "recipient_hidden_size"}
+    source_values = asdict(source_config)
+    target_values = asdict(target_config)
+    changed = [
+        key
+        for key in sorted(source_values)
+        if key not in allowed and source_values[key] != target_values.get(key)
+    ]
+    if changed:
+        raise ValueError(
+            "recipient_capacity_reinit may change only recipient_branch_channels and recipient_hidden_size; "
+            f"incompatible config fields: {', '.join(changed)}"
+        )
+
+
 def _recipient_only_expansion_label_override(
     *,
     init_checkpoint: Path,
@@ -5023,6 +5062,8 @@ def _recipient_only_expansion_label_override(
         # warm start.  Without the unconditional check a same-width seed could
         # accidentally enter the new pilot path.
         _validate_recipient_input_width_expansion_config(source_config, config)
+    elif init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_CAPACITY_REINIT:
+        _validate_recipient_capacity_reinit_config(source_config, config)
     elif source_config != config:
         raise ValueError(
             "init checkpoint model config does not match the requested training config; "
@@ -5057,7 +5098,11 @@ def _recipient_only_expansion_label_override(
             "mode": (
                 "checkpoint_financial_label_maps_recipient_input_width_expansion_v1"
                 if init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_INPUT_WIDTH_EXPANSION
-                else "checkpoint_financial_label_maps_v1"
+                else (
+                    "checkpoint_financial_label_maps_recipient_capacity_reinit_v1"
+                    if init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_CAPACITY_REINIT
+                    else "checkpoint_financial_label_maps_v1"
+                )
             ),
             "reason": (
                 "recipient-only v12 fine-tune freezes every non-recipient parameter, so payment and bank "
@@ -5167,6 +5212,46 @@ def _recipient_classifier_unicode_expansion_state(
     }
 
 
+def _recipient_capacity_reinit_state(
+    *,
+    source_state_dict: Mapping[str, object],
+    target_state_dict: Mapping[str, object],
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Copy the frozen side of a v12 model and keep its private branch fresh."""
+    source_keys = set(source_state_dict)
+    target_keys = set(target_state_dict)
+    if source_keys != target_keys:
+        raise ValueError(
+            "recipient_capacity_reinit requires the same parameter names; "
+            f"missing={sorted(target_keys - source_keys)}, unexpected={sorted(source_keys - target_keys)}"
+        )
+    adapted: dict[str, object] = dict(target_state_dict)
+    copied: list[str] = []
+    reinitialised: list[str] = []
+    for key in sorted(target_keys):
+        if key.startswith("recipient_"):
+            reinitialised.append(str(key))
+            continue
+        source_value = source_state_dict[key]
+        target_value = target_state_dict[key]
+        source_shape = tuple(getattr(source_value, "shape", ()))
+        target_shape = tuple(getattr(target_value, "shape", ()))
+        if source_shape != target_shape:
+            raise ValueError(
+                "recipient_capacity_reinit changed a frozen tensor shape: "
+                f"{key} has source shape {source_shape} but target shape {target_shape}"
+            )
+        adapted[key] = source_value
+        copied.append(str(key))
+    if not copied or not reinitialised:
+        raise ValueError("recipient_capacity_reinit found no frozen or recipient tensors")
+    return adapted, {
+        "frozen_tensor_count": len(copied),
+        "recipient_tensor_count_reinitialized": len(reinitialised),
+        "recipient_parameter_prefix": "recipient_",
+    }
+
+
 def _parameter_only_initialization(
     *,
     init_checkpoint: Path | None,
@@ -5211,6 +5296,8 @@ def _parameter_only_initialization(
         # override boundary.  Direct callers must not be able to bypass the
         # strictly-wider v12-only preflight.
         _validate_recipient_input_width_expansion_config(source_config, config)
+    elif init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_CAPACITY_REINIT:
+        _validate_recipient_capacity_reinit_config(source_config, config)
     elif source_config != config:
         raise ValueError(
             "init checkpoint model config does not match the requested training config; "
@@ -5268,6 +5355,23 @@ def _parameter_only_initialization(
         raise ValueError("init checkpoint recipient character map does not match the current training data")
     if target_state_dict is None:
         raise ValueError("recipient-only expansion init modes require a freshly initialised v12 target state")
+    if init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_CAPACITY_REINIT:
+        remapped_state, capacity_mapping = _recipient_capacity_reinit_state(
+            source_state_dict=state_dict,
+            target_state_dict=target_state_dict,
+        )
+        initialization.update(
+            {
+                "mode": "parameter_only_recipient_capacity_reinit",
+                "init_checkpoint_mode": init_checkpoint_mode,
+                "recipient_capacity_mapping": capacity_mapping,
+                "source_recipient_branch_channels": _recipient_branch_channels(source_config),
+                "target_recipient_branch_channels": _recipient_branch_channels(config),
+                "source_recipient_hidden_size": _recipient_hidden_size(source_config),
+                "target_recipient_hidden_size": _recipient_hidden_size(config),
+            }
+        )
+        return remapped_state, initialization
     remapped_state, row_mapping = _recipient_classifier_unicode_expansion_state(
         source_state_dict=state_dict,
         target_state_dict=target_state_dict,
@@ -9375,7 +9479,8 @@ def build_parser() -> argparse.ArgumentParser:
             "recipient_only_expansion is v12 recipient-only only: it locks payment/bank maps to the seed and "
             "maps additive recipient Unicode rows by character. recipient_input_width_expansion additionally "
             "permits only a strictly wider v12 recipient input while keeping all learned tensor shapes and "
-            "financial/shared topology unchanged."
+            "financial/shared topology unchanged. recipient_capacity_reinit copies every financial/shared "
+            "tensor but deliberately reinitialises a monotonically larger private recipient CNN/GRU."
         ),
     )
     train.add_argument(

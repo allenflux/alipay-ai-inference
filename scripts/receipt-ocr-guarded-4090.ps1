@@ -11,10 +11,14 @@ param(
     # is omitted, a sibling best.onnx is used whenever the supplied checkpoint
     # came from a prior guarded run.
     [string]$SeedModel,
-    [ValidateSet("recipient_only_expansion", "recipient_input_width_expansion")]
+    [ValidateSet("recipient_only_expansion", "recipient_input_width_expansion", "recipient_capacity_reinit")]
     [string]$InitCheckpointMode = "recipient_only_expansion",
     [ValidateRange(64, 4096)]
     [int]$RecipientInputWidth = 1024,
+    [ValidateRange(8, 256)]
+    [int]$RecipientBranchChannels = 24,
+    [ValidateRange(16, 2048)]
+    [int]$RecipientHiddenSize = 256,
     [ValidateRange(0.0, 1.0)]
     [double]$AmountFloor = 0.7885,
     [ValidateRange(0.0, 1.0)]
@@ -125,6 +129,17 @@ if ($InitCheckpointMode -eq "recipient_only_expansion" -and $RecipientInputWidth
 if ($InitCheckpointMode -eq "recipient_input_width_expansion" -and $RecipientInputWidth -le 1024) {
     throw "recipient_input_width_expansion requires RecipientInputWidth greater than the 1024px v12 seed view."
 }
+if ($InitCheckpointMode -eq "recipient_capacity_reinit") {
+    if ($RecipientInputWidth -ne 1024) {
+        throw "recipient_capacity_reinit keeps the seed input width at 1024."
+    }
+    if ($RecipientBranchChannels -lt 24 -or $RecipientHiddenSize -lt 256) {
+        throw "recipient_capacity_reinit cannot reduce the 24-channel/256-hidden seed branch."
+    }
+    if ($RecipientBranchChannels -eq 24 -and $RecipientHiddenSize -eq 256) {
+        throw "recipient_capacity_reinit requires a larger branch channel count or hidden size."
+    }
+}
 
 function Get-ExactDisplay([object]$Metric) {
     if ($null -eq $Metric) {
@@ -171,7 +186,7 @@ Write-Host "  seed-model=$seedModel"
 Write-Host "  records=$records"
 Write-Host "  output=$output"
 Write-Host ("  floors: amount={0:P2}, time={1:P2}, payment={2:P2}" -f $AmountFloor, $TimeFloor, $PaymentFloor)
-Write-Host ("  recipient target={0:P2}; input-width={1}; init-mode={2}" -f $RecipientFloor, $RecipientInputWidth, $InitCheckpointMode)
+Write-Host ("  recipient target={0:P2}; input-width={1}; branch-channels={2}; hidden={3}; init-mode={4}" -f $RecipientFloor, $RecipientInputWidth, $RecipientBranchChannels, $RecipientHiddenSize, $InitCheckpointMode)
 $persistentWorkers = if ($NumWorkers -gt 0) { "on" } else { "off" }
 Write-Host ("  recipe: recipient-only, lr={0}, workers={1}, persistent-workers={2}, prefetch={3}, validate-every={4}, TF32=on, cuDNN-benchmark=on" -f $LearningRate, $NumWorkers, $persistentWorkers, $PrefetchFactor, $ValidationEvery)
 Write-Host ("  recipient teacher confidence: below {0} x{1}, curriculum-epochs={2}" -f $RecipientLowConfidenceThreshold, $RecipientLowConfidenceLossWeight, $RecipientConfidenceCurriculumEpochs)
@@ -250,11 +265,11 @@ $trainArgs = @(
     "--image-width", "512",
     "--recipient-input-height", "128",
     "--recipient-input-width", "$RecipientInputWidth",
-    "--recipient-branch-channels", "24",
+    "--recipient-branch-channels", "$RecipientBranchChannels",
     "--base-channels", "32",
     "--numeric-hidden-size", "96",
     "--payment-hidden-size", "128",
-    "--recipient-hidden-size", "256",
+    "--recipient-hidden-size", "$RecipientHiddenSize",
     "--recipient-value-left-trim", "0.30",
     "--epochs", "$Epochs",
     "--batch-size", "12",

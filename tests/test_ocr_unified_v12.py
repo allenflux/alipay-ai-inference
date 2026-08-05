@@ -13,6 +13,7 @@ import pytest
 import transfer_receipt_ai.ocr_unified as ocr_unified
 
 from transfer_receipt_ai.ocr_unified import (
+    INIT_CHECKPOINT_MODE_RECIPIENT_CAPACITY_REINIT,
     INIT_CHECKPOINT_MODE_RECIPIENT_INPUT_WIDTH_EXPANSION,
     INIT_CHECKPOINT_MODE_RECIPIENT_ONLY_EXPANSION,
     KIND_V12,
@@ -665,6 +666,85 @@ def test_v12_recipient_input_width_expansion_preserves_all_learned_tensors(tmp_p
             payment_bank_prefix_classes=source_bank,
             torch=torch,
             target_state_dict=target_model.state_dict(),
+        )
+
+
+def test_v12_recipient_capacity_reinit_copies_only_frozen_side(tmp_path: Path) -> None:
+    """A larger private reader starts fresh without touching financial tensors."""
+    torch = pytest.importorskip("torch")
+    source_config = _tiny_v12_config()
+    seed, source_state, source_payment, source_bank = _write_v12_expansion_seed(
+        tmp_path,
+        config=source_config,
+        torch=torch,
+    )
+    target_config = UnifiedReaderConfig(
+        **{
+            **asdict(source_config),
+            "recipient_branch_channels": int(source_config.recipient_branch_channels or 0) + 4,
+            "recipient_hidden_size": int(source_config.recipient_hidden_size or 0) + 8,
+        }
+    )
+    effective_payment, effective_bank, effective_recipient, policy = _recipient_only_expansion_label_override(
+        init_checkpoint=seed,
+        init_checkpoint_mode=INIT_CHECKPOINT_MODE_RECIPIENT_CAPACITY_REINIT,
+        config=target_config,
+        amount_characters=list(V8_AMOUNT_CHARACTERS),
+        time_characters=list(V6_TIME_CHARACTERS),
+        payment_characters=source_payment,
+        recipient_characters=["乙", "甲"],
+        payment_bank_prefix_classes=source_bank,
+        torch=torch,
+    )
+    assert policy["mode"] == "checkpoint_financial_label_maps_recipient_capacity_reinit_v1"
+    target_model = build_unified_reader(
+        payment_vocab_size=len(effective_payment) + 1,
+        payment_bank_prefix_vocab_size=len(effective_bank),
+        recipient_vocab_size=len(effective_recipient) + 1,
+        config=target_config,
+    )
+    fresh_target_state = {
+        key: value.detach().clone() for key, value in target_model.state_dict().items()
+    }
+    mapped_state, initialization = _parameter_only_initialization(
+        init_checkpoint=seed,
+        init_checkpoint_mode=INIT_CHECKPOINT_MODE_RECIPIENT_CAPACITY_REINIT,
+        config=target_config,
+        amount_characters=list(V8_AMOUNT_CHARACTERS),
+        time_characters=list(V6_TIME_CHARACTERS),
+        payment_characters=effective_payment,
+        recipient_characters=effective_recipient,
+        payment_bank_prefix_classes=effective_bank,
+        torch=torch,
+        target_state_dict=target_model.state_dict(),
+    )
+    assert mapped_state is not None
+    assert initialization["mode"] == "parameter_only_recipient_capacity_reinit"
+    assert initialization["source_recipient_branch_channels"] == 8
+    assert initialization["target_recipient_branch_channels"] == 12
+    assert initialization["source_recipient_hidden_size"] == 16
+    assert initialization["target_recipient_hidden_size"] == 24
+    for key, value in mapped_state.items():
+        if key.startswith("recipient_"):
+            torch.testing.assert_close(value, fresh_target_state[key], rtol=0.0, atol=0.0)
+        else:
+            torch.testing.assert_close(value, source_state[key], rtol=0.0, atol=0.0)
+    target_model.load_state_dict(mapped_state, strict=True)
+
+    reduced = UnifiedReaderConfig(
+        **asdict(source_config)
+    )
+    with pytest.raises(ValueError, match="requires a larger"):
+        _recipient_only_expansion_label_override(
+            init_checkpoint=seed,
+            init_checkpoint_mode=INIT_CHECKPOINT_MODE_RECIPIENT_CAPACITY_REINIT,
+            config=reduced,
+            amount_characters=list(V8_AMOUNT_CHARACTERS),
+            time_characters=list(V6_TIME_CHARACTERS),
+            payment_characters=source_payment,
+            recipient_characters=["乙", "甲"],
+            payment_bank_prefix_classes=source_bank,
+            torch=torch,
         )
 
 
