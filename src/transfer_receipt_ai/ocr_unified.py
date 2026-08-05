@@ -5017,14 +5017,17 @@ def _recipient_only_expansion_label_override(
         raise FileNotFoundError(checkpoint_path)
     payload = _load_checkpoint(checkpoint_path, torch=torch)
     source_config = _checkpoint_config(payload)
-    if source_config != config:
-        if init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_INPUT_WIDTH_EXPANSION:
-            _validate_recipient_input_width_expansion_config(source_config, config)
-        else:
-            raise ValueError(
-                "init checkpoint model config does not match the requested training config; "
-                "use the same architecture, input sizes, head widths, and decoder policy"
-            )
+    if init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_INPUT_WIDTH_EXPANSION:
+        # Validate even when the two dataclasses compare equal: this mode is a
+        # strictly-wider exception, never an alias for an ordinary recipient
+        # warm start.  Without the unconditional check a same-width seed could
+        # accidentally enter the new pilot path.
+        _validate_recipient_input_width_expansion_config(source_config, config)
+    elif source_config != config:
+        raise ValueError(
+            "init checkpoint model config does not match the requested training config; "
+            "use the same architecture, input sizes, head widths, and decoder policy"
+        )
     (
         source_amount_characters,
         source_time_characters,
@@ -5203,14 +5206,16 @@ def _parameter_only_initialization(
         raise FileNotFoundError(checkpoint_path)
     payload = _load_checkpoint(checkpoint_path, torch=torch)
     source_config = _checkpoint_config(payload)
-    if source_config != config:
-        if init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_INPUT_WIDTH_EXPANSION:
-            _validate_recipient_input_width_expansion_config(source_config, config)
-        else:
-            raise ValueError(
-                "init checkpoint model config does not match the requested training config; "
-                "use the same architecture, input sizes, head widths, and decoder policy"
-            )
+    if init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_INPUT_WIDTH_EXPANSION:
+        # Keep this guard at the parameter-load boundary as well as the label
+        # override boundary.  Direct callers must not be able to bypass the
+        # strictly-wider v12-only preflight.
+        _validate_recipient_input_width_expansion_config(source_config, config)
+    elif source_config != config:
+        raise ValueError(
+            "init checkpoint model config does not match the requested training config; "
+            "use the same architecture, input sizes, head widths, and decoder policy"
+        )
     (
         source_amount_characters,
         source_time_characters,
