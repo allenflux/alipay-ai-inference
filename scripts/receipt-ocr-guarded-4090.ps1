@@ -7,12 +7,22 @@ param(
     # Optional audited recipient-only checkpoint for a controlled follow-up
     # pilot.  Leaving this blank preserves the known r2 baseline default.
     [string]$SeedCheckpoint,
+    # Optional matching ONNX artifact for the actual warm-start seed. When it
+    # is omitted, a sibling best.onnx is used whenever the supplied checkpoint
+    # came from a prior guarded run.
+    [string]$SeedModel,
+    [ValidateSet("recipient_only_expansion", "recipient_input_width_expansion")]
+    [string]$InitCheckpointMode = "recipient_only_expansion",
+    [ValidateRange(64, 4096)]
+    [int]$RecipientInputWidth = 1024,
     [ValidateRange(0.0, 1.0)]
     [double]$AmountFloor = 0.7885,
     [ValidateRange(0.0, 1.0)]
     [double]$TimeFloor = 0.9840,
     [ValidateRange(0.0, 1.0)]
     [double]$PaymentFloor = 0.9325,
+    [ValidateRange(0.0, 1.0)]
+    [double]$RecipientFloor = 0.90,
     [ValidateRange(0.0, 16.0)]
     [double]$RecipientLossWeight = 4.0,
     # Keep the established teacher-confidence recipe as the default, but make
@@ -54,10 +64,26 @@ $labelsRoot = Join-Path $TeacherRoot "paddle-teacher-labels-5field-recipient95-v
 $manifestRoot = Join-Path $TeacherRoot "unified-manifest-v12-r3-4090-r1"
 $records = Join-Path $manifestRoot "unified_fields.jsonl"
 $seedCheckpoint = $SeedCheckpoint
-if ([string]::IsNullOrWhiteSpace($seedCheckpoint)) {
+$usesDefaultR2Seed = [string]::IsNullOrWhiteSpace($seedCheckpoint)
+if ($usesDefaultR2Seed) {
     $seedCheckpoint = Join-Path $TeacherRoot "unified-run-v12-120k-r2-recipient-priority\best.pt"
 }
-$baselineModel = Join-Path $TeacherRoot "models\receipt_unified_field_reader_v12_120k_r2_recipient24_h256.onnx"
+$fallbackSeedModel = Join-Path $TeacherRoot "models\receipt_unified_field_reader_v12_120k_r2_recipient24_h256.onnx"
+if ([string]::IsNullOrWhiteSpace($SeedModel)) {
+    $siblingSeedModel = Join-Path (Split-Path -Parent $seedCheckpoint) "best.onnx"
+    if (Test-Path -LiteralPath $siblingSeedModel) {
+        $seedModel = $siblingSeedModel
+    }
+    elseif ($usesDefaultR2Seed) {
+        $seedModel = $fallbackSeedModel
+    }
+    else {
+        throw "The supplied SeedCheckpoint has no sibling best.onnx. Supply -SeedModel so the displayed baseline matches the warm-start seed."
+    }
+}
+else {
+    $seedModel = $SeedModel
+}
 
 if ([string]::IsNullOrWhiteSpace($RunName)) {
     $RunName = "unified-run-v12-r3-4090-recipient-only-" + (Get-Date -Format "yyyyMMdd-HHmmss")
@@ -71,7 +97,7 @@ foreach ($required in @(
     @{ Name = "r3 records"; Path = $records },
     @{ Name = "r3 crop root"; Path = $labelsRoot },
     @{ Name = "recipient-only seed checkpoint"; Path = $seedCheckpoint },
-    @{ Name = "r2 baseline ONNX"; Path = $baselineModel }
+    @{ Name = "warm-start seed ONNX baseline"; Path = $seedModel }
 )) {
     if (-not (Test-Path -LiteralPath $required.Path)) {
         throw "Missing $($required.Name): $($required.Path)"
@@ -79,6 +105,15 @@ foreach ($required in @(
 }
 if (Test-Path -LiteralPath $output) {
     throw "Refusing to reuse training output: $output"
+}
+if ($RecipientInputWidth % 4 -ne 0) {
+    throw "RecipientInputWidth must be divisible by 4."
+}
+if ($InitCheckpointMode -eq "recipient_only_expansion" -and $RecipientInputWidth -ne 1024) {
+    throw "recipient_only_expansion keeps the seed architecture; use recipient_input_width_expansion for a wider recipient input."
+}
+if ($InitCheckpointMode -eq "recipient_input_width_expansion" -and $RecipientInputWidth -le 1024) {
+    throw "recipient_input_width_expansion requires RecipientInputWidth greater than the 1024px v12 seed view."
 }
 
 function Get-ExactDisplay([object]$Metric) {
@@ -121,14 +156,16 @@ function Get-TrainingExactDisplay([object]$Record, [string]$Field) {
 
 Write-Host "guarded_4090_recipient_only preflight"
 Write-Host "  seed=$seedCheckpoint"
+Write-Host "  seed-model=$seedModel"
 Write-Host "  records=$records"
 Write-Host "  output=$output"
 Write-Host ("  floors: amount={0:P2}, time={1:P2}, payment={2:P2}" -f $AmountFloor, $TimeFloor, $PaymentFloor)
+Write-Host ("  recipient target={0:P2}; input-width={1}; init-mode={2}" -f $RecipientFloor, $RecipientInputWidth, $InitCheckpointMode)
 $persistentWorkers = if ($NumWorkers -gt 0) { "on" } else { "off" }
 Write-Host ("  recipe: recipient-only, lr={0}, workers={1}, persistent-workers={2}, prefetch={3}, validate-every={4}, TF32=on, cuDNN-benchmark=on" -f $LearningRate, $NumWorkers, $persistentWorkers, $PrefetchFactor, $ValidationEvery)
 Write-Host ("  recipient teacher confidence: below {0} x{1}, curriculum-epochs={2}" -f $RecipientLowConfidenceThreshold, $RecipientLowConfidenceLossWeight, $RecipientConfidenceCurriculumEpochs)
 Write-Host ("  recipient-tail CTC: rare-support<={0} x{1}; long-length>={2} x{3}; max(), no receipt resampling" -f $RecipientTailRareCharacterMaxSupport, $RecipientTailRareCharacterLossWeight, $RecipientTailLongTextMinLength, $RecipientTailLongTextLossWeight)
-Write-Host ("  recipient target: 90.00% strict exact ({0})" -f $(if ($DiagnosticOnly) { "diagnostic only" } else { "required" }))
+Write-Host ("  recipient target: {0:P2} strict exact ({1})" -f $RecipientFloor, $(if ($DiagnosticOnly) { "diagnostic only" } else { "required" }))
 try {
     & nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
 }
@@ -140,11 +177,13 @@ if ($CheckOnly) {
     exit 0
 }
 
-# Establish the baseline on this exact r3 validation split.  A comparison
-# against a different older split must not authorize an 80-epoch run.
+# Establish the actual warm-start seed baseline on this exact r3 validation
+# split. A comparison against a different older split must not authorize an
+# 80-epoch run, and the displayed recipient baseline must match the model
+# whose private branch is being expanded.
 $baselineArgs = @(
     "-m", "transfer_receipt_ai.ocr_unified", "evaluate",
-    "--model", $baselineModel,
+    "--model", $seedModel,
     "--records", $records,
     "--dataset-root", $labelsRoot,
     "--split", "val",
@@ -179,10 +218,10 @@ if ($baseline.providers -notcontains "CUDAExecutionProvider") {
 if ([double]$baselineAmount.raw_exact_match -lt $AmountFloor -or
     [double]$baselineTime.raw_exact_match -lt $TimeFloor -or
     [double]$baselinePayment.raw_exact_match -lt $PaymentFloor) {
-    throw "The r2 baseline does not satisfy the requested floors on this exact r3 val split. Recalibrate metric/split before training."
+    throw "The warm-start seed does not satisfy the requested floors on this exact r3 val split. Recalibrate metric/split before training."
 }
-if ([double]$baselineRecipient.oov_reference_rate -gt 0.10) {
-    Write-Warning "Recipient val OOV alone makes 90% strict exact impossible without charset/data changes. The run remains diagnostic only."
+if ([double]$baselineRecipient.oov_reference_rate -gt (1.0 - $RecipientFloor)) {
+    throw "Recipient val OOV alone makes the requested strict exact target impossible without charset/data changes; refusing to spend training epochs."
 }
 
 # Freeze every non-recipient v12 parameter and disable receipt-level
@@ -199,7 +238,7 @@ $trainArgs = @(
     "--image-height", "80",
     "--image-width", "512",
     "--recipient-input-height", "128",
-    "--recipient-input-width", "1024",
+    "--recipient-input-width", "$RecipientInputWidth",
     "--recipient-branch-channels", "24",
     "--base-channels", "32",
     "--numeric-hidden-size", "96",
@@ -228,7 +267,7 @@ $trainArgs = @(
     "--checkpoint-min-time-candidate-exact", "$TimeFloor",
     "--checkpoint-min-payment-candidate-exact", "$PaymentFloor",
     "--init-checkpoint", $seedCheckpoint,
-    "--init-checkpoint-mode", "recipient_only_expansion",
+    "--init-checkpoint-mode", $InitCheckpointMode,
     "--ctc-loss-weight", "0.75",
     "--structured-loss-weight", "1.0",
     "--amount-format-min-confidence", "0.80",
@@ -280,20 +319,20 @@ finally {
         if ($null -ne $best -and $null -ne $best.val_candidate_text_by_field) {
             $bestRecipientMetric = $best.val_candidate_text_by_field.recipient_field
         }
-        $trainingRecipientTargetReached = ($null -ne $bestRecipientMetric -and [double]$bestRecipientMetric.exact_match -ge 0.90)
+        $trainingRecipientTargetReached = ($null -ne $bestRecipientMetric -and [double]$bestRecipientMetric.exact_match -ge $RecipientFloor)
 
         Write-Host ""
         Write-Host "guarded_4090_recipient_only final_summary"
         [pscustomobject]@{
             BestEpoch = $summary.best_checkpoint_epoch
             EligibleEpochs = $eligible
-            TargetRecipientStrictExact = "90.00%"
+            TargetRecipientStrictExact = ("{0:P2}" -f $RecipientFloor)
             BaselineRecipient = Get-ExactDisplay $baselineRecipient
             BestAmount = Get-TrainingExactDisplay $best "amount"
             BestTime = Get-TrainingExactDisplay $best "time"
             BestPayment = Get-TrainingExactDisplay $best "payment_method_field"
             BestRecipient = Get-TrainingExactDisplay $best "recipient_field"
-            TrainingRecipient90Reached = $trainingRecipientTargetReached
+            TrainingRecipientTargetReached = $trainingRecipientTargetReached
             LastAmount = Get-TrainingExactDisplay $last "amount"
             LastTime = Get-TrainingExactDisplay $last "time"
             LastPayment = Get-TrainingExactDisplay $last "payment_method_field"
@@ -355,7 +394,7 @@ elseif ($exitCode -eq 0) {
             "--min-amount-exact-match", "$AmountFloor",
             "--min-time-exact-match", "$TimeFloor",
             "--min-payment-exact-match", "$PaymentFloor",
-            "--min-recipient-exact-match", "0.90"
+            "--min-recipient-exact-match", "$RecipientFloor"
         )
         & python @candidateArgs
         $candidateExitCode = $LASTEXITCODE
@@ -372,7 +411,7 @@ elseif ($exitCode -eq 0) {
                 Time = Get-ExactDisplay $candidateTime
                 Payment = Get-ExactDisplay $candidatePayment
                 Recipient = Get-ExactDisplay $candidateRecipient
-                Recipient90Reached = ([double]$candidateRecipient.raw_exact_match -ge 0.90)
+                RecipientTargetReached = ([double]$candidateRecipient.raw_exact_match -ge $RecipientFloor)
                 RecipientOov = ("{0}/{1}={2:P2}" -f $candidateRecipient.oov_reference_records, $candidateRecipient.records, $candidateRecipient.oov_reference_rate)
                 Providers = ($candidate.providers -join ", ")
                 Accepted = $candidate.acceptance.passed

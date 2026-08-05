@@ -13,6 +13,7 @@ import pytest
 import transfer_receipt_ai.ocr_unified as ocr_unified
 
 from transfer_receipt_ai.ocr_unified import (
+    INIT_CHECKPOINT_MODE_RECIPIENT_INPUT_WIDTH_EXPANSION,
     INIT_CHECKPOINT_MODE_RECIPIENT_ONLY_EXPANSION,
     KIND_V12,
     PAYMENT_BANK_OTHER_CLASS,
@@ -540,6 +541,205 @@ def test_v12_recipient_only_expansion_retains_a_missing_seed_character(tmp_path:
 
     assert effective_recipient == ["丙", "乙", "甲"]
     assert label_policy["recipient_character_map"]["checkpoint_characters_retained_not_in_current_train_count"] == 1
+
+
+def test_v12_recipient_input_width_expansion_preserves_all_learned_tensors(tmp_path: Path) -> None:
+    """A wider v12 recipient view may warm-start without changing model semantics."""
+    torch = pytest.importorskip("torch")
+    source_config = _tiny_v12_config()
+    seed, source_state, source_payment, source_bank = _write_v12_expansion_seed(
+        tmp_path,
+        config=source_config,
+        torch=torch,
+    )
+    target_config = UnifiedReaderConfig(
+        **{**asdict(source_config), "recipient_input_width": source_config.recipient_input_width + 64}
+    )
+    effective_payment, effective_bank, effective_recipient, policy = _recipient_only_expansion_label_override(
+        init_checkpoint=seed,
+        init_checkpoint_mode=INIT_CHECKPOINT_MODE_RECIPIENT_INPUT_WIDTH_EXPANSION,
+        config=target_config,
+        amount_characters=list(V8_AMOUNT_CHARACTERS),
+        time_characters=list(V6_TIME_CHARACTERS),
+        payment_characters=source_payment,
+        recipient_characters=["乙", "甲"],
+        payment_bank_prefix_classes=source_bank,
+        torch=torch,
+    )
+    assert effective_payment == source_payment
+    assert effective_bank == source_bank
+    assert effective_recipient == ["乙", "甲"]
+    assert policy["mode"] == "checkpoint_financial_label_maps_recipient_input_width_expansion_v1"
+    assert policy["source_recipient_input_width"] == source_config.recipient_input_width
+    assert policy["target_recipient_input_width"] == target_config.recipient_input_width
+
+    target_model = build_unified_reader(
+        payment_vocab_size=len(effective_payment) + 1,
+        payment_bank_prefix_vocab_size=len(effective_bank),
+        recipient_vocab_size=len(effective_recipient) + 1,
+        config=target_config,
+    )
+    mapped_state, initialization = _parameter_only_initialization(
+        init_checkpoint=seed,
+        init_checkpoint_mode=INIT_CHECKPOINT_MODE_RECIPIENT_INPUT_WIDTH_EXPANSION,
+        config=target_config,
+        amount_characters=list(V8_AMOUNT_CHARACTERS),
+        time_characters=list(V6_TIME_CHARACTERS),
+        payment_characters=effective_payment,
+        recipient_characters=effective_recipient,
+        payment_bank_prefix_classes=effective_bank,
+        torch=torch,
+        target_state_dict=target_model.state_dict(),
+    )
+
+    assert initialization["mode"] == "parameter_only_recipient_input_width_expansion"
+    assert initialization["source_recipient_input_width"] == source_config.recipient_input_width
+    assert initialization["target_recipient_input_width"] == target_config.recipient_input_width
+    assert mapped_state is not None
+    for key, source_value in source_state.items():
+        torch.testing.assert_close(mapped_state[key], source_value, rtol=0.0, atol=0.0)
+    target_model.load_state_dict(mapped_state, strict=True)
+
+    # The financial path has no data dependency on the separate recipient
+    # view. It must remain numerically identical when the fifth input grows.
+    source_model = build_unified_reader(
+        payment_vocab_size=len(source_payment) + 1,
+        payment_bank_prefix_vocab_size=len(source_bank),
+        recipient_vocab_size=3,
+        config=source_config,
+    )
+    source_model.load_state_dict(source_state, strict=True)
+    source_model.eval()
+    target_model.eval()
+    field_images = torch.randn((1, 5, 1, source_config.image_height, source_config.image_width))
+    with torch.no_grad():
+        source_outputs = ocr_unified._unpack_reader_outputs(
+            source_model(
+                field_images,
+                torch.randn((1, 1, source_config.recipient_input_height, source_config.recipient_input_width)),
+            ),
+            config=source_config,
+        )
+        target_outputs = ocr_unified._unpack_reader_outputs(
+            target_model(
+                field_images,
+                torch.randn((1, 1, target_config.recipient_input_height, target_config.recipient_input_width)),
+            ),
+            config=target_config,
+        )
+    for name, source_output in source_outputs.items():
+        if name != "recipient_logits":
+            torch.testing.assert_close(target_outputs[name], source_output, rtol=0.0, atol=0.0)
+    assert target_outputs["recipient_logits"].shape[0] == target_config.recipient_input_width // 4
+    assert source_outputs["recipient_logits"].shape[0] == source_config.recipient_input_width // 4
+
+    same_width = UnifiedReaderConfig(**asdict(source_config))
+    with pytest.raises(ValueError, match="strictly larger recipient_input_width"):
+        _parameter_only_initialization(
+            init_checkpoint=seed,
+            init_checkpoint_mode=INIT_CHECKPOINT_MODE_RECIPIENT_INPUT_WIDTH_EXPANSION,
+            config=same_width,
+            amount_characters=list(V8_AMOUNT_CHARACTERS),
+            time_characters=list(V6_TIME_CHARACTERS),
+            payment_characters=source_payment,
+            recipient_characters=["乙", "甲"],
+            payment_bank_prefix_classes=source_bank,
+            torch=torch,
+            target_state_dict=target_model.state_dict(),
+        )
+    incompatible_target = UnifiedReaderConfig(
+        **{
+            **asdict(target_config),
+            "recipient_hidden_size": int(target_config.recipient_hidden_size or 0) + 8,
+        }
+    )
+    with pytest.raises(ValueError, match="incompatible config fields: recipient_hidden_size"):
+        _parameter_only_initialization(
+            init_checkpoint=seed,
+            init_checkpoint_mode=INIT_CHECKPOINT_MODE_RECIPIENT_INPUT_WIDTH_EXPANSION,
+            config=incompatible_target,
+            amount_characters=list(V8_AMOUNT_CHARACTERS),
+            time_characters=list(V6_TIME_CHARACTERS),
+            payment_characters=source_payment,
+            recipient_characters=["乙", "甲"],
+            payment_bank_prefix_classes=source_bank,
+            torch=torch,
+            target_state_dict=target_model.state_dict(),
+        )
+
+
+def test_v12_recipient_input_width_expansion_keeps_epoch_zero_when_training_regresses(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The widened seed remains best.pt unless an audited epoch exceeds it."""
+    torch = pytest.importorskip("torch")
+    onnx = pytest.importorskip("onnx")
+    pytest.importorskip("onnxruntime")
+    flat_manifest = _write_v12_source_manifest(tmp_path)
+    unified_dir = tmp_path / "unified-width-v12"
+    build_unified_dataset(
+        records_path=flat_manifest,
+        output_dir=unified_dir,
+        architecture="v12",
+    )
+    source_config = _tiny_v12_config()
+    target_config = UnifiedReaderConfig(
+        **{**asdict(source_config), "recipient_input_width": source_config.recipient_input_width + 64}
+    )
+    seed, _, _, _ = _write_v12_expansion_seed(tmp_path, config=source_config, torch=torch)
+    scores = iter((0.80, 0.70, 0.60))
+    writes: list[tuple[str, int]] = []
+    original_write_checkpoint = ocr_unified._write_checkpoint
+
+    def fake_evaluate(*_args: object, **_kwargs: object) -> dict[str, object]:
+        score = next(scores)
+        metrics = _scheduled_validation_metrics(score)
+        metrics["candidate_text_by_field"]["recipient_field"] = {
+            "records": 1,
+            "exact_matches": int(score * 10),
+            "exact_match": score,
+        }
+        return metrics
+
+    def record_write(path: Path, payload: dict[str, object], *, torch: object) -> None:
+        writes.append((path.name, int(payload["epoch"])))
+        original_write_checkpoint(path, payload, torch=torch)
+
+    monkeypatch.setattr(ocr_unified, "_evaluate_model", fake_evaluate)
+    monkeypatch.setattr(ocr_unified, "_write_checkpoint", record_write)
+    checkpoint = train_unified_reader(
+        records_path=unified_dir / "unified_fields.jsonl",
+        dataset_root=flat_manifest.parent,
+        output_dir=tmp_path / "width-regression-run",
+        config=target_config,
+        device="cpu",
+        epochs=2,
+        batch_size=1,
+        payment_bank_prefix_min_support=1,
+        recipient_only_fine_tune=True,
+        init_checkpoint=seed,
+        init_checkpoint_mode=INIT_CHECKPOINT_MODE_RECIPIENT_INPUT_WIDTH_EXPANSION,
+        checkpoint_selection="recipient_priority",
+        checkpoint_min_amount_candidate_exact=0.5,
+        checkpoint_min_time_candidate_exact=0.5,
+        checkpoint_min_payment_candidate_exact=0.5,
+    )
+
+    summary = json.loads((checkpoint.parent / "training_summary.json").read_text(encoding="utf-8"))
+    assert [record["epoch"] for record in summary["records"]] == [0, 1, 2]
+    assert summary["records"][0]["validation_schedule_reason"] == "initialization_baseline"
+    assert summary["best_checkpoint_epoch"] == 0
+    assert [epoch for name, epoch in writes if name == "best.pt"] == [0]
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    assert _checkpoint_config(payload) == target_config
+    model_path, _, _ = export_unified_onnx(
+        checkpoint_path=checkpoint,
+        output_path=checkpoint.parent / "epoch-zero-width.onnx",
+    )
+    onnx.checker.check_model(onnx.load_model(model_path))
+    exported_config, _, _ = _load_onnx_artifacts(model_path)
+    assert exported_config == target_config
 
 
 def test_v12_metadata_freezes_the_two_static_input_shapes() -> None:

@@ -86,8 +86,19 @@ CHECKPOINT_SELECTION_MODES = frozenset(
 )
 INIT_CHECKPOINT_MODE_STRICT = "strict"
 INIT_CHECKPOINT_MODE_RECIPIENT_ONLY_EXPANSION = "recipient_only_expansion"
+INIT_CHECKPOINT_MODE_RECIPIENT_INPUT_WIDTH_EXPANSION = "recipient_input_width_expansion"
 INIT_CHECKPOINT_MODES = frozenset(
-    (INIT_CHECKPOINT_MODE_STRICT, INIT_CHECKPOINT_MODE_RECIPIENT_ONLY_EXPANSION)
+    (
+        INIT_CHECKPOINT_MODE_STRICT,
+        INIT_CHECKPOINT_MODE_RECIPIENT_ONLY_EXPANSION,
+        INIT_CHECKPOINT_MODE_RECIPIENT_INPUT_WIDTH_EXPANSION,
+    )
+)
+RECIPIENT_ONLY_INIT_CHECKPOINT_MODES = frozenset(
+    (
+        INIT_CHECKPOINT_MODE_RECIPIENT_ONLY_EXPANSION,
+        INIT_CHECKPOINT_MODE_RECIPIENT_INPUT_WIDTH_EXPANSION,
+    )
 )
 # These are the mature text heads that must not silently regress while a
 # recipient-focused experiment chooses its checkpoint.  The values are supplied
@@ -4939,6 +4950,39 @@ def _label_map_provenance(
     }
 
 
+def _validate_recipient_input_width_expansion_config(
+    source_config: UnifiedReaderConfig,
+    target_config: UnifiedReaderConfig,
+) -> None:
+    """Allow a recipient-only seed to gain horizontal pixels, and nothing else.
+
+    The v12 recipient branch is fully convolutional in its horizontal axis, so
+    increasing its static input width changes the available glyph resolution
+    and CTC time steps without changing a learned tensor shape.  This is a
+    deliberately narrow warm-start exception: all financial/shared topology,
+    crop geometry, recipient CNN width, decoder width, and output semantics
+    must remain byte-compatible with the seed.
+    """
+    if not (_is_v12(source_config) and _is_v12(target_config)):
+        raise ValueError("recipient_input_width_expansion is supported only by architecture v12")
+    if target_config.recipient_input_width <= source_config.recipient_input_width:
+        raise ValueError(
+            "recipient_input_width_expansion requires a strictly larger recipient_input_width than the seed"
+        )
+    source_values = asdict(source_config)
+    target_values = asdict(target_config)
+    changed = [
+        key
+        for key in sorted(source_values)
+        if key != "recipient_input_width" and source_values[key] != target_values.get(key)
+    ]
+    if changed:
+        raise ValueError(
+            "recipient_input_width_expansion may change only recipient_input_width; "
+            f"incompatible config fields: {', '.join(changed)}"
+        )
+
+
 def _recipient_only_expansion_label_override(
     *,
     init_checkpoint: Path,
@@ -4949,6 +4993,7 @@ def _recipient_only_expansion_label_override(
     recipient_characters: Sequence[str] | None,
     payment_bank_prefix_classes: Sequence[str] | None,
     torch: Any,
+    init_checkpoint_mode: str = INIT_CHECKPOINT_MODE_RECIPIENT_ONLY_EXPANSION,
 ) -> tuple[list[str], list[str], list[str], dict[str, object]]:
     """Lock financial label semantics to a v12 seed for a recipient-only run.
 
@@ -4961,8 +5006,10 @@ def _recipient_only_expansion_label_override(
     cannot accidentally discard a previously learned output row while the
     persisted Unicode-map ordering remains valid.
     """
+    if init_checkpoint_mode not in RECIPIENT_ONLY_INIT_CHECKPOINT_MODES:
+        raise ValueError("recipient label override requires a recipient-only expansion init mode")
     if not _is_v12(config):
-        raise ValueError("recipient_only_expansion is supported only by architecture v12")
+        raise ValueError("recipient-only expansion is supported only by architecture v12")
     if recipient_characters is None or payment_bank_prefix_classes is None:
         raise ValueError("recipient_only_expansion requires v12 recipient and payment bank label maps")
     checkpoint_path = Path(init_checkpoint).resolve()
@@ -4971,10 +5018,13 @@ def _recipient_only_expansion_label_override(
     payload = _load_checkpoint(checkpoint_path, torch=torch)
     source_config = _checkpoint_config(payload)
     if source_config != config:
-        raise ValueError(
-            "init checkpoint model config does not match the requested training config; "
-            "use the same architecture, input sizes, head widths, and decoder policy"
-        )
+        if init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_INPUT_WIDTH_EXPANSION:
+            _validate_recipient_input_width_expansion_config(source_config, config)
+        else:
+            raise ValueError(
+                "init checkpoint model config does not match the requested training config; "
+                "use the same architecture, input sizes, head widths, and decoder policy"
+            )
     (
         source_amount_characters,
         source_time_characters,
@@ -5001,10 +5051,22 @@ def _recipient_only_expansion_label_override(
         list(source_payment_bank_prefix_classes),
         effective_recipient_characters,
         {
-            "mode": "checkpoint_financial_label_maps_v1",
+            "mode": (
+                "checkpoint_financial_label_maps_recipient_input_width_expansion_v1"
+                if init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_INPUT_WIDTH_EXPANSION
+                else "checkpoint_financial_label_maps_v1"
+            ),
             "reason": (
                 "recipient-only v12 fine-tune freezes every non-recipient parameter, so payment and bank "
                 "classifier row semantics remain locked to the compatible seed checkpoint"
+            ),
+            **(
+                {
+                    "source_recipient_input_width": source_config.recipient_input_width,
+                    "target_recipient_input_width": config.recipient_input_width,
+                }
+                if init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_INPUT_WIDTH_EXPANSION
+                else {}
             ),
             "payment_character_map": _label_map_provenance(
                 source_payment_characters,
@@ -5130,7 +5192,7 @@ def _parameter_only_initialization(
         )
     if init_checkpoint is None:
         if init_checkpoint_mode != INIT_CHECKPOINT_MODE_STRICT:
-            raise ValueError("recipient_only_expansion requires a compatible --init-checkpoint")
+            raise ValueError("recipient-only expansion init modes require a compatible --init-checkpoint")
         return None, {
             "mode": "random",
             "optimizer_restored": False,
@@ -5142,10 +5204,13 @@ def _parameter_only_initialization(
     payload = _load_checkpoint(checkpoint_path, torch=torch)
     source_config = _checkpoint_config(payload)
     if source_config != config:
-        raise ValueError(
-            "init checkpoint model config does not match the requested training config; "
-            "use the same architecture, input sizes, head widths, and decoder policy"
-        )
+        if init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_INPUT_WIDTH_EXPANSION:
+            _validate_recipient_input_width_expansion_config(source_config, config)
+        else:
+            raise ValueError(
+                "init checkpoint model config does not match the requested training config; "
+                "use the same architecture, input sizes, head widths, and decoder policy"
+            )
     (
         source_amount_characters,
         source_time_characters,
@@ -5193,11 +5258,11 @@ def _parameter_only_initialization(
         return state_dict, initialization
 
     if not _is_v12(config):
-        raise ValueError("recipient_only_expansion is supported only by architecture v12")
+        raise ValueError("recipient-only expansion init modes are supported only by architecture v12")
     if source_recipient_characters is None or recipient_characters is None:
         raise ValueError("init checkpoint recipient character map does not match the current training data")
     if target_state_dict is None:
-        raise ValueError("recipient_only_expansion requires a freshly initialised v12 target state")
+        raise ValueError("recipient-only expansion init modes require a freshly initialised v12 target state")
     remapped_state, row_mapping = _recipient_classifier_unicode_expansion_state(
         source_state_dict=state_dict,
         target_state_dict=target_state_dict,
@@ -5206,9 +5271,21 @@ def _parameter_only_initialization(
     )
     initialization.update(
         {
-            "mode": "parameter_only_recipient_unicode_expansion",
-            "init_checkpoint_mode": INIT_CHECKPOINT_MODE_RECIPIENT_ONLY_EXPANSION,
+            "mode": (
+                "parameter_only_recipient_input_width_expansion"
+                if init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_INPUT_WIDTH_EXPANSION
+                else "parameter_only_recipient_unicode_expansion"
+            ),
+            "init_checkpoint_mode": init_checkpoint_mode,
             "recipient_classifier_row_mapping": row_mapping,
+            **(
+                {
+                    "source_recipient_input_width": source_config.recipient_input_width,
+                    "target_recipient_input_width": config.recipient_input_width,
+                }
+                if init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_INPUT_WIDTH_EXPANSION
+                else {}
+            ),
         }
     )
     return remapped_state, initialization
@@ -5327,11 +5404,11 @@ def _validate_validation_every(
     if not (
         _is_v12(config)
         and recipient_only_fine_tune
-        and init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_ONLY_EXPANSION
+        and init_checkpoint_mode in RECIPIENT_ONLY_INIT_CHECKPOINT_MODES
     ):
         raise ValueError(
             "validation_every > 1 is supported only by v12 recipient_only_fine_tune "
-            "with init_checkpoint_mode=recipient_only_expansion"
+            "with a recipient-only expansion init checkpoint mode"
         )
 
 
@@ -5469,13 +5546,13 @@ def train_unified_reader(
             "init_checkpoint_mode must be one of "
             f"{', '.join(sorted(INIT_CHECKPOINT_MODES))}"
         )
-    if init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_ONLY_EXPANSION:
+    if init_checkpoint_mode in RECIPIENT_ONLY_INIT_CHECKPOINT_MODES:
         if not recipient_only_fine_tune or not _is_v12(config):
             raise ValueError(
-                "recipient_only_expansion requires architecture v12 with recipient_only_fine_tune enabled"
+                "recipient-only expansion init modes require architecture v12 with recipient_only_fine_tune enabled"
             )
         if init_checkpoint is None:
-            raise ValueError("recipient_only_expansion requires a compatible --init-checkpoint")
+            raise ValueError("recipient-only expansion init modes require a compatible --init-checkpoint")
     _validate_validation_every(
         validation_every,
         config=config,
@@ -5619,7 +5696,7 @@ def train_unified_reader(
     )
     payment_bank_prefix_counts = dict(data_derived_payment_bank_prefix_counts)
     financial_label_policy: dict[str, object] | None = None
-    if init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_ONLY_EXPANSION:
+    if init_checkpoint_mode in RECIPIENT_ONLY_INIT_CHECKPOINT_MODES:
         assert init_checkpoint is not None
         assert payment_bank_prefix_classes is not None
         (
@@ -5636,6 +5713,7 @@ def train_unified_reader(
             recipient_characters=recipient_characters,
             payment_bank_prefix_classes=data_derived_payment_bank_prefix_classes,
             torch=torch,
+            init_checkpoint_mode=init_checkpoint_mode,
         )
         payment_bank_prefix_counts = _payment_bank_prefix_retained_counts(
             train_records,
@@ -5882,7 +5960,7 @@ def train_unified_reader(
     frozen_non_recipient_parameter_snapshot: dict[str, bytes] | None = None
     if (
         validation_every > 1
-        and init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_ONLY_EXPANSION
+        and init_checkpoint_mode in RECIPIENT_ONLY_INIT_CHECKPOINT_MODES
     ):
         frozen_non_recipient_parameter_snapshot = _non_recipient_parameter_bytes(model)
 
@@ -5949,6 +6027,140 @@ def train_unified_reader(
     best_score: tuple[float, ...] | None = None
     best_epoch: int | None = None
     best_path = output_dir / "best.pt"
+    if init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_INPUT_WIDTH_EXPANSION:
+        # The wider view deliberately changes recipient pixels before the
+        # first optimizer step.  Measure and persist that exact transplanted
+        # model as epoch zero so a pilot cannot silently return a checkpoint
+        # worse than its own width-expanded starting point.
+        if init_checkpoint is None:
+            raise AssertionError("recipient input-width expansion has no seed checkpoint")
+        initialization_started = perf_counter()
+        model.eval()
+        initialization_validation = _evaluate_model(
+            model,
+            validation_loader,
+            config=config,
+            device=target_device,
+            amount_characters=amount_characters,
+            amount_to_id=amount_to_id,
+            time_characters=time_characters,
+            time_to_id=time_to_id,
+            payment_characters=payment_characters,
+            payment_to_id=payment_to_id,
+            recipient_characters=recipient_characters,
+            recipient_to_id=recipient_to_id,
+            payment_bank_prefix_classes=payment_bank_prefix_classes,
+            payment_bank_class_weights=None,
+            status_to_id=status_to_id,
+            status_criterion=status_validation_criterion,
+            status_enabled=bool(status_policy["training_enabled"]),
+            payment_loss_weight=payment_loss_weight,
+            recipient_loss_weight=recipient_loss_weight,
+            ctc_loss_weight=ctc_loss_weight,
+            structured_loss_weight=structured_loss_weight,
+            torch=torch,
+        )
+        if uses_cuda:
+            torch.cuda.synchronize(target_device)
+        initialization_score, initialization_failures = _checkpoint_selection_score(
+            initialization_validation,
+            config=config,
+            status_policy=status_policy,
+            policy=checkpoint_selection_policy,
+        )
+        if initialization_score is None:
+            raise ValueError(
+                "recipient_input_width_expansion initialization does not satisfy the protected checkpoint floors: "
+                + "; ".join(initialization_failures)
+            )
+        initialization_record: dict[str, object] = {
+            "epoch": 0,
+            "train_loss": None,
+            "train_seconds": 0.0,
+            "validation_performed": True,
+            "validation_schedule_reason": "initialization_baseline",
+            "validation_seconds": perf_counter() - initialization_started,
+            "epoch_seconds": perf_counter() - initialization_started,
+            "val_loss": initialization_validation["loss"],
+            "val_exact_match": initialization_validation["exact_match"],
+            "val_delivery_coverage": initialization_validation["delivery_coverage"],
+            "val_delivery_exact_match": initialization_validation["delivery_exact_match"],
+            "val_delivery_exact_overall": initialization_validation["delivery_exact_overall"],
+            "val_delivery_false_accepts": initialization_validation["delivery_false_accepts"],
+            "val_verifier_exact_match": initialization_validation["verifier_exact_match"],
+            "val_verifier_macro_exact_match": initialization_validation["verifier_macro_exact_match"],
+            "val_verifier_by_field": initialization_validation["verifier_by_field"],
+            "val_candidate_text_exact_match": initialization_validation["candidate_text_exact_match"],
+            "val_candidate_text_macro_exact_match": initialization_validation["candidate_text_macro_exact_match"],
+            "val_candidate_text_by_field": initialization_validation["candidate_text_by_field"],
+            "val_ctc_by_field": initialization_validation["ctc_by_field"],
+            "val_by_field": initialization_validation["by_field"],
+            "val_status_non_success_to_success": initialization_validation["status_non_success_to_success"],
+            "checkpoint_selection_eligible": True,
+            "checkpoint_selection_protection_failures": [],
+            "checkpoint_selection_score": list(initialization_score),
+            "checkpoint_protection": _checkpoint_protection_report(
+                initialization_validation,
+                policy=checkpoint_selection_policy,
+                failures=initialization_failures,
+            ),
+        }
+        baseline_payload = _load_checkpoint(Path(init_checkpoint), torch=torch)
+        baseline_payload.update(
+            {
+                "schema_version": SCHEMA_VERSION,
+                "kind": _kind_for_config(config),
+                "state_dict": model.state_dict(),
+                "config": asdict(config),
+                "amount_characters": amount_characters,
+                "time_characters": time_characters,
+                "payment_characters": payment_characters,
+                "recipient_characters": recipient_characters,
+                "recipient_blank_index": RECIPIENT_BLANK_INDEX,
+                "recipient_charset_sha256": hashlib.sha256(
+                    "".join(recipient_characters or []).encode("utf-8")
+                ).hexdigest(),
+                "recipient_charset_source": _recipient_charset_source(config),
+                "recipient_target": _recipient_target_mode(config),
+                "recipient_oov_by_split": recipient_oov,
+                "recipient_sampling_policy": recipient_sampling_policy,
+                "recipient_confidence_policy": recipient_confidence_policy,
+                "recipient_tail_loss_policy": recipient_tail_loss_policy,
+                "recipient_train_augmentation_policy": recipient_train_augmentation_policy,
+                "status_classes": list(STATUS_CLASSES),
+                "field_counts": field_counts,
+                "status_class_counts": status_counts,
+                "structured_target_counts": structured_counts,
+                "status_head_policy": status_policy,
+                "payment_oov_by_split": payment_oov,
+                "payment_bank_prefix_classes": payment_bank_prefix_classes,
+                "payment_bank_prefix_min_support": payment_bank_prefix_min_support,
+                "payment_bank_prefix_class_counts": payment_bank_prefix_counts,
+                "payment_bank_prefix_train_class_counts": payment_bank_train_counts,
+                "payment_bank_prefix_oov_by_split": payment_bank_prefix_oov,
+                "payment_loss_weight": payment_loss_weight,
+                "recipient_loss_weight": recipient_loss_weight,
+                "checkpoint_selection_policy": checkpoint_selection_policy,
+                "initialization": initialization,
+                "training_runtime": training_runtime,
+                "fine_tune_policy": fine_tune_policy,
+                "ctc_loss_weight": ctc_loss_weight,
+                "structured_loss_weight": structured_loss_weight,
+                "epoch": 0,
+                "metrics": initialization_record,
+                **_recipient_artifact_metadata(
+                    config,
+                    recipient_sampling_policy=recipient_sampling_policy,
+                    recipient_confidence_policy=recipient_confidence_policy,
+                    recipient_tail_loss_policy=recipient_tail_loss_policy,
+                    recipient_train_augmentation_policy=recipient_train_augmentation_policy,
+                ),
+            }
+        )
+        _write_checkpoint(best_path, baseline_payload, torch=torch)
+        history.append(initialization_record)
+        best_score = initialization_score
+        best_epoch = 0
     for epoch in range(1, epochs + 1):
         epoch_started = perf_counter()
         model.train()
@@ -9154,8 +9366,11 @@ def build_parser() -> argparse.ArgumentParser:
         choices=tuple(sorted(INIT_CHECKPOINT_MODES)),
         default=INIT_CHECKPOINT_MODE_STRICT,
         help=(
-            "strict requires every label map to match the seed. recipient_only_expansion is v12 recipient-only "
-            "only: it locks payment/bank maps to the seed and maps additive recipient Unicode rows by character."
+            "strict requires every label map and model config to match the seed. "
+            "recipient_only_expansion is v12 recipient-only only: it locks payment/bank maps to the seed and "
+            "maps additive recipient Unicode rows by character. recipient_input_width_expansion additionally "
+            "permits only a strictly wider v12 recipient input while keeping all learned tensor shapes and "
+            "financial/shared topology unchanged."
         ),
     )
     train.add_argument(
