@@ -46,6 +46,12 @@ class _Policy:
     min_support: int
 
 
+@dataclass(frozen=True)
+class _SignatureCandidateIndex:
+    max_edit_distance: int
+    by_signature: Mapping[str, Sequence[_LexiconName]]
+
+
 def _read_jsonl(path: Path) -> list[dict[str, object]]:
     source = Path(path).expanduser().resolve()
     if not source.is_file():
@@ -110,6 +116,28 @@ def _similarity(left: str, right: str, distance: int) -> float:
     return 1.0 - (distance / max(len(left), len(right), 1))
 
 
+def _deletion_signatures(value: str, *, max_deletes: int) -> frozenset[str]:
+    """Return strings reachable by deleting up to ``max_deletes`` characters.
+
+    Two strings within Levenshtein distance ``d`` share at least one deletion
+    signature after deleting at most ``d`` characters from each side.  The audit
+    uses this as an index so broad policy sweeps do not repeatedly compare each
+    validation prediction with every known Paddle recipient.
+    """
+
+    signatures = {value}
+    frontier = {value}
+    for _ in range(max_deletes):
+        next_frontier: set[str] = set()
+        for item in frontier:
+            next_frontier.update(item[:index] + item[index + 1 :] for index in range(len(item)))
+        signatures.update(next_frontier)
+        frontier = next_frontier
+        if not frontier:
+            break
+    return frozenset(signatures)
+
+
 def _recipient_slot(record: Mapping[str, object]) -> Mapping[str, object] | None:
     slots = record.get("slots")
     if not isinstance(slots, Mapping):
@@ -156,15 +184,45 @@ def _load_recipient_comparisons(comparisons: Path) -> list[dict[str, object]]:
     return rows
 
 
+def _build_signature_index(
+    names: Sequence[_LexiconName],
+    *,
+    candidate_keys: Iterable[str],
+    max_edit_distance: int,
+) -> _SignatureCandidateIndex:
+    candidate_key_set = {key for key in candidate_keys if key}
+    candidate_lengths = {len(key) for key in candidate_key_set}
+    wanted_signatures = {
+        signature
+        for key in candidate_key_set
+        for signature in _deletion_signatures(key, max_deletes=max_edit_distance)
+    }
+    by_signature: dict[str, list[_LexiconName]] = defaultdict(list)
+    for name in names:
+        if all(abs(len(name.key) - length) > max_edit_distance for length in candidate_lengths):
+            continue
+        for signature in _deletion_signatures(name.key, max_deletes=max_edit_distance):
+            if signature in wanted_signatures:
+                by_signature[signature].append(name)
+    return _SignatureCandidateIndex(
+        max_edit_distance=max_edit_distance,
+        by_signature={signature: tuple(items) for signature, items in by_signature.items()},
+    )
+
+
 def _candidate_pool(
     candidate_key: str,
     *,
     policy: _Policy,
-    by_length: Mapping[int, Sequence[_LexiconName]],
+    signature_index: _SignatureCandidateIndex,
 ) -> Iterable[_LexiconName]:
     candidate_characters = frozenset(candidate_key)
-    for length in range(max(0, len(candidate_key) - policy.max_edit_distance), len(candidate_key) + policy.max_edit_distance + 1):
-        for name in by_length.get(length, ()):
+    seen: set[str] = set()
+    for signature in _deletion_signatures(candidate_key, max_deletes=policy.max_edit_distance):
+        for name in signature_index.by_signature.get(signature, ()):
+            if name.text in seen:
+                continue
+            seen.add(name.text)
             if name.occurrences < policy.min_support:
                 continue
             # A cheap lower bound: if two strings have too few shared distinct
@@ -179,13 +237,13 @@ def _nearest_unique_match(
     candidate_text: str,
     *,
     policy: _Policy,
-    by_length: Mapping[int, Sequence[_LexiconName]],
+    signature_index: _SignatureCandidateIndex,
 ) -> tuple[_LexiconName, int, float] | None:
     candidate_key = _key(candidate_text)
     if not candidate_key:
         return None
     best: list[tuple[_LexiconName, int, float]] = []
-    for name in _candidate_pool(candidate_key, policy=policy, by_length=by_length):
+    for name in _candidate_pool(candidate_key, policy=policy, signature_index=signature_index):
         distance = _bounded_levenshtein(candidate_key, name.key, maximum=policy.max_edit_distance)
         if distance is None:
             continue
@@ -223,7 +281,7 @@ def _evaluate_policy(
     rows: Sequence[Mapping[str, object]],
     *,
     policy: _Policy,
-    by_length: Mapping[int, Sequence[_LexiconName]],
+    signature_index: _SignatureCandidateIndex,
 ) -> dict[str, object]:
     total = len(rows)
     current_exact = sum(1 for row in rows if _text(row.get("candidate_text")) == _text(row.get("reference_text")))
@@ -236,7 +294,7 @@ def _evaluate_policy(
         candidate = _text(row.get("candidate_text"))
         before_exact = candidate == reference
         resolved = candidate
-        match = _nearest_unique_match(candidate, policy=policy, by_length=by_length)
+        match = _nearest_unique_match(candidate, policy=policy, signature_index=signature_index)
         if match is not None:
             name, distance, similarity = match
             resolved = name.text
@@ -356,16 +414,21 @@ def build_recipient_lexicon_audit(
         raise ValueError("target must be in (0, 1]")
     rows = _load_recipient_comparisons(comparisons)
     names, counts = _load_lexicon_names(manifest, lexicon_splits=lexicon_splits)
-    by_length: dict[int, list[_LexiconName]] = defaultdict(list)
-    for name in names:
-        by_length[len(name.key)].append(name)
     policies = [
         _Policy(name=f"edit{distance}_sim{similarity:.2f}_support{support}", max_edit_distance=distance, min_similarity=similarity, min_support=support)
         for distance in (1, 2)
         for similarity in (0.80, 0.85, 0.90)
         for support in (1, 2, 3, 5, 10, 25)
     ]
-    policy_reports = [_evaluate_policy(rows, policy=policy, by_length=by_length) for policy in policies]
+    candidate_keys = {_key(_text(row.get("candidate_text"))) for row in rows}
+    signature_indexes = {
+        distance: _build_signature_index(names, candidate_keys=candidate_keys, max_edit_distance=distance)
+        for distance in sorted({policy.max_edit_distance for policy in policies})
+    }
+    policy_reports = [
+        _evaluate_policy(rows, policy=policy, signature_index=signature_indexes[policy.max_edit_distance])
+        for policy in policies
+    ]
     safe_report = _evaluate_safe_one_edit(rows, names)
     current_exact = int(safe_report["current_exact"])
     train_coverage = sum(1 for row in rows if _text(row.get("reference_text")) in counts)
