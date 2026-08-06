@@ -42,6 +42,9 @@ $endToEndScorer = Join-Path $PSScriptRoot "receipt_mlnet_unified_evaluate.py"
 $projectFile = Join-Path $repoRoot "dotnet\ReceiptMlNet.Cli\ReceiptMlNet.Cli.csproj"
 $preprocessingContractTestProject = Join-Path $repoRoot "dotnet\ReceiptMlNet.Cli.PreprocessingContractTests\ReceiptMlNet.Cli.PreprocessingContractTests.csproj"
 $rectificationContractTestProject = Join-Path $repoRoot "dotnet\ReceiptMlNet.Cli.RectificationContractTests\ReceiptMlNet.Cli.RectificationContractTests.csproj"
+$singleCpuEntrypoint = Join-Path $repoRoot "dotnet\ReceiptMlNet.Cli\DeliveryScripts\run-receipt-single-cpu.ps1"
+$batchCpuEntrypoint = Join-Path $repoRoot "dotnet\ReceiptMlNet.Cli\DeliveryScripts\run-receipt-batch-cpu.ps1"
+$cpuDeliveryReadme = Join-Path $repoRoot "dotnet\ReceiptMlNet.Cli\DeliveryScripts\README-CPU.md"
 
 if ([string]::IsNullOrWhiteSpace($DetectorModel)) {
     $DetectorModel = Join-Path $repoRoot "artifacts\receipt_lrcnn_v1.onnx"
@@ -178,6 +181,9 @@ Require-File $normalizer "JSON normalizer"
 Require-File $projectFile "ML.NET project"
 Require-File $preprocessingContractTestProject "ML.NET preprocessing contract test project"
 Require-File $rectificationContractTestProject "ML.NET rectification contract test project"
+Require-File $singleCpuEntrypoint "single-image production CPU entrypoint"
+Require-File $batchCpuEntrypoint "batch production CPU entrypoint"
+Require-File $cpuDeliveryReadme "production CPU delivery README"
 
 $unifiedModel = Join-Path $RunDirectory "best.onnx"
 $unifiedSidecars = Assert-UnifiedBundle $unifiedModel
@@ -471,6 +477,9 @@ try {
     Copy-Item -LiteralPath $unifiedLabels -Destination $unifiedDirectory
     Copy-Item -LiteralPath $unifiedContract -Destination $unifiedDirectory
     Copy-Item -LiteralPath $onnxValidationSummary -Destination (Join-Path $evidenceDirectory "onnx-validation-summary.json")
+    Copy-Item -LiteralPath $singleCpuEntrypoint -Destination $stagingRoot
+    Copy-Item -LiteralPath $batchCpuEntrypoint -Destination $stagingRoot
+    Copy-Item -LiteralPath $cpuDeliveryReadme -Destination $stagingRoot
 
     $executable = Join-Path $appDirectory "ReceiptMlNet.Cli.exe"
     Require-File $executable "published ML.NET executable"
@@ -900,6 +909,11 @@ try {
         detector_model = [IO.Path]::GetFileName($DetectorModel)
         device_model = if ($IncludeDeviceModel) { [IO.Path]::GetFileName($DeviceModel) } else { $null }
         unified_model = "models/unified/$([IO.Path]::GetFileName($unifiedModel))"
+        production_entrypoints = @(
+            [IO.Path]::GetFileName($singleCpuEntrypoint),
+            [IO.Path]::GetFileName($batchCpuEntrypoint)
+        )
+        delivery_readme = [IO.Path]::GetFileName($cpuDeliveryReadme)
         text_delivery_policy = $textDeliveryPolicy
     }
     $packageConfig | ConvertTo-Json -Depth 8 |
