@@ -240,7 +240,7 @@ internal sealed class UnifiedOcrBundle
         var primaryInput = RequireObject(contract, "input", contractPath);
         ValidateInput(primaryInput, "field_images", [5, 1, fieldHeight, fieldWidth], contractPath);
         var inputs = RequireArray(contract, "inputs", contractPath);
-        if (inputs.GetArrayLength() != 2 || !JsonElement.DeepEquals(inputs[0], primaryInput))
+        if (inputs.GetArrayLength() != 2 || !JsonDeepEquals(inputs[0], primaryInput))
         {
             throw ContractError(contractPath, "v12 contract must declare exactly two ordered ONNX inputs with input as the first entry");
         }
@@ -560,9 +560,58 @@ internal sealed class UnifiedOcrBundle
     {
         if (!left.TryGetProperty(leftName, out var leftValue)
             || !right.TryGetProperty(rightName, out var rightValue)
-            || !JsonElement.DeepEquals(leftValue, rightValue))
+            || !JsonDeepEquals(leftValue, rightValue))
         {
             throw ContractError(leftPath, $"{leftName} must match {rightPath}:{rightName}");
+        }
+    }
+
+    // JsonElement.DeepEquals is not available in the .NET 8 runtime used by
+    // the production host. Keep contract comparison semantic (object property
+    // order does not matter) without raising the target framework.
+    private static bool JsonDeepEquals(JsonElement left, JsonElement right)
+    {
+        if (left.ValueKind != right.ValueKind)
+        {
+            return false;
+        }
+        switch (left.ValueKind)
+        {
+            case JsonValueKind.Object:
+            {
+                var leftProperties = left.EnumerateObject()
+                    .OrderBy(property => property.Name, StringComparer.Ordinal)
+                    .ToArray();
+                var rightProperties = right.EnumerateObject()
+                    .OrderBy(property => property.Name, StringComparer.Ordinal)
+                    .ToArray();
+                return leftProperties.Length == rightProperties.Length
+                    && leftProperties.Zip(rightProperties).All(pair =>
+                        pair.First.Name == pair.Second.Name
+                        && JsonDeepEquals(pair.First.Value, pair.Second.Value));
+            }
+            case JsonValueKind.Array:
+            {
+                var leftItems = left.EnumerateArray().ToArray();
+                var rightItems = right.EnumerateArray().ToArray();
+                return leftItems.Length == rightItems.Length
+                    && leftItems.Zip(rightItems).All(pair => JsonDeepEquals(pair.First, pair.Second));
+            }
+            case JsonValueKind.String:
+                return left.GetString() == right.GetString();
+            case JsonValueKind.Number:
+                return left.TryGetDecimal(out var leftDecimal)
+                    && right.TryGetDecimal(out var rightDecimal)
+                        ? leftDecimal == rightDecimal
+                        : left.GetRawText() == right.GetRawText();
+            case JsonValueKind.True:
+            case JsonValueKind.False:
+                return left.GetBoolean() == right.GetBoolean();
+            case JsonValueKind.Null:
+            case JsonValueKind.Undefined:
+                return true;
+            default:
+                return left.GetRawText() == right.GetRawText();
         }
     }
 
