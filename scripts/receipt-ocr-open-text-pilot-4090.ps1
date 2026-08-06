@@ -6,6 +6,10 @@ param(
     [string]$RunName,
     [ValidateRange(1024, 2048)]
     [int]$RecipientInputWidth = 1024,
+    [ValidateRange(0, 16)]
+    [int]$NumWorkers = 0,
+    [ValidateRange(0, 1000000)]
+    [int]$TrainProgressEvery = 250,
     [switch]$UnfreezeLegacy,
     [switch]$FullOnnxValidation
 )
@@ -55,6 +59,8 @@ $runnerArgs = @{
     RecipientTailRareCharacterLossWeight = 2.0
     RecipientTailLongTextMinLength = 9
     RecipientTailLongTextLossWeight = 2.0
+    NumWorkers = $NumWorkers
+    TrainProgressEvery = $TrainProgressEvery
 }
 if ($UnfreezeLegacy) {
     $runnerArgs["RecipientOpenTextUnfreezeLegacy"] = $true
