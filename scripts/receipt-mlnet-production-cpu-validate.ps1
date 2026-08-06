@@ -7,11 +7,17 @@ param(
     [ValidateRange(1, 1000)]
     [int]$SmokeLimit = 1,
     [ValidateRange(1, 10000)]
-    [int]$PilotLimit = 100
+    [int]$PilotLimit = 100,
+    [ValidateSet("none", "max-side-1600")]
+    [string]$Rectification = "max-side-1600"
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+
+if ($Mode -eq "formal" -and $Rectification -ne "max-side-1600") {
+    throw "Formal production CPU validation requires -Rectification max-side-1600."
+}
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $pythonExe = Join-Path $repoRoot ".venv-cu126\Scripts\python.exe"
@@ -56,6 +62,7 @@ if ($Mode -eq "smoke") {
         -DeliveryDir $delivery `
         -Limit $SmokeLimit `
         -RuntimeFlavor cpu `
+        -Rectification $Rectification `
         -IncludeDeviceModel `
         -Annotate all
 }
@@ -71,6 +78,7 @@ elseif ($Mode -eq "pilot") {
         -DeliveryDir $delivery `
         -Limit $PilotLimit `
         -RuntimeFlavor cpu `
+        -Rectification $Rectification `
         -IncludeDeviceModel `
         -Annotate none
     & $pythonExe $scorer score `
@@ -99,6 +107,7 @@ else {
         -Output $output `
         -DeliveryDir $delivery `
         -RuntimeFlavor cpu `
+        -Rectification $Rectification `
         -IncludeDeviceModel `
         -Annotate none
 }
@@ -111,3 +120,4 @@ if ($Mode -in @("pilot", "formal")) {
     Write-Host "  evaluation=$evaluation"
 }
 Write-Host "  delivery=$delivery"
+Write-Host "  rectification=$Rectification"

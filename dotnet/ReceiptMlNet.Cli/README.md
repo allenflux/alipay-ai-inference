@@ -30,9 +30,12 @@ Python pipeline:
   reserved fifth slot; `recipient_value_image` is the dedicated high-resolution
   recipient value crop. Candidate text is diagnostic; the current v12 contract
   delivers every text/status business value as `review`.
-- Not included: receipt screen/quad detection and source-image perspective
-  correction. Use already rectified images when perspective correction is
-  needed.
+- Included for the production wrapper: EXIF-upright full-image OpenCV cubic
+  normalization with longest side 1600 (`--rectification max-side-1600`),
+  matching the Python direct-screenshot path. Detected boxes are projected
+  back to the upright source coordinates.
+- Not included: automatic receipt screen/quad detection. Perspective photos
+  still need an externally rectified input.
 
 ## 当前三模型交付（Windows x64，CPU 正式生产）
 
@@ -48,7 +51,8 @@ OCR 模型：
 `*.contract.json` 和 `best.labels.json` 是模型契约、字符表及哈希证据，不是额外
 神经网络。运行顺序是：输入已摆正/已透视纠正的回单图 → 检测字段框 → 裁出字段图 →
 一次 unified OCR → 规范化并写 JSON；设备模型可在同一流程中附加设备结果。当前 .NET
-程序还不做票面四边形检测和透视纠正，因此拍照原图必须先完成这一步。
+程序会执行与 Python 直接截图口径一致的长边 1600 全图 OpenCV 规范化，但还不做票面
+四边形自动检测；带透视的拍照原图必须先完成外部矫正。
 
 Paddle 只在训练准备阶段生成教师标签。发布目录中的 .NET 8 程序、检测器、设备模型和
 unified OCR ONNX 在生产推理时都不加载 Paddle、PaddleOCR 或 Python。下面的打包脚本会用
@@ -57,6 +61,8 @@ unified OCR ONNX 在生产推理时都不加载 Paddle、PaddleOCR 或 Python。
 正式生产基线固定为 **CPU**：`OnnxRuntimeFlavor=cpu`、`--device cpu`。4090/GPU
 用于训练或可选性能检查，不能代替 CPU 正式验收。打包脚本使用 Release publish，整个批次
 只启动一次进程并复用模型 Session；批量验收使用 `-Annotate none` 可避免 JPG 绘制开销。
+正式 wrapper 同时固定 `--rectification max-side-1600`，避免训练 crop 与生产 crop 走不同
+的重采样路径。
 
 当前已固定上述 wide1536 产物和数据路径的机器可直接使用一键入口；它自动创建带 UTC
 时间戳的新输出目录，完整包始终包含并实际运行设备模型：
@@ -93,6 +99,7 @@ $smokePackage = "D:\alipay-ai-data\delivery\ReceiptMlNet-wide1536-cpu-smoke-1"
   -DeliveryDir $smokePackage `
   -Limit 1 `
   -RuntimeFlavor cpu `
+  -Rectification max-side-1600 `
   -IncludeDeviceModel `
   -Annotate all
 ```
@@ -130,6 +137,7 @@ $cpuPackage = "D:\alipay-ai-data\delivery\ReceiptMlNet-wide1536-cpu-production"
   -Output $cpuOutput `
   -DeliveryDir $cpuPackage `
   -RuntimeFlavor cpu `
+  -Rectification max-side-1600 `
   -IncludeDeviceModel `
   -Annotate none
 ```
@@ -180,6 +188,7 @@ $output = "D:\output\one-receipt-result"
   --input $receiptInput `
   --output $output `
   --device cpu `
+  --rectification max-side-1600 `
   --annotate all `
   --require-complete
 ```
@@ -232,11 +241,12 @@ It does not turn v12 candidates into delivered business values: current v12
 `fields.*.value` remains `review` until a separately calibrated artifact policy
 permits delivery.
 
-This runner has not ported Python's OpenCV perspective rectification or
-homography projection. Therefore, for now both compatibility-named JPGs show
-the same EXIF-upright source-coordinate annotation. They visually match the
-Python rectified annotation when the input is already rectified, but are not a
-pixel-for-pixel substitute for Python's original-photo projection.
+With `--rectification max-side-1600`, this runner ports Python's full-image
+OpenCV cubic normalization and homography projection for the direct-screenshot
+path. Detection and OCR run on that normalized image; JSON boxes and both
+compatibility-named JPGs are projected back to EXIF-upright source coordinates.
+Automatic phone/screen quadrilateral detection is intentionally not included,
+so perspective photos still require external rectification before inference.
 
 ## PP-OCR CPU
 

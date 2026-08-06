@@ -1175,8 +1175,9 @@ python -m receipt_inference.cli `
   --limit 1000
 ```
 
-这里必须使用 Python `receipt_inference.cli` 的结果目录：其中保存了透视矫正几何，后续才能从原图重建
-同样的字段裁图。当前 ML.NET CLI 的 JSON 不含这套几何，不能直接作为这一步的 `--results`。
+这里必须使用 Python `receipt_inference.cli` 的结果目录：`ocr_truth_dataset` 当前要求
+`detections[].bbox_rectified`。ML.NET CLI 已输出 source/rectified 尺寸、双向单应矩阵及
+`bbox_image`，但尚未公开 `bbox_rectified`，因此仍不能直接作为这一步的 `--results`。
 
 ### 2. 准备离线交易真值 JSONL
 
@@ -1479,9 +1480,9 @@ v12 的 .NET 接入会使用与 Python 相同的冻结检测框裁图几何，�
 也会显示 OCR 文本。PP-OCR 的 `det/cls/rec` Session 每批只创建一次。`--ocr unified` 同样从检测框裁图，但直接
 运行单个 v12 字段 reader，不运行 PP-OCR 的 DB/cls/rec 流水线。
 
-目前仍未移植 OpenCV 透视矫正、单应矩阵回投。因此输入需要是已纠正的回单图/截图；两张兼容命名的 JPG
-仍基于 EXIF 摆正后的输入坐标绘制，内容相同。照片类原图要获得与 Python 完全相同的几何结果，需要后续
-移植矫正模块。
+生产参数 `--rectification max-side-1600` 已移植 Python 直接截图路径的 OpenCV 全图 cubic
+规范化和单应矩阵回投：检测/OCR 在规范化图上执行，JSON 框和两张兼容命名 JPG 均回投至
+EXIF 摆正后的源坐标。当前未实现的是自动 screen/quad 检测，因此带透视的照片原图仍须先做外部矫正。
 
 安装 [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0) 后，CPU 单图验证：
 
@@ -1500,6 +1501,7 @@ dotnet run --no-build --project .\dotnet\ReceiptMlNet.Cli\ReceiptMlNet.Cli.cspro
   --input "D:\download\TempFakeImages\s3_voucher_GWCZ2071991511234514944_20260701001815.png" `
   --output "D:\download\TempFakeResults_mlnet_onnx_ocr_cpu_1" `
   --device cpu `
+  --rectification max-side-1600 `
   --annotate all `
   --require-complete
 ```
@@ -1577,13 +1579,13 @@ dotnet run --no-build --project .\dotnet\ReceiptMlNet.Cli\ReceiptMlNet.Cli.cspro
   --input $sample `
   --output "D:\download\TempFakeResults_mlnet_unified_v12_gpu_1" `
   --device cuda:0 `
+  --rectification max-side-1600 `
   --annotate all `
   --require-complete
 ```
 
 此 GPU 命令会让检测器、设备模型和 unified OCR Session 都请求 `cuda:0`；少量 ONNX shape/metadata 节点仍可在
-CPU 上执行。GPU 命令成功后，再以新的输出目录复跑同一命令并把 `--device cuda:0` 改为 `--device cpu`，完成最终
-CPU 交付验收。
+CPU 上执行。GPU 仅用于可选 benchmark，不是正式验收前置条件，也不能替代下方完整 Windows CPU formal 门禁。
 
 不要混用 CPU/GPU 的输出目录。下面命名中的最后一段是本次验证上限：`_1`、`_100`、`_10000`。
 
@@ -1626,7 +1628,8 @@ dotnet run --no-build --project .\dotnet\ReceiptMlNet.Cli\ReceiptMlNet.Cli.cspro
   --limit 100
 ```
 
-10,000 张正式 CPU / GPU 回归只改输出目录与执行设备；每次先构建匹配的 Runtime flavor：
+以下 10,000 张命令是历史 PP-OCR 性能回归示例，并非当前 unified-v12 正式交付门禁；它带
+`--limit 10000`，既不覆盖当前 10016 张 canonical val，也不执行严格字段 scorer：
 
 ```powershell
 $batchInput = "D:\download\TempFakeImages"
@@ -1666,14 +1669,23 @@ dotnet run --no-build --project .\dotnet\ReceiptMlNet.Cli\ReceiptMlNet.Cli.cspro
   --limit 10000
 ```
 
-中断续跑时，在对应命令末尾添加 `--skip-existing`；如果旧 JSON 没有 `fields`，在 `--ocr onnx` 模式下会
+中断历史性能回归时，可在对应命令末尾添加 `--skip-existing`；如果旧 JSON 没有 `fields`，在 `--ocr onnx` 模式下会
 自动重跑而不会误跳过。CPU 与 GPU 输出的 `inference_manifest.json` / `inference_errors.jsonl` 可分别用于
 统计两套验证的成功数、错误数和耗时。
+
+当前三模型 unified-v12 的唯一正式生产验收入口如下。它固定 Windows x64 CPU、设备模型、
+`max-side-1600`，禁止 `Limit`，完整跑 10016 张 canonical val；四字段保护线全部通过后才原子发布交付包：
+
+```powershell
+cd D:\alipay-ai-data\alipay-ai-inference
+git pull
+.\scripts\receipt-mlnet-production-cpu-validate.ps1 -Mode formal
+```
 
 ## CPU / macOS 开发环境
 
 CPU 环境可以直接安装 PyTorch CPU wheel，并使用 `--device cpu`。macOS Apple Silicon
-可以使用 `--device mps`；生产验收仍应在最终 Windows CUDA 服务器上进行。
+可以使用 `--device mps`；正式生产验收必须在最终 Windows x64 CPU 环境完成，CUDA/MPS 仅用于训练或可选性能测试。
 
 ## 后续增加模型
 

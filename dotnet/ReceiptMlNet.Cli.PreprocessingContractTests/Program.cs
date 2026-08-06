@@ -15,6 +15,7 @@ internal static class Program
             VerifyCase(13, 5);
             VerifyCase(9, 16);
             VerifyCase(1179, 2556);
+            VerifyRecipientTrimUsesPythonDoubleToEven();
             Console.WriteLine("PASS: detector/statusbar preprocessing is bit-exact against the legacy implementation.");
             return 0;
         }
@@ -23,6 +24,15 @@ internal static class Program
             Console.Error.WriteLine(error);
             return 1;
         }
+    }
+
+    private static void VerifyRecipientTrimUsesPythonDoubleToEven()
+    {
+        // Python round(55 * 0.30) sees the exact JSON double computation at
+        // 16.5 and chooses the even integer 16.  Parsing 0.30 as float first
+        // produces 16.500000655... and incorrectly trims 17 pixels.
+        AssertEqual(16, UnifiedOcrImageOps.LeftTrimPixels(55, 0.30), "recipient trim 16.5 to even");
+        AssertEqual(20, UnifiedOcrImageOps.LeftTrimPixels(65, 0.30), "recipient trim 19.5 to even");
     }
 
     private static void VerifyCase(int width, int height)

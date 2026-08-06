@@ -75,7 +75,7 @@ internal sealed class UnifiedOcrBundle
         int fieldWidth,
         int recipientHeight,
         int recipientWidth,
-        float recipientLeftTrim,
+        double recipientLeftTrim,
         float amountFormatMinimumConfidence,
         IReadOnlyList<string> amountCharacters,
         IReadOnlyList<string> timeCharacters,
@@ -124,7 +124,7 @@ internal sealed class UnifiedOcrBundle
     public int FieldWidth { get; }
     public int RecipientHeight { get; }
     public int RecipientWidth { get; }
-    public float RecipientLeftTrim { get; }
+    public double RecipientLeftTrim { get; }
     public float AmountFormatMinimumConfidence { get; }
     public IReadOnlyList<string> AmountCharacters { get; }
     public IReadOnlyList<string> TimeCharacters { get; }
@@ -180,7 +180,7 @@ internal sealed class UnifiedOcrBundle
         {
             throw ContractError(contractPath, "image_width and recipient_input_width must both be static multiples of 4");
         }
-        var recipientLeftTrim = RequireFiniteFloat(model, "recipient_value_left_trim", contractPath, 0.0f, float.BitDecrement(1.0f));
+        var recipientLeftTrim = RequireFiniteDouble(model, "recipient_value_left_trim", contractPath, 0.0, double.BitDecrement(1.0));
         var amountFormatMinimumConfidence = RequireFiniteFloat(model, "amount_format_min_confidence", contractPath, 0.0f, 1.0f);
 
         RequireInteger(labels, "schema_version", labelsPath, 1);
@@ -220,8 +220,8 @@ internal sealed class UnifiedOcrBundle
 
         RequireString(labels, "recipient_input_preprocess", labelsPath, RecipientPreprocess);
         RequireString(contract, "recipient_input_preprocess", contractPath, RecipientPreprocess);
-        RequireFloatEqual(labels, "recipient_value_left_trim", recipientLeftTrim, labelsPath);
-        RequireFloatEqual(contract, "recipient_value_left_trim", recipientLeftTrim, contractPath);
+        RequireDoubleEqual(labels, "recipient_value_left_trim", recipientLeftTrim, labelsPath);
+        RequireDoubleEqual(contract, "recipient_value_left_trim", recipientLeftTrim, contractPath);
         RequireIntArray(labels, "recipient_input_shape", labelsPath, [1, 1, recipientHeight, recipientWidth]);
         RequireIntArray(contract, "recipient_input_shape", contractPath, [1, 1, recipientHeight, recipientWidth]);
         RequireString(labels, "recipient_input_name", labelsPath, "recipient_value_image");
@@ -298,7 +298,7 @@ internal sealed class UnifiedOcrBundle
         RequireString(recipientOutput, "input_preprocess", contractPath, RecipientPreprocess);
         RequireString(recipientOutput, "input_name", contractPath, "recipient_value_image");
         RequireString(recipientOutput, "horizontal_alignment", contractPath, "center");
-        RequireFloatEqual(recipientOutput, "left_trim_fraction", recipientLeftTrim, contractPath);
+        RequireDoubleEqual(recipientOutput, "left_trim_fraction", recipientLeftTrim, contractPath);
 
         var statusOutput = RequireObject(outputs, "status_logits", contractPath);
         RequireString(statusOutput, "runtime_policy", contractPath, statusRuntimePolicy);
@@ -478,10 +478,28 @@ internal sealed class UnifiedOcrBundle
         return actual;
     }
 
+    private static double RequireFiniteDouble(JsonElement source, string name, string path, double minimum, double maximum)
+    {
+        if (!source.TryGetProperty(name, out var value) || !value.TryGetDouble(out var actual) || !double.IsFinite(actual) || actual < minimum || actual > maximum)
+        {
+            throw ContractError(path, $"{name} must be a finite number in [{minimum}, {maximum}]");
+        }
+        return actual;
+    }
+
     private static void RequireFloatEqual(JsonElement source, string name, float expected, string path)
     {
         var actual = RequireFiniteFloat(source, name, path, float.NegativeInfinity, float.PositiveInfinity);
         if (MathF.Abs(actual - expected) > 1e-7f)
+        {
+            throw ContractError(path, $"{name} does not match the model configuration");
+        }
+    }
+
+    private static void RequireDoubleEqual(JsonElement source, string name, double expected, string path)
+    {
+        var actual = RequireFiniteDouble(source, name, path, double.NegativeInfinity, double.PositiveInfinity);
+        if (Math.Abs(actual - expected) > 1e-12)
         {
             throw ContractError(path, $"{name} does not match the model configuration");
         }

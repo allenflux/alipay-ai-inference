@@ -15,6 +15,8 @@ param(
     [int]$Limit = 0,
     [ValidateSet("cpu", "gpu")]
     [string]$RuntimeFlavor = "cpu",
+    [ValidateSet("none", "max-side-1600")]
+    [string]$Rectification = "max-side-1600",
     [switch]$IncludeDeviceModel,
     [ValidateSet("all", "flagged", "none")]
     [string]$Annotate = "none",
@@ -38,6 +40,8 @@ $pythonExe = Join-Path $repoRoot ".venv-cu126\Scripts\python.exe"
 $normalizer = Join-Path $PSScriptRoot "normalize_json_summary.py"
 $endToEndScorer = Join-Path $PSScriptRoot "receipt_mlnet_unified_evaluate.py"
 $projectFile = Join-Path $repoRoot "dotnet\ReceiptMlNet.Cli\ReceiptMlNet.Cli.csproj"
+$preprocessingContractTestProject = Join-Path $repoRoot "dotnet\ReceiptMlNet.Cli.PreprocessingContractTests\ReceiptMlNet.Cli.PreprocessingContractTests.csproj"
+$rectificationContractTestProject = Join-Path $repoRoot "dotnet\ReceiptMlNet.Cli.RectificationContractTests\ReceiptMlNet.Cli.RectificationContractTests.csproj"
 
 if ([string]::IsNullOrWhiteSpace($DetectorModel)) {
     $DetectorModel = Join-Path $repoRoot "artifacts\receipt_lrcnn_v1.onnx"
@@ -68,6 +72,12 @@ if ($hasRecords -and $Limit -ne 0) {
 }
 if ($hasRecords -and $RuntimeFlavor -ne "cpu") {
     throw "Formal end-to-end delivery validation requires -RuntimeFlavor cpu; GPU is benchmark/smoke only."
+}
+if ($hasRecords -and $Rectification -ne "max-side-1600") {
+    throw "Formal end-to-end delivery validation requires -Rectification max-side-1600."
+}
+if ($hasRecords -and -not $IncludeDeviceModel) {
+    throw "Formal end-to-end delivery validation requires -IncludeDeviceModel for the complete three-model pipeline."
 }
 if ($hasRecords) {
     $Records = [IO.Path]::GetFullPath($Records)
@@ -166,6 +176,8 @@ function Assert-UnifiedBundle([string]$ModelPath) {
 Require-File $pythonExe "project Python interpreter"
 Require-File $normalizer "JSON normalizer"
 Require-File $projectFile "ML.NET project"
+Require-File $preprocessingContractTestProject "ML.NET preprocessing contract test project"
+Require-File $rectificationContractTestProject "ML.NET rectification contract test project"
 
 $unifiedModel = Join-Path $RunDirectory "best.onnx"
 $unifiedSidecars = Assert-UnifiedBundle $unifiedModel
@@ -181,13 +193,21 @@ $onnxValidationSummary = Join-Path $RunDirectory "onnx-val\summary.json"
 Require-File $onnxValidationSummary "final ONNX validation summary"
 
 $detectorContract = Assert-StandardModelContract $DetectorModel "receipt_lrcnn_v1"
+$detectorModelSha256 = Get-Sha256 $DetectorModel
+$detectorContractSha256 = Get-Sha256 $detectorContract
 $deviceContract = $null
+$deviceModelSha256 = $null
+$deviceContractSha256 = $null
 if ($IncludeDeviceModel) {
     $deviceContract = Assert-StandardModelContract $DeviceModel "statusbar_device_v1"
+    $deviceModelSha256 = Get-Sha256 $DeviceModel
+    $deviceContractSha256 = Get-Sha256 $deviceContract
 }
 
 $summary = Read-NormalizedJson $onnxValidationSummary
 $unifiedModelSha256 = Get-Sha256 $unifiedModel
+$unifiedLabelsSha256 = Get-Sha256 $unifiedLabels
+$unifiedContractSha256 = Get-Sha256 $unifiedContract
 if ([string]$summary.model_sha256 -ne $unifiedModelSha256) {
     throw "onnx-val summary model_sha256 does not belong to best.onnx."
 }
@@ -349,6 +369,8 @@ $modelDirectory = Join-Path $stagingRoot "models"
 $unifiedDirectory = Join-Path $modelDirectory "unified"
 $evidenceDirectory = Join-Path $stagingRoot "evidence"
 $consoleLog = Join-Path $evidenceDirectory "console.log"
+$preprocessingContractTestLog = Join-Path $evidenceDirectory "preprocessing-contract-test.log"
+$rectificationContractTestLog = Join-Path $evidenceDirectory "rectification-contract-test.log"
 $published = $false
 
 try {
@@ -415,6 +437,28 @@ try {
         throw "dotnet publish failed with exit code $LASTEXITCODE"
     }
 
+    Write-Host "mlnet_preprocessing_contract_test"
+    & dotnet run `
+        --project $preprocessingContractTestProject `
+        -c Release `
+        "-p:OnnxRuntimeFlavor=$RuntimeFlavor" 2>&1 |
+        Tee-Object -FilePath $preprocessingContractTestLog |
+        Tee-Object -FilePath $consoleLog -Append
+    if ($LASTEXITCODE -ne 0) {
+        throw "ML.NET preprocessing contract test failed with exit code $LASTEXITCODE"
+    }
+
+    Write-Host "mlnet_rectification_contract_test"
+    & dotnet run `
+        --project $rectificationContractTestProject `
+        -c Release `
+        "-p:OnnxRuntimeFlavor=$RuntimeFlavor" 2>&1 |
+        Tee-Object -FilePath $rectificationContractTestLog |
+        Tee-Object -FilePath $consoleLog -Append
+    if ($LASTEXITCODE -ne 0) {
+        throw "ML.NET rectification contract test failed with exit code $LASTEXITCODE"
+    }
+
     $deliveryDetector = Join-Path $modelDirectory ([IO.Path]::GetFileName($DetectorModel))
     Copy-Item -LiteralPath $DetectorModel -Destination $deliveryDetector
     Copy-Item -LiteralPath $detectorContract -Destination $modelDirectory
@@ -439,6 +483,7 @@ try {
             "--ocr-model", $deliveryUnifiedModel,
             "--output", $Output,
             "--device", $runtimeDevice,
+            "--rectification", $Rectification,
             "--annotate", $Annotate,
             "--continue-on-error"
         )
@@ -569,6 +614,57 @@ try {
         }
         if ([string]$result.model_contracts.unified_ocr_model_sha256 -ne $unifiedModelSha256) {
             throw "Result does not reference the delivered unified OCR model: $resultPath"
+        }
+        if ([string]$result.model_contracts.detector_sha256 -ne $detectorModelSha256 `
+            -or [string]$result.model_contracts.detector_contract_sha256 -ne $detectorContractSha256 `
+            -or [string]$result.model_contracts.unified_ocr_labels_sha256 -ne $unifiedLabelsSha256 `
+            -or [string]$result.model_contracts.unified_ocr_contract_sha256 -ne $unifiedContractSha256) {
+            throw "Result contains mixed detector or unified sidecar provenance: $resultPath"
+        }
+        if ($IncludeDeviceModel) {
+            if ([string]$result.model_contracts.device_sha256 -ne $deviceModelSha256 `
+                -or [string]$result.model_contracts.device_contract_sha256 -ne $deviceContractSha256 `
+                -or $null -eq $result.PSObject.Properties["device"] `
+                -or $null -eq $result.device) {
+                throw "Result does not prove execution of the delivered device model: $resultPath"
+            }
+        }
+        $geometryProperty = $result.PSObject.Properties["geometry"]
+        if ($null -eq $geometryProperty -or $null -eq $geometryProperty.Value) {
+            throw "Result has no geometry evidence: $resultPath"
+        }
+        $geometry = $geometryProperty.Value
+        if ([string]$geometry.rectification -ne $Rectification) {
+            throw "Result rectification does not match the requested production mode ${Rectification}: $resultPath"
+        }
+        foreach ($sizeName in @("source_size", "rectified_size")) {
+            $sizeProperty = $geometry.PSObject.Properties[$sizeName]
+            if ($null -eq $sizeProperty `
+                -or [int]$sizeProperty.Value.width -le 0 `
+                -or [int]$sizeProperty.Value.height -le 0) {
+                throw "Result geometry has an invalid ${sizeName}: $resultPath"
+            }
+        }
+        if ($Rectification -eq "max-side-1600") {
+            $rectifiedMaximumSide = [Math]::Max(
+                [int]$geometry.rectified_size.width,
+                [int]$geometry.rectified_size.height)
+            if ($rectifiedMaximumSide -gt 1600 `
+                -or [int]$geometry.rotation_degrees -ne 0 `
+                -or [bool]$geometry.screen_detected) {
+                throw "Result geometry is not the fail-closed max-side-1600 full-image contract: $resultPath"
+            }
+            foreach ($matrixName in @("H_original_to_rectified", "H_rectified_to_original")) {
+                $matrixProperty = $geometry.PSObject.Properties[$matrixName]
+                if ($null -eq $matrixProperty -or @($matrixProperty.Value).Count -ne 3) {
+                    throw "Result geometry is missing a 3x3 ${matrixName}: $resultPath"
+                }
+                foreach ($matrixRow in @($matrixProperty.Value)) {
+                    if (@($matrixRow).Count -ne 3) {
+                        throw "Result geometry has a malformed ${matrixName}: $resultPath"
+                    }
+                }
+            }
         }
         $receiptCandidateComplete = $true
         foreach ($fieldName in @("amount", "time", "recipient", "payment_method")) {
@@ -738,6 +834,24 @@ try {
         model_sha256 = $unifiedModelSha256
         runtime_flavor = $RuntimeFlavor
         runtime_device = $runtimeDevice
+        rectification = $Rectification
+        geometry_audit = [ordered]@{
+            requested_mode = $Rectification
+            checked_results = $written
+            matching_results = $written
+            matrices_valid = $true
+            source_sizes_valid = $true
+        }
+        contract_tests = [ordered]@{
+            preprocessing = [ordered]@{
+                status = "passed"
+                log_sha256 = Get-Sha256 $preprocessingContractTestLog
+            }
+            rectification = [ordered]@{
+                status = "passed"
+                log_sha256 = Get-Sha256 $rectificationContractTestLog
+            }
+        }
         inference_summary = $runtimeSummary
         end_to_end_evaluation = $endToEndEvidence
         onnx_validation = [ordered]@{
@@ -769,6 +883,7 @@ try {
         self_contained = $false
         onnx_runtime_flavor = $RuntimeFlavor
         runtime_device = $runtimeDevice
+        rectification = $Rectification
         prerequisites = if ($RuntimeFlavor -eq "cpu") {
             @("Microsoft.NETCore.App 8.x")
         }

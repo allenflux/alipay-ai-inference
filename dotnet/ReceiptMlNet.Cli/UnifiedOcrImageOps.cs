@@ -41,23 +41,21 @@ internal static class UnifiedOcrImageOps
         int targetHeight,
         int targetWidth,
         bool rightAlign,
-        float leftCropFraction = 0.0f)
+        double leftCropFraction = 0.0)
     {
         if (targetHeight <= 0 || targetWidth <= 0)
         {
             throw new ArgumentOutOfRangeException(nameof(targetHeight), "Unified OCR target dimensions must be positive");
         }
-        if (!float.IsFinite(leftCropFraction) || leftCropFraction < 0.0f || leftCropFraction >= 1.0f)
+        if (!double.IsFinite(leftCropFraction) || leftCropFraction < 0.0 || leftCropFraction >= 1.0)
         {
             throw new ArgumentOutOfRangeException(nameof(leftCropFraction), "Unified OCR left crop fraction must be in [0, 1)");
         }
 
         using var grayscale = ToGrayscale(image);
-        if (leftCropFraction > 0.0f)
+        if (leftCropFraction > 0.0)
         {
-            var left = Math.Min(
-                grayscale.Width - 1,
-                Math.Max(0, (int)Math.Round(grayscale.Width * leftCropFraction, MidpointRounding.ToEven)));
+            var left = LeftTrimPixels(grayscale.Width, leftCropFraction);
             grayscale.Mutate(context => context.Crop(new Rectangle(left, 0, grayscale.Width - left, grayscale.Height)));
         }
 
@@ -79,6 +77,21 @@ internal static class UnifiedOcrImageOps
             }
         }
         return values;
+    }
+
+    internal static int LeftTrimPixels(int width, double leftCropFraction)
+    {
+        if (width <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(width));
+        }
+        if (!double.IsFinite(leftCropFraction) || leftCropFraction < 0.0 || leftCropFraction >= 1.0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(leftCropFraction));
+        }
+        return Math.Min(
+            width - 1,
+            Math.Max(0, (int)Math.Round(width * leftCropFraction, MidpointRounding.ToEven)));
     }
 
     private static Image<L8> ToGrayscale(Image<Rgb24> source)
