@@ -440,7 +440,6 @@ try {
             "--output", $Output,
             "--device", $runtimeDevice,
             "--annotate", $Annotate,
-            "--require-complete",
             "--continue-on-error"
         )
         if ($null -ne $resolvedInput) {
@@ -539,6 +538,12 @@ try {
     }
 
     $candidateComplete = 0
+    $candidateByField = [ordered]@{
+        amount = 0
+        time = 0
+        recipient = 0
+        payment_method = 0
+    }
     $manifestSourceSet = @{}
     $resultEvidenceRows = @()
     foreach ($manifestRecord in $allManifest) {
@@ -560,16 +565,30 @@ try {
         if ([string]$result.model_contracts.unified_ocr_model_sha256 -ne $unifiedModelSha256) {
             throw "Result does not reference the delivered unified OCR model: $resultPath"
         }
+        $receiptCandidateComplete = $true
         foreach ($fieldName in @("amount", "time", "recipient", "payment_method")) {
             $field = $result.fields.PSObject.Properties[$fieldName]
-            if ($null -eq $field -or [string]::IsNullOrWhiteSpace([string]$field.Value.candidate)) {
-                throw "Result has no $fieldName candidate: $resultPath"
+            if ($null -eq $field) {
+                throw "Result has no $fieldName field object: $resultPath"
             }
-            if ([string]$field.Value.delivery_policy -ne $textDeliveryPolicy `
-                -or [string]$field.Value.delivery_value -ne $textReviewValue `
+            if ([string]$field.Value.delivery_policy -ne $textDeliveryPolicy) {
+                throw "Result $fieldName has the wrong delivery policy: $resultPath"
+            }
+            $candidate = [string]$field.Value.candidate
+            if ([string]::IsNullOrWhiteSpace($candidate)) {
+                $receiptCandidateComplete = $false
+                if ([string]$field.Value.state -notin @("absent", "unreadable") `
+                    -or ($null -ne $field.Value.value -and [string]$field.Value.value -ne $textReviewValue) `
+                    -or ($null -ne $field.Value.delivery_value -and [string]$field.Value.delivery_value -ne $textReviewValue)) {
+                    throw "Result $fieldName has an invalid fail-closed missing-candidate state: $resultPath"
+                }
+                continue
+            }
+            $candidateByField[$fieldName]++
+            if ([string]$field.Value.delivery_value -ne $textReviewValue `
                 -or [string]$field.Value.value -ne $textReviewValue `
                 -or [string]$field.Value.state -ne "review") {
-                throw "Result $fieldName escaped the required review-only policy: $resultPath"
+                throw "Result $fieldName candidate escaped the required review-only policy: $resultPath"
             }
         }
         $resultEvidenceRows += [ordered]@{
@@ -578,7 +597,9 @@ try {
             result_sha256 = Get-Sha256 $resultPath
             result_bytes = (Get-Item -LiteralPath $resultPath).Length
         }
-        $candidateComplete++
+        if ($receiptCandidateComplete) {
+            $candidateComplete++
+        }
     }
 
     if ($null -ne $resolvedInputList) {
@@ -700,6 +721,7 @@ try {
         validation_scope = $validationScope
         input_mode = if ($null -ne $resolvedInput) { "input" } else { "input_list" }
         candidate_complete = $candidateComplete
+        candidates_by_field = $candidateByField
         output = $Output
         include_device_model = [bool]$IncludeDeviceModel
         annotate = $Annotate
@@ -790,6 +812,7 @@ try {
     Write-Host "  written=$written"
     Write-Host "  errors=$errorCount"
     Write-Host "  candidate-complete=$candidateComplete"
+    Write-Host "  candidates-by-field=$($candidateByField | ConvertTo-Json -Compress)"
     Write-Host "  mean-ms=$($runtimeLatencies.mean)"
     Write-Host "  p50-ms=$($runtimeLatencies.p50)"
     Write-Host "  p95-ms=$($runtimeLatencies.p95)"

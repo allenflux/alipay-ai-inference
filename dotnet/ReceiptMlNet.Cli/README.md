@@ -131,7 +131,8 @@ $cpuPackage = "D:\alipay-ai-data\delivery\ReceiptMlNet-wide1536-cpu-production"
   -Annotate none
 ```
 
-正式门槛为：完整 val 回单及四字段候选覆盖率均为 100%，没有推理错误或混用模型哈希；
+正式门槛为：完整 val 回单覆盖率为 100%，manifest 中实际带真值的四字段候选覆盖率各为
+100%（不要求一张只标了部分字段的回单凭空补齐未标字段），没有推理错误或混用模型哈希；
 金额 exact match ≥ **78.85%**，时间 ≥ **98.40%**，付款方式 ≥ **93.25%**，
 收款方 ≥ **90.00%**。脚本还会核对 `best.onnx`、labels、contracts、检测器和设备
 模型哈希，以及既有 `onnx-val/summary.json` 的 val split、manifest、字段样本数和保护线。
