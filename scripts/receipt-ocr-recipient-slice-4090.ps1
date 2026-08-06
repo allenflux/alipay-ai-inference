@@ -18,7 +18,15 @@ $labelsRoot = Join-Path $TeacherRoot "paddle-teacher-labels-5field-recipient95-v
 $manifestRoot = Join-Path $TeacherRoot "unified-manifest-v12-r3-4090-r1"
 $records = Join-Path $manifestRoot "unified_fields.jsonl"
 $run = (Resolve-Path -LiteralPath $RunDirectory).Path
-$comparisons = Join-Path $run "onnx-val\comparisons.jsonl"
+$standardComparisons = Join-Path $run "onnx-val\comparisons.jsonl"
+$beamComparisons = Join-Path $run "validation\comparisons.jsonl"
+$comparisons = if (Test-Path -LiteralPath $standardComparisons) {
+    $standardComparisons
+} elseif (Test-Path -LiteralPath $beamComparisons) {
+    $beamComparisons
+} else {
+    $standardComparisons
+}
 $reportPath = if ([string]::IsNullOrWhiteSpace($Report)) {
     Join-Path $run "recipient-slice-report.json"
 } elseif ([System.IO.Path]::IsPathRooted($Report)) {
