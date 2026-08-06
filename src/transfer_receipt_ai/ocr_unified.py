@@ -5823,6 +5823,7 @@ def train_unified_reader(
     num_workers: int = 0,
     prefetch_factor: int = 2,
     persistent_workers: bool = False,
+    train_progress_every: int = 0,
     cuda_tf32: bool = False,
     cudnn_benchmark: bool = False,
 ) -> Path:
@@ -5948,6 +5949,8 @@ def train_unified_reader(
         raise ValueError("prefetch_factor must be positive")
     if persistent_workers and num_workers <= 0:
         raise ValueError("persistent_workers requires num_workers to be positive")
+    if train_progress_every < 0:
+        raise ValueError("train_progress_every cannot be negative")
     if payment_bank_prefix_min_support <= 0:
         raise ValueError("payment_bank_prefix_min_support must be positive")
     if not math.isfinite(recipient_sampling_weight):
@@ -6092,6 +6095,7 @@ def train_unified_reader(
         "num_workers": num_workers,
         "prefetch_factor": prefetch_factor if num_workers > 0 else None,
         "persistent_workers": persistent_workers,
+        "train_progress_every": train_progress_every,
         "cuda_tf32_requested": cuda_tf32,
         "cudnn_benchmark_requested": cudnn_benchmark,
         "recipient_only_private_branch_training": recipient_only_fine_tune,
@@ -6483,7 +6487,8 @@ def train_unified_reader(
         train_dataset.set_epoch(epoch)
         total_loss_tensor: Any | None = None
         total_receipts = 0
-        for batch in train_loader:
+        total_batches = len(train_loader)
+        for batch_index, batch in enumerate(train_loader, start=1):
             if recipient_only_fine_tune:
                 recipient_value_images, batch_records = batch
                 recipient_value_images = recipient_value_images.to(target_device, non_blocking=uses_cuda)
@@ -6572,6 +6577,14 @@ def train_unified_reader(
             else:
                 total_loss_tensor.add_(weighted_loss)
             total_receipts += len(batch_records)
+            if train_progress_every and (
+                batch_index == 1 or batch_index % train_progress_every == 0 or batch_index == total_batches
+            ):
+                print(
+                    f"train epoch {epoch}/{epochs}: batch {batch_index}/{total_batches} "
+                    f"receipts={total_receipts} elapsed_s={perf_counter() - epoch_started:.1f}",
+                    flush=True,
+                )
         # The hot recipient-only path intentionally avoids per-batch CPU
         # reads.  Synchronise once at the epoch boundary so the recorded
         # training/validation timings are not misleadingly split across the
@@ -9876,6 +9889,12 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     train.add_argument(
+        "--train-progress-every",
+        type=int,
+        default=0,
+        help="Print training progress every N batches inside each epoch; 0 disables progress output",
+    )
+    train.add_argument(
         "--cuda-tf32",
         action="store_true",
         help="Opt in to high-precision TF32 CUDA matmul/convolution kernels (for example RTX 4090)",
@@ -10062,6 +10081,7 @@ def main(argv: list[str] | None = None) -> None:
                 num_workers=args.num_workers,
                 prefetch_factor=args.prefetch_factor,
                 persistent_workers=args.persistent_workers,
+                train_progress_every=args.train_progress_every,
                 cuda_tf32=args.cuda_tf32,
                 cudnn_benchmark=args.cudnn_benchmark,
             )

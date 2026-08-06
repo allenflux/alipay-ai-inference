@@ -60,6 +60,8 @@ param(
     [int]$NumWorkers = 4,
     [ValidateRange(1, 16)]
     [int]$PrefetchFactor = 2,
+    [ValidateRange(0, 1000000)]
+    [int]$TrainProgressEvery = 250,
     [ValidateRange(1, 80)]
     [int]$ValidationEvery = 5,
     [switch]$DiagnosticOnly,
@@ -319,6 +321,7 @@ $trainArgs = @(
     "--seed", "42",
     "--num-workers", "$NumWorkers",
     "--prefetch-factor", "$PrefetchFactor",
+    "--train-progress-every", "$TrainProgressEvery",
     "--validation-every", "$ValidationEvery",
     "--cuda-tf32",
     "--cudnn-benchmark"
