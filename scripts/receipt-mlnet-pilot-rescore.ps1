@@ -47,8 +47,8 @@ if (-not (Test-Path -LiteralPath $summary)) {
 }
 
 & $report -EvaluationDir $EvaluationDir -ResultsDir $ResultsDir
-if ($LASTEXITCODE -ne 0) {
-    throw "Pilot diagnostic report failed with exit code $LASTEXITCODE"
+if (-not $?) {
+    throw "Pilot diagnostic report failed."
 }
 
 Write-Host "mlnet_cpu_pilot_rescore_complete"

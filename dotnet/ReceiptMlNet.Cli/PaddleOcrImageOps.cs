@@ -18,16 +18,15 @@ internal static class PaddleOcrImageOps
     {
         var bytes = new byte[checked(image.Width * image.Height * 3)];
         var offset = 0;
-        for (var y = 0; y < image.Height; y++)
+        image.ProcessPixelRows(accessor =>
         {
-            for (var x = 0; x < image.Width; x++)
+            for (var y = 0; y < image.Height; y++)
             {
-                var pixel = image[x, y];
-                bytes[offset++] = pixel.R;
-                bytes[offset++] = pixel.G;
-                bytes[offset++] = pixel.B;
+                var rowBytes = MemoryMarshal.AsBytes(accessor.GetRowSpan(y));
+                rowBytes.CopyTo(bytes.AsSpan(offset, rowBytes.Length));
+                offset += rowBytes.Length;
             }
-        }
+        });
 
         var result = new Mat(image.Height, image.Width, MatType.CV_8UC3);
         Marshal.Copy(bytes, 0, result.Data, bytes.Length);

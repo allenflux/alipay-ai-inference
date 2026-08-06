@@ -124,7 +124,8 @@ internal static class ReceiptMlNetProgram
                     detectorContract,
                     deviceContract,
                     ocrBundle,
-                    unifiedOcrBundle))
+                    unifiedOcrBundle,
+                    options.Rectification))
             {
                 manifest.Add(new ManifestRecord(
                     Path.GetFullPath(inputFile),
@@ -145,6 +146,7 @@ internal static class ReceiptMlNetProgram
                     ocrEngine,
                     unifiedOcrEngine,
                     options.ScoreThreshold,
+                    options.Rectification,
                     out var stageLatency);
                 inferenceStopwatch.Stop();
                 var inferenceMs = Math.Round(inferenceStopwatch.Elapsed.TotalMilliseconds, 4);
@@ -227,12 +229,12 @@ internal static class ReceiptMlNetProgram
         PaddleOcrEngine? ocrEngine,
         UnifiedOcrEngine? unifiedOcrEngine,
         float scoreThreshold,
+        string rectificationMode,
         out InferenceStageLatency stageLatency)
     {
         var stageStopwatch = Stopwatch.StartNew();
         using var source = ImagePipeline.LoadUprightRgb(inputFile);
         var imageLoadMs = StopAndReadMilliseconds(stageStopwatch);
-        var sourceSize = new ImageSize(source.Width, source.Height);
 
         double? deviceMs = null;
         stageStopwatch.Restart();
@@ -243,7 +245,9 @@ internal static class ReceiptMlNetProgram
         }
 
         stageStopwatch.Restart();
-        var prepared = ImagePipeline.PrepareDetectorInput(source);
+        using var rectification = ReceiptRectifier.Rectify(source, rectificationMode);
+        var rectified = rectification.Image;
+        var prepared = ImagePipeline.PrepareDetectorInput(rectified);
         var detectorPreprocessMs = StopAndReadMilliseconds(stageStopwatch);
 
         stageStopwatch.Restart();
@@ -258,7 +262,7 @@ internal static class ReceiptMlNetProgram
         if (ocrEngine is not null)
         {
             stageStopwatch.Restart();
-            detections = EnrichWithOcr(source, detections, ocrEngine);
+            detections = EnrichWithOcr(rectified, detections, ocrEngine);
             paddleOcrMs = StopAndReadMilliseconds(stageStopwatch);
         }
 
@@ -266,7 +270,7 @@ internal static class ReceiptMlNetProgram
         UnifiedOcrReadResult? unifiedOcr = null;
         if (unifiedOcrEngine is not null)
         {
-            unifiedOcr = unifiedOcrEngine.RecognizeReceipt(source, detections, out var measuredUnifiedOcrLatency);
+            unifiedOcr = unifiedOcrEngine.RecognizeReceipt(rectified, detections, out var measuredUnifiedOcrLatency);
             unifiedOcrLatency = measuredUnifiedOcrLatency;
         }
 
@@ -280,6 +284,12 @@ internal static class ReceiptMlNetProgram
             : unifiedOcr is not null
                 ? BuildUnifiedFields(detections, unifiedOcr)
                 : null;
+        // Detector and OCR boxes remain in rectified coordinates through all
+        // crop operations.  Only the public bbox_image values are projected
+        // back to the EXIF-upright source coordinate system.
+        var outputDetections = detections
+            .Select(detection => detection with { BboxImage = rectification.ProjectBoxToSource(detection.BboxImage) })
+            .ToList();
         var resultAssemblyMs = StopAndReadMilliseconds(stageStopwatch);
 
         stageLatency = new InferenceStageLatency(
@@ -294,25 +304,33 @@ internal static class ReceiptMlNetProgram
             unifiedOcrLatency?.PostprocessMs,
             resultAssemblyMs);
 
+        var rectificationGeometry = rectification.Geometry();
         return new ReceiptResult(
             Path.GetFullPath(inputFile),
             "mlnet",
             new DetectorGeometry(
-                sourceSize,
+                rectificationGeometry.SourceSize,
+                rectificationGeometry.RectifiedSize,
                 new ImageSize(ImagePipeline.DetectorWidth, ImagePipeline.DetectorHeight),
                 "letterbox",
-                "not_applied"),
-            detections,
+                rectificationGeometry.Rectification,
+                rectificationGeometry.RotationDegrees,
+                rectificationGeometry.ScreenDetected,
+                rectificationGeometry.ScreenQuadOriginal,
+                rectificationGeometry.HOriginalToRectified,
+                rectificationGeometry.HRectifiedToOriginal),
+            outputDetections,
             fields,
             device,
             null,
             new[]
             {
                 "This .NET CLI performs ONNX model inference.",
-                "Input must already be an upright, rectified receipt image when perspective correction is needed.",
-                "Annotated JPGs use upright source coordinates. Their original/rectified pair is identical until perspective rectification is ported to .NET.",
+                "EXIF orientation is applied before inference. Rectification mode max-side-1600 mirrors Python's full-image warp and does not detect or crop a phone/screen boundary.",
+                "Perspective photos still require an externally rectified input; automatic screen detection is intentionally outside this production mode.",
+                "bbox_image and both compatibility-named annotated JPGs use EXIF-upright source coordinates.",
                 ocrEngine is not null
-                    ? "OCR uses the verified PP-OCR ONNX delivery bundle; source-image perspective rectification is not yet ported to .NET."
+                    ? "OCR uses the verified PP-OCR ONNX delivery bundle on the selected rectified image."
                     : unifiedOcrEngine is not null
                         ? "OCR uses the verified architecture-v12 unified ONNX reader in one session/run per receipt. Its current text/status contract is review-only: candidates are diagnostic and delivered values fail closed to review."
                         : "OCR field extraction is disabled; use --ocr onnx --ocr-bundle <delivery-directory> or --ocr unified --ocr-model <v12-reader.onnx> to enable it.",
@@ -586,7 +604,8 @@ internal static class ReceiptMlNetProgram
         ModelContract detector,
         ModelContract? device,
         PaddleOcrDeliveryBundle? paddleOcr,
-        UnifiedOcrBundle? unifiedOcr)
+        UnifiedOcrBundle? unifiedOcr,
+        string rectificationMode)
     {
         if (!File.Exists(outputPath))
         {
@@ -603,6 +622,9 @@ internal static class ReceiptMlNetProgram
             if ((requiresOcrFields
                     && (!document.RootElement.TryGetProperty("fields", out var fields)
                         || fields.ValueKind != JsonValueKind.Object))
+                || !document.RootElement.TryGetProperty("geometry", out var geometry)
+                || geometry.ValueKind != JsonValueKind.Object
+                || !HasJsonString(geometry, "rectification", rectificationMode)
                 || !document.RootElement.TryGetProperty("model_contracts", out var contracts)
                 || contracts.ValueKind != JsonValueKind.Object)
             {
@@ -1191,6 +1213,7 @@ internal sealed record CliOptions(
     string Device,
     float ScoreThreshold,
     string AnnotationMode,
+    string Rectification,
     bool RequireComplete,
     bool ContinueOnError,
     bool SkipExisting,
@@ -1206,6 +1229,7 @@ Usage:
     [--ocr-model <receipt_unified_field_reader_v12.onnx>] \
     (--input <image-or-directory> | --input-list <txt>) --output <directory> \
     [--device auto|cpu|cuda:0] [--score-threshold 0.50] [--annotate all|flagged|none] \
+    [--rectification none|max-side-1600] \
     [--require-complete] [--continue-on-error] [--skip-existing] [--limit 100]
 
 This .NET CLI runs the receipt/device ONNX models and can optionally run a
@@ -1214,7 +1238,9 @@ reader (--ocr unified). The two OCR modes are mutually exclusive. Unified OCR
 requires its adjacent .labels.json and .contract.json sidecars and emits
 review-only delivery values until independently human-calibrated. It writes
 JSON and, by default, two annotated JPGs. It does not yet include perspective
-rectification; use an already rectified image when needed.
+screen detection. --rectification max-side-1600 applies the Python-compatible
+full-image cubic warp after EXIF orientation and limits the longest side to
+1600; perspective photos still require an externally rectified input.
 """;
 
     public static CliOptions Parse(string[] args)
@@ -1230,6 +1256,7 @@ rectification; use an already rectified image when needed.
         var device = "auto";
         var scoreThreshold = 0.50f;
         var annotationMode = "all";
+        var rectification = ReceiptRectifier.NoneMode;
         var requireComplete = false;
         var continueOnError = false;
         var skipExisting = false;
@@ -1249,6 +1276,7 @@ rectification; use an already rectified image when needed.
                 case "--output": output = NextValue(args, ref index); break;
                 case "--device": device = NextValue(args, ref index); break;
                 case "--annotate": annotationMode = ParseAnnotationMode(NextValue(args, ref index)); break;
+                case "--rectification": rectification = ParseRectification(NextValue(args, ref index)); break;
                 case "--score-threshold":
                     if (!float.TryParse(NextValue(args, ref index), NumberStyles.Float, CultureInfo.InvariantCulture, out scoreThreshold) || scoreThreshold is < 0.0f or > 1.0f)
                     {
@@ -1296,7 +1324,7 @@ rectification; use an already rectified image when needed.
             throw new UsageException("--ocr-model requires --ocr unified");
         }
         _ = DeviceSetting.Parse(device);
-        return new CliOptions(detector, deviceModel, ocrMode, ocrBundle, ocrModel, input, inputList, output, device, scoreThreshold, annotationMode, requireComplete, continueOnError, skipExisting, limit);
+        return new CliOptions(detector, deviceModel, ocrMode, ocrBundle, ocrModel, input, inputList, output, device, scoreThreshold, annotationMode, rectification, requireComplete, continueOnError, skipExisting, limit);
     }
 
     private static string ParseOcrMode(string value)
@@ -1317,6 +1345,16 @@ rectification; use an already rectified image when needed.
             return mode;
         }
         throw new UsageException("--annotate must be all, flagged, or none");
+    }
+
+    private static string ParseRectification(string value)
+    {
+        var mode = value.ToLowerInvariant();
+        if (mode is ReceiptRectifier.NoneMode or ReceiptRectifier.MaxSide1600Mode)
+        {
+            return mode;
+        }
+        throw new UsageException("--rectification must be none or max-side-1600");
     }
 
     private static string NextValue(string[] args, ref int index)
@@ -1341,7 +1379,19 @@ internal sealed record ReceiptResult(
     ContractReferences? ModelContracts,
     string[] Limitations);
 
-internal sealed record DetectorGeometry(ImageSize SourceSize, ImageSize DetectorCanvas, string ResizeMode, string Rectification);
+internal sealed record DetectorGeometry(
+    ImageSize SourceSize,
+    ImageSize RectifiedSize,
+    ImageSize DetectorCanvas,
+    string ResizeMode,
+    string Rectification,
+    int RotationDegrees,
+    bool ScreenDetected,
+    float[][] ScreenQuadOriginal,
+    [property: JsonPropertyName("H_original_to_rectified")]
+    double[][] HOriginalToRectified,
+    [property: JsonPropertyName("H_rectified_to_original")]
+    double[][] HRectifiedToOriginal);
 internal sealed record ImageSize(int Width, int Height);
 internal sealed record DetectionResult(string Label, float Score, float[] BboxImage, OcrResult? Ocr = null);
 internal sealed record OcrResult(
