@@ -302,20 +302,8 @@ internal sealed class UnifiedOcrEngine : IDisposable
         {
             throw new InvalidOperationException("Unified OCR CTC tensor differs from the verified character dictionary");
         }
-        var text = new System.Text.StringBuilder();
-        var scores = new List<float>();
-        var previous = -1;
-        for (var time = 0; time < output.Shape[0]; time++)
-        {
-            var decoded = ArgMax(output.Values, checked(time * output.Shape[1]), output.Shape[1]);
-            if (decoded.Index != 0 && decoded.Index != previous)
-            {
-                text.Append(characters[decoded.Index - 1]);
-                scores.Add(decoded.Confidence);
-            }
-            previous = decoded.Index;
-        }
-        return new CtcRead(text.ToString(), scores.Count == 0 ? 0.0f : scores.Average());
+        var decoded = UnifiedCtcDecoder.Decode(output.Values, output.Shape[0], output.Shape[1], characters);
+        return new CtcRead(decoded.Text, decoded.Confidence);
     }
 
     private StructuredRead? TryDecodeStructuredAmount(
@@ -514,41 +502,10 @@ internal sealed class UnifiedOcrEngine : IDisposable
         return ArgMax(output.Values, 0, output.Shape[0]);
     }
 
-    private static ClassRead ArgMax(float[] values, int offset, int count)
+    private static ClassRead ArgMax(ReadOnlySpan<float> values, int offset, int count)
     {
-        if (count <= 0 || offset < 0 || offset + count > values.Length)
-        {
-            throw new InvalidOperationException("Unified OCR output contains an invalid score vector");
-        }
-        var maximum = values[offset];
-        if (!float.IsFinite(maximum))
-        {
-            throw new InvalidOperationException("Unified OCR output contains a non-finite score");
-        }
-        var maximumIndex = 0;
-        for (var index = 1; index < count; index++)
-        {
-            var value = values[offset + index];
-            if (!float.IsFinite(value))
-            {
-                throw new InvalidOperationException("Unified OCR output contains a non-finite score");
-            }
-            if (value > maximum)
-            {
-                maximum = value;
-                maximumIndex = index;
-            }
-        }
-        var denominator = 0.0;
-        for (var index = 0; index < count; index++)
-        {
-            denominator += Math.Exp(values[offset + index] - maximum);
-        }
-        if (!double.IsFinite(denominator) || denominator <= 0.0)
-        {
-            throw new InvalidOperationException("Unified OCR output has an invalid softmax denominator");
-        }
-        var confidence = (float)(1.0 / denominator);
+        var maximumIndex = UnifiedCtcDecoder.FindMaximumIndex(values, offset, count, out var maximum);
+        var confidence = UnifiedCtcDecoder.WinningSoftmaxConfidence(values, offset, count, maximum);
         return new ClassRead(maximumIndex, confidence);
     }
 

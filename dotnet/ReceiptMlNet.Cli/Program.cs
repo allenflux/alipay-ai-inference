@@ -1006,22 +1006,28 @@ internal static class ImagePipeline
         var top = (DetectorHeight - resizedHeight) / 2;
         // ImageSharp calls the bilinear kernel "Triangle".
         using var resized = source.Clone(context => context.Resize(resizedWidth, resizedHeight, KnownResamplers.Triangle));
-        using var canvas = new Image<Rgb24>(DetectorWidth, DetectorHeight);
-        canvas.Mutate(context => context.DrawImage(resized, new Point(left, top), 1.0f));
 
+        // float arrays are zero-initialised, so writing the resized pixels at
+        // their letterbox offset is exactly the former black-canvas + opaque
+        // DrawImage operation without allocating and traversing that canvas.
         var values = new float[3 * DetectorHeight * DetectorWidth];
         var plane = DetectorHeight * DetectorWidth;
-        for (var y = 0; y < DetectorHeight; y++)
+        resized.ProcessPixelRows(accessor =>
         {
-            for (var x = 0; x < DetectorWidth; x++)
+            for (var y = 0; y < resizedHeight; y++)
             {
-                var pixel = canvas[x, y];
-                var offset = y * DetectorWidth + x;
-                values[offset] = pixel.R / 255.0f;
-                values[plane + offset] = pixel.G / 255.0f;
-                values[2 * plane + offset] = pixel.B / 255.0f;
+                var row = accessor.GetRowSpan(y);
+                var destinationRow = (y + top) * DetectorWidth + left;
+                for (var x = 0; x < row.Length; x++)
+                {
+                    var pixel = row[x];
+                    var offset = destinationRow + x;
+                    values[offset] = pixel.R / 255.0f;
+                    values[plane + offset] = pixel.G / 255.0f;
+                    values[2 * plane + offset] = pixel.B / 255.0f;
+                }
             }
-        }
+        });
         return new DetectorInputTensor(values, source.Width, source.Height, (float)resizedWidth / source.Width, (float)resizedHeight / source.Height, left, top);
     }
 
@@ -1034,17 +1040,22 @@ internal static class ImagePipeline
         using var canvas = strip.Clone(context => context.Resize(StatusbarWidth, StatusbarHeight, KnownResamplers.Bicubic));
         var values = new float[3 * StatusbarHeight * StatusbarWidth];
         var plane = StatusbarHeight * StatusbarWidth;
-        for (var y = 0; y < StatusbarHeight; y++)
+        canvas.ProcessPixelRows(accessor =>
         {
-            for (var x = 0; x < StatusbarWidth; x++)
+            for (var y = 0; y < StatusbarHeight; y++)
             {
-                var pixel = canvas[x, y];
-                var offset = y * StatusbarWidth + x;
-                values[offset] = (pixel.R / 255.0f - 0.485f) / 0.229f;
-                values[plane + offset] = (pixel.G / 255.0f - 0.456f) / 0.224f;
-                values[2 * plane + offset] = (pixel.B / 255.0f - 0.406f) / 0.225f;
+                var row = accessor.GetRowSpan(y);
+                var destinationRow = y * StatusbarWidth;
+                for (var x = 0; x < row.Length; x++)
+                {
+                    var pixel = row[x];
+                    var offset = destinationRow + x;
+                    values[offset] = (pixel.R / 255.0f - 0.485f) / 0.229f;
+                    values[plane + offset] = (pixel.G / 255.0f - 0.456f) / 0.224f;
+                    values[2 * plane + offset] = (pixel.B / 255.0f - 0.406f) / 0.225f;
+                }
             }
-        }
+        });
         return values;
     }
 }

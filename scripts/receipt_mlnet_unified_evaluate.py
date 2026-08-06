@@ -22,6 +22,7 @@ import os
 import re
 import sys
 from collections.abc import Iterable, Mapping, Sequence
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -160,6 +161,34 @@ def _reference_text(field: str, slot: Mapping[str, Any]) -> str | None:
     raise AssertionError(field)
 
 
+def _amount_semantic_decimal(value: str | None) -> Decimal | None:
+    """Return a strict numeric CNY diagnostic, never an OCR repair.
+
+    Raw display exact-match remains the delivery guard.  This parallel view
+    only ignores surrounding whitespace plus the two supported yen glyphs,
+    their optional display-space and valid thousands separators.  The shared
+    v8 parser rejects malformed grouping, OCR substitutions and ambiguous
+    signs before ``Decimal`` is allowed to compare the digits.
+    """
+    if not isinstance(value, str):
+        return None
+    parsed = parse_amount_visible_format_target(value.strip())
+    if parsed is None:
+        return None
+    canonical = parsed.get("canonical_decimal")
+    if not isinstance(canonical, str):
+        return None
+    try:
+        decimal = Decimal(canonical)
+    except InvalidOperation:
+        return None
+    return decimal if decimal.is_finite() else None
+
+
+def _amount_semantic_text(value: Decimal | None) -> str | None:
+    return format(value, "f") if value is not None else None
+
+
 def _expected_receipts(records_path: Path, *, split: str) -> dict[str, dict[str, Any]]:
     expected: dict[str, dict[str, Any]] = {}
     for record in _load_jsonl(records_path):
@@ -171,22 +200,31 @@ def _expected_receipts(records_path: Path, *, split: str) -> dict[str, dict[str,
         if not isinstance(raw_slots, Mapping):
             raise EvaluationInputError(f"{records_path}: record {record.get('id')!r} has no slots object")
         references: dict[str, str] = {}
+        reference_diagnostics: dict[str, dict[str, Any]] = {}
         for field in FIELD_RESULT_KEYS:
             slot = raw_slots.get(field)
             if isinstance(slot, Mapping):
                 reference = _reference_text(field, slot)
                 if reference is not None:
                     references[field] = reference
+                    reference_diagnostics[field] = {
+                        "reference_crop_sha256": slot.get("crop_sha256"),
+                        "reference_detector_score": slot.get("detector_score"),
+                        "reference_bbox_rectified": slot.get("bbox_rectified"),
+                    }
         if key not in expected:
             expected[key] = {
                 "source": source,
                 "id": str(record.get("id", source)),
                 "group_id": record.get("group_id"),
+                "teacher_result_json": record.get("result_json"),
                 "references": references,
+                "reference_diagnostics": reference_diagnostics,
             }
             continue
         existing = expected[key]
         existing_references = existing["references"]
+        existing_diagnostics = existing["reference_diagnostics"]
         for field, reference in references.items():
             previous = existing_references.get(field)
             if previous is not None and previous != reference:
@@ -195,6 +233,7 @@ def _expected_receipts(records_path: Path, *, split: str) -> dict[str, dict[str,
                     f"{previous!r} and {reference!r}"
                 )
             existing_references[field] = reference
+            existing_diagnostics.setdefault(field, reference_diagnostics[field])
     if not expected:
         raise EvaluationInputError(f"{records_path}: no records with split={split!r}")
     return expected
@@ -230,6 +269,62 @@ def _candidate(result: Mapping[str, Any], result_key: str) -> tuple[str | None, 
     if not isinstance(candidate, str) or not candidate:
         return None, "candidate_missing"
     return candidate, None
+
+
+def _result_field_diagnostics(
+    result: Mapping[str, Any] | None,
+    *,
+    result_key: str,
+    detector_label: str,
+) -> dict[str, Any]:
+    if result is None:
+        return {
+            "ctc_candidate_text": None,
+            "structured_candidate_text": None,
+            "detection_bbox_image": None,
+            "detection_score": None,
+            "result_geometry": None,
+        }
+
+    fields = result.get("fields")
+    result_field = fields.get(result_key) if isinstance(fields, Mapping) else None
+    ctc_candidate = result_field.get("ctc_candidate") if isinstance(result_field, Mapping) else None
+    structured_candidate = (
+        result_field.get("structured_candidate") if isinstance(result_field, Mapping) else None
+    )
+
+    detection_bbox: list[float] | None = None
+    detection_score: float | None = None
+    detections = result.get("detections")
+    if isinstance(detections, list):
+        for detection in detections:
+            if not isinstance(detection, Mapping) or detection.get("label") != detector_label:
+                continue
+            raw_bbox = detection.get("bbox_image")
+            if (
+                isinstance(raw_bbox, list)
+                and len(raw_bbox) == 4
+                and all(isinstance(value, (int, float)) and not isinstance(value, bool) for value in raw_bbox)
+                and all(math.isfinite(float(value)) for value in raw_bbox)
+            ):
+                detection_bbox = [float(value) for value in raw_bbox]
+            raw_score = detection.get("score")
+            if (
+                isinstance(raw_score, (int, float))
+                and not isinstance(raw_score, bool)
+                and math.isfinite(float(raw_score))
+            ):
+                detection_score = float(raw_score)
+            break
+
+    geometry = result.get("geometry")
+    return {
+        "ctc_candidate_text": ctc_candidate if isinstance(ctc_candidate, str) else None,
+        "structured_candidate_text": structured_candidate if isinstance(structured_candidate, str) else None,
+        "detection_bbox_image": detection_bbox,
+        "detection_score": detection_score,
+        "result_geometry": dict(geometry) if isinstance(geometry, Mapping) else None,
+    }
 
 
 def _floor(value: str) -> float:
@@ -389,6 +484,31 @@ def _field_metrics(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _amount_semantic_metrics(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    records = len(rows)
+    reference_parseable = sum(row.get("reference_amount_decimal") is not None for row in rows)
+    candidate_parseable = sum(row.get("candidate_amount_decimal") is not None for row in rows)
+    comparable = sum(
+        row.get("reference_amount_decimal") is not None and row.get("candidate_amount_decimal") is not None
+        for row in rows
+    )
+    exact_matches = sum(bool(row.get("amount_semantic_exact")) for row in rows)
+    return {
+        "diagnostic_only": True,
+        "affects_acceptance": False,
+        "normalization": (
+            "strip surrounding whitespace; accept strict v8 CNY display grammar; remove ¥/￥, optional "
+            "currency space and valid thousands separators; compare canonical digits with Decimal"
+        ),
+        "records": records,
+        "reference_parseable_records": reference_parseable,
+        "candidate_parseable_records": candidate_parseable,
+        "comparable_records": comparable,
+        "exact_matches": exact_matches,
+        "exact_match": exact_matches / records if records else None,
+    }
+
+
 def score_results(
     *,
     records_path: Path,
@@ -461,25 +581,43 @@ def score_results(
             if not candidate_present:
                 missing_field_sources[field].append(str(truth["source"]))
                 receipt_complete = False
-            comparisons.append(
-                {
-                    "schema_version": SCHEMA_VERSION,
-                    "kind": "receipt_mlnet_unified_comparison_v1",
-                    "id": truth["id"],
-                    "group_id": truth["group_id"],
-                    "split": split,
-                    "source": truth["source"],
-                    "result_json": result_entry["path"].resolve().as_posix() if result_entry is not None else None,
-                    "manifest_status": result_entry["status"] if result_entry is not None else None,
-                    "field": field,
-                    "reference_text": reference,
-                    "candidate_text": candidate,
-                    "candidate_present": candidate_present,
-                    "missing_reason": missing_reason,
-                    "raw_exact": candidate == reference if candidate_present else False,
-                    "unified_model_sha256": result_entry["model_sha256"] if result_entry is not None else None,
-                }
+            comparison = {
+                "schema_version": SCHEMA_VERSION,
+                "kind": "receipt_mlnet_unified_comparison_v1",
+                "id": truth["id"],
+                "group_id": truth["group_id"],
+                "split": split,
+                "source": truth["source"],
+                "teacher_result_json": truth.get("teacher_result_json"),
+                "result_json": result_entry["path"].resolve().as_posix() if result_entry is not None else None,
+                "manifest_status": result_entry["status"] if result_entry is not None else None,
+                "field": field,
+                "reference_text": reference,
+                "candidate_text": candidate,
+                "candidate_present": candidate_present,
+                "missing_reason": missing_reason,
+                "raw_exact": candidate == reference if candidate_present else False,
+                "unified_model_sha256": result_entry["model_sha256"] if result_entry is not None else None,
+            }
+            comparison.update(truth["reference_diagnostics"].get(field, {}))
+            comparison.update(
+                _result_field_diagnostics(result, result_key=result_key, detector_label=field)
             )
+            if field == "amount":
+                reference_decimal = _amount_semantic_decimal(reference)
+                candidate_decimal = _amount_semantic_decimal(candidate)
+                comparison.update(
+                    {
+                        "reference_amount_decimal": _amount_semantic_text(reference_decimal),
+                        "candidate_amount_decimal": _amount_semantic_text(candidate_decimal),
+                        "amount_semantic_exact": (
+                            reference_decimal is not None
+                            and candidate_decimal is not None
+                            and reference_decimal == candidate_decimal
+                        ),
+                    }
+                )
+            comparisons.append(comparison)
         if receipt_complete:
             fully_scored_receipts += 1
 
@@ -488,6 +626,9 @@ def score_results(
         field: _field_metrics([row for row in comparisons if row["field"] == field])
         for field in FIELD_RESULT_KEYS
     }
+    amount_semantic = _amount_semantic_metrics(
+        [row for row in comparisons if row["field"] == "amount"]
+    )
     expected_keys = set(expected)
     extra_manifest_sources = sorted(
         str(entry["source"]) for key, entry in results.items() if key not in expected_keys
@@ -563,6 +704,7 @@ def score_results(
         "model_sha256": model_sha256,
         "artifact_audit": artifact_audit,
         "by_field": by_field,
+        "amount_semantic": amount_semantic,
         "floors": floors,
         "coverage": coverage,
         "missing": missing,

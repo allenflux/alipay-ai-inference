@@ -216,6 +216,109 @@ def test_score_counts_missing_result_and_candidate_as_errors(tmp_path: Path) -> 
     assert any("recipient_field: candidate_coverage=0.0000" in failure for failure in summary["failures"])
 
 
+def test_amount_semantic_is_diagnostic_only_and_preserves_digit_differences(tmp_path: Path) -> None:
+    model = tmp_path / "best.onnx"
+    model.write_bytes(b"unified-v12-model")
+    model_sha256 = hashlib.sha256(model.read_bytes()).hexdigest()
+    equivalent_source = tmp_path / "equivalent.png"
+    different_source = tmp_path / "different.png"
+    records = tmp_path / "unified_fields.jsonl"
+    equivalent_record = _record(
+        "equivalent",
+        equivalent_source,
+        amount_text="2000.00",
+        amount_visible="2000.00",
+        time_text="09:10",
+        time_visible="09:10",
+    )
+    equivalent_record["result_json"] = str(tmp_path / "teacher-equivalent.json")
+    different_record = _record(
+        "different",
+        different_source,
+        amount_text="300.00",
+        amount_visible="300.00",
+        time_text="09:10",
+        time_visible="09:10",
+    )
+    _write_jsonl(records, [equivalent_record, different_record])
+
+    results = tmp_path / "results"
+    manifest: list[dict[str, object]] = []
+    for name, source, amount, ctc, structured, bbox in (
+        ("equivalent", equivalent_source, " \t￥2,000.00 \n", "2000.00", "￥2,000.00", [10, 20, 110, 45]),
+        ("different", different_source, "￥301.00", "301.00", "￥301.00", [11, 21, 111, 46]),
+    ):
+        result = _result(
+            source,
+            model_sha256,
+            amount=amount,
+            time="09:10",
+            payment_method="余额",
+            recipient="商户甲",
+        )
+        amount_field = result["fields"]["amount"]
+        amount_field["ctc_candidate"] = ctc
+        amount_field["structured_candidate"] = structured
+        result["detections"] = [
+            {"label": "amount", "score": 0.987654, "bbox_image": bbox},
+        ]
+        result["geometry"] = {
+            "resize_mode": "letterbox",
+            "perspective_rectification": "not_applied",
+        }
+        result_path = results / f"{name}.json"
+        _write_json(result_path, result)
+        manifest.append({"source": str(source), "result": str(result_path), "status": "written"})
+    _write_json(results / "inference_manifest.json", manifest)
+    output = tmp_path / "evaluation"
+
+    summary = score_results(
+        records_path=records,
+        results_root=results,
+        model_path=model,
+        output_dir=output,
+        amount_floor=1.0,
+    )
+
+    # Both display strings remain strict failures, so this diagnostic cannot
+    # weaken the existing formal protection line.
+    assert not summary["accepted"]
+    assert summary["by_field"]["amount"]["raw_exact_matches"] == 0
+    assert any("amount: raw_exact_match=0.0000 < 1.0000" in failure for failure in summary["failures"])
+    assert summary["amount_semantic"] == {
+        "diagnostic_only": True,
+        "affects_acceptance": False,
+        "normalization": (
+            "strip surrounding whitespace; accept strict v8 CNY display grammar; remove ¥/￥, optional "
+            "currency space and valid thousands separators; compare canonical digits with Decimal"
+        ),
+        "records": 2,
+        "reference_parseable_records": 2,
+        "candidate_parseable_records": 2,
+        "comparable_records": 2,
+        "exact_matches": 1,
+        "exact_match": 0.5,
+    }
+
+    comparisons = [
+        json.loads(line)
+        for line in (output / "comparisons.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    amounts = {row["id"]: row for row in comparisons if row["field"] == "amount"}
+    assert amounts["equivalent"]["amount_semantic_exact"] is True
+    assert amounts["equivalent"]["reference_amount_decimal"] == "2000.00"
+    assert amounts["equivalent"]["candidate_amount_decimal"] == "2000.00"
+    assert amounts["equivalent"]["ctc_candidate_text"] == "2000.00"
+    assert amounts["equivalent"]["structured_candidate_text"] == "￥2,000.00"
+    assert amounts["equivalent"]["detection_bbox_image"] == [10.0, 20.0, 110.0, 45.0]
+    assert amounts["equivalent"]["detection_score"] == pytest.approx(0.987654)
+    assert amounts["equivalent"]["result_geometry"]["perspective_rectification"] == "not_applied"
+    assert amounts["equivalent"]["teacher_result_json"] == str(tmp_path / "teacher-equivalent.json")
+    assert amounts["different"]["amount_semantic_exact"] is False
+    assert amounts["different"]["reference_amount_decimal"] == "300.00"
+    assert amounts["different"]["candidate_amount_decimal"] == "301.00"
+
+
 def test_score_rejects_source_mismatch_and_wrong_model_sha(tmp_path: Path) -> None:
     model = tmp_path / "best.onnx"
     model.write_bytes(b"expected-model")
