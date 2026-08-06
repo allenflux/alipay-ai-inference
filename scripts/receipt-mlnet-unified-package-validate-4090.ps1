@@ -579,19 +579,24 @@ try {
             if ([string]$field.Value.delivery_policy -ne $textDeliveryPolicy) {
                 throw "Result $fieldName has the wrong delivery policy: $resultPath"
             }
-            $candidate = [string]$field.Value.candidate
+            $candidateProperty = $field.Value.PSObject.Properties["candidate"]
+            $candidate = if ($null -eq $candidateProperty) { $null } else { [string]$candidateProperty.Value }
+            $valueProperty = $field.Value.PSObject.Properties["value"]
+            $fieldValue = if ($null -eq $valueProperty) { $null } else { $valueProperty.Value }
+            $deliveryValueProperty = $field.Value.PSObject.Properties["delivery_value"]
+            $fieldDeliveryValue = if ($null -eq $deliveryValueProperty) { $null } else { $deliveryValueProperty.Value }
             if ([string]::IsNullOrWhiteSpace($candidate)) {
                 $receiptCandidateComplete = $false
                 if ([string]$field.Value.state -notin @("absent", "unreadable") `
-                    -or ($null -ne $field.Value.value -and [string]$field.Value.value -ne $textReviewValue) `
-                    -or ($null -ne $field.Value.delivery_value -and [string]$field.Value.delivery_value -ne $textReviewValue)) {
+                    -or ($null -ne $fieldValue -and [string]$fieldValue -ne $textReviewValue) `
+                    -or ($null -ne $fieldDeliveryValue -and [string]$fieldDeliveryValue -ne $textReviewValue)) {
                     throw "Result $fieldName has an invalid fail-closed missing-candidate state: $resultPath"
                 }
                 continue
             }
             $candidateByField[$fieldName]++
-            if ([string]$field.Value.delivery_value -ne $textReviewValue `
-                -or [string]$field.Value.value -ne $textReviewValue `
+            if ([string]$fieldDeliveryValue -ne $textReviewValue `
+                -or [string]$fieldValue -ne $textReviewValue `
                 -or [string]$field.Value.state -ne "review") {
                 throw "Result $fieldName candidate escaped the required review-only policy: $resultPath"
             }
