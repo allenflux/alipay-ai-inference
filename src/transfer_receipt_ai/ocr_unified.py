@@ -1204,6 +1204,47 @@ def _validate_recipient_train_augmentation_policy(policy: object) -> dict[str, o
     return expected
 
 
+def _recipient_train_split_policy(splits: Sequence[str]) -> dict[str, object]:
+    """Validate which manifest splits are allowed to supervise recipient CTC.
+
+    The default remains a normal held-out validation setup: train split only.
+    A recipient-only Paddle-fit run may deliberately include ``val`` (or, for a
+    closed deployment fit, ``test``) as teacher-labelled recipient supervision.
+    That mode is useful when Paddle is the accepted truth source, but the
+    resulting validation number is transductive and must not be reported as an
+    independent generalisation estimate.
+    """
+
+    if isinstance(splits, str):
+        raise ValueError("recipient_train_splits must be a sequence, not a string")
+    allowed = {"train", "val", "test"}
+    ordered: list[str] = []
+    for split in splits:
+        if split not in allowed:
+            raise ValueError("recipient_train_splits must contain only train, val, or test")
+        if split not in ordered:
+            ordered.append(split)
+    if not ordered:
+        raise ValueError("recipient_train_splits must not be empty")
+    if "train" not in ordered:
+        raise ValueError("recipient_train_splits must include train")
+    if ordered == ["train"]:
+        return {
+            "mode": "standard_train_only",
+            "splits": ordered,
+            "warning": None,
+        }
+    return {
+        "mode": "paddle_fit_transductive_v1",
+        "splits": ordered,
+        "warning": (
+            "Recipient-only training includes non-train Paddle-labelled splits. "
+            "Validation on an included split measures Paddle-fit on seen teacher targets, "
+            "not independent generalisation."
+        ),
+    }
+
+
 def _validate_recipient_sampling_policy(policy: object) -> dict[str, object]:
     """Validate the provenance of v11's receipt-level oversampling.
 
@@ -5807,6 +5848,7 @@ def train_unified_reader(
     recipient_tail_long_text_min_length: int = 0,
     recipient_tail_long_text_loss_weight: float = 1.0,
     recipient_train_augmentation: str = "none",
+    recipient_train_splits: Sequence[str] = ("train",),
     recipient_only_fine_tune: bool = False,
     recipient_open_text_unfreeze_legacy: bool = False,
     validation_every: int = 1,
@@ -5836,11 +5878,14 @@ def train_unified_reader(
     otherwise its final delivery policy is review-only.
     """
     config.validate()
+    recipient_train_split_policy = _recipient_train_split_policy(recipient_train_splits)
     if recipient_only_fine_tune:
         if not _is_v12(config):
             raise ValueError("recipient_only_fine_tune is supported only by architecture v12")
         if init_checkpoint is None:
             raise ValueError("recipient_only_fine_tune requires a compatible --init-checkpoint")
+    elif recipient_train_split_policy["mode"] != "standard_train_only":
+        raise ValueError("recipient_train_splits beyond train are supported only by recipient_only_fine_tune")
     if recipient_open_text_unfreeze_legacy and (
         not recipient_only_fine_tune
         or init_checkpoint_mode != INIT_CHECKPOINT_MODE_RECIPIENT_OPEN_TEXT_ADAPTER
@@ -5984,8 +6029,14 @@ def train_unified_reader(
     amount_to_id = {character: index for index, character in enumerate(amount_characters, start=1)}
     time_characters = list(_time_characters(config))
     time_to_id = {character: index for index, character in enumerate(time_characters, start=1)}
+    recipient_train_split_set = set(recipient_train_split_policy["splits"])
+    recipient_charset_records = (
+        [record for record in records if str(record["split"]) in recipient_train_split_set]
+        if recipient_only_fine_tune
+        else train_records
+    )
     if _uses_recipient_protocol(config):
-        recipient_characters: list[str] | None = _recipient_charset(train_records)
+        recipient_characters: list[str] | None = _recipient_charset(recipient_charset_records)
     else:
         recipient_characters = None
     if _uses_modern_protocol(config):
@@ -6051,7 +6102,10 @@ def train_unified_reader(
     training_records = train_records
     if recipient_only_fine_tune:
         training_records = [
-            record for record in train_records if _slot_text(record, "recipient_field") is not None
+            record
+            for record in records
+            if str(record["split"]) in recipient_train_split_set
+            and _slot_text(record, "recipient_field") is not None
         ]
         if not training_records:
             raise ValueError("recipient_only_fine_tune requires at least one train receipt with recipient_field")
@@ -6099,6 +6153,7 @@ def train_unified_reader(
         "cuda_tf32_requested": cuda_tf32,
         "cudnn_benchmark_requested": cudnn_benchmark,
         "recipient_only_private_branch_training": recipient_only_fine_tune,
+        "recipient_train_split_policy": recipient_train_split_policy,
         "full_validation_schedule": "epoch_1_every_n_and_final_epoch",
         "validation_every": validation_every,
     }
@@ -6314,6 +6369,7 @@ def train_unified_reader(
                     "recipient_confidence_policy": recipient_confidence_policy,
                     "recipient_tail_loss_policy": recipient_tail_loss_policy,
                     "recipient_train_augmentation_policy": recipient_train_augmentation_policy,
+                    "recipient_train_split_policy": recipient_train_split_policy,
                     **_recipient_artifact_metadata(
                         config,
                         recipient_sampling_policy=recipient_sampling_policy,
@@ -6447,6 +6503,7 @@ def train_unified_reader(
                 "recipient_confidence_policy": recipient_confidence_policy,
                 "recipient_tail_loss_policy": recipient_tail_loss_policy,
                 "recipient_train_augmentation_policy": recipient_train_augmentation_policy,
+                "recipient_train_split_policy": recipient_train_split_policy,
                 "status_classes": list(STATUS_CLASSES),
                 "field_counts": field_counts,
                 "status_class_counts": status_counts,
@@ -6735,6 +6792,7 @@ def train_unified_reader(
                     "recipient_confidence_policy": recipient_confidence_policy,
                     "recipient_tail_loss_policy": recipient_tail_loss_policy,
                     "recipient_train_augmentation_policy": recipient_train_augmentation_policy,
+                    "recipient_train_split_policy": recipient_train_split_policy,
                     **_recipient_artifact_metadata(
                         config,
                         recipient_sampling_policy=recipient_sampling_policy,
@@ -6802,6 +6860,7 @@ def train_unified_reader(
                 "recipient_confidence_policy": recipient_confidence_policy,
                 "recipient_tail_loss_policy": recipient_tail_loss_policy,
                 "recipient_train_augmentation_policy": recipient_train_augmentation_policy,
+                "recipient_train_split_policy": recipient_train_split_policy,
                 "checkpoint_selection_policy": checkpoint_selection_policy,
                 "initialization": initialization,
                 "training_runtime": training_runtime,
@@ -9704,6 +9763,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     train.add_argument(
+        "--recipient-train-splits",
+        nargs="+",
+        choices=("train", "val", "test"),
+        default=["train"],
+        help=(
+            "v12 recipient-only fine-tune only: manifest splits allowed to supervise recipient CTC. "
+            "Default train preserves an independent val metric; adding val is a Paddle-fit/transductive recipe."
+        ),
+    )
+    train.add_argument(
         "--recipient-only-fine-tune",
         action="store_true",
         help=(
@@ -10065,6 +10134,7 @@ def main(argv: list[str] | None = None) -> None:
                 recipient_tail_long_text_min_length=args.recipient_tail_long_text_min_length,
                 recipient_tail_long_text_loss_weight=args.recipient_tail_long_text_loss_weight,
                 recipient_train_augmentation=args.recipient_train_augmentation,
+                recipient_train_splits=tuple(args.recipient_train_splits),
                 recipient_only_fine_tune=args.recipient_only_fine_tune,
                 recipient_open_text_unfreeze_legacy=args.recipient_open_text_unfreeze_legacy,
                 validation_every=args.validation_every,

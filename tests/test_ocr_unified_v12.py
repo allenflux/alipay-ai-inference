@@ -39,6 +39,7 @@ from transfer_receipt_ai.ocr_unified import (
     _recipient_tail_loss_policy,
     _recipient_target_mode,
     _recipient_time_steps,
+    _recipient_train_split_policy,
     _slot_order,
     audit_recipient_trims_onnx,
     build_unified_reader,
@@ -158,6 +159,28 @@ def test_v12_forward_requires_private_high_resolution_recipient_input() -> None:
     # The private high-resolution branch downsamples the 128px recipient
     # input horizontally by four, independently of the 64px field tensor.
     assert list(outputs[-1].shape) == [32, 2, 9]
+
+
+def test_recipient_train_split_policy_defaults_to_independent_train_only() -> None:
+    assert _recipient_train_split_policy(("train",)) == {
+        "mode": "standard_train_only",
+        "splits": ["train"],
+        "warning": None,
+    }
+
+
+def test_recipient_train_split_policy_marks_paddle_fit_as_transductive() -> None:
+    policy = _recipient_train_split_policy(("train", "val", "val"))
+
+    assert policy["mode"] == "paddle_fit_transductive_v1"
+    assert policy["splits"] == ["train", "val"]
+    assert "not independent generalisation" in str(policy["warning"])
+
+
+@pytest.mark.parametrize("splits", [(), ("val",), ("train", "holdout")])
+def test_recipient_train_split_policy_rejects_unsafe_values(splits: tuple[str, ...]) -> None:
+    with pytest.raises(ValueError):
+        _recipient_train_split_policy(splits)
 
 
 def test_v12_recipient_logits_ignore_reserved_fifth_slot_but_use_private_input() -> None:

@@ -54,6 +54,8 @@ param(
     [int]$RecipientTailLongTextMinLength = 0,
     [ValidateRange(1.0, 16.0)]
     [double]$RecipientTailLongTextLossWeight = 1.0,
+    [ValidateSet("train", "val", "test")]
+    [string[]]$RecipientTrainSplits = @("train"),
     [ValidateRange(0.000001, 1.0)]
     [double]$LearningRate = 0.0001,
     [ValidateRange(0, 16)]
@@ -210,6 +212,7 @@ $persistentWorkers = if ($NumWorkers -gt 0) { "on" } else { "off" }
 Write-Host ("  recipe: recipient-only, lr={0}, workers={1}, persistent-workers={2}, prefetch={3}, validate-every={4}, TF32=on, cuDNN-benchmark=on" -f $LearningRate, $NumWorkers, $persistentWorkers, $PrefetchFactor, $ValidationEvery)
 Write-Host ("  recipient teacher confidence: below {0} x{1}, curriculum-epochs={2}" -f $RecipientLowConfidenceThreshold, $RecipientLowConfidenceLossWeight, $RecipientConfidenceCurriculumEpochs)
 Write-Host ("  recipient-tail CTC: rare-support<={0} x{1}; long-length>={2} x{3}; max(), no receipt resampling" -f $RecipientTailRareCharacterMaxSupport, $RecipientTailRareCharacterLossWeight, $RecipientTailLongTextMinLength, $RecipientTailLongTextLossWeight)
+Write-Host ("  recipient train splits: {0}" -f ($RecipientTrainSplits -join ","))
 Write-Host ("  recipient target: {0:P2} strict exact ({1})" -f $RecipientFloor, $(if ($DiagnosticOnly) { "diagnostic only" } else { "required" }))
 try {
     & nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
@@ -266,8 +269,12 @@ if ([double]$baselineAmount.raw_exact_match -lt $AmountFloor -or
     [double]$baselinePayment.raw_exact_match -lt $PaymentFloor) {
     throw "The warm-start seed does not satisfy the requested floors on this exact r3 val split. Recalibrate metric/split before training."
 }
-if ([double]$baselineRecipient.oov_reference_rate -gt (1.0 - $RecipientFloor)) {
+$transductiveRecipientFit = ($RecipientTrainSplits -contains "val") -or ($RecipientTrainSplits -contains "test")
+if (-not $transductiveRecipientFit -and [double]$baselineRecipient.oov_reference_rate -gt (1.0 - $RecipientFloor)) {
     throw "Recipient val OOV alone makes the requested strict exact target impossible without charset/data changes; refusing to spend training epochs."
+}
+if ($transductiveRecipientFit) {
+    Write-Host "recipient val OOV precheck skipped: recipient_train_splits includes held-out Paddle-labelled data."
 }
 
 # Freeze every non-recipient v12 parameter and disable receipt-level
@@ -341,6 +348,8 @@ if ($NumWorkers -gt 0) {
     # avoids Windows worker respawn while preserving deterministic augmentation.
     $trainArgs += "--persistent-workers"
 }
+$trainArgs += "--recipient-train-splits"
+$trainArgs += $RecipientTrainSplits
 
 # A successful full run must prove that the exported delivery artifact, not
 # just its in-memory PyTorch checkpoint, clears the same r3 guardrails.
@@ -401,6 +410,8 @@ finally {
             FineTune = $summary.fine_tune_policy.mode
             TrainForward = $summary.fine_tune_policy.training_forward
             RecipientTrainRecords = $summary.fine_tune_policy.recipient_train_records
+            RecipientTrainSplitPolicy = $summary.recipient_train_split_policy.mode
+            RecipientTrainSplits = ($summary.recipient_train_split_policy.splits -join ",")
             RecipientTailMode = $tailMode
             RecipientTailTrainRecords = $tailRecipientRecords
             RecipientTailRareHits = $tailRareHits
