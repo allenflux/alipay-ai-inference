@@ -469,7 +469,12 @@ try {
     Require-File $manifestPath "ML.NET inference manifest"
     Require-File $errorsPath "ML.NET inference errors"
     Require-File $runtimeSummaryPath "ML.NET inference summary"
-    $allManifest = @(Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json)
+    # Windows PowerShell 5.1 emits a JSON top-level array as one pipeline
+    # object. Do not wrap the command itself in @(...), which would report a
+    # batch of N records as Count=1; retain the decoded array and use its own
+    # Count property instead.
+    $allManifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    $manifestCount = if ($null -eq $allManifest) { 0 } else { [int]$allManifest.Count }
     $runtimeSummary = Get-Content -LiteralPath $runtimeSummaryPath -Raw -Encoding UTF8 | ConvertFrom-Json
     $errorText = Get-Content -LiteralPath $errorsPath -Raw -Encoding UTF8
     $errorCount = [int]$runtimeSummary.errors
@@ -505,8 +510,8 @@ try {
     $written = @($allManifest | Where-Object { [string]$_.status -eq "written" }).Count
     $skipped = @($allManifest | Where-Object { [string]$_.status -eq "skipped_existing" }).Count
     $unknownStatuses = @($allManifest | Where-Object { [string]$_.status -notin @("written", "skipped_existing") })
-    if ($allManifest.Count + $errorCount -ne $expectedRecords) {
-        throw "Validation accounting mismatch: selected=$expectedRecords manifest=$($allManifest.Count) errors=$errorCount"
+    if ($manifestCount + $errorCount -ne $expectedRecords) {
+        throw "Validation accounting mismatch: selected=$expectedRecords manifest=$manifestCount errors=$errorCount"
     }
     if ($written -ne $expectedRecords -or $skipped -ne 0 -or $unknownStatuses.Count -ne 0 -or $errorCount -ne 0) {
         throw "Validation was not clean: selected=$expectedRecords written=$written skipped=$skipped errors=$errorCount"
