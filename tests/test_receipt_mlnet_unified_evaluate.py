@@ -149,6 +149,9 @@ def test_score_matches_v12_references_and_accepts_uniform_model(tmp_path: Path) 
     )
 
     assert summary["accepted"]
+    assert summary["kind"] == "receipt_mlnet_unified_candidate_evaluation_v1"
+    assert "evaluation_scope" not in summary
+    assert "formal_delivery_gate" not in summary
     assert summary["failures"] == []
     assert summary["artifact_audit"]["all_results_match_model"]
     assert summary["coverage"]["result_coverage"] == 1.0
@@ -302,3 +305,79 @@ def test_cli_score_returns_one_after_writing_failed_report(tmp_path: Path) -> No
 
     assert exit_code == 1
     assert (output / "summary.json").is_file()
+
+
+def test_score_limit_uses_records_prefix_without_counting_full_val_tail_missing(tmp_path: Path) -> None:
+    model = tmp_path / "best.onnx"
+    model.write_bytes(b"unified-v12-model")
+    model_sha256 = hashlib.sha256(model.read_bytes()).hexdigest()
+    sources = [tmp_path / f"{name}.png" for name in ("first", "second", "third")]
+    records = tmp_path / "unified_fields.jsonl"
+    _write_jsonl(
+        records,
+        [
+            _record("first", sources[0], recipient="商户甲"),
+            _record("second", sources[1], recipient="商户乙"),
+            _record("third", sources[2], recipient="商户丙"),
+        ],
+    )
+    results = tmp_path / "results"
+    manifest: list[dict[str, object]] = []
+    for index, source in enumerate(sources[:1]):
+        result_path = results / f"result-{index}.json"
+        _write_json(
+            result_path,
+            _result(
+                source,
+                model_sha256,
+                amount="¥ 1,234.56",
+                time="2026-08-06 07:08:09",
+                payment_method="余额",
+                recipient="商户甲",
+            ),
+        )
+        manifest.append({"source": str(source), "result": str(result_path), "status": "written"})
+    _write_json(results / "inference_manifest.json", manifest)
+    output = tmp_path / "evaluation"
+
+    exit_code = main(
+        [
+            "score",
+            "--records",
+            str(records),
+            "--results",
+            str(results),
+            "--model",
+            str(model),
+            "--output",
+            str(output),
+            "--limit",
+            "1",
+        ]
+    )
+
+    summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
+    assert exit_code == 0
+    assert summary["kind"] == "receipt_mlnet_unified_candidate_partial_pilot_evaluation_v1"
+    assert summary["evaluation_scope"] == {
+        "kind": "partial_pilot",
+        "requested_limit": 1,
+        "evaluated_expected_receipts": 1,
+        "full_split_expected_receipts": 3,
+        "selection_order": "first_unique_source_in_records_manifest_order",
+        "formal_delivery_gate": False,
+    }
+    assert summary["coverage"]["expected_receipts"] == 1
+    assert summary["missing"]["result_receipts"] == 0
+    assert summary["failures"] == []
+    assert summary["pilot_thresholds_passed"] is True
+    assert summary["formal_delivery_gate"] is False
+    assert summary["accepted"] is False
+    assert summary["acceptance"]["passed"] is False
+    assert summary["acceptance"]["pilot_thresholds_passed"] is True
+    assert "partial_pilot" in summary["warning"]
+    assert "formal_delivery_gate=false" in summary["warning"]
+
+    comparisons = [json.loads(line) for line in (output / "comparisons.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert {row["id"] for row in comparisons} == {"first"}
+    assert len(comparisons) == 4

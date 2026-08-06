@@ -27,6 +27,16 @@ internal sealed record UnifiedOcrReadResult(
     string TextRuntimePolicy);
 
 /// <summary>
+/// Observability-only timing for the unified reader.  The three measurements
+/// bracket the existing input construction, single ONNX Runtime Run call and
+/// output materialisation/decoding respectively.
+/// </summary>
+internal sealed record UnifiedOcrStageLatency(
+    double PreprocessMs,
+    double InferenceMs,
+    double PostprocessMs);
+
+/// <summary>
 /// One-session implementation of architecture-v12 unified receipt OCR.
 /// Every receipt produces exactly one ONNX Runtime Run call with the two
 /// fixed contract inputs.  The model, labels and contract are verified by
@@ -76,8 +86,12 @@ internal sealed class UnifiedOcrEngine : IDisposable
     /// Builds the frozen two-input ABI and invokes the model once.  Missing
     /// detection/crop slots stay all-white and are intentionally not decoded.
     /// </summary>
-    public UnifiedOcrReadResult RecognizeReceipt(Image<Rgb24> source, IReadOnlyList<DetectionResult> detections)
+    public UnifiedOcrReadResult RecognizeReceipt(
+        Image<Rgb24> source,
+        IReadOnlyList<DetectionResult> detections,
+        out UnifiedOcrStageLatency stageLatency)
     {
+        var stageStopwatch = System.Diagnostics.Stopwatch.StartNew();
         var byLabel = detections.ToDictionary(item => item.Label, StringComparer.Ordinal);
         var fieldValues = Enumerable.Repeat(1.0f, checked(5 * _bundle.FieldHeight * _bundle.FieldWidth)).ToArray();
         var recipientValues = Enumerable.Repeat(1.0f, checked(_bundle.RecipientHeight * _bundle.RecipientWidth)).ToArray();
@@ -98,10 +112,15 @@ internal sealed class UnifiedOcrEngine : IDisposable
             NamedOnnxValue.CreateFromTensor(FieldImagesInput, fieldTensor),
             NamedOnnxValue.CreateFromTensor(RecipientValueInput, recipientTensor),
         };
+        var preprocessMs = StopAndReadMilliseconds(stageStopwatch);
 
         Dictionary<string, OrtOutput> outputs;
+        double inferenceMs;
+        stageStopwatch.Restart();
         using (IDisposableReadOnlyCollection<DisposableNamedOnnxValue> runtimeOutputs = _session.Run(inputs))
         {
+            inferenceMs = StopAndReadMilliseconds(stageStopwatch);
+            stageStopwatch.Restart();
             outputs = ReadOutputs(runtimeOutputs);
         }
 
@@ -134,7 +153,7 @@ internal sealed class UnifiedOcrEngine : IDisposable
             statusConfidence = status.Confidence;
         }
 
-        return new UnifiedOcrReadResult(
+        var result = new UnifiedOcrReadResult(
             candidates,
             statusCandidate,
             statusConfidence,
@@ -142,6 +161,15 @@ internal sealed class UnifiedOcrEngine : IDisposable
             _bundle.StatusRuntimePolicy,
             _bundle.TextReviewValue,
             _bundle.TextRuntimePolicy);
+        var postprocessMs = StopAndReadMilliseconds(stageStopwatch);
+        stageLatency = new UnifiedOcrStageLatency(preprocessMs, inferenceMs, postprocessMs);
+        return result;
+    }
+
+    private static double StopAndReadMilliseconds(System.Diagnostics.Stopwatch stopwatch)
+    {
+        stopwatch.Stop();
+        return Math.Round(stopwatch.Elapsed.TotalMilliseconds, 4);
     }
 
     public void Dispose() => _session.Dispose();

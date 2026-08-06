@@ -242,6 +242,16 @@ def _floor(value: str) -> float:
     return parsed
 
 
+def _limit(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exception:
+        raise argparse.ArgumentTypeError("must be a non-negative integer") from exception
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be a non-negative integer")
+    return parsed
+
+
 def _load_manifest_results(
     *,
     manifest_path: Path,
@@ -391,6 +401,7 @@ def score_results(
     time_floor: float = DEFAULT_TIME_FLOOR,
     payment_floor: float = DEFAULT_PAYMENT_FLOOR,
     recipient_floor: float = DEFAULT_RECIPIENT_FLOOR,
+    limit: int = 0,
 ) -> dict[str, Any]:
     records_path = records_path.resolve()
     results_root = results_root.resolve()
@@ -405,13 +416,22 @@ def score_results(
     }.items():
         if isinstance(floor, bool) or not math.isfinite(float(floor)) or not 0.0 <= float(floor) <= 1.0:
             raise EvaluationInputError(f"{name} must be between 0 and 1")
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+        raise EvaluationInputError("limit must be a non-negative integer")
     if not model_path.is_file():
         raise EvaluationInputError(f"Unified ONNX model not found: {model_path}")
     if not manifest_path.is_file():
         raise EvaluationInputError(f"ML.NET inference manifest not found: {manifest_path}")
 
     model_sha256 = _sha256(model_path)
-    expected = _expected_receipts(records_path, split=split)
+    full_expected = _expected_receipts(records_path, split=split)
+    full_expected_count = len(full_expected)
+    # ``prepare`` emits sources in the first-seen order of the records
+    # manifest.  Preserve that same order here so ``--limit N`` evaluates the
+    # exact prefix sent to the ML.NET ``--input-list`` invocation.  In
+    # particular, never choose a convenient prefix from the results that
+    # happened to be written successfully.
+    expected = dict(list(full_expected.items())[:limit]) if limit > 0 else full_expected
     results, artifact_audit, integrity_failures = _load_manifest_results(
         manifest_path=manifest_path,
         model_sha256=model_sha256,
@@ -529,6 +549,7 @@ def score_results(
         if float(observed) < floor:
             failures.append(f"{field}: raw_exact_match={float(observed):.4f} < {floor:.4f}")
 
+    sample_thresholds_passed = not failures
     summary: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "kind": "receipt_mlnet_unified_candidate_evaluation_v1",
@@ -545,10 +566,10 @@ def score_results(
         "floors": floors,
         "coverage": coverage,
         "missing": missing,
-        "accepted": not failures,
+        "accepted": sample_thresholds_passed,
         "failures": failures,
         "acceptance": {
-            "passed": not failures,
+            "passed": sample_thresholds_passed,
             "failures": failures,
             "min_amount_exact_match": float(amount_floor),
             "min_time_exact_match": float(time_floor),
@@ -560,6 +581,33 @@ def score_results(
             "independently verified business truth, and the artifact's business values remain review-only."
         ),
     }
+    if limit > 0:
+        # A subset is useful for fast diagnostics, but it must never be
+        # consumable as formal delivery evidence.  Keep threshold failures
+        # separate so the CLI can still return 0/1 for the pilot itself while
+        # all delivery-acceptance flags remain fail-closed.
+        summary["kind"] = "receipt_mlnet_unified_candidate_partial_pilot_evaluation_v1"
+        summary["evaluation_scope"] = {
+            "kind": "partial_pilot",
+            "requested_limit": limit,
+            "evaluated_expected_receipts": len(expected),
+            "full_split_expected_receipts": full_expected_count,
+            "selection_order": "first_unique_source_in_records_manifest_order",
+            "formal_delivery_gate": False,
+        }
+        summary["formal_delivery_gate"] = False
+        summary["pilot_thresholds_passed"] = sample_thresholds_passed
+        summary["accepted"] = False
+        summary["acceptance"]["passed"] = False
+        summary["acceptance"]["formal_delivery_gate"] = False
+        summary["acceptance"]["pilot_thresholds_passed"] = sample_thresholds_passed
+        summary["warning"] = (
+            "partial_pilot: only the first "
+            f"{len(expected)} of {full_expected_count} expected {split} receipt source(s) were evaluated; "
+            "formal_delivery_gate=false and this report cannot be accepted as delivery evidence. "
+            "It compares ML.NET candidate text with v12 manifest labels; Paddle-derived labels are not "
+            "independently verified business truth, and business values remain review-only."
+        )
     output_dir.mkdir(parents=True, exist_ok=True)
     _atomic_write_jsonl(output_dir / "comparisons.jsonl", comparisons)
     _atomic_write_json(output_dir / "summary.json", summary)
@@ -586,6 +634,12 @@ def _parser() -> argparse.ArgumentParser:
     score.add_argument("--time-floor", type=_floor, default=DEFAULT_TIME_FLOOR)
     score.add_argument("--payment-floor", type=_floor, default=DEFAULT_PAYMENT_FLOOR)
     score.add_argument("--recipient-floor", type=_floor, default=DEFAULT_RECIPIENT_FLOOR)
+    score.add_argument(
+        "--limit",
+        type=_limit,
+        default=0,
+        help="evaluate only the first N expected sources in records/input-list order; 0 evaluates all",
+    )
     return parser
 
 
@@ -611,6 +665,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             time_floor=args.time_floor,
             payment_floor=args.payment_floor,
             recipient_floor=args.recipient_floor,
+            limit=args.limit,
         )
         metrics = summary["by_field"]
         rendered = ", ".join(

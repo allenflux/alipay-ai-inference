@@ -64,10 +64,13 @@ unified OCR ONNX 在生产推理时都不加载 Paddle、PaddleOCR 或 Python。
 ```powershell
 Set-Location D:\alipay-ai-data\alipay-ai-inference
 & .\scripts\receipt-mlnet-production-cpu-validate.ps1 -Mode smoke
+& .\scripts\receipt-mlnet-production-cpu-validate.ps1 -Mode pilot -PilotLimit 100
 & .\scripts\receipt-mlnet-production-cpu-validate.ps1 -Mode formal
 ```
 
-第一条只跑 CPU 接线与速度冒烟，第二条才执行完整 val、四字段评分和正式原子发布。下面是
+第一条只跑 CPU 接线与速度冒烟；第二条按 manifest 顺序跑前 100 张并评分，但报告会固定
+标为 `partial_pilot`、`formal_delivery_gate=false`，只能用于决定是否值得跑全量；第三条才
+执行完整 val、四字段评分和正式原子发布。下面是
 等价的展开命令，便于改路径或接入 CI。
 
 ### 1. CPU 单图冒烟（只验证接线，不是正式门槛）
@@ -140,7 +143,8 @@ $cpuPackage = "D:\alipay-ai-data\delivery\ReceiptMlNet-wide1536-cpu-production"
 
 CPU 性能证据写在 `$cpuOutput\inference_summary.json`，其中
 `inference_latency_ms.mean/p50/p95` 分别是本次 CPU 全量运行的平均、P50 和 P95
-单图模型推理耗时。相同文件会复制到
+单图模型推理耗时；`stage_latency_ms` 进一步拆出图像加载、设备识别、检测预处理/推理/
+后处理、统一 OCR 预处理/推理/后处理与结果组装。相同文件会复制到
 `$cpuPackage\evidence\inference_summary.json`；控制台末尾也会打印 `mean-ms`、
 `p50-ms` 和 `p95-ms`。正式报告必须引用这组 CPU 数值，不能引用 GPU 数值替代。
 

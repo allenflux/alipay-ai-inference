@@ -1,11 +1,13 @@
 [CmdletBinding()]
 param(
-    [ValidateSet("smoke", "formal")]
+    [ValidateSet("smoke", "pilot", "formal")]
     [string]$Mode = "formal",
     [string]$TeacherRoot = "D:\alipay-ai-data\receipt-lite-teacher-120k-v1",
     [string]$RunDirectory,
     [ValidateRange(1, 1000)]
-    [int]$SmokeLimit = 1
+    [int]$SmokeLimit = 1,
+    [ValidateRange(1, 10000)]
+    [int]$PilotLimit = 100
 )
 
 Set-StrictMode -Version Latest
@@ -57,6 +59,33 @@ if ($Mode -eq "smoke") {
         -IncludeDeviceModel `
         -Annotate all
 }
+elseif ($Mode -eq "pilot") {
+    $output = Join-Path $validationRoot "mlnet-wide1536-cpu-pilot-$PilotLimit-$tag"
+    $evaluation = Join-Path $validationRoot "mlnet-wide1536-cpu-pilot-$PilotLimit-e2e-$tag"
+    $delivery = Join-Path $deliveryRoot "ReceiptMlNet-wide1536-cpu-pilot-$PilotLimit-$tag"
+    Write-Host "mlnet_production_cpu_pilot"
+    & $packager `
+        -RunDirectory $RunDirectory `
+        -InputList $inputList `
+        -Output $output `
+        -DeliveryDir $delivery `
+        -Limit $PilotLimit `
+        -RuntimeFlavor cpu `
+        -IncludeDeviceModel `
+        -Annotate none
+    & $pythonExe $scorer score `
+        --records $records `
+        --results $output `
+        --model (Join-Path $RunDirectory "best.onnx") `
+        --output $evaluation `
+        --split val `
+        --limit $PilotLimit
+    $pilotScoreExitCode = $LASTEXITCODE
+    if (-not (Test-Path -LiteralPath (Join-Path $evaluation "summary.json"))) {
+        throw "CPU pilot scorer did not write summary.json; exit code $pilotScoreExitCode"
+    }
+    Write-Host "  pilot-score-exit=$pilotScoreExitCode"
+}
 else {
     $output = Join-Path $validationRoot "mlnet-wide1536-cpu-full-$tag"
     $evaluation = Join-Path $validationRoot "mlnet-wide1536-cpu-full-e2e-$tag"
@@ -78,7 +107,7 @@ Write-Host "mlnet_production_cpu_complete"
 Write-Host "  mode=$Mode"
 Write-Host "  input-list=$inputList"
 Write-Host "  output=$output"
-if ($Mode -eq "formal") {
+if ($Mode -in @("pilot", "formal")) {
     Write-Host "  evaluation=$evaluation"
 }
 Write-Host "  delivery=$delivery"

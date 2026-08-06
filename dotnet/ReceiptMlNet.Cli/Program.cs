@@ -91,6 +91,7 @@ internal static class ReceiptMlNetProgram
         }
         var manifest = new List<ManifestRecord>();
         var inferenceLatencies = new List<double>();
+        var stageLatencies = new List<InferenceStageLatency>();
         var errorCount = 0;
         Exception? fatalException = null;
         var errorsPath = Path.Combine(options.OutputDirectory, "inference_errors.jsonl");
@@ -137,7 +138,14 @@ internal static class ReceiptMlNetProgram
             try
             {
                 var inferenceStopwatch = Stopwatch.StartNew();
-                var result = InferImage(inputFile, detector, deviceClassifier, ocrEngine, unifiedOcrEngine, options.ScoreThreshold);
+                var result = InferImage(
+                    inputFile,
+                    detector,
+                    deviceClassifier,
+                    ocrEngine,
+                    unifiedOcrEngine,
+                    options.ScoreThreshold,
+                    out var stageLatency);
                 inferenceStopwatch.Stop();
                 var inferenceMs = Math.Round(inferenceStopwatch.Elapsed.TotalMilliseconds, 4);
                 if (options.RequireComplete)
@@ -172,8 +180,10 @@ internal static class ReceiptMlNetProgram
                     "written",
                     annotationPaths.Rectified,
                     annotationPaths.Original,
-                    inferenceMs));
+                    inferenceMs,
+                    stageLatency));
                 inferenceLatencies.Add(inferenceMs);
+                stageLatencies.Add(stageLatency);
             }
             catch (Exception exception)
             {
@@ -200,7 +210,8 @@ internal static class ReceiptMlNetProgram
             skippedCount,
             errorCount,
             Math.Round(totalStopwatch.Elapsed.TotalSeconds, 4),
-            SummarizeLatencies(inferenceLatencies));
+            SummarizeLatencies(inferenceLatencies),
+            SummarizeStageLatencies(stageLatencies));
         WriteJsonAtomic(Path.Combine(options.OutputDirectory, "inference_summary.json"), summary);
         if (fatalException is not null)
         {
@@ -215,22 +226,53 @@ internal static class ReceiptMlNetProgram
         DeviceModel? deviceClassifier,
         PaddleOcrEngine? ocrEngine,
         UnifiedOcrEngine? unifiedOcrEngine,
-        float scoreThreshold)
+        float scoreThreshold,
+        out InferenceStageLatency stageLatency)
     {
+        var stageStopwatch = Stopwatch.StartNew();
         using var source = ImagePipeline.LoadUprightRgb(inputFile);
+        var imageLoadMs = StopAndReadMilliseconds(stageStopwatch);
         var sourceSize = new ImageSize(source.Width, source.Height);
+
+        double? deviceMs = null;
+        stageStopwatch.Restart();
         var device = deviceClassifier?.Classify(source);
+        if (deviceClassifier is not null)
+        {
+            deviceMs = StopAndReadMilliseconds(stageStopwatch);
+        }
+
+        stageStopwatch.Restart();
         var prepared = ImagePipeline.PrepareDetectorInput(source);
+        var detectorPreprocessMs = StopAndReadMilliseconds(stageStopwatch);
+
+        stageStopwatch.Restart();
         var predictions = detector.Predict(prepared.Tensor);
+        var detectorInferenceMs = StopAndReadMilliseconds(stageStopwatch);
+
+        stageStopwatch.Restart();
         var detections = PostProcessDetections(predictions, prepared, scoreThreshold);
+        var detectorPostprocessMs = StopAndReadMilliseconds(stageStopwatch);
+
+        double? paddleOcrMs = null;
         if (ocrEngine is not null)
         {
+            stageStopwatch.Restart();
             detections = EnrichWithOcr(source, detections, ocrEngine);
+            paddleOcrMs = StopAndReadMilliseconds(stageStopwatch);
         }
+
+        UnifiedOcrStageLatency? unifiedOcrLatency = null;
         UnifiedOcrReadResult? unifiedOcr = null;
         if (unifiedOcrEngine is not null)
         {
-            unifiedOcr = unifiedOcrEngine.RecognizeReceipt(source, detections);
+            unifiedOcr = unifiedOcrEngine.RecognizeReceipt(source, detections, out var measuredUnifiedOcrLatency);
+            unifiedOcrLatency = measuredUnifiedOcrLatency;
+        }
+
+        stageStopwatch.Restart();
+        if (unifiedOcr is not null)
+        {
             detections = EnrichWithUnifiedOcr(detections, unifiedOcr);
         }
         var fields = ocrEngine is not null
@@ -238,6 +280,19 @@ internal static class ReceiptMlNetProgram
             : unifiedOcr is not null
                 ? BuildUnifiedFields(detections, unifiedOcr)
                 : null;
+        var resultAssemblyMs = StopAndReadMilliseconds(stageStopwatch);
+
+        stageLatency = new InferenceStageLatency(
+            imageLoadMs,
+            deviceMs,
+            detectorPreprocessMs,
+            detectorInferenceMs,
+            detectorPostprocessMs,
+            paddleOcrMs,
+            unifiedOcrLatency?.PreprocessMs,
+            unifiedOcrLatency?.InferenceMs,
+            unifiedOcrLatency?.PostprocessMs,
+            resultAssemblyMs);
 
         return new ReceiptResult(
             Path.GetFullPath(inputFile),
@@ -262,6 +317,12 @@ internal static class ReceiptMlNetProgram
                         ? "OCR uses the verified architecture-v12 unified ONNX reader in one session/run per receipt. Its current text/status contract is review-only: candidates are diagnostic and delivered values fail closed to review."
                         : "OCR field extraction is disabled; use --ocr onnx --ocr-bundle <delivery-directory> or --ocr unified --ocr-model <v12-reader.onnx> to enable it.",
             });
+    }
+
+    private static double StopAndReadMilliseconds(Stopwatch stopwatch)
+    {
+        stopwatch.Stop();
+        return Math.Round(stopwatch.Elapsed.TotalMilliseconds, 4);
     }
 
     private static List<DetectionResult> PostProcessDetections(
@@ -738,6 +799,27 @@ internal static class ReceiptMlNetProgram
             Math.Round(sorted.Average(), 4),
             Math.Round(Percentile(sorted, 0.50), 4),
             Math.Round(Percentile(sorted, 0.95), 4));
+    }
+
+    private static InferenceStageLatencySummary SummarizeStageLatencies(
+        IReadOnlyCollection<InferenceStageLatency> latencies)
+    {
+        return new InferenceStageLatencySummary(
+            SummarizeLatencies(latencies.Select(item => item.ImageLoad).ToArray()),
+            SummarizeOptionalLatencies(latencies.Select(item => item.Device)),
+            SummarizeLatencies(latencies.Select(item => item.DetectorPreprocess).ToArray()),
+            SummarizeLatencies(latencies.Select(item => item.DetectorInference).ToArray()),
+            SummarizeLatencies(latencies.Select(item => item.DetectorPostprocess).ToArray()),
+            SummarizeOptionalLatencies(latencies.Select(item => item.PaddleOcr)),
+            SummarizeOptionalLatencies(latencies.Select(item => item.UnifiedOcrPreprocess)),
+            SummarizeOptionalLatencies(latencies.Select(item => item.UnifiedOcrInference)),
+            SummarizeOptionalLatencies(latencies.Select(item => item.UnifiedOcrPostprocess)),
+            SummarizeLatencies(latencies.Select(item => item.ResultAssembly).ToArray()));
+    }
+
+    private static LatencySummary SummarizeOptionalLatencies(IEnumerable<double?> latencies)
+    {
+        return SummarizeLatencies(latencies.Where(value => value.HasValue).Select(value => value!.Value).ToArray());
     }
 
     private static double Percentile(IReadOnlyList<double> sorted, double quantile)
@@ -1309,7 +1391,8 @@ internal sealed record ManifestRecord(
     string Status,
     string? AnnotatedRectified = null,
     string? AnnotatedOriginal = null,
-    double? InferenceMs = null);
+    double? InferenceMs = null,
+    InferenceStageLatency? StageLatencyMs = null);
 internal sealed record ErrorRecord(string Source, string ErrorType, string Message);
 internal sealed record InputWorkItem(string Source, string Output);
 internal sealed record InferenceSummary(
@@ -1320,9 +1403,32 @@ internal sealed record InferenceSummary(
     int Skipped,
     int Errors,
     double TotalSeconds,
-    LatencySummary InferenceLatencyMs);
+    LatencySummary InferenceLatencyMs,
+    InferenceStageLatencySummary StageLatencyMs);
 internal sealed record LatencySummary(
     int Count,
     [property: JsonIgnore(Condition = JsonIgnoreCondition.Never)] double? Mean,
     [property: JsonIgnore(Condition = JsonIgnoreCondition.Never)] double? P50,
     [property: JsonIgnore(Condition = JsonIgnoreCondition.Never)] double? P95);
+internal sealed record InferenceStageLatency(
+    double ImageLoad,
+    double? Device,
+    double DetectorPreprocess,
+    double DetectorInference,
+    double DetectorPostprocess,
+    double? PaddleOcr,
+    double? UnifiedOcrPreprocess,
+    double? UnifiedOcrInference,
+    double? UnifiedOcrPostprocess,
+    double ResultAssembly);
+internal sealed record InferenceStageLatencySummary(
+    LatencySummary ImageLoad,
+    LatencySummary Device,
+    LatencySummary DetectorPreprocess,
+    LatencySummary DetectorInference,
+    LatencySummary DetectorPostprocess,
+    LatencySummary PaddleOcr,
+    LatencySummary UnifiedOcrPreprocess,
+    LatencySummary UnifiedOcrInference,
+    LatencySummary UnifiedOcrPostprocess,
+    LatencySummary ResultAssembly);
