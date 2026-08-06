@@ -3,7 +3,10 @@ param(
     [string]$TeacherRoot = "D:\alipay-ai-data\receipt-lite-teacher-120k-v1",
     [ValidateRange(1, 80)]
     [int]$Epochs = 16,
-    [string]$RunName
+    [string]$RunName,
+    [ValidateRange(0, 16)]
+    [int]$NumWorkers = 0,
+    [switch]$DiagnosticOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -47,6 +50,8 @@ Write-Host "capacity32_h384_pilot_train"
     -RecipientTailRareCharacterMaxSupport 3 `
     -RecipientTailRareCharacterLossWeight 3.0 `
     -RecipientTailLongTextMinLength 9 `
-    -RecipientTailLongTextLossWeight 3.0
+    -RecipientTailLongTextLossWeight 3.0 `
+    -NumWorkers $NumWorkers `
+    -DiagnosticOnly:$DiagnosticOnly
 
 exit $LASTEXITCODE
