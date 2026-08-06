@@ -9,7 +9,7 @@ param(
     [ValidateRange(0.0, 1.0)]
     [double]$PaymentFloor = 0.9325,
     [ValidateRange(0.0, 1.0)]
-    [double]$RecipientFloor = 0.70,
+    [double]$RecipientFloor = 0.90,
     [ValidateRange(0, 1000000)]
     [int]$ProgressEvery = 250
 )
@@ -19,6 +19,7 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 $pythonExe = Join-Path $repoRoot ".venv-cu126\Scripts\python.exe"
 $records = Join-Path $TeacherRoot "unified-manifest-v12-r3-4090-r1\unified_fields.jsonl"
 $datasetRoot = Join-Path $TeacherRoot "paddle-teacher-labels-5field-recipient95-v12-r3-4090-r1"
+$normalizer = Join-Path $PSScriptRoot "normalize_json_summary.py"
 
 if ([string]::IsNullOrWhiteSpace($RunDirectory)) {
     $latest = Get-ChildItem -LiteralPath $TeacherRoot -Directory -Filter "unified-run-v12-r3-4090-paddle-fit-open-text-*" |
@@ -33,7 +34,8 @@ if ([string]::IsNullOrWhiteSpace($RunDirectory)) {
 $checkpoint = Join-Path $RunDirectory "best.pt"
 $model = Join-Path $RunDirectory "best.onnx"
 $evaluation = Join-Path $RunDirectory "onnx-val"
-foreach ($required in @($pythonExe, $records, $datasetRoot, $checkpoint)) {
+$trainingSummaryPath = Join-Path $RunDirectory "training_summary.json"
+foreach ($required in @($pythonExe, $records, $datasetRoot, $checkpoint, $trainingSummaryPath, $normalizer)) {
     if (-not (Test-Path -LiteralPath $required)) {
         throw "Missing Paddle-fit validation dependency: $required"
     }
@@ -46,6 +48,17 @@ Write-Host "paddle_fit_export_validate_4090"
 Write-Host "  run=$RunDirectory"
 Write-Host "  checkpoint=$checkpoint"
 Write-Host "  model=$model"
+Write-Host ("  recipient-floor={0:P2}" -f $RecipientFloor)
+
+$trainingSummary = ((& $pythonExe $normalizer $trainingSummaryPath) -join "`n") | ConvertFrom-Json
+$bestTraining = @($trainingSummary.records | Where-Object { $_.epoch -eq $trainingSummary.best_checkpoint_epoch })[0]
+$lastTraining = @($trainingSummary.records | Select-Object -Last 1)[0]
+$bestRecipient = $bestTraining.val_candidate_text_by_field.recipient_field
+$lastRecipient = $lastTraining.val_candidate_text_by_field.recipient_field
+Write-Host "paddle_fit_training_provenance"
+Write-Host ("  policy={0}; splits={1}" -f $trainingSummary.recipient_train_split_policy.mode, (($trainingSummary.recipient_train_split_policy.splits | ForEach-Object { $_ }) -join ","))
+Write-Host ("  best-epoch={0}; best-recipient={1}/{2}={3:P2}" -f $trainingSummary.best_checkpoint_epoch, $bestRecipient.exact_matches, $bestRecipient.records, $bestRecipient.exact_match)
+Write-Host ("  last-epoch={0}; last-recipient={1}/{2}={3:P2}" -f $lastTraining.epoch, $lastRecipient.exact_matches, $lastRecipient.records, $lastRecipient.exact_match)
 
 Write-Host "paddle_fit_export"
 & $pythonExe -m transfer_receipt_ai.ocr_unified export `
@@ -72,7 +85,6 @@ $exitCode = $LASTEXITCODE
 
 $summaryPath = Join-Path $evaluation "summary.json"
 if (Test-Path -LiteralPath $summaryPath) {
-    $normalizer = Join-Path $PSScriptRoot "normalize_json_summary.py"
     $summary = ((& $pythonExe $normalizer $summaryPath) -join "`n") | ConvertFrom-Json
     Write-Host "paddle_fit_onnx_final_summary"
     foreach ($field in @("amount", "time", "payment_method_field", "recipient_field")) {
