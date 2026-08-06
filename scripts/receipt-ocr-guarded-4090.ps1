@@ -231,7 +231,8 @@ $baselineArgs = @(
     "--dataset-root", $labelsRoot,
     "--split", "val",
     "--output", $baselineOutput,
-    "--device", "cuda:0"
+    "--device", "cuda:0",
+    "--progress-every", "250"
 )
 & $pythonExe @baselineArgs
 if ($LASTEXITCODE -ne 0) {
@@ -447,7 +448,8 @@ elseif ($exitCode -eq 0) {
             "--min-amount-exact-match", "$AmountFloor",
             "--min-time-exact-match", "$TimeFloor",
             "--min-payment-exact-match", "$PaymentFloor",
-            "--min-recipient-exact-match", "$RecipientFloor"
+            "--min-recipient-exact-match", "$RecipientFloor",
+            "--progress-every", "250"
         )
         & $pythonExe @candidateArgs
         $candidateExitCode = $LASTEXITCODE
