@@ -1,4 +1,6 @@
+using System.Diagnostics;
 using System.Globalization;
+using System.Runtime.ExceptionServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -44,6 +46,7 @@ internal static class ReceiptMlNetProgram
 
     private static void Run(CliOptions options)
     {
+        var totalStopwatch = Stopwatch.StartNew();
         var detectorContract = ModelContract.LoadAndVerify(options.DetectorPath, "receipt_lrcnn_v1");
         ModelContract? deviceContract = options.DeviceModelPath is null
             ? null
@@ -55,10 +58,13 @@ internal static class ReceiptMlNetProgram
             ? UnifiedOcrBundle.LoadAndVerify(options.OcrModelPath!)
             : null;
 
-        var inputFiles = EnumerateInputFiles(options.InputPath).ToList();
+        var inputFiles = options.InputListPath is null
+            ? EnumerateInputFiles(options.InputPath!).ToList()
+            : ReadInputList(options.InputListPath).ToList();
         if (inputFiles.Count == 0)
         {
-            throw new UsageException($"No supported image files found under {options.InputPath}");
+            var inputDescription = options.InputListPath ?? options.InputPath;
+            throw new UsageException($"No supported image files found under {inputDescription}");
         }
         if (options.Limit is not null)
         {
@@ -66,10 +72,27 @@ internal static class ReceiptMlNetProgram
         }
 
         Directory.CreateDirectory(options.OutputDirectory);
-        var sourceRoot = File.Exists(options.InputPath)
-            ? Path.GetDirectoryName(Path.GetFullPath(options.InputPath))!
-            : Path.GetFullPath(options.InputPath);
+        var sourceRoot = options.InputPath is null
+            ? null
+            : File.Exists(options.InputPath)
+                ? Path.GetDirectoryName(Path.GetFullPath(options.InputPath))!
+                : Path.GetFullPath(options.InputPath);
+        var workItems = inputFiles
+            .Select(inputFile => new InputWorkItem(
+                inputFile,
+                options.InputListPath is null
+                    ? OutputPathFor(options.OutputDirectory, sourceRoot!, inputFile)
+                    : OutputPathForInputList(options.OutputDirectory, inputFile)))
+            .ToList();
+        var outputPathComparer = OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
+        if (workItems.Select(item => item.Output).Distinct(outputPathComparer).Count() != workItems.Count)
+        {
+            throw new UsageException("Input paths produced duplicate output names; refusing to overwrite a result");
+        }
         var manifest = new List<ManifestRecord>();
+        var inferenceLatencies = new List<double>();
+        var errorCount = 0;
+        Exception? fatalException = null;
         var errorsPath = Path.Combine(options.OutputDirectory, "inference_errors.jsonl");
         File.WriteAllText(errorsPath, string.Empty, Encoding.UTF8);
 
@@ -90,9 +113,10 @@ internal static class ReceiptMlNetProgram
             Console.WriteLine($"Unified OCR ONNX execution provider: {unifiedOcrEngine.ExecutionProvider} (one v12 session/run per receipt)");
         }
 
-        foreach (var inputFile in inputFiles)
+        foreach (var workItem in workItems)
         {
-            var outputFile = OutputPathFor(options.OutputDirectory, sourceRoot, inputFile);
+            var inputFile = workItem.Source;
+            var outputFile = workItem.Output;
             var annotationPaths = AnnotationPaths.ForResultJson(outputFile);
             if (options.SkipExisting && ExistingResultSatisfiesRequestedMode(
                     outputFile,
@@ -112,7 +136,10 @@ internal static class ReceiptMlNetProgram
 
             try
             {
+                var inferenceStopwatch = Stopwatch.StartNew();
                 var result = InferImage(inputFile, detector, deviceClassifier, ocrEngine, unifiedOcrEngine, options.ScoreThreshold);
+                inferenceStopwatch.Stop();
+                var inferenceMs = Math.Round(inferenceStopwatch.Elapsed.TotalMilliseconds, 4);
                 if (options.RequireComplete)
                 {
                     EnsureCoreFields(result.Detections);
@@ -144,21 +171,42 @@ internal static class ReceiptMlNetProgram
                     outputFile,
                     "written",
                     annotationPaths.Rectified,
-                    annotationPaths.Original));
+                    annotationPaths.Original,
+                    inferenceMs));
+                inferenceLatencies.Add(inferenceMs);
             }
             catch (Exception exception)
             {
+                errorCount++;
                 var error = new ErrorRecord(Path.GetFullPath(inputFile), exception.GetType().Name, exception.Message);
                 File.AppendAllText(errorsPath, JsonSerializer.Serialize(error, JsonOptions) + Environment.NewLine, Encoding.UTF8);
                 if (!options.ContinueOnError)
                 {
-                    throw;
+                    fatalException = exception;
+                    break;
                 }
             }
         }
 
         WriteJsonAtomic(Path.Combine(options.OutputDirectory, "inference_manifest.json"), manifest);
-        Console.WriteLine($"Wrote {manifest.Count(record => record.Status == "written")} ML.NET result bundle(s) to {options.OutputDirectory}");
+        totalStopwatch.Stop();
+        var writtenCount = manifest.Count(record => record.Status == "written");
+        var skippedCount = manifest.Count(record => record.Status == "skipped_existing");
+        var summary = new InferenceSummary(
+            device.Requested,
+            unifiedOcrEngine?.ExecutionProvider,
+            workItems.Count,
+            writtenCount,
+            skippedCount,
+            errorCount,
+            Math.Round(totalStopwatch.Elapsed.TotalSeconds, 4),
+            SummarizeLatencies(inferenceLatencies));
+        WriteJsonAtomic(Path.Combine(options.OutputDirectory, "inference_summary.json"), summary);
+        if (fatalException is not null)
+        {
+            ExceptionDispatchInfo.Capture(fatalException).Throw();
+        }
+        Console.WriteLine($"Wrote {writtenCount} ML.NET result bundle(s) to {options.OutputDirectory}");
     }
 
     private static ReceiptResult InferImage(
@@ -605,6 +653,58 @@ internal static class ReceiptMlNetProgram
             .OrderBy(path => path, StringComparer.Ordinal);
     }
 
+    private static IReadOnlyList<string> ReadInputList(string inputListPath)
+    {
+        var fullListPath = Path.GetFullPath(inputListPath);
+        if (!File.Exists(fullListPath))
+        {
+            throw new UsageException($"Input list does not exist: {fullListPath}");
+        }
+
+        var listDirectory = Path.GetDirectoryName(fullListPath)!;
+        var pathComparer = OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
+        var seen = new HashSet<string>(pathComparer);
+        var resolved = new List<string>();
+        var lineNumber = 0;
+        foreach (var rawLine in File.ReadLines(fullListPath))
+        {
+            lineNumber++;
+            var entry = rawLine.Trim();
+            if (entry.Length == 0 || entry.StartsWith('#'))
+            {
+                continue;
+            }
+
+            string fullPath;
+            try
+            {
+                fullPath = Path.GetFullPath(entry, listDirectory);
+            }
+            catch (Exception exception) when (exception is ArgumentException or NotSupportedException or PathTooLongException)
+            {
+                throw new UsageException($"Invalid image path at {fullListPath}:{lineNumber}: {exception.Message}");
+            }
+            if (!File.Exists(fullPath))
+            {
+                throw new UsageException($"Input image at {fullListPath}:{lineNumber} does not exist: {fullPath}");
+            }
+            if (!ImageExtensions.Contains(Path.GetExtension(fullPath)))
+            {
+                throw new UsageException($"Unsupported image extension at {fullListPath}:{lineNumber}: {fullPath}");
+            }
+            if (seen.Add(fullPath))
+            {
+                resolved.Add(fullPath);
+            }
+        }
+
+        if (resolved.Count == 0)
+        {
+            throw new UsageException($"Input list contains no image paths: {fullListPath}");
+        }
+        return resolved;
+    }
+
     private static string OutputPathFor(string outputDirectory, string sourceRoot, string sourcePath)
     {
         var relative = Path.GetRelativePath(sourceRoot, sourcePath);
@@ -613,6 +713,43 @@ internal static class ReceiptMlNetProgram
             relative = Path.GetFileName(sourcePath);
         }
         return Path.Combine(outputDirectory, Path.ChangeExtension(relative, ".json"));
+    }
+
+    private static string OutputPathForInputList(string outputDirectory, string sourcePath)
+    {
+        var identity = Path.GetFullPath(sourcePath);
+        if (OperatingSystem.IsWindows())
+        {
+            identity = identity.ToUpperInvariant();
+        }
+        var digest = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(identity))).ToLowerInvariant();
+        return Path.Combine(outputDirectory, "input-list", digest + ".json");
+    }
+
+    private static LatencySummary SummarizeLatencies(IReadOnlyCollection<double> latencies)
+    {
+        if (latencies.Count == 0)
+        {
+            return new LatencySummary(0, null, null, null);
+        }
+        var sorted = latencies.OrderBy(value => value).ToArray();
+        return new LatencySummary(
+            sorted.Length,
+            Math.Round(sorted.Average(), 4),
+            Math.Round(Percentile(sorted, 0.50), 4),
+            Math.Round(Percentile(sorted, 0.95), 4));
+    }
+
+    private static double Percentile(IReadOnlyList<double> sorted, double quantile)
+    {
+        var position = (sorted.Count - 1) * quantile;
+        var lower = (int)Math.Floor(position);
+        var upper = (int)Math.Ceiling(position);
+        if (lower == upper)
+        {
+            return sorted[lower];
+        }
+        return sorted[lower] + (sorted[upper] - sorted[lower]) * (position - lower);
     }
 
     private static void WriteJsonAtomic<T>(string path, T payload)
@@ -635,7 +772,7 @@ internal static class ReceiptMlNetProgram
 
     private static readonly string[] RequiredLabels =
     {
-        "amount", "transfer_status", "recipient_field", "payment_method_field",
+        "time", "amount", "transfer_status", "recipient_field", "payment_method_field",
     };
 
     private static readonly HashSet<string> ImageExtensions = new(StringComparer.OrdinalIgnoreCase)
@@ -955,7 +1092,8 @@ internal sealed record CliOptions(
     string OcrMode,
     string? OcrBundlePath,
     string? OcrModelPath,
-    string InputPath,
+    string? InputPath,
+    string? InputListPath,
     string OutputDirectory,
     string Device,
     float ScoreThreshold,
@@ -973,7 +1111,7 @@ Usage:
     [--ocr none|onnx|unified] \
     [--ocr-bundle <paddle-ocr-delivery-directory>] \
     [--ocr-model <receipt_unified_field_reader_v12.onnx>] \
-    --input <image-or-directory> --output <directory> \
+    (--input <image-or-directory> | --input-list <txt>) --output <directory> \
     [--device auto|cpu|cuda:0] [--score-threshold 0.50] [--annotate all|flagged|none] \
     [--require-complete] [--continue-on-error] [--skip-existing] [--limit 100]
 
@@ -994,6 +1132,7 @@ rectification; use an already rectified image when needed.
         string? ocrBundle = null;
         string? ocrModel = null;
         string? input = null;
+        string? inputList = null;
         string? output = null;
         var device = "auto";
         var scoreThreshold = 0.50f;
@@ -1013,6 +1152,7 @@ rectification; use an already rectified image when needed.
                 case "--ocr-bundle": ocrBundle = NextValue(args, ref index); break;
                 case "--ocr-model": ocrModel = NextValue(args, ref index); break;
                 case "--input": input = NextValue(args, ref index); break;
+                case "--input-list": inputList = NextValue(args, ref index); break;
                 case "--output": output = NextValue(args, ref index); break;
                 case "--device": device = NextValue(args, ref index); break;
                 case "--annotate": annotationMode = ParseAnnotationMode(NextValue(args, ref index)); break;
@@ -1036,9 +1176,15 @@ rectification; use an already rectified image when needed.
                 default: throw new UsageException($"Unknown argument: {args[index]}");
             }
         }
-        if (string.IsNullOrWhiteSpace(detector) || string.IsNullOrWhiteSpace(input) || string.IsNullOrWhiteSpace(output))
+        if (string.IsNullOrWhiteSpace(detector) || string.IsNullOrWhiteSpace(output))
         {
-            throw new UsageException("--detector, --input and --output are required");
+            throw new UsageException("--detector and --output are required");
+        }
+        var hasInput = !string.IsNullOrWhiteSpace(input);
+        var hasInputList = !string.IsNullOrWhiteSpace(inputList);
+        if (hasInput == hasInputList)
+        {
+            throw new UsageException("Specify exactly one of --input or --input-list");
         }
         if (ocrMode == "onnx" && string.IsNullOrWhiteSpace(ocrBundle))
         {
@@ -1057,7 +1203,7 @@ rectification; use an already rectified image when needed.
             throw new UsageException("--ocr-model requires --ocr unified");
         }
         _ = DeviceSetting.Parse(device);
-        return new CliOptions(detector, deviceModel, ocrMode, ocrBundle, ocrModel, input, output, device, scoreThreshold, annotationMode, requireComplete, continueOnError, skipExisting, limit);
+        return new CliOptions(detector, deviceModel, ocrMode, ocrBundle, ocrModel, input, inputList, output, device, scoreThreshold, annotationMode, requireComplete, continueOnError, skipExisting, limit);
     }
 
     private static string ParseOcrMode(string value)
@@ -1162,5 +1308,21 @@ internal sealed record ManifestRecord(
     string Result,
     string Status,
     string? AnnotatedRectified = null,
-    string? AnnotatedOriginal = null);
+    string? AnnotatedOriginal = null,
+    double? InferenceMs = null);
 internal sealed record ErrorRecord(string Source, string ErrorType, string Message);
+internal sealed record InputWorkItem(string Source, string Output);
+internal sealed record InferenceSummary(
+    string RequestedDevice,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? UnifiedProvider,
+    int Input,
+    int Written,
+    int Skipped,
+    int Errors,
+    double TotalSeconds,
+    LatencySummary InferenceLatencyMs);
+internal sealed record LatencySummary(
+    int Count,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.Never)] double? Mean,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.Never)] double? P50,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.Never)] double? P95);
