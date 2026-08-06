@@ -7,7 +7,7 @@ param(
     [ValidateRange(1024, 2048)]
     [int]$RecipientInputWidth = 1536,
     [ValidateRange(0, 16)]
-    [int]$NumWorkers = 0,
+    [int]$NumWorkers = 4,
     [ValidateRange(0, 1000000)]
     [int]$TrainProgressEvery = 250,
     [switch]$AdapterOnly,
