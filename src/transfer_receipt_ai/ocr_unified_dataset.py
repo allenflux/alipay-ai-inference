@@ -52,6 +52,7 @@ import argparse
 import hashlib
 import json
 import math
+import unicodedata
 from collections import Counter
 from collections.abc import Iterable, Mapping
 from pathlib import Path
@@ -150,32 +151,80 @@ def _is_cjk_ideograph(character: str) -> bool:
     )
 
 
-def _visible_status_cjk_text(value: object) -> str:
-    """Return the visible Chinese status line from a Paddle OCR result.
+def _visible_status_cjk_match(value: object) -> tuple[str, int]:
+    """Return one exact visible status phrase and its retained match count.
 
-    Some Alipay status crops contain a small pinyin guide above the Chinese
-    business text.  Paddle legitimately returns both lines, but teaching that
-    combined string makes the deployable reader sensitive to tone marks,
-    spacing and capitalization that are irrelevant to transfer status.  Keep
-    only CJK ideographs that are actually present in the OCR result; never
-    manufacture text from the semantic class.
+    Paddle can return a pinyin guide, a neighbouring amount sentence, or the
+    same Chinese status phrase twice.  A whole-string CJK projection would
+    either reject valid text or join unrelated text into a made-up target.
+    Instead, split on every non-CJK letter or digit, then search the remaining
+    visible CJK streams for exact audited phrases.  Punctuation and whitespace
+    may separate visible ideographs, but Latin text and digits are hard
+    boundaries and can never be crossed.
+
+    A shorter match is removed only when its span is contained in a longer
+    match (for example ``未成功`` inside ``转账未成功``).  Repeated copies of the
+    same phrase are deterministic; two distinct surviving phrases are
+    ambiguous and return no target.  The semantic class never participates in
+    extraction.
     """
     if not isinstance(value, str):
-        return ""
-    cleaned = clean_text(value)
-    first_cjk = next(
-        (index for index, character in enumerate(cleaned) if _is_cjk_ideograph(character)),
-        None,
-    )
-    if first_cjk is None:
-        return ""
-    visible_suffix = cleaned[first_cjk:]
-    # Pinyin is valid only as a leading guide line.  Once the Chinese line has
-    # begun, another alphabetic fragment would mean that filtering characters
-    # could manufacture a continuous status phrase that was never visible.
-    if any(character.isalpha() and not _is_cjk_ideograph(character) for character in visible_suffix):
-        return ""
-    return "".join(character for character in visible_suffix if _is_cjk_ideograph(character))
+        return "", 0
+    cleaned = unicodedata.normalize("NFC", clean_text(value))
+    segments: list[str] = []
+    current: list[str] = []
+    for character in cleaned:
+        if _is_cjk_ideograph(character):
+            current.append(character)
+        elif character.isalpha() or character.isdigit():
+            if current:
+                segments.append("".join(current))
+                current = []
+        else:
+            # Whitespace and punctuation can appear between the visibly
+            # separated ideographs of one OCR line.
+            continue
+    if current:
+        segments.append("".join(current))
+
+    matches: list[tuple[int, int, int, str]] = []
+    for segment_index, segment in enumerate(segments):
+        for phrase in STATUS_VISIBLE_CJK_TEXTS:
+            start = segment.find(phrase)
+            while start >= 0:
+                end = start + len(phrase)
+                # A success phrase directly negated in the same visible CJK
+                # stream is not positive evidence (for example 未转账成功).
+                if not (
+                    normalize_status(phrase) == "success"
+                    and start > 0
+                    and segment[start - 1] in {"未", "不", "非"}
+                ):
+                    matches.append((segment_index, start, end, phrase))
+                start = segment.find(phrase, start + 1)
+
+    retained: list[tuple[int, int, int, str]] = []
+    for match in matches:
+        segment_index, start, end, _phrase = match
+        contained = any(
+            other_segment == segment_index
+            and other_start <= start
+            and end <= other_end
+            and (other_end - other_start) > (end - start)
+            for other_segment, other_start, other_end, _other_phrase in matches
+        )
+        if not contained:
+            retained.append(match)
+
+    phrases = {phrase for _segment, _start, _end, phrase in retained}
+    if len(phrases) != 1:
+        return "", len(retained)
+    phrase = next(iter(phrases))
+    return phrase, sum(match_phrase == phrase for *_span, match_phrase in retained)
+
+
+def _visible_status_cjk_text(value: object) -> str:
+    return _visible_status_cjk_match(value)[0]
 
 # V12 deliberately reuses the fully-audited v11 recipient labels.  Only the
 # reader-side pixels change: it receives a dedicated high-resolution value
@@ -612,12 +661,13 @@ def _slot_payload(
             # record text may be a semantic label or a legacy transcription,
             # so it remains audit evidence and can never override Paddle.
             raw_text = record.get("paddle_text")
-            visible_text = _visible_status_cjk_text(raw_text)
+            visible_text, visible_match_count = _visible_status_cjk_match(raw_text)
+            audit["visible_phrase_match_count"] = visible_match_count
             if not isinstance(raw_text, str):
                 audit["reason"] = "paddle_text:not_a_string"
-            elif not visible_text:
+            elif not any(_is_cjk_ideograph(character) for character in raw_text):
                 audit["reason"] = "paddle_text:no_visible_cjk_status_text"
-            elif visible_text not in STATUS_VISIBLE_CJK_TEXTS:
+            elif not visible_text or visible_text not in STATUS_VISIBLE_CJK_TEXTS:
                 audit["reason"] = "paddle_text:unsupported_visible_cjk_status_text"
             else:
                 normalized = normalize_status(visible_text)

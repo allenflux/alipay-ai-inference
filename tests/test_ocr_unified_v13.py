@@ -48,8 +48,37 @@ from transfer_receipt_ai.ocr_unified import (
 from transfer_receipt_ai.ocr_unified_dataset import (
     KIND_V13 as DATASET_KIND_V13,
     V13_SLOT_ORDER,
+    _visible_status_cjk_match,
     build_unified_dataset,
 )
+
+
+@pytest.mark.parametrize(
+    ("paddle_text", "expected"),
+    (
+        ("支付成功 chenggong", "支付成功"),
+        ("转账成功 zhuanzhangchenggong", "转账成功"),
+        ("转账 转账成功", "转账成功"),
+        ("款支付成功", "支付成功"),
+        ("转账成功 点", "转账成功"),
+        ("笔199.98元的支出，结果是（转账成功）", "转账成功"),
+        ("zhī fù chéng gōng 支 付 成 功", "支付成功"),
+    ),
+)
+def test_v13_extracts_one_exact_visible_status_phrase_from_real_teacher_shapes(
+    paddle_text: str,
+    expected: str,
+) -> None:
+    assert _visible_status_cjk_match(paddle_text)[0] == expected
+
+
+def test_v13_status_phrase_extraction_deduplicates_but_rejects_ambiguity() -> None:
+    assert _visible_status_cjk_match("转账成功 转账成功") == ("转账成功", 2)
+    assert _visible_status_cjk_match("转账未成功") == ("转账未成功", 1)
+    assert _visible_status_cjk_match("转账成功 支付成功")[0] == ""
+    assert _visible_status_cjk_match("转abc账成功")[0] == ""
+    assert _visible_status_cjk_match("未转账成功")[0] == ""
+    assert _visible_status_cjk_match("success") == ("", 0)
 
 
 def _tiny_config(version: int) -> UnifiedReaderConfig:
