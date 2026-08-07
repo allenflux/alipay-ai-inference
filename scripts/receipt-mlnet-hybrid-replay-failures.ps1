@@ -28,6 +28,14 @@ $inputList = "$OutputDirectory.inputs.txt"
 $cliApp = "$OutputDirectory.cli-app"
 $cliAssembly = Join-Path $cliApp "ReceiptMlNet.Cli.dll"
 
+function Get-OptionalProperty($Object, [string]$Name) {
+    $property = $Object.PSObject.Properties[$Name]
+    if ($null -eq $property) {
+        return $null
+    }
+    return $property.Value
+}
+
 foreach ($required in @(
     @{ Name = ".NET host"; Path = $DotnetExe; Kind = "Leaf" },
     @{ Name = "ML.NET project"; Path = $project; Kind = "Leaf" },
@@ -66,6 +74,8 @@ foreach ($source in $failedSources) {
     }
 }
 
+$outputParent = Split-Path -Parent $OutputDirectory
+New-Item -ItemType Directory -Path $outputParent -Force | Out-Null
 [IO.File]::WriteAllLines(
     $inputList,
     [string[]]$failedSources,
@@ -91,8 +101,7 @@ if ($LASTEXITCODE -ne 0) {
     --output $OutputDirectory `
     --device cpu `
     --rectification max-side-1600 `
-    --annotate none `
-    --require-complete
+    --annotate none
 if ($LASTEXITCODE -ne 0) {
     throw "Hybrid failed-source replay exited with code $LASTEXITCODE"
 }
@@ -105,11 +114,11 @@ $evidence = foreach ($row in @($manifest)) {
         source = [string]$row.source
         inference_ms = [double]$row.inference_ms
         state = [string]$recipient.state
-        candidate = $recipient.candidate
-        route = $recipient.hybrid_ocr_route
-        failure_reason = $recipient.hybrid_ocr_failure_reason
-        first_raw = $recipient.hybrid_ocr_first_raw
-        retry_raw = $recipient.hybrid_ocr_retry_raw
+        candidate = Get-OptionalProperty $recipient "candidate"
+        route = Get-OptionalProperty $recipient "hybrid_ocr_route"
+        failure_reason = Get-OptionalProperty $recipient "hybrid_ocr_failure_reason"
+        first_raw = Get-OptionalProperty $recipient "hybrid_ocr_first_raw"
+        retry_raw = Get-OptionalProperty $recipient "hybrid_ocr_retry_raw"
     }
 }
 
