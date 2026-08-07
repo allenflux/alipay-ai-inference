@@ -391,7 +391,7 @@ def test_cpu_ab_rejects_a_changed_threshold_or_cpu_contract(tmp_path: Path) -> N
         compare.analyze_plan(plan_path)
 
 
-@pytest.mark.parametrize("changed_value", [None, 0, -1, True, "16", 257])
+@pytest.mark.parametrize("changed_value", [0, -1, True, "16", 257])
 def test_cpu_ab_rejects_invalid_candidate_detector_thread_contract(
     tmp_path: Path,
     changed_value: object,
@@ -403,6 +403,26 @@ def test_cpu_ab_rejects_invalid_candidate_detector_thread_contract(
 
     with pytest.raises(compare.ValidationError, match="candidate detector intra-op threads"):
         compare.analyze_plan(plan_path)
+
+
+def test_cpu_ab_accepts_default_candidate_detector_threads(tmp_path: Path) -> None:
+    plan_path = _fixture_plan(tmp_path)
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    plan["cli_contract"]["detector_intra_op_threads"]["candidate"] = None
+    for run in plan["runs"]:
+        if run["variant"] == "candidate":
+            run["detector_intra_op_threads"] = None
+            summary_path = Path(run["output_directory"]) / "inference_summary.json"
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            summary["detector_intra_op_threads"] = None
+            _write_json(summary_path, summary)
+    _write_json(plan_path, plan)
+
+    report, differences = compare.analyze_plan(plan_path)
+
+    assert report["accepted"] is True
+    assert differences == []
+    assert report["cli_contract"]["detector_intra_op_threads"]["candidate"] is None
 
 
 def test_cpu_ab_rejects_threading_the_baseline(tmp_path: Path) -> None:
@@ -556,9 +576,9 @@ def test_cpu_ab_powershell_applies_detector_threads_only_to_candidate() -> None:
         / "receipt-mlnet-cpu-ab-validate.ps1"
     ).read_text(encoding="utf-8")
 
-    assert "[ValidateRange(1, 256)]" in script
+    assert "[ValidateRange(0, 256)]" in script
     assert "[int]$CandidateDetectorIntraOpThreads" in script
-    assert 'if ($variant -eq "candidate")' in script
+    assert '$variant -eq "candidate" -and $CandidateDetectorThreads -gt 0' in script
     assert '"--detector-intra-op-threads"' in script
     assert "baseline = $null" in script
-    assert "candidate = $CandidateDetectorIntraOpThreads" in script
+    assert "candidate = if ($CandidateDetectorIntraOpThreads -gt 0)" in script

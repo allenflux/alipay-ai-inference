@@ -403,13 +403,13 @@ def _validate_cli_contract(plan: Mapping[str, Any]) -> dict[str, int | None]:
         raise ValidationError(
             "baseline detector intra-op threads must remain null/default"
         )
-    if (
+    if candidate_threads is not None and (
         isinstance(candidate_threads, bool)
         or not isinstance(candidate_threads, int)
         or not 1 <= candidate_threads <= MAXIMUM_DETECTOR_INTRA_OP_THREADS
     ):
         raise ValidationError(
-            "candidate detector intra-op threads must be an integer in "
+            "candidate detector intra-op threads must be null/default or an integer in "
             f"[1, {MAXIMUM_DETECTOR_INTRA_OP_THREADS}]"
         )
     return {"baseline": None, "candidate": candidate_threads}

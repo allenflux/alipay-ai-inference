@@ -22,9 +22,8 @@ param(
     [int]$WarmupImages = 8,
     [ValidateRange(3, 20)]
     [int]$Repetitions = 3,
-    [Parameter(Mandatory = $true)]
-    [ValidateRange(1, 256)]
-    [int]$CandidateDetectorIntraOpThreads,
+    [ValidateRange(0, 256)]
+    [int]$CandidateDetectorIntraOpThreads = 0,
     [string]$PythonExecutable
 )
 
@@ -315,7 +314,7 @@ function Invoke-CpuRun(
         $arguments += @("--limit", [string]$Descriptor.expected_count)
     }
     $expectedDetectorThreads = $null
-    if ($variant -eq "candidate") {
+    if ($variant -eq "candidate" -and $CandidateDetectorThreads -gt 0) {
         $expectedDetectorThreads = $CandidateDetectorThreads
         $arguments += @(
             "--detector-intra-op-threads",
@@ -465,7 +464,7 @@ foreach ($phaseSpec in @(
                 iteration = $iteration
                 execution_order = $executionOrder
                 expected_count = [int]$phaseSpec.Expected
-                detector_intra_op_threads = if ($variant -eq "candidate") {
+                detector_intra_op_threads = if ($variant -eq "candidate" -and $CandidateDetectorIntraOpThreads -gt 0) {
                     $CandidateDetectorIntraOpThreads
                 }
                 else {
@@ -510,7 +509,12 @@ $plan = [ordered]@{
         includes_device_model = $true
         detector_intra_op_threads = [ordered]@{
             baseline = $null
-            candidate = $CandidateDetectorIntraOpThreads
+            candidate = if ($CandidateDetectorIntraOpThreads -gt 0) {
+                $CandidateDetectorIntraOpThreads
+            }
+            else {
+                $null
+            }
         }
     }
     performance_gate = [ordered]@{
@@ -536,7 +540,13 @@ if ($InputLimit -gt 0) {
 }
 Write-Host "Warmup      : $WarmupRuns x $warmupLimit image(s) per variant"
 Write-Host "Measured    : $Repetitions full repeat(s) per variant"
-Write-Host "Threads     : baseline=default; candidate detector intra-op=$CandidateDetectorIntraOpThreads"
+$candidateThreadDescription = if ($CandidateDetectorIntraOpThreads -gt 0) {
+    [string]$CandidateDetectorIntraOpThreads
+}
+else {
+    "default"
+}
+Write-Host "Threads     : baseline=default; candidate detector intra-op=$candidateThreadDescription"
 Write-Host "Output root : $OutputRoot"
 Write-Host ""
 
