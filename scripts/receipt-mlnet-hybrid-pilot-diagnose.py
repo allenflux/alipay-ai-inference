@@ -9,7 +9,9 @@ import json
 import math
 from pathlib import Path
 import re
+import shutil
 from typing import Any, Mapping
+from uuid import uuid4
 
 
 RECIPIENT_LABELS = ("收款方", "收款人", "收款账户", "收款账号")
@@ -165,8 +167,65 @@ def _aggregate_pair_reasons(raw: object, line_count: object, expected: object) -
     return reasons
 
 
+def _export_failure_crops(
+    specs: list[dict[str, Any]], output: Path
+) -> None:
+    if output.exists():
+        raise FileExistsError(f"refusing to overwrite failure crop output: {output}")
+    try:
+        from PIL import Image
+    except ImportError as error:
+        raise RuntimeError("--crop-output requires Pillow") from error
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    stage = output.parent / f".{output.name}.{uuid4().hex}.tmp"
+    stage.mkdir()
+    manifest: list[dict[str, Any]] = []
+    try:
+        for index, spec in enumerate(specs, start=1):
+            source = Path(str(spec["source"]))
+            box = spec["recipient_box"]
+            with Image.open(source) as opened:
+                with opened.convert("RGB") as image:
+                    width, height = image.size
+                    margin_x = max(2.0, (box[2] - box[0]) * 0.08)
+                    margin_y = max(2.0, (box[3] - box[1]) * 0.08)
+                    left = max(0, min(width, math.floor(box[0] - margin_x)))
+                    top = max(0, min(height, math.floor(box[1] - margin_y)))
+                    right = max(0, min(width, math.ceil(box[2] + margin_x)))
+                    bottom = max(0, min(height, math.ceil(box[3] + margin_y)))
+                    if right <= left or bottom <= top:
+                        raise ValueError(f"invalid recipient crop for {source}")
+                    primary_name = f"{index:03d}-primary.png"
+                    retry_name = f"{index:03d}-left-context.png"
+                    image.crop((left, top, right, bottom)).save(stage / primary_name)
+                    image.crop((0, top, right, bottom)).save(stage / retry_name)
+            manifest.append(
+                {
+                    "source": str(source),
+                    "recipient_box": box,
+                    "primary": primary_name,
+                    "left_context_retry": retry_name,
+                }
+            )
+        (stage / "manifest.jsonl").write_text(
+            "".join(
+                json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+                for record in manifest
+            ),
+            encoding="utf-8",
+        )
+        stage.replace(output)
+    except Exception:
+        shutil.rmtree(stage, ignore_errors=True)
+        raise
+
+
 def diagnose(
-    comparison: Path, hybrid: Path, records: Path | None = None
+    comparison: Path,
+    hybrid: Path,
+    records: Path | None = None,
+    crop_output: Path | None = None,
 ) -> list[dict[str, Any]]:
     comparison_rows = [
         json.loads(line)
@@ -206,6 +265,7 @@ def diagnose(
             }
 
     diagnostics: list[dict[str, Any]] = []
+    crop_specs: list[dict[str, Any]] = []
     for comparison_row in failed:
         source = comparison_row.get("source")
         result = _load_json(results[_source_key(source)])
@@ -254,6 +314,13 @@ def diagnose(
                 "likely_blocker": likely,
             }
         )
+        recipient_box = _box(detections.get("recipient_field"))
+        if crop_output is not None:
+            if recipient_box is None:
+                raise ValueError(f"missing valid recipient box for failed source: {source}")
+            crop_specs.append({"source": source, "recipient_box": recipient_box})
+    if crop_output is not None:
+        _export_failure_crops(crop_specs, crop_output)
     return diagnostics
 
 
@@ -262,11 +329,13 @@ def main() -> int:
     parser.add_argument("--comparison", type=Path, required=True)
     parser.add_argument("--hybrid", type=Path, required=True)
     parser.add_argument("--records", type=Path)
+    parser.add_argument("--crop-output", type=Path)
     args = parser.parse_args()
     rows = diagnose(
         args.comparison.resolve(),
         args.hybrid.resolve(),
         args.records.resolve() if args.records is not None else None,
+        args.crop_output.resolve() if args.crop_output is not None else None,
     )
     for row in rows:
         print(json.dumps(row, ensure_ascii=False, separators=(",", ":")))
