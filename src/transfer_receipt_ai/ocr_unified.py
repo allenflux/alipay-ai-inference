@@ -106,6 +106,7 @@ INIT_CHECKPOINT_MODE_RECIPIENT_ONLY_EXPANSION = "recipient_only_expansion"
 INIT_CHECKPOINT_MODE_RECIPIENT_INPUT_WIDTH_EXPANSION = "recipient_input_width_expansion"
 INIT_CHECKPOINT_MODE_RECIPIENT_CAPACITY_REINIT = "recipient_capacity_reinit"
 INIT_CHECKPOINT_MODE_RECIPIENT_OPEN_TEXT_ADAPTER = "recipient_open_text_adapter"
+INIT_CHECKPOINT_MODE_RECIPIENT_VISUAL_CONTEXT_REINIT = "recipient_visual_context_reinit"
 INIT_CHECKPOINT_MODES = frozenset(
     (
         INIT_CHECKPOINT_MODE_STRICT,
@@ -113,6 +114,7 @@ INIT_CHECKPOINT_MODES = frozenset(
         INIT_CHECKPOINT_MODE_RECIPIENT_INPUT_WIDTH_EXPANSION,
         INIT_CHECKPOINT_MODE_RECIPIENT_CAPACITY_REINIT,
         INIT_CHECKPOINT_MODE_RECIPIENT_OPEN_TEXT_ADAPTER,
+        INIT_CHECKPOINT_MODE_RECIPIENT_VISUAL_CONTEXT_REINIT,
     )
 )
 RECIPIENT_ONLY_INIT_CHECKPOINT_MODES = frozenset(
@@ -121,6 +123,7 @@ RECIPIENT_ONLY_INIT_CHECKPOINT_MODES = frozenset(
         INIT_CHECKPOINT_MODE_RECIPIENT_INPUT_WIDTH_EXPANSION,
         INIT_CHECKPOINT_MODE_RECIPIENT_CAPACITY_REINIT,
         INIT_CHECKPOINT_MODE_RECIPIENT_OPEN_TEXT_ADAPTER,
+        INIT_CHECKPOINT_MODE_RECIPIENT_VISUAL_CONTEXT_REINIT,
     )
 )
 # These are the mature text heads that must not silently regress while a
@@ -683,6 +686,20 @@ class UnifiedReaderConfig:
     recipient_open_text_layers: int = 0
     recipient_open_text_heads: int = 8
     recipient_open_text_feedforward: int | None = None
+    # Train-time dropout for the private recipient Transformer.  It is zero
+    # by default so every published v12/v13 checkpoint keeps its historical
+    # graph and numerics.  A capacity-reinitialised recipient experiment may
+    # opt into bounded dropout without changing ONNX inputs/outputs; dropout
+    # is disabled by ``eval()`` before export and therefore adds no runtime op.
+    recipient_open_text_dropout: float = 0.0
+    # The established branch is retained as the default for byte-compatible
+    # v12/v13 loading.  ``residual_positional_transformer_v2`` is a genuinely
+    # different open-text recogniser: a standard residual 2-D visual encoder,
+    # explicit learned sequence positions, and a direct Transformer CTC head
+    # (no BiGRU and no zero-gated adapter).  It is opt-in and v13-only so the
+    # existing status-text ABI remains unchanged while its private recipient
+    # tensors can be reinitialised under a dedicated audited mode.
+    recipient_backbone: str = "legacy_depthwise_gru_v1"
     pooled_width: int = 8
     # v8 applies the display renderer only when every finite format component
     # is confident.  This is a diagnostic-candidate gate, never a business
@@ -737,6 +754,27 @@ class UnifiedReaderConfig:
             raise ValueError("recipient open-text width must be divisible by recipient_open_text_heads")
         if self.recipient_open_text_feedforward is not None and self.recipient_open_text_feedforward < recipient_width:
             raise ValueError("recipient_open_text_feedforward must be at least the bidirectional recipient width")
+        if (
+            not math.isfinite(self.recipient_open_text_dropout)
+            or not 0.0 <= self.recipient_open_text_dropout <= 0.5
+        ):
+            raise ValueError("recipient_open_text_dropout must be between 0 and 0.5")
+        if self.architecture_version not in {12, 13} and not math.isclose(
+            self.recipient_open_text_dropout, 0.0, rel_tol=0.0, abs_tol=1e-12
+        ):
+            raise ValueError("recipient_open_text_dropout is supported only by architecture v12 or v13")
+        if self.recipient_backbone not in {
+            "legacy_depthwise_gru_v1",
+            "residual_positional_transformer_v2",
+        }:
+            raise ValueError("recipient_backbone is invalid")
+        if self.recipient_backbone != "legacy_depthwise_gru_v1":
+            if self.architecture_version != 13:
+                raise ValueError("the residual recipient backbone is supported only by architecture v13")
+            if self.recipient_open_text_layers < 2:
+                raise ValueError("the residual recipient backbone requires at least two Transformer layers")
+            if self.recipient_input_width % 8:
+                raise ValueError("the residual recipient backbone requires recipient_input_width divisible by 8")
 
 
 def _recipient_hidden_size(config: UnifiedReaderConfig) -> int:
@@ -755,6 +793,8 @@ def _recipient_branch_channels(config: UnifiedReaderConfig) -> int:
 
 def _recipient_time_steps(config: UnifiedReaderConfig) -> int:
     """Return the CTC sequence length for the fifth output head."""
+    if config.recipient_backbone == "residual_positional_transformer_v2":
+        return config.recipient_input_width // 8
     return config.recipient_input_width // 4 if _uses_high_resolution_recipient_input(config) else config.image_width // 4
 
 
@@ -1232,21 +1272,40 @@ def _combine_recipient_loss_weights(
 
 
 def _recipient_train_augmentation_policy(*, mode: str, seed: int) -> dict[str, object]:
-    """Freeze the small v12-only recipient perturbation policy used in train."""
+    """Freeze a train-only recipient perturbation policy.
+
+    ``robust_v2`` is still deliberately label preserving: it uses only small
+    geometry/contrast/noise changes and a bounded one-dimensional blur.  The
+    policy is deterministic per (seed, epoch, receipt id), so a validation or
+    held-out test crop is never augmented and Windows worker scheduling cannot
+    change the training stream.
+    """
     if isinstance(seed, bool) or not isinstance(seed, int):
         raise ValueError("recipient train augmentation seed must be an integer")
     if mode == "none":
         return {"mode": "none"}
-    if mode != "light_v1":
-        raise ValueError("recipient_train_augmentation must be none or light_v1")
-    return {
-        "mode": "light_v1",
-        "seed": int(seed),
-        "horizontal_shift_px": 8,
-        "vertical_shift_px": 2,
-        "contrast_delta": 0.12,
-        "noise_std": 0.01,
-    }
+    if mode == "light_v1":
+        return {
+            "mode": "light_v1",
+            "seed": int(seed),
+            "horizontal_shift_px": 8,
+            "vertical_shift_px": 2,
+            "contrast_delta": 0.12,
+            "noise_std": 0.01,
+        }
+    if mode == "robust_v2":
+        return {
+            "mode": "robust_v2",
+            "seed": int(seed),
+            "horizontal_shift_px": 16,
+            "vertical_shift_px": 3,
+            "horizontal_scale_delta": 0.06,
+            "vertical_scale_delta": 0.04,
+            "contrast_delta": 0.18,
+            "noise_std": 0.015,
+            "blur_probability": 0.25,
+        }
+    raise ValueError("recipient_train_augmentation must be none, light_v1, or robust_v2")
 
 
 def _validate_recipient_train_augmentation_policy(policy: object) -> dict[str, object]:
@@ -1258,9 +1317,9 @@ def _validate_recipient_train_augmentation_policy(policy: object) -> dict[str, o
         if set(policy) != {"mode"}:
             raise ValueError("recipient train augmentation policy is invalid")
         return _recipient_train_augmentation_policy(mode="none", seed=0)
-    if mode != "light_v1":
+    if mode not in {"light_v1", "robust_v2"}:
         raise ValueError("recipient train augmentation policy is invalid")
-    expected = _recipient_train_augmentation_policy(mode="light_v1", seed=policy.get("seed"))
+    expected = _recipient_train_augmentation_policy(mode=str(mode), seed=policy.get("seed"))
     if dict(policy) != expected:
         raise ValueError("recipient train augmentation policy is invalid")
     return expected
@@ -1438,13 +1497,18 @@ def _recipient_artifact_metadata(
                 "recipient_input_shape": [1, 1, config.recipient_input_height, config.recipient_input_width],
                 "recipient_branch_channels": _recipient_branch_channels(config),
                 "recipient_time_steps": _recipient_time_steps(config),
+                "recipient_backbone": config.recipient_backbone,
             }
         )
         # Keep legacy v12 sidecars loadable: this additive provenance key is
         # present only when the graph actually contains the new adapter.
         if config.recipient_open_text_layers:
             metadata["recipient_open_text_encoder"] = {
-                "mode": "zero_gated_transformer_context_v1",
+                "mode": (
+                    "direct_positional_transformer_ctc_v2"
+                    if config.recipient_backbone == "residual_positional_transformer_v2"
+                    else "zero_gated_transformer_context_v1"
+                ),
                 "layers": config.recipient_open_text_layers,
                 "heads": config.recipient_open_text_heads,
                 "feedforward": int(
@@ -1452,6 +1516,15 @@ def _recipient_artifact_metadata(
                     or (_recipient_hidden_size(config) * 2 * 4)
                 ),
             }
+            if (
+                config.recipient_backbone == "residual_positional_transformer_v2"
+                or not math.isclose(
+                    config.recipient_open_text_dropout, 0.0, rel_tol=0.0, abs_tol=1e-12
+                )
+            ):
+                metadata["recipient_open_text_encoder"]["dropout"] = (
+                    config.recipient_open_text_dropout
+                )
     return metadata
 
 
@@ -1594,6 +1667,38 @@ def build_unified_reader(
         def forward(self, value: Any) -> Any:
             return self.layers(value)
 
+    class ResidualConvBlock(nn.Module):
+        """Standard-convolution OCR block used only by the v2 recipient path.
+
+        The old private branch is intentionally depthwise-separable and very
+        small.  That is efficient but its held-out recipient ceiling remained
+        low even after width/hidden-size sweeps.  This block spends capacity on
+        neighbouring stroke interactions before sequence modelling, while
+        GroupNorm keeps train/inference behaviour batch-size independent.
+        """
+
+        def __init__(self, in_channels: int, out_channels: int, *, stride: tuple[int, int]) -> None:
+            super().__init__()
+            self.main = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False),
+                nn.GroupNorm(_group_count(out_channels), out_channels),
+                nn.SiLU(inplace=True),
+                nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
+                nn.GroupNorm(_group_count(out_channels), out_channels),
+            )
+            self.skip = (
+                nn.Identity()
+                if stride == (1, 1) and in_channels == out_channels
+                else nn.Sequential(
+                    nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
+                    nn.GroupNorm(_group_count(out_channels), out_channels),
+                )
+            )
+            self.activation = nn.SiLU(inplace=True)
+
+        def forward(self, value: Any) -> Any:
+            return self.activation(self.main(value) + self.skip(value))
+
     class VerticalTextReducer(nn.Module):
         """Collapse a fixed feature height without averaging away digit strokes.
 
@@ -1704,22 +1809,32 @@ def build_unified_reader(
                             nn.GroupNorm(_group_count(recipient_first), recipient_first),
                             nn.SiLU(inplace=True),
                         )
-                        self.recipient_encoder = nn.Sequential(
-                            DepthwiseBlock(recipient_first, recipient_second, stride=(2, 2)),
-                            DepthwiseBlock(recipient_second, recipient_third, stride=(2, 1)),
-                            DepthwiseBlock(recipient_third, recipient_channels, stride=(1, 1)),
-                        )
+                        if config.recipient_backbone == "residual_positional_transformer_v2":
+                            self.recipient_encoder = nn.Sequential(
+                                ResidualConvBlock(recipient_first, recipient_second, stride=(2, 2)),
+                                ResidualConvBlock(recipient_second, recipient_second, stride=(1, 1)),
+                                ResidualConvBlock(recipient_second, recipient_third, stride=(2, 2)),
+                                ResidualConvBlock(recipient_third, recipient_channels, stride=(1, 1)),
+                            )
+                        else:
+                            self.recipient_encoder = nn.Sequential(
+                                DepthwiseBlock(recipient_first, recipient_second, stride=(2, 2)),
+                                DepthwiseBlock(recipient_second, recipient_third, stride=(2, 1)),
+                                DepthwiseBlock(recipient_third, recipient_channels, stride=(1, 1)),
+                            )
                         recipient_feature_height = (config.recipient_input_height + 7) // 8
                     self.recipient_ctc_vertical_reducer = VerticalTextReducer(
                         recipient_channels, recipient_feature_height
                     )
-                    self.recipient_ctc_sequence = nn.GRU(
-                        recipient_channels, _recipient_hidden_size(config), bidirectional=True
-                    )
-                    self.recipient_classifier = nn.Linear(
-                        _recipient_hidden_size(config) * 2, int(recipient_vocab_size)
-                    )
-                    if config.recipient_open_text_layers:
+                    recipient_model_width = _recipient_hidden_size(config) * 2
+                    if config.recipient_backbone == "residual_positional_transformer_v2":
+                        self.recipient_input_projection = nn.Linear(
+                            recipient_channels, recipient_model_width
+                        )
+                        self.recipient_position_embedding = nn.Parameter(
+                            torch.empty(_recipient_time_steps(config), 1, recipient_model_width)
+                        )
+                        nn.init.normal_(self.recipient_position_embedding, std=0.02)
                         recipient_model_width = _recipient_hidden_size(config) * 2
                         recipient_feedforward = int(
                             config.recipient_open_text_feedforward or recipient_model_width * 4
@@ -1728,7 +1843,38 @@ def build_unified_reader(
                             d_model=recipient_model_width,
                             nhead=config.recipient_open_text_heads,
                             dim_feedforward=recipient_feedforward,
-                            dropout=0.0,
+                            dropout=config.recipient_open_text_dropout,
+                            activation="gelu",
+                            batch_first=False,
+                            norm_first=True,
+                        )
+                        self.recipient_open_text_encoder = nn.TransformerEncoder(
+                            open_text_layer,
+                            num_layers=config.recipient_open_text_layers,
+                            enable_nested_tensor=False,
+                        )
+                        self.recipient_classifier = nn.Linear(
+                            recipient_model_width, int(recipient_vocab_size)
+                        )
+                    else:
+                        self.recipient_ctc_sequence = nn.GRU(
+                            recipient_channels, _recipient_hidden_size(config), bidirectional=True
+                        )
+                        self.recipient_classifier = nn.Linear(
+                            recipient_model_width, int(recipient_vocab_size)
+                        )
+                    if (
+                        config.recipient_backbone == "legacy_depthwise_gru_v1"
+                        and config.recipient_open_text_layers
+                    ):
+                        recipient_feedforward = int(
+                            config.recipient_open_text_feedforward or recipient_model_width * 4
+                        )
+                        open_text_layer = nn.TransformerEncoderLayer(
+                            d_model=recipient_model_width,
+                            nhead=config.recipient_open_text_heads,
+                            dim_feedforward=recipient_feedforward,
+                            dropout=config.recipient_open_text_dropout,
                             activation="gelu",
                             batch_first=False,
                             norm_first=True,
@@ -1902,12 +2048,18 @@ def build_unified_reader(
                         recipient_features = self.recipient_ctc_vertical_reducer(recipient_encoded)
                     else:
                         recipient_features = self.recipient_ctc_vertical_reducer(encoded[:, 4])
-                    recipient_sequence, _ = self.recipient_ctc_sequence(recipient_features.permute(2, 0, 1))
-                    if config.recipient_open_text_layers:
-                        refined_recipient_sequence = self.recipient_open_text_encoder(recipient_sequence)
-                        recipient_sequence = recipient_sequence + torch.tanh(
-                            self.recipient_open_text_gate
-                        ) * (refined_recipient_sequence - recipient_sequence)
+                    recipient_sequence = recipient_features.permute(2, 0, 1)
+                    if config.recipient_backbone == "residual_positional_transformer_v2":
+                        recipient_sequence = self.recipient_input_projection(recipient_sequence)
+                        recipient_sequence = recipient_sequence + self.recipient_position_embedding
+                        recipient_sequence = self.recipient_open_text_encoder(recipient_sequence)
+                    else:
+                        recipient_sequence, _ = self.recipient_ctc_sequence(recipient_sequence)
+                        if config.recipient_open_text_layers:
+                            refined_recipient_sequence = self.recipient_open_text_encoder(recipient_sequence)
+                            recipient_sequence = recipient_sequence + torch.tanh(
+                                self.recipient_open_text_gate
+                            ) * (refined_recipient_sequence - recipient_sequence)
                     recipient_logits = self.recipient_classifier(recipient_sequence)
             elif self.architecture_version == 5:
                 payment_features = self.payment_vertical_reducer(encoded[:, 3])  # [batch,C,T]
@@ -2812,8 +2964,8 @@ def _recipient_augmentation_rng(
     record id makes the train-only perturbation reproducible regardless of
     worker scheduling.
     """
-    if policy.get("mode") != "light_v1":
-        raise ValueError("recipient augmentation RNG requires light_v1 policy")
+    if policy.get("mode") not in {"light_v1", "robust_v2"}:
+        raise ValueError("recipient augmentation RNG requires a non-empty recipient augmentation policy")
     seed = policy.get("seed")
     if isinstance(seed, bool) or not isinstance(seed, int):
         raise ValueError("recipient augmentation policy seed is invalid")
@@ -2848,6 +3000,23 @@ def _augment_recipient_value_input(
         raise ValueError("recipient value input contains non-finite pixels")
     rng = _recipient_augmentation_rng(record, policy=normalized_policy, epoch=epoch)
     _, height, width = image.shape
+    augmented_source = image
+    if normalized_policy["mode"] == "robust_v2":
+        horizontal_delta = float(normalized_policy["horizontal_scale_delta"])
+        vertical_delta = float(normalized_policy["vertical_scale_delta"])
+        scaled_width = max(1, int(round(width * float(rng.uniform(1.0 - horizontal_delta, 1.0)))))
+        scaled_height = max(1, int(round(height * float(rng.uniform(1.0 - vertical_delta, 1.0)))))
+        source_u8 = np.rint(np.clip(image[0], 0.0, 1.0) * 255.0).astype(np.uint8)
+        resampling = getattr(Image, "Resampling", Image).BILINEAR
+        resized = np.asarray(
+            Image.fromarray(source_u8, mode="L").resize((scaled_width, scaled_height), resampling),
+            dtype=np.float32,
+        ) / 255.0
+        scaled = np.ones_like(image, dtype=np.float32)
+        scaled_top = (height - scaled_height) // 2
+        scaled_left = (width - scaled_width) // 2
+        scaled[0, scaled_top : scaled_top + scaled_height, scaled_left : scaled_left + scaled_width] = resized
+        augmented_source = scaled
     horizontal_limit = int(normalized_policy["horizontal_shift_px"])
     vertical_limit = int(normalized_policy["vertical_shift_px"])
     shift_x = int(rng.integers(-horizontal_limit, horizontal_limit + 1))
@@ -2864,7 +3033,7 @@ def _augment_recipient_value_input(
     if source_x_end > source_x_start and source_y_end > source_y_start:
         shifted[
             :, destination_y_start:destination_y_end, destination_x_start:destination_x_end
-        ] = image[:, source_y_start:source_y_end, source_x_start:source_x_end]
+        ] = augmented_source[:, source_y_start:source_y_end, source_x_start:source_x_end]
     # White remains white under the contrast transform; only ink strength is
     # altered. This avoids teaching the model a non-existent dark background.
     contrast_delta = float(normalized_policy["contrast_delta"])
@@ -2873,16 +3042,28 @@ def _augment_recipient_value_input(
     noise_std = float(normalized_policy["noise_std"])
     if noise_std > 0.0:
         augmented = augmented + rng.normal(0.0, noise_std, size=augmented.shape).astype(np.float32)
+    if (
+        normalized_policy["mode"] == "robust_v2"
+        and float(rng.random()) < float(normalized_policy["blur_probability"])
+    ):
+        # A narrow horizontal kernel models mild screenshot/display blur while
+        # preserving the vertical strokes that distinguish Chinese glyphs.
+        padded = np.pad(augmented, ((0, 0), (0, 0), (1, 1)), mode="edge")
+        augmented = (
+            0.25 * padded[:, :, :-2]
+            + 0.50 * padded[:, :, 1:-1]
+            + 0.25 * padded[:, :, 2:]
+        )
     return np.clip(augmented, 0.0, 1.0).astype(np.float32, copy=False)
 
 
 class _UnifiedReceiptDataset:
     """A picklable dataset so Windows DataLoader workers remain usable.
 
-    ``light_v1`` derives its augmentation from the training epoch.  A regular
+    Recipient augmentation derives its perturbation from the training epoch.  A regular
     integer would be copied into each Windows-spawned worker, which previously
     made persistent workers unsafe: they would keep augmenting every epoch as
-    epoch zero.  For ``light_v1`` only, a shared-memory CPU tensor is safely
+    epoch zero.  For either non-empty policy, a shared-memory CPU tensor is safely
     transported by ``torch.utils.data.DataLoader`` across both fork and spawn
     contexts, so the parent can advance the epoch without recreating workers
     or changing the per-record RNG formula.
@@ -2896,8 +3077,8 @@ class _UnifiedReceiptDataset:
         recipient_train_augmentation_policy: Mapping[str, object] | None = None,
         recipient_only: bool = False,
     ) -> None:
-        if recipient_only and not _is_v12(config):
-            raise ValueError("recipient_only dataset is supported only by architecture v12")
+        if recipient_only and not _uses_v12_recipient_topology(config):
+            raise ValueError("recipient_only dataset is supported only by architecture v12 or v13")
         self._records = list(records)
         self._config = config
         self._recipient_only = recipient_only
@@ -2908,7 +3089,7 @@ class _UnifiedReceiptDataset:
         )
         self._epoch = 0
         self._shared_augmentation_epoch: Any | None = None
-        if self._recipient_train_augmentation_policy["mode"] == "light_v1":
+        if self._recipient_train_augmentation_policy["mode"] != "none":
             # Do not use ``multiprocessing.Value`` here: a Value created from
             # a Linux fork context cannot be sent to an explicitly spawned
             # worker.  A shared CPU tensor is portable across DataLoader
@@ -2927,7 +3108,7 @@ class _UnifiedReceiptDataset:
             self._shared_augmentation_epoch.fill_(self._epoch)
 
     def _augmentation_epoch(self) -> int:
-        """Return the worker-visible epoch used only by ``light_v1``."""
+        """Return the worker-visible epoch used only by recipient augmentation."""
         if self._shared_augmentation_epoch is None:
             return self._epoch
         return int(self._shared_augmentation_epoch.item())
@@ -2996,8 +3177,8 @@ def _recipient_only_logits(model: Any, recipient_value_images: Any, *, config: U
     Full five-field inference still runs for every validation epoch, where the
     protection floors are measured.
     """
-    if not _is_v12(config):
-        raise ValueError("recipient-only logits are supported only by architecture v12")
+    if not _uses_v12_recipient_topology(config):
+        raise ValueError("recipient-only logits are supported only by architecture v12 or v13")
     expected_shape = [recipient_value_images.shape[0], 1, config.recipient_input_height, config.recipient_input_width]
     if list(recipient_value_images.shape) != expected_shape:
         raise ValueError(
@@ -3006,12 +3187,18 @@ def _recipient_only_logits(model: Any, recipient_value_images: Any, *, config: U
         )
     encoded = model.recipient_encoder(model.recipient_stem(recipient_value_images))
     features = model.recipient_ctc_vertical_reducer(encoded)
-    sequence, _ = model.recipient_ctc_sequence(features.permute(2, 0, 1))
-    if config.recipient_open_text_layers:
-        refined_sequence = model.recipient_open_text_encoder(sequence)
-        sequence = sequence + model.recipient_open_text_gate.tanh() * (
-            refined_sequence - sequence
-        )
+    sequence = features.permute(2, 0, 1)
+    if config.recipient_backbone == "residual_positional_transformer_v2":
+        sequence = model.recipient_input_projection(sequence)
+        sequence = sequence + model.recipient_position_embedding
+        sequence = model.recipient_open_text_encoder(sequence)
+    else:
+        sequence, _ = model.recipient_ctc_sequence(sequence)
+        if config.recipient_open_text_layers:
+            refined_sequence = model.recipient_open_text_encoder(sequence)
+            sequence = sequence + model.recipient_open_text_gate.tanh() * (
+                refined_sequence - sequence
+            )
     return model.recipient_classifier(sequence)
 
 
@@ -5291,7 +5478,9 @@ def _checkpoint_selection_policy(
             **status_text_selection,
         }
     if not _uses_recipient_protocol(config):
-        raise ValueError("checkpoint_selection=recipient_priority requires architecture v9, v10, v11, or v12")
+        raise ValueError(
+            "checkpoint_selection=recipient_priority requires architecture v9, v10, v11, v12, or v13"
+        )
     missing = [field for field, value in raw_minima.items() if value is None]
     if missing:
         raise ValueError(
@@ -5590,6 +5779,49 @@ def _validate_recipient_open_text_adapter_config(
         )
 
 
+def _validate_recipient_visual_context_reinit_config(
+    source_config: UnifiedReaderConfig,
+    target_config: UnifiedReaderConfig,
+) -> None:
+    """Guard the one new recipient recogniser without changing v13's ABI.
+
+    This is intentionally not another width/capacity retry.  The source must
+    be the established depthwise+BiGRU branch and the target must replace it
+    with the residual visual encoder plus direct positional Transformer.  Only
+    private-recipient topology/training-time dropout fields may differ; every
+    shared, financial, status, input-shape and output-policy field remains
+    byte-compatible with the v13 seed.
+    """
+
+    if not (_is_v13(source_config) and _is_v13(target_config)):
+        raise ValueError("recipient_visual_context_reinit requires v13 source and target configs")
+    if source_config.recipient_backbone != "legacy_depthwise_gru_v1":
+        raise ValueError("recipient_visual_context_reinit requires the established legacy recipient seed")
+    if target_config.recipient_backbone != "residual_positional_transformer_v2":
+        raise ValueError("recipient_visual_context_reinit requires the residual positional Transformer target")
+    allowed = {
+        "recipient_backbone",
+        "recipient_branch_channels",
+        "recipient_hidden_size",
+        "recipient_open_text_layers",
+        "recipient_open_text_heads",
+        "recipient_open_text_feedforward",
+        "recipient_open_text_dropout",
+    }
+    source_values = asdict(source_config)
+    target_values = asdict(target_config)
+    changed = [
+        key
+        for key in sorted(source_values)
+        if key not in allowed and source_values[key] != target_values.get(key)
+    ]
+    if changed:
+        raise ValueError(
+            "recipient_visual_context_reinit changed a non-recipient config field: "
+            + ", ".join(changed)
+        )
+
+
 def _recipient_only_expansion_label_override(
     *,
     init_checkpoint: Path,
@@ -5615,8 +5847,13 @@ def _recipient_only_expansion_label_override(
     """
     if init_checkpoint_mode not in RECIPIENT_ONLY_INIT_CHECKPOINT_MODES:
         raise ValueError("recipient label override requires a recipient-only expansion init mode")
-    if not _is_v12(config):
-        raise ValueError("recipient-only expansion is supported only by architecture v12")
+    v13_visual_context_reinit = _is_v13(config) and (
+        init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_VISUAL_CONTEXT_REINIT
+    )
+    if not (_is_v12(config) or v13_visual_context_reinit):
+        raise ValueError(
+            "recipient-only expansion is supported by architecture v12, or by v13 visual-context reinitialisation"
+        )
     if recipient_characters is None or payment_bank_prefix_classes is None:
         raise ValueError("recipient_only_expansion requires v12 recipient and payment bank label maps")
     checkpoint_path = Path(init_checkpoint).resolve()
@@ -5634,6 +5871,8 @@ def _recipient_only_expansion_label_override(
         _validate_recipient_capacity_reinit_config(source_config, config)
     elif init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_OPEN_TEXT_ADAPTER:
         _validate_recipient_open_text_adapter_config(source_config, config)
+    elif init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_VISUAL_CONTEXT_REINIT:
+        _validate_recipient_visual_context_reinit_config(source_config, config)
     elif source_config != config:
         raise ValueError(
             "init checkpoint model config does not match the requested training config; "
@@ -5657,7 +5896,14 @@ def _recipient_only_expansion_label_override(
     if source_recipient_characters is None:
         raise ValueError("init checkpoint recipient character map does not match the current training data")
     source_recipient_set = set(source_recipient_characters)
-    effective_recipient_characters = sorted(source_recipient_set | set(recipient_characters))
+    fresh_train_only_recipient_map = (
+        init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_VISUAL_CONTEXT_REINIT
+    )
+    effective_recipient_characters = (
+        sorted(set(recipient_characters))
+        if fresh_train_only_recipient_map
+        else sorted(source_recipient_set | set(recipient_characters))
+    )
     if source_payment_bank_prefix_classes is None:
         raise ValueError("init checkpoint payment bank-prefix class map does not match the current training data")
     return (
@@ -5672,14 +5918,18 @@ def _recipient_only_expansion_label_override(
                     "checkpoint_financial_label_maps_recipient_capacity_reinit_v1"
                     if init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_CAPACITY_REINIT
                     else (
-                        "checkpoint_financial_label_maps_recipient_open_text_adapter_v1"
-                        if init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_OPEN_TEXT_ADAPTER
-                        else "checkpoint_financial_label_maps_v1"
+                        "checkpoint_financial_label_maps_recipient_visual_context_reinit_v1"
+                        if init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_VISUAL_CONTEXT_REINIT
+                        else (
+                            "checkpoint_financial_label_maps_recipient_open_text_adapter_v1"
+                            if init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_OPEN_TEXT_ADAPTER
+                            else "checkpoint_financial_label_maps_v1"
+                        )
                     )
                 )
             ),
             "reason": (
-                "recipient-only v12 fine-tune freezes every non-recipient parameter, so payment and bank "
+                "recipient-only v12/v13 fine-tune freezes every non-recipient parameter, so payment and bank "
                 "classifier row semantics remain locked to the compatible seed checkpoint"
             ),
             **(
@@ -5702,7 +5952,11 @@ def _recipient_only_expansion_label_override(
                 data_derived_values=payment_bank_prefix_classes,
             ),
             "recipient_character_map": {
-                "mode": "checkpoint_base_plus_train_only_additions_v1",
+                "mode": (
+                    "fresh_train_only_reinitialized_recipient_v1"
+                    if fresh_train_only_recipient_map
+                    else "checkpoint_base_plus_train_only_additions_v1"
+                ),
                 "checkpoint_count": len(source_recipient_characters),
                 "checkpoint_sha256": _label_map_sha256(source_recipient_characters),
                 "data_derived_count": len(recipient_characters),
@@ -5710,7 +5964,12 @@ def _recipient_only_expansion_label_override(
                 "effective_count": len(effective_recipient_characters),
                 "effective_sha256": _label_map_sha256(effective_recipient_characters),
                 "checkpoint_characters_retained_not_in_current_train_count": len(
-                    source_recipient_set - set(recipient_characters)
+                    set(effective_recipient_characters) - set(recipient_characters)
+                ),
+                "checkpoint_characters_discarded_for_blind_reinit_count": (
+                    len(source_recipient_set - set(recipient_characters))
+                    if fresh_train_only_recipient_map
+                    else 0
                 ),
                 "new_data_derived_character_count": len(
                     set(recipient_characters) - source_recipient_set
@@ -5925,6 +6184,47 @@ def _recipient_capacity_reinit_state(
     }
 
 
+def _recipient_visual_context_reinit_state(
+    *,
+    source_state_dict: Mapping[str, object],
+    target_state_dict: Mapping[str, object],
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Copy every frozen v13 tensor and keep the new recipient branch fresh."""
+
+    source_frozen = {key for key in source_state_dict if not str(key).startswith("recipient_")}
+    target_frozen = {key for key in target_state_dict if not str(key).startswith("recipient_")}
+    source_recipient = {key for key in source_state_dict if str(key).startswith("recipient_")}
+    target_recipient = {key for key in target_state_dict if str(key).startswith("recipient_")}
+    if source_frozen != target_frozen:
+        raise ValueError(
+            "recipient_visual_context_reinit changed the frozen parameter set; "
+            f"missing={sorted(target_frozen - source_frozen)}, "
+            f"unexpected={sorted(source_frozen - target_frozen)}"
+        )
+    if not source_frozen or not source_recipient or not target_recipient:
+        raise ValueError("recipient_visual_context_reinit has an incomplete source or target model")
+    adapted: dict[str, object] = dict(target_state_dict)
+    for key in sorted(source_frozen):
+        source_value = source_state_dict[key]
+        target_value = target_state_dict[key]
+        source_shape = tuple(getattr(source_value, "shape", ()))
+        target_shape = tuple(getattr(target_value, "shape", ()))
+        if source_shape != target_shape:
+            raise ValueError(
+                "recipient_visual_context_reinit changed a frozen tensor shape: "
+                f"{key} source={source_shape}, target={target_shape}"
+            )
+        adapted[key] = source_value
+    return adapted, {
+        "frozen_tensor_count": len(source_frozen),
+        "source_recipient_tensor_count_discarded": len(source_recipient),
+        "target_recipient_tensor_count_reinitialized": len(target_recipient),
+        "recipient_parameter_prefix": "recipient_",
+        "source_backbone": "legacy_depthwise_gru_v1",
+        "target_backbone": "residual_positional_transformer_v2",
+    }
+
+
 def _recipient_open_text_adapter_state(
     *,
     source_state_dict: Mapping[str, object],
@@ -6042,6 +6342,8 @@ def _parameter_only_initialization(
         _validate_recipient_capacity_reinit_config(source_config, config)
     elif init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_OPEN_TEXT_ADAPTER:
         _validate_recipient_open_text_adapter_config(source_config, config)
+    elif init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_VISUAL_CONTEXT_REINIT:
+        _validate_recipient_visual_context_reinit_config(source_config, config)
     elif v12_status_text_expansion:
         source_values = asdict(source_config)
         target_values = asdict(config)
@@ -6163,12 +6465,38 @@ def _parameter_only_initialization(
             raise ValueError("init checkpoint status-text character map does not match the current training data")
         return state_dict, initialization
 
-    if not _is_v12(config):
-        raise ValueError("recipient-only expansion init modes are supported only by architecture v12")
+    v13_visual_context_reinit = _is_v13(config) and (
+        init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_VISUAL_CONTEXT_REINIT
+    )
+    if not (_is_v12(config) or v13_visual_context_reinit):
+        raise ValueError(
+            "recipient-only expansion init modes require architecture v12, or v13 visual-context reinitialisation"
+        )
     if source_recipient_characters is None or recipient_characters is None:
         raise ValueError("init checkpoint recipient character map does not match the current training data")
     if target_state_dict is None:
-        raise ValueError("recipient-only expansion init modes require a freshly initialised v12 target state")
+        raise ValueError("recipient-only expansion init modes require a freshly initialised target state")
+    source_status_text_characters = _checkpoint_status_text_characters(
+        payload, config=source_config
+    )
+    if source_status_text_characters is None or status_text_characters is None:
+        if source_status_text_characters is not status_text_characters:
+            raise ValueError("init checkpoint status-text character map does not match the current training data")
+    elif list(source_status_text_characters) != list(status_text_characters):
+        raise ValueError("init checkpoint status-text character map does not match the current training data")
+    if init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_VISUAL_CONTEXT_REINIT:
+        remapped_state, visual_context_mapping = _recipient_visual_context_reinit_state(
+            source_state_dict=state_dict,
+            target_state_dict=target_state_dict,
+        )
+        initialization.update(
+            {
+                "mode": "parameter_only_recipient_visual_context_reinit",
+                "init_checkpoint_mode": init_checkpoint_mode,
+                "recipient_visual_context_mapping": visual_context_mapping,
+            }
+        )
+        return remapped_state, initialization
     if init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_CAPACITY_REINIT:
         remapped_state, capacity_mapping = _recipient_capacity_reinit_state(
             source_state_dict=state_dict,
@@ -6344,14 +6672,18 @@ def _validate_validation_every(
     if validation_every == 1:
         return
     recipient_private_safe = (
-        _is_v12(config)
+        _uses_v12_recipient_topology(config)
         and recipient_only_fine_tune
         and init_checkpoint_mode in RECIPIENT_ONLY_INIT_CHECKPOINT_MODES
+        and (
+            _is_v12(config)
+            or init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_VISUAL_CONTEXT_REINIT
+        )
     )
     status_text_private_safe = _is_v13(config) and status_text_only_fine_tune
     if not (recipient_private_safe or status_text_private_safe):
         raise ValueError(
-            "validation_every > 1 is supported only by guarded v12 recipient_only_fine_tune "
+            "validation_every > 1 is supported only by guarded v12/v13 recipient_only_fine_tune "
             "or v13 status_text_only_fine_tune"
         )
 
@@ -6522,8 +6854,8 @@ def train_unified_reader(
             raise ValueError("status_text_only_fine_tune requires a compatible v12 or v13 --init-checkpoint")
     recipient_train_split_policy = _recipient_train_split_policy(recipient_train_splits)
     if recipient_only_fine_tune:
-        if not _is_v12(config):
-            raise ValueError("recipient_only_fine_tune is supported only by architecture v12")
+        if not _uses_v12_recipient_topology(config):
+            raise ValueError("recipient_only_fine_tune is supported only by architecture v12 or v13")
         if init_checkpoint is None:
             raise ValueError("recipient_only_fine_tune requires a compatible --init-checkpoint")
     elif recipient_train_split_policy["mode"] != "standard_train_only":
@@ -6542,9 +6874,13 @@ def train_unified_reader(
             f"{', '.join(sorted(INIT_CHECKPOINT_MODES))}"
         )
     if init_checkpoint_mode in RECIPIENT_ONLY_INIT_CHECKPOINT_MODES:
-        if not recipient_only_fine_tune or not _is_v12(config):
+        v13_visual_context_reinit = _is_v13(config) and (
+            init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_VISUAL_CONTEXT_REINIT
+        )
+        if not recipient_only_fine_tune or not (_is_v12(config) or v13_visual_context_reinit):
             raise ValueError(
-                "recipient-only expansion init modes require architecture v12 with recipient_only_fine_tune enabled"
+                "recipient-only expansion init modes require v12 recipient_only_fine_tune, "
+                "or v13 recipient visual-context reinitialisation"
             )
         if init_checkpoint is None:
             raise ValueError("recipient-only expansion init modes require a compatible --init-checkpoint")
@@ -7014,14 +7350,14 @@ def train_unified_reader(
         if trainable_parameter_count == 0:
             raise AssertionError("v12 recipient-only fine-tune found no recipient parameters")
         fine_tune_policy = {
-            "mode": "recipient_only_v12",
+            "mode": f"recipient_only_v{config.architecture_version}",
             "trainable_parameter_count": trainable_parameter_count,
             "frozen_parameter_count": sum(
                 parameter.numel() for parameter in model.parameters() if not parameter.requires_grad
             ),
             "trainable_parameter_prefix": trainable_recipient_prefix,
             "open_text_legacy_recipient_unfrozen": recipient_open_text_unfreeze_legacy,
-            "training_forward": "private_recipient_branch_only_v12",
+            "training_forward": f"private_recipient_branch_only_v{config.architecture_version}",
             "source_train_records": len(train_records),
             "recipient_train_records": len(training_records),
             "full_validation_schedule": "epoch_1_every_n_and_final_epoch",
@@ -7780,6 +8116,8 @@ def _config_from_mapping(
                 if raw.get("recipient_open_text_feedforward") is not None
                 else None
             ),
+            recipient_open_text_dropout=float(raw.get("recipient_open_text_dropout") or 0.0),
+            recipient_backbone=str(raw.get("recipient_backbone") or "legacy_depthwise_gru_v1"),
             pooled_width=int(raw["pooled_width"]),
             amount_format_min_confidence=float(raw.get("amount_format_min_confidence", 0.90)),
         )
@@ -10857,11 +11195,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     train.add_argument(
         "--recipient-train-augmentation",
-        choices=("none", "light_v1"),
+        choices=("none", "light_v1", "robust_v2"),
         default="none",
         help=(
-            "v12 only: train-only recipient value-crop perturbation; light_v1 uses deterministic small shifts, "
-            "contrast and noise without changing the ONNX input contract"
+            "v12/v13 only: train-only recipient value-crop perturbation; robust_v2 adds bounded downscale and "
+            "mild blur to deterministic shifts/contrast/noise without changing the ONNX input contract"
         ),
     )
     train.add_argument(
@@ -10952,7 +11290,9 @@ def build_parser() -> argparse.ArgumentParser:
             "financial/shared topology unchanged. recipient_capacity_reinit copies every financial/shared "
             "tensor but deliberately reinitialises a monotonically larger private recipient CNN/GRU."
             " recipient_open_text_adapter copies the complete seed, adds a zero-gated Transformer context "
-            "encoder, and trains only that adapter."
+            "encoder, and trains only that adapter. recipient_visual_context_reinit is v13-only: it copies "
+            "every non-recipient tensor from a v13 seed and freshly trains the residual visual + direct "
+            "positional Transformer CTC recipient branch."
         ),
     )
     train.add_argument(
@@ -11047,6 +11387,24 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="v12 open-text adapter feed-forward width; defaults to four times its model width",
     )
+    train.add_argument(
+        "--recipient-open-text-dropout",
+        type=float,
+        default=0.0,
+        help=(
+            "v12/v13 private recipient Transformer train-time dropout; 0 preserves historical checkpoints, "
+            "a capacity-reinitialised open-text candidate may use a bounded value such as 0.10"
+        ),
+    )
+    train.add_argument(
+        "--recipient-backbone",
+        choices=("legacy_depthwise_gru_v1", "residual_positional_transformer_v2"),
+        default="legacy_depthwise_gru_v1",
+        help=(
+            "Private recipient recogniser. The v2 residual/positional Transformer path is v13-only and "
+            "requires recipient_visual_context_reinit from a compatible v13 seed."
+        ),
+    )
     train.add_argument("--pooled-width", type=int, default=8)
     train.add_argument("--seed", type=int, default=42)
     train.add_argument(
@@ -11065,7 +11423,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--persistent-workers",
         action="store_true",
         help=(
-            "Keep DataLoader workers alive between epochs. v12 light_v1 recipient augmentation uses a "
+            "Keep DataLoader workers alive between epochs. v12/v13 recipient augmentation uses a "
             "process-shared epoch counter, so its deterministic per-record perturbations remain epoch-correct."
         ),
     )
@@ -11218,6 +11576,8 @@ def main(argv: list[str] | None = None) -> None:
                 recipient_open_text_layers=args.recipient_open_text_layers,
                 recipient_open_text_heads=args.recipient_open_text_heads,
                 recipient_open_text_feedforward=args.recipient_open_text_feedforward,
+                recipient_open_text_dropout=args.recipient_open_text_dropout,
+                recipient_backbone=args.recipient_backbone,
                 pooled_width=args.pooled_width,
                 amount_format_min_confidence=args.amount_format_min_confidence,
             )
