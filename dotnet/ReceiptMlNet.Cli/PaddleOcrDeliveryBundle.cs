@@ -111,6 +111,8 @@ internal sealed class PaddleOcrDeliveryBundle
 
             var sourceAuditHash = ReadRequiredString(contract, "source_audit_contract_sha256", "delivery contract");
             RequireSha256(sourceAuditHash, "delivery contract source_audit_contract_sha256");
+            VerifyNativeAssetIdentity(RequireProperty(contract, "native_asset_identity", "delivery contract"));
+            VerifyAdapterContract(RequireProperty(contract, "adapter_contract", "delivery contract"));
 
             var models = ParseModels(directory, RequireProperty(contract, "models", "delivery contract"));
             var dictionary = ParseFileRecord(
@@ -185,6 +187,136 @@ internal sealed class PaddleOcrDeliveryBundle
         return new ReadOnlyDictionary<string, PaddleOcrModelInfo>(models);
     }
 
+    private static void VerifyNativeAssetIdentity(JsonElement element)
+    {
+        RequireObject(element, "native_asset_identity");
+        if (ReadRequiredInt(element, "schema_version", "native_asset_identity") != 1
+            || !string.Equals(
+                ReadRequiredString(element, "kind", "native_asset_identity"),
+                "paddle_ocr_native_asset_identity_v1",
+                StringComparison.Ordinal))
+        {
+            throw new UsageException("Unsupported Paddle OCR native asset identity");
+        }
+        RequireSha256(
+            ReadRequiredString(element, "sha256", "native_asset_identity"),
+            "native_asset_identity SHA-256");
+        var components = RequireProperty(element, "components", "native_asset_identity");
+        RequireObject(components, "native_asset_identity components");
+        var componentNames = components.EnumerateObject().Select(property => property.Name).ToArray();
+        var requiredNames = new[] { "det", "rec", "cls", "dictionary" };
+        if (componentNames.Length != requiredNames.Length
+            || !componentNames.ToHashSet(StringComparer.Ordinal).SetEquals(requiredNames))
+        {
+            throw new UsageException("Paddle OCR native asset identity must contain det, rec, cls and dictionary hashes");
+        }
+        foreach (var name in requiredNames)
+        {
+            RequireSha256(
+                ReadRequiredString(components, name, "native_asset_identity components"),
+                $"native_asset_identity {name} SHA-256");
+        }
+        var files = RequireProperty(element, "files", "native_asset_identity");
+        if (files.ValueKind != JsonValueKind.Array || files.GetArrayLength() < 7)
+        {
+            throw new UsageException("Paddle OCR native asset identity has an incomplete file set");
+        }
+    }
+
+    private static void VerifyAdapterContract(JsonElement element)
+    {
+        RequireObject(element, "adapter_contract");
+        RequireExactString(element, "adapter_version", "paddle_ocr_dotnet_adapter_v1", "adapter_contract");
+        RequireExactString(element, "input_color_order", "RGB_passthrough_to_paddle_v2", "adapter_contract");
+        RequireExactString(
+            element,
+            "hardware_note",
+            "Snapshot initialisation may run on CPU; device-selection args are not OCR behavior parity settings.",
+            "adapter_contract");
+
+        var aggregation = RequireProperty(element, "line_aggregation", "adapter_contract");
+        RequireObject(aggregation, "adapter_contract line_aggregation");
+        RequireExactString(
+            aggregation,
+            "text",
+            "clean each non-empty line then join with one ASCII space",
+            "adapter_contract line_aggregation");
+        RequireExactString(
+            aggregation,
+            "confidence",
+            "arithmetic mean of all Paddle line confidences",
+            "adapter_contract line_aggregation");
+
+        var preprocessing = RequireProperty(element, "preprocessing", "adapter_contract");
+        RequireObject(preprocessing, "adapter_contract preprocessing");
+        VerifyNormalization(
+            RequireProperty(preprocessing, "detector_normalization", "adapter_contract preprocessing"),
+            [0.485, 0.456, 0.406],
+            [0.229, 0.224, 0.225],
+            "detector_normalization");
+        VerifyNormalization(
+            RequireProperty(preprocessing, "classifier_recognizer_normalization", "adapter_contract preprocessing"),
+            [0.5, 0.5, 0.5],
+            [0.5, 0.5, 0.5],
+            "classifier_recognizer_normalization");
+        RequireExactString(
+            preprocessing,
+            "classifier_recognizer_right_padding",
+            "float_zero_after_normalization",
+            "adapter_contract preprocessing");
+
+        var components = RequireProperty(element, "required_components", "adapter_contract");
+        if (components.ValueKind != JsonValueKind.Array
+            || !components.EnumerateArray().Select(value => value.GetString()).SequenceEqual(
+                new[] { "text_detection", "angle_classification", "text_recognition" },
+                StringComparer.Ordinal))
+        {
+            throw new UsageException("Paddle OCR adapter_contract required_components are unsupported");
+        }
+    }
+
+    private static void VerifyNormalization(
+        JsonElement element,
+        IReadOnlyList<double> expectedMean,
+        IReadOnlyList<double> expectedStd,
+        string description)
+    {
+        RequireObject(element, $"adapter_contract {description}");
+        var scale = RequireProperty(element, "scale", $"adapter_contract {description}");
+        if (!scale.TryGetDouble(out var scaleValue) || Math.Abs(scaleValue - 1.0 / 255.0) > 1e-15)
+        {
+            throw new UsageException($"Paddle OCR adapter_contract {description}.scale is unsupported");
+        }
+        VerifyDoubleArray(RequireProperty(element, "mean", description), expectedMean, $"{description}.mean");
+        VerifyDoubleArray(RequireProperty(element, "std", description), expectedStd, $"{description}.std");
+    }
+
+    private static void VerifyDoubleArray(JsonElement element, IReadOnlyList<double> expected, string description)
+    {
+        if (element.ValueKind != JsonValueKind.Array || element.GetArrayLength() != expected.Count)
+        {
+            throw new UsageException($"Paddle OCR adapter_contract {description} is unsupported");
+        }
+        var index = 0;
+        foreach (var item in element.EnumerateArray())
+        {
+            if (!item.TryGetDouble(out var actual) || Math.Abs(actual - expected[index]) > 1e-12)
+            {
+                throw new UsageException($"Paddle OCR adapter_contract {description} is unsupported");
+            }
+            index++;
+        }
+    }
+
+    private static void RequireExactString(JsonElement element, string property, string expected, string description)
+    {
+        var actual = ReadRequiredString(element, property, description);
+        if (!string.Equals(actual, expected, StringComparison.Ordinal))
+        {
+            throw new UsageException($"Paddle OCR {description}.{property} is unsupported");
+        }
+    }
+
     private static PaddleOcrModelInfo ParseModel(string directory, string role, JsonElement element)
     {
         RequireObject(element, $"{role} model record");
@@ -210,6 +342,10 @@ internal sealed class PaddleOcrDeliveryBundle
         if (!string.Equals(inputs[0].ElementType, "tensor(float)", StringComparison.Ordinal))
         {
             throw new UsageException($"Paddle OCR {role} ONNX input must be tensor(float); found {inputs[0].ElementType}");
+        }
+        if (outputs.Any(output => !string.Equals(output.ElementType, "tensor(float)", StringComparison.Ordinal)))
+        {
+            throw new UsageException($"Paddle OCR {role} ONNX outputs must all be tensor(float)");
         }
 
         var dynamic = ParseDynamicShapeRequirement(

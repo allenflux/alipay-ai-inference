@@ -16,6 +16,7 @@ remains required before calling it production accuracy.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -40,6 +41,14 @@ _RECIPIENT_FIELD = "recipient_field"
 _SPLITS = frozenset(("val", "test"))
 _FULL_DET_CLS_REC_MODE = "full_det_cls_rec"
 _SKIP_DET_CLS_REC_EXPERIMENT_MODE = "experimental_skip_det_cls_rec"
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def _read_jsonl(path: Path) -> list[dict[str, object]]:
@@ -86,6 +95,7 @@ def _load_recipient_records(
     dataset_root: Path,
     split: str,
     limit: int | None,
+    require_crop_hash: bool = False,
 ) -> list[dict[str, object]]:
     source = Path(manifest_path).expanduser().resolve()
     records = _read_jsonl(source)
@@ -127,6 +137,16 @@ def _load_recipient_records(
             source=source,
             line_number=line_number,
         )
+        declared_crop_hash = slot.get("crop_sha256")
+        if require_crop_hash and (
+            not isinstance(declared_crop_hash, str)
+            or len(declared_crop_hash) != 64
+            or any(character not in "0123456789abcdef" for character in declared_crop_hash)
+        ):
+            raise ValueError(f"{source}:{line_number}: bundle-bound evidence requires crop_sha256")
+        actual_crop_hash = _sha256(image_path)
+        if declared_crop_hash is not None and declared_crop_hash != actual_crop_hash:
+            raise ValueError(f"{source}:{line_number}: recipient crop SHA-256 differs from manifest")
         selected.append(
             {
                 "id": receipt_id,
@@ -134,7 +154,7 @@ def _load_recipient_records(
                 "group_id": record.get("group_id"),
                 "source": record.get("source"),
                 "result_json": record.get("result_json"),
-                "crop_sha256": slot.get("crop_sha256"),
+                "crop_sha256": actual_crop_hash,
                 "image": image_path.as_posix(),
                 "reference_text": reference_text,
                 "recipient_visible_text": reference_visible_text,
@@ -183,7 +203,7 @@ def _default_runtime_probe(_: object) -> dict[str, object]:
 
 def _verify_reader_matches_bundle(reader: object, bundle_dir: Path) -> dict[str, object]:
     """Hash-check a frozen bundle and ensure the live reader resolved the same assets."""
-    from .paddle_ocr_bundle import verify_bundle
+    from .paddle_ocr_bundle import CONTRACT_FILENAME, MODEL_ROLES, verify_bundle
 
     bundle = Path(bundle_dir).expanduser().resolve()
     contract = verify_bundle(bundle)
@@ -206,15 +226,69 @@ def _verify_reader_matches_bundle(reader: object, bundle_dir: Path) -> dict[str,
             raise ValueError(
                 f"PaddleOCR {role} model differs from frozen bundle: runtime={actual}, bundle={expected}"
             )
+        live_directory = Path(actual).expanduser().resolve()
+        bundle_directory = asset.get("bundle_directory") if isinstance(asset, Mapping) else None
+        file_records = asset.get("files") if isinstance(asset, Mapping) else None
+        if not isinstance(bundle_directory, str) or not isinstance(file_records, list):
+            raise ValueError(f"PaddleOCR bundle has invalid frozen {role} file records")
+        expected_relative_files: set[str] = set()
+        bundle_prefix = Path(bundle_directory)
+        for record in file_records:
+            if not isinstance(record, Mapping):
+                raise ValueError(f"PaddleOCR bundle has invalid frozen {role} file record")
+            relative = record.get("path")
+            expected_hash = record.get("sha256")
+            expected_size = record.get("size_bytes")
+            if not isinstance(relative, str) or not isinstance(expected_hash, str) or not isinstance(expected_size, int):
+                raise ValueError(f"PaddleOCR bundle has invalid frozen {role} file record")
+            try:
+                live_relative = Path(relative).relative_to(bundle_prefix)
+            except ValueError as error:
+                raise ValueError(f"Frozen {role} file escapes its bundle directory: {relative}") from error
+            expected_relative_files.add(live_relative.as_posix())
+            live_file = (live_directory / live_relative).resolve()
+            try:
+                live_file.relative_to(live_directory)
+            except ValueError as error:
+                raise ValueError(f"Frozen {role} file escapes its live model directory: {relative}") from error
+            if not live_file.is_file() or live_file.stat().st_size != expected_size or _sha256(live_file) != expected_hash:
+                raise ValueError(f"PaddleOCR live {role} model bytes differ from frozen bundle: {live_file}")
+        actual_relative_files = {
+            path.relative_to(live_directory).as_posix()
+            for path in live_directory.rglob("*")
+            if path.is_file()
+        }
+        if actual_relative_files != expected_relative_files:
+            raise ValueError(f"PaddleOCR live {role} model file set differs from frozen bundle")
     expected_charset = dictionary.get("source_path")
     actual_charset = args.get("rec_char_dict_path")
     if not isinstance(expected_charset, str) or not isinstance(actual_charset, str):
         raise ValueError("PaddleOCR bundle/runtime lacks recognition charset path")
     if Path(actual_charset).expanduser().resolve() != Path(expected_charset).expanduser().resolve():
         raise ValueError("PaddleOCR recognition charset differs from frozen bundle")
+    charset_path = Path(actual_charset).expanduser().resolve()
+    charset_hash = dictionary.get("sha256")
+    charset_size = dictionary.get("size_bytes")
+    if (
+        not isinstance(charset_hash, str)
+        or not isinstance(charset_size, int)
+        or charset_path.stat().st_size != charset_size
+        or _sha256(charset_path) != charset_hash
+    ):
+        raise ValueError("PaddleOCR live recognition charset bytes differ from frozen bundle")
+    native_identity = contract.get("native_asset_identity")
+    if not isinstance(native_identity, Mapping):
+        raise ValueError("PaddleOCR bundle has no verified native asset identity")
+    components = native_identity.get("components")
+    if not isinstance(components, Mapping) or set(components) != {*MODEL_ROLES, "dictionary"}:
+        raise ValueError("PaddleOCR bundle has invalid native component identities")
     return {
         "path": bundle.as_posix(),
         "contract_kind": contract.get("kind"),
+        "contract_sha256": _sha256(bundle / CONTRACT_FILENAME),
+        "native_asset_identity_sha256": native_identity.get("sha256"),
+        "native_component_sha256": dict(components),
+        "live_source_bytes_verified": True,
         "verified": True,
     }
 
@@ -341,11 +415,14 @@ def evaluate_paddle_recipients(
     output = Path(output_dir).expanduser().resolve()
     if output.exists():
         raise ValueError(f"Refusing to overwrite existing Paddle recipient evaluation: {output}")
+    manifest = Path(manifest_path).expanduser().resolve()
+    manifest_sha256 = _sha256(manifest)
     records = _load_recipient_records(
         manifest_path=manifest_path,
         dataset_root=root,
         split=split,
         limit=limit,
+        require_crop_hash=bundle_dir is not None,
     )
     reader = reader_factory(normalized_device)
     runtime = dict(runtime_probe(reader))
@@ -365,6 +442,8 @@ def evaluate_paddle_recipients(
     candidate_modes: Counter[str] = Counter()
     for number, record in enumerate(records, start=1):
         image_path = Path(str(record["image"]))
+        if _sha256(image_path) != record["crop_sha256"]:
+            raise ValueError(f"Recipient crop changed after manifest validation: {image_path}")
         with Image.open(image_path) as image:
             image_rgb = np.asarray(image.convert("RGB")).copy()
         started = perf_counter()
@@ -406,10 +485,26 @@ def evaluate_paddle_recipients(
     anchored_exact_matches = sum(bool(record["anchored_value_exact"]) for record in comparisons)
     fallback_exact_matches = sum(bool(record["fallback_value_exact"]) for record in comparisons)
     anchored_value_exact_match = anchored_exact_matches / len(comparisons)
+    if _sha256(manifest) != manifest_sha256:
+        raise ValueError(f"Manifest changed during Paddle recipient evaluation: {manifest}")
+    if bundle_dir is not None:
+        bundle_after = _verify_reader_matches_bundle(reader, Path(bundle_dir))
+        if bundle_after != bundle:
+            raise ValueError("Frozen Paddle bundle or live source assets changed during evaluation")
+        bundle = {**bundle_after, "verified_before_and_after": True}
+
+    output.mkdir(parents=True, exist_ok=False)
+    comparisons_path = output / "comparisons.jsonl"
+    disagreements_path = output / "disagreements.jsonl"
+    _atomic_jsonl(comparisons_path, comparisons)
+    _atomic_jsonl(disagreements_path, [row for row in comparisons if not bool(row["anchored_value_exact"])])
     summary: dict[str, object] = {
         "schema_version": EVALUATION_SCHEMA_VERSION,
         "kind": EVALUATION_KIND,
-        "manifest": Path(manifest_path).expanduser().resolve().as_posix(),
+        "manifest": manifest.as_posix(),
+        "manifest_sha256": manifest_sha256,
+        "comparisons_sha256": _sha256(comparisons_path),
+        "disagreements_sha256": _sha256(disagreements_path),
         "dataset_root": root.as_posix(),
         "evaluation_split": split,
         "records": len(comparisons),
@@ -443,9 +538,6 @@ def evaluate_paddle_recipients(
             "It proves neither business accuracy nor a replacement model until a human-truth holdout is evaluated."
         ),
     }
-    output.mkdir(parents=True, exist_ok=False)
-    _atomic_jsonl(output / "comparisons.jsonl", comparisons)
-    _atomic_jsonl(output / "disagreements.jsonl", [row for row in comparisons if not bool(row["anchored_value_exact"])])
     _atomic_json(output / "summary.json", summary)
     return summary, bool(summary["acceptance"]["passed"])
 

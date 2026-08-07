@@ -823,6 +823,19 @@ def score_results(
             "It compares ML.NET candidate text with unified manifest labels; Paddle-derived labels are not "
             "independently verified business truth, and business values remain review-only."
         )
+    else:
+        # An unbounded invocation evaluates every expected receipt in the
+        # requested split.  Keep this explicit so release automation cannot
+        # mistake a passing partial pilot for formal evidence.
+        summary["evaluation_scope"] = {
+            "kind": "full_split",
+            "requested_limit": None,
+            "evaluated_expected_receipts": len(expected),
+            "full_split_expected_receipts": full_expected_count,
+            "formal_delivery_gate": sample_thresholds_passed,
+        }
+        summary["formal_delivery_gate"] = sample_thresholds_passed
+        summary["acceptance"]["formal_delivery_gate"] = sample_thresholds_passed
     output_dir.mkdir(parents=True, exist_ok=True)
     _atomic_write_jsonl(output_dir / "comparisons.jsonl", comparisons)
     _atomic_write_json(output_dir / "summary.json", summary)

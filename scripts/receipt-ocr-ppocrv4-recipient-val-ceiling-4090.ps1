@@ -47,10 +47,21 @@ if (Test-Path -LiteralPath $OutputDirectory) {
 if (-not [string]::IsNullOrWhiteSpace($Bundle) -and -not (Test-Path -LiteralPath $Bundle)) {
     throw "Frozen Paddle bundle not found: $Bundle"
 }
+if ($Limit -eq 0 -and [string]::IsNullOrWhiteSpace($Bundle)) {
+    throw "A full val run intended for delivery must supply -Bundle from the fresh snapshot+ONNX export step."
+}
+if ($Limit -eq 0 -and $SkipDetection) {
+    throw "A full delivery-bound val run must use det+cls+rec; -SkipDetection is pilot-only."
+}
+if (-not [string]::IsNullOrWhiteSpace($Bundle)) {
+    $Bundle = [IO.Path]::GetFullPath($Bundle)
+}
+$manifestSha256 = (Get-FileHash -LiteralPath $records -Algorithm SHA256).Hash.ToLowerInvariant()
 
 Write-Host "receipt_ocr_ppocrv4_recipient_val_ceiling_4090"
 Write-Host "  split=val (hard locked); device=cuda (CPU fallback is rejected)"
 Write-Host "  records=$records"
+Write-Host "  trusted-manifest-sha256=$manifestSha256"
 Write-Host "  crop-root=$labelsRoot"
 Write-Host "  python=$pythonPath"
 Write-Host "  output=$OutputDirectory"

@@ -35,6 +35,17 @@ internal sealed class PaddleOcrEngine : IDisposable
         _classifier = sessions.Classifier;
         _recognizer = sessions.Recognizer;
         ExecutionProvider = provider;
+        try
+        {
+            VerifySessionContract(_detector, bundle.DetModel);
+            VerifySessionContract(_classifier, bundle.ClsModel);
+            VerifySessionContract(_recognizer, bundle.RecModel);
+        }
+        catch
+        {
+            Dispose();
+            throw;
+        }
     }
 
     /// <summary>The provider successfully used for all three OCR sessions.</summary>
@@ -144,7 +155,10 @@ internal sealed class PaddleOcrEngine : IDisposable
     private Mat ClassifyAngle(Mat rgb)
     {
         var shape = _bundle.Settings.ClsImageShape;
-        using var prepared = PaddleOcrImageOps.ResizeKeepRatio(rgb, shape.Height, shape.Width, padRight: true);
+        // Paddle v2 normalizes only the resized pixels into a zero-initialized
+        // float tensor. Padding is therefore normalized-space 0, not a black
+        // uint8 pixel which would normalize to -1.
+        using var prepared = PaddleOcrImageOps.ResizeKeepRatio(rgb, shape.Height, shape.Width, padRight: false);
         var tensor = PaddleOcrImageOps.ToNormalizedNchw(prepared, CenterMean, CenterStd, shape.Width, shape.Height);
         var output = Run(_classifier, _bundle.ClsModel, tensor, [1, shape.Channels, shape.Height, shape.Width]);
         if (output.Shape.Length < 2 || output.Shape[^1] < 2)
@@ -208,7 +222,7 @@ internal sealed class PaddleOcrEngine : IDisposable
                     batch[index].Image,
                     shape.Height,
                     inputWidth,
-                    padRight: true);
+                    padRight: false);
                 var tensor = PaddleOcrImageOps.ToNormalizedNchw(
                     prepared,
                     CenterMean,
@@ -318,6 +332,59 @@ internal sealed class PaddleOcrEngine : IDisposable
         {
             provider = "cpu (auto fallback)";
             return CreateCpuSessions(bundle);
+        }
+    }
+
+    private static void VerifySessionContract(InferenceSession session, PaddleOcrModelInfo model)
+    {
+        var inputNames = session.InputMetadata.Keys.ToArray();
+        if (inputNames.Length != 1 || !string.Equals(inputNames[0], model.Input.Name, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                $"Paddle OCR {model.Role} runtime inputs differ from its verified contract: [{string.Join(',', inputNames)}]");
+        }
+        VerifyTensorContract(session.InputMetadata[model.Input.Name], model.Input, model.Role);
+
+        var expectedOutputs = model.Outputs.Select(output => output.Name).ToHashSet(StringComparer.Ordinal);
+        var outputNames = session.OutputMetadata.Keys.ToArray();
+        if (outputNames.Length != expectedOutputs.Count
+            || outputNames.Distinct(StringComparer.Ordinal).Count() != outputNames.Length
+            || !outputNames.ToHashSet(StringComparer.Ordinal).SetEquals(expectedOutputs))
+        {
+            throw new InvalidOperationException(
+                $"Paddle OCR {model.Role} runtime outputs differ from its verified contract: [{string.Join(',', outputNames)}]");
+        }
+        foreach (var output in model.Outputs)
+        {
+            VerifyTensorContract(session.OutputMetadata[output.Name], output, model.Role);
+        }
+    }
+
+    private static void VerifyTensorContract(
+        NodeMetadata metadata,
+        PaddleOcrTensorContract contract,
+        string role)
+    {
+        if (!metadata.IsTensor || metadata.ElementType != typeof(float))
+        {
+            throw new InvalidOperationException(
+                $"Paddle OCR {role} runtime tensor {contract.Name} must be tensor(float)");
+        }
+        if (metadata.Dimensions.Length != contract.Shape.Count)
+        {
+            throw new InvalidOperationException(
+                $"Paddle OCR {role} runtime tensor {contract.Name} rank differs from its verified contract");
+        }
+        for (var axis = 0; axis < contract.Shape.Count; axis++)
+        {
+            var actual = metadata.Dimensions[axis];
+            var expected = contract.Shape[axis];
+            if ((expected.StaticValue is { } fixedValue && actual != fixedValue)
+                || (expected.IsDynamic && actual > 0))
+            {
+                throw new InvalidOperationException(
+                    $"Paddle OCR {role} runtime tensor {contract.Name} axis {axis} differs from its verified contract");
+            }
         }
     }
 

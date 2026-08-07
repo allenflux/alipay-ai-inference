@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+from types import SimpleNamespace
 from pathlib import Path
 
 import numpy as np
@@ -11,10 +12,12 @@ from PIL import Image
 
 from transfer_receipt_ai.ocr import OCRResult, _extract_paddle_lines
 from transfer_receipt_ai.paddle_recipient_evaluate import (
+    _verify_reader_matches_bundle,
     build_parser,
     evaluate_paddle_recipients,
     format_paddle_recipient_evaluation,
 )
+from transfer_receipt_ai.paddle_ocr_bundle import snapshot_bundle
 
 
 def _write_jsonl(path: Path, rows: list[dict[str, object]]) -> None:
@@ -116,6 +119,11 @@ def test_paddle_recipient_evaluation_uses_value_extraction_and_writes_new_output
     assert rows[1]["anchored_value_exact"] is False
     assert rows[1]["fallback_value_exact"] is True
     assert len((output / "disagreements.jsonl").read_text(encoding="utf-8").splitlines()) == 1
+    assert summary["manifest_sha256"] == __import__("hashlib").sha256(manifest.read_bytes()).hexdigest()
+    assert summary["comparisons_sha256"] == __import__("hashlib").sha256(
+        (output / "comparisons.jsonl").read_bytes()
+    ).hexdigest()
+    assert all(len(row["crop_sha256"]) == 64 for row in rows)
     text = format_paddle_recipient_evaluation(summary)
     assert "anchored=1/2=50.00%" in text
     assert "mode=full_det_cls_rec; experimental=False; det=True; cls=True; rec=True" in text
@@ -246,6 +254,42 @@ def test_paddle_recipient_evaluation_rejects_manifest_without_strict_anchor(tmp_
             output_dir=tmp_path / "out",
             device="cpu",
         )
+
+
+def test_reader_bundle_binding_hashes_live_model_bytes_and_rejects_mutation(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    model_dirs: dict[str, Path] = {}
+    for role in ("det", "rec", "cls"):
+        directory = source / role
+        directory.mkdir(parents=True)
+        (directory / "inference.pdmodel").write_bytes(f"{role}-model".encode())
+        (directory / "inference.pdiparams").write_bytes(f"{role}-params".encode())
+        model_dirs[role] = directory
+    charset = source / "ppocr_keys_v1.txt"
+    charset.write_text("你\n好\n", encoding="utf-8")
+    bundle = snapshot_bundle(
+        output_dir=tmp_path / "bundle",
+        model_dirs=model_dirs,
+        charset_path=charset,
+        effective_args={},
+        runtime={},
+    )
+    args = SimpleNamespace(
+        det_model_dir=str(model_dirs["det"]),
+        rec_model_dir=str(model_dirs["rec"]),
+        cls_model_dir=str(model_dirs["cls"]),
+        rec_char_dict_path=str(charset),
+    )
+    reader = SimpleNamespace(_engine=SimpleNamespace(args=args))
+
+    identity = _verify_reader_matches_bundle(reader, bundle)
+
+    assert identity["live_source_bytes_verified"] is True
+    assert len(identity["contract_sha256"]) == 64
+    assert set(identity["native_component_sha256"]) == {"det", "rec", "cls", "dictionary"}
+    (model_dirs["rec"] / "inference.pdiparams").write_bytes(b"rec-tampered")
+    with pytest.raises(ValueError, match="live rec model bytes differ"):
+        _verify_reader_matches_bundle(reader, bundle)
 
 
 def test_paddle_recipient_wrapper_parses_when_powershell_is_available() -> None:

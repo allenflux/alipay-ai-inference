@@ -49,6 +49,8 @@ CONTRACT_FILENAME = "paddle_ocr_bundle.contract.json"
 DELIVERY_CONTRACT_FILENAME = "paddle_ocr_delivery.contract.json"
 MODEL_ROLES = ("det", "rec", "cls")
 REQUIRED_MODEL_FILENAMES = ("inference.pdmodel", "inference.pdiparams")
+NATIVE_IDENTITY_KIND = "paddle_ocr_native_asset_identity_v1"
+ADAPTER_VERSION = "paddle_ocr_dotnet_adapter_v1"
 
 
 class PaddleOcrBundleError(ValueError):
@@ -73,6 +75,172 @@ def _file_record(path: Path, *, relative_to: Path) -> dict[str, object]:
 
 def _all_file_records(directory: Path, *, relative_to: Path) -> list[dict[str, object]]:
     return [_file_record(path, relative_to=relative_to) for path in sorted(directory.rglob("*")) if path.is_file()]
+
+
+def _canonical_json_sha256(value: Mapping[str, object]) -> str:
+    payload = json.dumps(dict(value), ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _native_asset_identity(
+    assets: Mapping[str, object], dictionary: Mapping[str, object]
+) -> dict[str, object]:
+    """Return a path-independent identity for the frozen native OCR bytes.
+
+    Source cache paths are intentionally excluded.  The identity travels into
+    evaluation and delivery evidence, so the exact det/rec/cls/dictionary
+    bytes remain comparable after the native Paddle files are omitted from the
+    lean runtime package.
+    """
+
+    files: list[dict[str, object]] = []
+    for role in MODEL_ROLES:
+        asset = assets.get(role)
+        records = asset.get("files") if isinstance(asset, Mapping) else None
+        if not isinstance(records, list) or not records:
+            raise PaddleOcrBundleError(f"Cannot identify missing/invalid frozen {role} files")
+        for record in records:
+            if not isinstance(record, Mapping):
+                raise PaddleOcrBundleError(f"Cannot identify invalid frozen {role} file record")
+            path = record.get("path")
+            sha256 = record.get("sha256")
+            size = record.get("size_bytes")
+            if not isinstance(path, str) or not isinstance(sha256, str) or not isinstance(size, int):
+                raise PaddleOcrBundleError(f"Cannot identify invalid frozen {role} file record")
+            files.append({"role": role, "path": path, "sha256": sha256.lower(), "size_bytes": size})
+    dictionary_path = dictionary.get("path")
+    dictionary_hash = dictionary.get("sha256")
+    dictionary_size = dictionary.get("size_bytes")
+    if (
+        not isinstance(dictionary_path, str)
+        or not isinstance(dictionary_hash, str)
+        or not isinstance(dictionary_size, int)
+    ):
+        raise PaddleOcrBundleError("Cannot identify invalid frozen character dictionary")
+    files.append(
+        {
+            "role": "dictionary",
+            "path": dictionary_path,
+            "sha256": dictionary_hash.lower(),
+            "size_bytes": dictionary_size,
+        }
+    )
+    ordered_files = sorted(files, key=lambda record: (str(record["role"]), str(record["path"])))
+    components: dict[str, str] = {}
+    for role in (*MODEL_ROLES, "dictionary"):
+        role_files = [record for record in ordered_files if record["role"] == role]
+        components[role] = _canonical_json_sha256({"role": role, "files": role_files})
+    unsigned: dict[str, object] = {
+        "schema_version": 1,
+        "kind": NATIVE_IDENTITY_KIND,
+        "components": components,
+        "files": ordered_files,
+    }
+    return {**unsigned, "sha256": _canonical_json_sha256(unsigned)}
+
+
+def _verify_native_asset_identity(contract: Mapping[str, Any]) -> dict[str, object]:
+    assets = contract.get("assets")
+    dictionary = contract.get("dictionary")
+    claimed = contract.get("native_asset_identity")
+    if not isinstance(assets, Mapping) or not isinstance(dictionary, Mapping) or not isinstance(claimed, Mapping):
+        raise PaddleOcrBundleError("Bundle contract has no native asset identity")
+    expected = _native_asset_identity(assets, dictionary)
+    if dict(claimed) != expected:
+        raise PaddleOcrBundleError("Bundle native asset identity differs from its frozen file records")
+    return expected
+
+
+def _verify_carried_native_asset_identity(value: object) -> dict[str, object]:
+    """Validate an identity embedded in a lean package without native files."""
+
+    if not isinstance(value, Mapping):
+        raise PaddleOcrBundleError("Delivery contract has no native asset identity")
+    schema = value.get("schema_version")
+    kind = value.get("kind")
+    files = value.get("files")
+    components = value.get("components")
+    claimed_hash = value.get("sha256")
+    if (
+        schema != 1
+        or kind != NATIVE_IDENTITY_KIND
+        or not isinstance(files, list)
+        or not files
+        or not isinstance(components, Mapping)
+    ):
+        raise PaddleOcrBundleError("Delivery contract has an invalid native asset identity")
+    normalized: list[dict[str, object]] = []
+    for record in files:
+        if not isinstance(record, Mapping):
+            raise PaddleOcrBundleError("Delivery native asset identity has an invalid file record")
+        role = record.get("role")
+        path = record.get("path")
+        sha256 = record.get("sha256")
+        size = record.get("size_bytes")
+        if (
+            role not in {*MODEL_ROLES, "dictionary"}
+            or not isinstance(path, str)
+            or not isinstance(sha256, str)
+            or len(sha256) != 64
+            or any(character not in "0123456789abcdef" for character in sha256)
+            or not isinstance(size, int)
+            or size < 0
+        ):
+            raise PaddleOcrBundleError("Delivery native asset identity has an invalid file record")
+        normalized.append({"role": role, "path": path, "sha256": sha256, "size_bytes": size})
+    if normalized != sorted(normalized, key=lambda record: (str(record["role"]), str(record["path"]))):
+        raise PaddleOcrBundleError("Delivery native asset identity files are not canonical")
+    expected_components: dict[str, str] = {}
+    for role in (*MODEL_ROLES, "dictionary"):
+        role_files = [record for record in normalized if record["role"] == role]
+        expected_components[role] = _canonical_json_sha256({"role": role, "files": role_files})
+    if dict(components) != expected_components:
+        raise PaddleOcrBundleError("Delivery native asset identity component hashes are invalid")
+    unsigned: dict[str, object] = {
+        "schema_version": 1,
+        "kind": NATIVE_IDENTITY_KIND,
+        "components": expected_components,
+        "files": normalized,
+    }
+    if not isinstance(claimed_hash, str) or claimed_hash != _canonical_json_sha256(unsigned):
+        raise PaddleOcrBundleError("Delivery native asset identity SHA-256 is invalid")
+    return {**unsigned, "sha256": claimed_hash}
+
+
+def _adapter_contract() -> dict[str, object]:
+    return {
+        "adapter_version": ADAPTER_VERSION,
+        # The current Python pipeline supplies an RGB ndarray from
+        # Pillow/OpenCV geometry code directly to PaddleOCR v2.  This wording
+        # prevents an unverified RGB/BGR swap in the C# adapter.
+        "input_color_order": "RGB_passthrough_to_paddle_v2",
+        "line_aggregation": {
+            "text": "clean each non-empty line then join with one ASCII space",
+            "confidence": "arithmetic mean of all Paddle line confidences",
+        },
+        "preprocessing": {
+            "detector_normalization": {
+                "scale": 0.00392156862745098,
+                "mean": [0.485, 0.456, 0.406],
+                "std": [0.229, 0.224, 0.225],
+            },
+            "classifier_recognizer_normalization": {
+                "scale": 0.00392156862745098,
+                "mean": [0.5, 0.5, 0.5],
+                "std": [0.5, 0.5, 0.5],
+            },
+            "classifier_recognizer_right_padding": "float_zero_after_normalization",
+        },
+        "hardware_note": "Snapshot initialisation may run on CPU; device-selection args are not OCR behavior parity settings.",
+        "required_components": ["text_detection", "angle_classification", "text_recognition"],
+    }
+
+
+def _verify_adapter_contract(value: object, *, description: str) -> dict[str, object]:
+    expected = _adapter_contract()
+    if not isinstance(value, Mapping) or dict(value) != expected:
+        raise PaddleOcrBundleError(f"{description} has an unsupported Paddle OCR adapter contract")
+    return expected
 
 
 def _atomic_json(path: Path, value: Mapping[str, object]) -> None:
@@ -258,6 +426,7 @@ def snapshot_bundle(
         shutil.copy2(charset, dictionary_destination)
         dictionary = _file_record(dictionary_destination, relative_to=stage)
         dictionary["source_path"] = str(charset)
+        native_identity = _native_asset_identity(assets, dictionary)
         contract: dict[str, object] = {
             "schema_version": BUNDLE_SCHEMA_VERSION,
             "kind": BUNDLE_KIND,
@@ -275,20 +444,9 @@ def snapshot_bundle(
             ],
             "assets": assets,
             "dictionary": dictionary,
+            "native_asset_identity": native_identity,
             "onnx": {},
-            "adapter_contract": {
-                # The current Python pipeline supplies an RGB ndarray from
-                # Pillow/OpenCV geometry code directly to PaddleOCR v2.  This
-                # wording intentionally prevents a future ONNX adapter from
-                # adding an unverified RGB/BGR swap while chasing parity.
-                "input_color_order": "RGB_passthrough_to_paddle_v2",
-                "line_aggregation": {
-                    "text": "clean each non-empty line then join with one ASCII space",
-                    "confidence": "arithmetic mean of all Paddle line confidences",
-                },
-                "hardware_note": "Snapshot initialisation may run on CPU; device-selection args are not OCR behavior parity settings.",
-                "required_components": ["text_detection", "angle_classification", "text_recognition"],
-            },
+            "adapter_contract": _adapter_contract(),
             "delivery_layout": {
                 "generated_by": "package-delivery",
                 "required": [
@@ -366,6 +524,8 @@ def verify_bundle(bundle_dir: Path, *, require_onnx: bool = False) -> dict[str, 
     if not isinstance(dictionary, Mapping):
         raise PaddleOcrBundleError("Bundle contract has no character dictionary")
     _verify_file_record(bundle, dictionary)
+    _verify_native_asset_identity(contract)
+    _verify_adapter_contract(contract.get("adapter_contract"), description="Bundle contract")
     onnx = contract.get("onnx")
     if not isinstance(onnx, Mapping):
         raise PaddleOcrBundleError("Bundle contract has invalid ONNX records")
@@ -455,6 +615,7 @@ def package_delivery_bundle(*, bundle_dir: Path, output_dir: Path) -> Path:
             "schema_version": BUNDLE_SCHEMA_VERSION,
             "kind": DELIVERY_KIND,
             "source_audit_contract_sha256": _sha256(bundle / CONTRACT_FILENAME),
+            "native_asset_identity": audit_contract["native_asset_identity"],
             "runtime": delivery_runtime,
             "effective_paddleocr_args": normalized_args,
             "adapter_contract": audit_contract.get("adapter_contract", {}),
@@ -487,6 +648,8 @@ def verify_delivery_bundle(delivery_dir: Path) -> dict[str, Any]:
         raise PaddleOcrBundleError("Unsupported Paddle OCR delivery contract schema")
     if contract.get("kind") != DELIVERY_KIND:
         raise PaddleOcrBundleError("Not a Paddle OCR delivery contract")
+    _verify_carried_native_asset_identity(contract.get("native_asset_identity"))
+    _verify_adapter_contract(contract.get("adapter_contract"), description="Delivery contract")
     models = contract.get("models")
     if not isinstance(models, Mapping) or set(models) != set(MODEL_ROLES):
         raise PaddleOcrBundleError("Delivery contract must contain det, rec and cls ONNX models")
@@ -561,6 +724,51 @@ def _paddle_onnx_options(bundle: Path, contract: Mapping[str, Any]) -> dict[str,
         raise PaddleOcrBundleError("Bundle contract has an invalid dictionary record")
     options["rec_char_dict_path"] = str(bundle / dictionary_path)
     return options
+
+
+def _paddle_native_options(bundle: Path, contract: Mapping[str, Any]) -> dict[str, object]:
+    """Construct a CPU reader from the source bytes frozen in ``bundle``.
+
+    Converter parity must never compare the exported ONNX files with whatever
+    model happens to be in PaddleOCR's mutable user cache.  Start from the
+    same behavior arguments as the ONNX reader, then bind det/rec/cls and the
+    dictionary to the snapshot itself.
+    """
+
+    options = _paddle_onnx_options(bundle, contract)
+    raw_assets = contract.get("assets")
+    raw_dictionary = contract.get("dictionary")
+    if not isinstance(raw_assets, Mapping) or not isinstance(raw_dictionary, Mapping):
+        raise PaddleOcrBundleError("Bundle contract has no native model or dictionary records")
+    options["use_onnx"] = False
+    options.pop("onnx_providers", None)
+    for role, parameter in (("det", "det_model_dir"), ("rec", "rec_model_dir"), ("cls", "cls_model_dir")):
+        record = raw_assets.get(role)
+        directory = record.get("bundle_directory") if isinstance(record, Mapping) else None
+        if not isinstance(directory, str):
+            raise PaddleOcrBundleError(f"Bundle contract has no frozen {role} model directory")
+        options[parameter] = str(bundle / directory)
+    dictionary_path = raw_dictionary.get("path")
+    if not isinstance(dictionary_path, str):
+        raise PaddleOcrBundleError("Bundle contract has an invalid dictionary record")
+    options["rec_char_dict_path"] = str(bundle / dictionary_path)
+    return options
+
+
+def _create_paddle_native_reader(bundle_dir: Path) -> Any:
+    """Create the CPU reference reader from immutable snapshot contents."""
+
+    bundle, contract = _load_contract(bundle_dir)
+    verify_bundle(bundle, require_onnx=True)
+    if _package_version("paddleocr") != "2.10.0":
+        raise PaddleOcrBundleError("ONNX converter parity validation requires paddleocr==2.10.0")
+    try:
+        import paddle
+        from paddleocr import PaddleOCR
+    except ModuleNotFoundError as error:
+        raise PaddleOcrBundleError("ONNX converter parity validation requires paddlepaddle and paddleocr==2.10.0") from error
+    paddle.set_device("cpu")
+    return PaddleOCR(**_paddle_native_options(bundle, contract))
 
 
 def _create_paddle_onnx_reader(bundle_dir: Path) -> Any:
@@ -646,16 +854,17 @@ def validate_onnx_conversion(
         raise PaddleOcrBundleError(f"Refusing to overwrite existing validation output: {output}")
     bundle = bundle_dir.expanduser().resolve()
     _ensure_output_does_not_overlap_sources(output, [bundle])
+    audit_contract = verify_bundle(bundle, require_onnx=True)
+    audit_contract_sha256 = _sha256(bundle / CONTRACT_FILENAME)
     images = _iter_ocr_validation_images(input_path, limit=limit)
     try:
         import numpy as np
         from PIL import Image
     except ModuleNotFoundError as error:
         raise PaddleOcrBundleError("ONNX converter parity validation requires numpy and Pillow") from error
-    from .ocr import PaddleOCRReader
-
-    # Both readers receive the same RGB ndarray; no BGR conversion is allowed.
-    baseline = PaddleOCRReader(device="cpu", require_v2=True)
+    # Both readers receive the same RGB ndarray and are bound to the same
+    # immutable snapshot; no mutable Paddle cache or BGR conversion is allowed.
+    baseline = _create_paddle_native_reader(bundle)
     candidate = _create_paddle_onnx_reader(bundle)
     comparisons: list[dict[str, object]] = []
     baseline_seconds: list[float] = []
@@ -665,27 +874,23 @@ def validate_onnx_conversion(
             with Image.open(image_path) as source_image:
                 image_rgb = np.asarray(source_image.convert("RGB")).copy()
             baseline_start = perf_counter()
-            baseline_result = baseline.recognize(image_rgb)
+            baseline_raw = baseline.ocr(image_rgb, cls=True)
             baseline_elapsed = perf_counter() - baseline_start
+            baseline_text, baseline_confidence, baseline_lines = _ocr_result_from_paddle_payload(baseline_raw)
             onnx_start = perf_counter()
             candidate_raw = candidate.ocr(image_rgb, cls=True)
             onnx_elapsed = perf_counter() - onnx_start
             candidate_text, candidate_confidence, candidate_lines = _ocr_result_from_paddle_payload(candidate_raw)
             confidence_delta = (
                 None
-                if baseline_result.confidence is None or candidate_confidence is None
-                else abs(float(baseline_result.confidence) - candidate_confidence)
+                if baseline_confidence is None or candidate_confidence is None
+                else abs(float(baseline_confidence) - candidate_confidence)
             )
-            baseline_lines = [
-                {"text": text, "confidence": confidence}
-                for text, confidence in baseline_result.lines
-                if text
-            ]
             comparison = {
                 "source": str(image_path),
                 "baseline": {
-                    "text": baseline_result.text,
-                    "confidence": baseline_result.confidence,
+                    "text": baseline_text,
+                    "confidence": baseline_confidence,
                     "lines": baseline_lines,
                     "elapsed_ms": baseline_elapsed * 1000.0,
                 },
@@ -695,8 +900,9 @@ def validate_onnx_conversion(
                     "lines": candidate_lines,
                     "elapsed_ms": onnx_elapsed * 1000.0,
                 },
-                "text_exact_match": baseline_result.text == candidate_text,
-                "line_text_exact_match": [line[0] for line in baseline_result.lines] == [str(line["text"]) for line in candidate_lines],
+                "text_exact_match": baseline_text == candidate_text,
+                "line_text_exact_match": [str(line["text"]) for line in baseline_lines]
+                == [str(line["text"]) for line in candidate_lines],
                 "confidence_absolute_delta": confidence_delta,
             }
             comparisons.append(comparison)
@@ -714,12 +920,18 @@ def validate_onnx_conversion(
         for record in comparisons
         if record["confidence_absolute_delta"] is not None
     ]
+    output.mkdir(parents=True)
+    comparisons_path = output / "comparisons.jsonl"
+    _atomic_jsonl(comparisons_path, comparisons)
     summary: dict[str, object] = {
         "schema_version": 1,
         "kind": "paddle_ocr_onnx_conversion_parity_v1",
         "bundle": str(bundle),
+        "bundle_contract_sha256": audit_contract_sha256,
+        "native_asset_identity_sha256": audit_contract["native_asset_identity"]["sha256"],
         "input": str(input_path.expanduser().resolve()),
         "records": len(comparisons),
+        "comparisons_sha256": _sha256(comparisons_path),
         "text_exact_match": text_matches / len(comparisons),
         "line_text_exact_match": line_matches / len(comparisons),
         "max_confidence_absolute_delta": max(confidence_deltas, default=None),
@@ -735,8 +947,6 @@ def validate_onnx_conversion(
         and (summary["max_confidence_absolute_delta"] is None or float(summary["max_confidence_absolute_delta"]) <= max_confidence_delta)
     )
     summary["accepted"] = accepted
-    output.mkdir(parents=True)
-    _atomic_jsonl(output / "comparisons.jsonl", comparisons)
     _atomic_json(output / "summary.json", summary)
     return summary, accepted
 

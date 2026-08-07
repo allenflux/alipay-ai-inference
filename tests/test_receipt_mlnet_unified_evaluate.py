@@ -155,8 +155,10 @@ def test_score_matches_v12_references_and_accepts_uniform_model(tmp_path: Path) 
 
     assert summary["accepted"]
     assert summary["kind"] == "receipt_mlnet_unified_candidate_evaluation_v1"
-    assert "evaluation_scope" not in summary
-    assert "formal_delivery_gate" not in summary
+    assert summary["evaluation_scope"]["kind"] == "full_split"
+    assert summary["evaluation_scope"]["requested_limit"] is None
+    assert summary["formal_delivery_gate"] is True
+    assert summary["acceptance"]["formal_delivery_gate"] is True
     assert summary["failures"] == []
     assert summary["artifact_audit"]["all_results_match_model"]
     assert summary["coverage"]["result_coverage"] == 1.0

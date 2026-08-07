@@ -66,6 +66,7 @@ internal sealed class UnifiedOcrEngine : IDisposable
     private readonly InferenceSession _session;
     private readonly float[] _fieldValues;
     private readonly float[] _recipientValues;
+    private readonly string[] _outputsWithoutRecipient;
 
     public UnifiedOcrEngine(UnifiedOcrBundle bundle, DeviceSetting requestedDevice)
     {
@@ -75,6 +76,9 @@ internal sealed class UnifiedOcrEngine : IDisposable
         // them for every receipt; this engine must not be shared concurrently.
         _fieldValues = new float[checked(5 * bundle.FieldHeight * bundle.FieldWidth)];
         _recipientValues = new float[checked(bundle.RecipientHeight * bundle.RecipientWidth)];
+        _outputsWithoutRecipient = bundle.OutputNames
+            .Where(name => !string.Equals(name, "recipient_logits", StringComparison.Ordinal))
+            .ToArray();
         _session = CreateSession(bundle.ModelPath, requestedDevice, out var provider);
         ExecutionProvider = provider;
         try
@@ -100,6 +104,20 @@ internal sealed class UnifiedOcrEngine : IDisposable
         IReadOnlyList<DetectionResult> detections,
         out UnifiedOcrStageLatency stageLatency)
     {
+        return RecognizeReceipt(source, detections, includeRecipient: true, out stageLatency);
+    }
+
+    /// <summary>
+    /// Hybrid delivery can omit v13's independent recipient output and crop.
+    /// Requesting only the other verified outputs lets ONNX Runtime prune that
+    /// branch while the external PP-OCR route supplies recipient text.
+    /// </summary>
+    public UnifiedOcrReadResult RecognizeReceipt(
+        Image<Rgb24> source,
+        IReadOnlyList<DetectionResult> detections,
+        bool includeRecipient,
+        out UnifiedOcrStageLatency stageLatency)
+    {
         var stageStopwatch = System.Diagnostics.Stopwatch.StartNew();
         var byLabel = detections.ToDictionary(item => item.Label, StringComparer.Ordinal);
         Array.Fill(_fieldValues, 1.0f);
@@ -112,7 +130,10 @@ internal sealed class UnifiedOcrEngine : IDisposable
         WriteField(byLabel.GetValueOrDefault("payment_method_field"), 3, rightAlign: true, source, _fieldValues, readable, "payment_method_field");
         // Architectures v12/v13 freeze channel 4 as white. Recipient text is read
         // only from the separate high-resolution input below.
-        WriteRecipient(byLabel.GetValueOrDefault("recipient_field"), source, _recipientValues, readable);
+        if (includeRecipient)
+        {
+            WriteRecipient(byLabel.GetValueOrDefault("recipient_field"), source, _recipientValues, readable);
+        }
 
         var fieldTensor = new DenseTensor<float>(_fieldValues, [5, 1, _bundle.FieldHeight, _bundle.FieldWidth]);
         var recipientTensor = new DenseTensor<float>(_recipientValues, [1, 1, _bundle.RecipientHeight, _bundle.RecipientWidth]);
@@ -127,14 +148,19 @@ internal sealed class UnifiedOcrEngine : IDisposable
         double inferenceMs;
         double postprocessMs;
         stageStopwatch.Restart();
-        using (IDisposableReadOnlyCollection<DisposableNamedOnnxValue> runtimeOutputs = _session.Run(inputs))
+        using (IDisposableReadOnlyCollection<DisposableNamedOnnxValue> runtimeOutputs =
+            includeRecipient
+                ? _session.Run(inputs)
+                : _session.Run(inputs, _outputsWithoutRecipient))
         {
             inferenceMs = StopAndReadMilliseconds(stageStopwatch);
             stageStopwatch.Restart();
             // DisposableNamedOnnxValue already exposes ORT's native CPU output
             // memory through DenseTensor.Buffer. Decode while that collection
             // is alive instead of copying every output tensor to a new array.
-            var outputs = ReadOutputViews(runtimeOutputs);
+            var outputs = includeRecipient
+                ? ReadOutputViews(runtimeOutputs)
+                : ReadOutputViews(runtimeOutputs, _outputsWithoutRecipient);
 
             var candidates = new Dictionary<string, UnifiedOcrCandidate>(StringComparer.Ordinal);
             if (readable.Contains("amount"))
@@ -150,7 +176,7 @@ internal sealed class UnifiedOcrEngine : IDisposable
                 candidates["payment_method_field"] = DecodeCtcCandidate(
                     outputs["payment_logits"], _bundle.PaymentCharacters);
             }
-            if (readable.Contains("recipient_field"))
+            if (includeRecipient && readable.Contains("recipient_field"))
             {
                 candidates["recipient_field"] = DecodeCtcCandidate(
                     outputs["recipient_logits"], _bundle.RecipientCharacters);
@@ -278,10 +304,18 @@ internal sealed class UnifiedOcrEngine : IDisposable
         readable.Add("recipient_field");
     }
 
-    private Dictionary<string, OrtOutput> ReadOutputViews(IDisposableReadOnlyCollection<DisposableNamedOnnxValue> runtimeOutputs)
+    private Dictionary<string, OrtOutput> ReadOutputViews(
+        IDisposableReadOnlyCollection<DisposableNamedOnnxValue> runtimeOutputs)
+    {
+        return ReadOutputViews(runtimeOutputs, _bundle.OutputNames);
+    }
+
+    private Dictionary<string, OrtOutput> ReadOutputViews(
+        IDisposableReadOnlyCollection<DisposableNamedOnnxValue> runtimeOutputs,
+        IReadOnlyCollection<string> requestedOutputs)
     {
         var names = runtimeOutputs.Select(output => output.Name).ToArray();
-        if (!HasExactNames(names, _bundle.OutputNames))
+        if (!HasExactNames(names, requestedOutputs))
         {
             throw new InvalidOperationException(
                 $"Unified OCR runtime outputs differ from its architecture-v{_bundle.ArchitectureVersion} contract: [{string.Join(',', names)}]");

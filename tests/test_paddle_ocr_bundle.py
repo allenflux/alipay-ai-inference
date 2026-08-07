@@ -11,6 +11,7 @@ from transfer_receipt_ai.paddle_ocr_bundle import (
     DELIVERY_CONTRACT_FILENAME,
     PaddleOcrBundleError,
     _paddle_onnx_options,
+    _paddle_native_options,
     _require_dynamic_ocr_shapes,
     build_parser,
     package_delivery_bundle,
@@ -74,6 +75,12 @@ def test_snapshot_bundle_copies_all_assets_and_records_adapter_contract(tmp_path
     assert contract["runtime"]["paddleocr_version"] == "2.10.0"
     assert contract["effective_paddleocr_args"]["use_angle_cls"] is True
     assert contract["adapter_contract"]["input_color_order"] == "RGB_passthrough_to_paddle_v2"
+    assert contract["adapter_contract"]["adapter_version"] == "paddle_ocr_dotnet_adapter_v1"
+    assert contract["adapter_contract"]["preprocessing"]["classifier_recognizer_right_padding"] == (
+        "float_zero_after_normalization"
+    )
+    assert contract["native_asset_identity"]["kind"] == "paddle_ocr_native_asset_identity_v1"
+    assert set(contract["native_asset_identity"]["components"]) == {"det", "rec", "cls", "dictionary"}
     assert contract["onnx"] == {}
     parsed = json.loads((bundle / CONTRACT_FILENAME).read_text(encoding="utf-8"))
     assert parsed["assets"]["cls"]["bundle_directory"] == "paddle/cls"
@@ -84,6 +91,17 @@ def test_verify_bundle_detects_modified_dictionary(tmp_path: Path) -> None:
     (bundle / "charset" / "ppocr_keys_v1.txt").write_text("被改了\n", encoding="utf-8")
 
     with pytest.raises(PaddleOcrBundleError, match="(size|SHA-256) differs"):
+        verify_bundle(bundle)
+
+
+def test_verify_bundle_detects_tampered_native_identity(tmp_path: Path) -> None:
+    bundle = _snapshot(tmp_path)
+    contract_path = bundle / CONTRACT_FILENAME
+    contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    contract["native_asset_identity"]["components"]["rec"] = "0" * 64
+    contract_path.write_text(json.dumps(contract), encoding="utf-8")
+
+    with pytest.raises(PaddleOcrBundleError, match="native asset identity differs"):
         verify_bundle(bundle)
 
 
@@ -124,6 +142,20 @@ def test_package_delivery_copies_only_deployable_assets(tmp_path: Path) -> None:
     assert (delivery / DELIVERY_CONTRACT_FILENAME).is_file()
     assert contract["effective_paddleocr_args"]["rec_model_dir"] == "onnx/paddle_ocr_rec.onnx"
     assert contract["package_size_bytes"] > 0
+    assert contract["native_asset_identity"]["kind"] == "paddle_ocr_native_asset_identity_v1"
+
+
+def test_verify_delivery_rejects_adapter_contract_semantic_change(tmp_path: Path) -> None:
+    bundle = _snapshot(tmp_path)
+    _add_fake_onnx_records(bundle)
+    delivery = package_delivery_bundle(bundle_dir=bundle, output_dir=tmp_path / "delivery")
+    contract_path = delivery / DELIVERY_CONTRACT_FILENAME
+    contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    contract["adapter_contract"]["preprocessing"]["classifier_recognizer_right_padding"] = "uint8_black"
+    contract_path.write_text(json.dumps(contract), encoding="utf-8")
+
+    with pytest.raises(PaddleOcrBundleError, match="unsupported Paddle OCR adapter contract"):
+        verify_delivery_bundle(delivery)
 
 
 def test_export_rejects_lost_dynamic_detector_or_recognizer_axes() -> None:
@@ -160,3 +192,29 @@ def test_conversion_parity_reader_is_forced_to_cpu_even_if_snapshot_used_gpu(tmp
     assert options["use_gpu"] is False
     assert options["onnx_providers"] == ["CPUExecutionProvider"]
     assert options["det_model_dir"] == str(bundle / "onnx" / "paddle_ocr_det.onnx")
+
+
+def test_conversion_native_reader_is_bound_to_snapshot_not_mutable_cache(tmp_path: Path) -> None:
+    bundle = tmp_path / "bundle"
+    contract = {
+        "effective_paddleocr_args": {"lang": "ch", "use_gpu": True, "gpu_id": 7},
+        "assets": {
+            role: {"bundle_directory": f"paddle/{role}"}
+            for role in ("det", "rec", "cls")
+        },
+        "onnx": {
+            role: {"path": f"onnx/paddle_ocr_{role}.onnx"}
+            for role in ("det", "rec", "cls")
+        },
+        "dictionary": {"path": "charset/ppocr_keys_v1.txt"},
+    }
+
+    options = _paddle_native_options(bundle, contract)
+
+    assert options["use_onnx"] is False
+    assert options["use_gpu"] is False
+    assert "onnx_providers" not in options
+    assert options["det_model_dir"] == str(bundle / "paddle" / "det")
+    assert options["rec_model_dir"] == str(bundle / "paddle" / "rec")
+    assert options["cls_model_dir"] == str(bundle / "paddle" / "cls")
+    assert options["rec_char_dict_path"] == str(bundle / "charset" / "ppocr_keys_v1.txt")

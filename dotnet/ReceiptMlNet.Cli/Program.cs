@@ -54,12 +54,17 @@ internal static class ReceiptMlNetProgram
         ModelContract? deviceContract = options.DeviceModelPath is null
             ? null
             : ModelContract.LoadAndVerify(options.DeviceModelPath, "statusbar_device_v1");
-        var ocrBundle = options.OcrMode == "onnx"
+        var ocrBundle = options.OcrMode is "onnx" or "hybrid-recipient"
             ? PaddleOcrDeliveryBundle.LoadAndVerify(options.OcrBundlePath!)
             : null;
-        var unifiedOcrBundle = options.OcrMode == "unified"
+        var unifiedOcrBundle = options.OcrMode is "unified" or "hybrid-recipient"
             ? UnifiedOcrBundle.LoadAndVerify(options.OcrModelPath!)
             : null;
+        if (options.OcrMode == "hybrid-recipient" && unifiedOcrBundle?.ArchitectureVersion != 13)
+        {
+            throw new UsageException(
+                "--ocr hybrid-recipient requires an architecture-v13 unified OCR model so visible transfer-status OCR remains active");
+        }
 
         var inputFiles = options.InputListPath is null
             ? EnumerateInputFiles(options.InputPath!).ToList()
@@ -128,6 +133,11 @@ internal static class ReceiptMlNetProgram
                 $"Unified OCR ONNX execution provider: {unifiedOcrEngine.ExecutionProvider} "
                 + $"(one v{unifiedOcrEngine.ArchitectureVersion} session/run per receipt)");
         }
+        if (options.OcrMode == "hybrid-recipient")
+        {
+            Console.WriteLine(
+                "OCR route: v13 amount/time/payment/status + PP-OCR det/cls/SVTR_LCNet recipient override");
+        }
 
         foreach (var workItem in workItems)
         {
@@ -161,6 +171,7 @@ internal static class ReceiptMlNetProgram
                     deviceClassifier,
                     ocrEngine,
                     unifiedOcrEngine,
+                    options.OcrMode,
                     options.ScoreThreshold,
                     options.Rectification,
                     out var stageLatency);
@@ -222,6 +233,7 @@ internal static class ReceiptMlNetProgram
         var skippedCount = manifest.Count(record => record.Status == "skipped_existing");
         var summary = new InferenceSummary(
             device.Requested,
+            ocrEngine?.ExecutionProvider,
             unifiedOcrEngine?.ExecutionProvider,
             options.DetectorIntraOpThreads,
             workItems.Count,
@@ -246,6 +258,7 @@ internal static class ReceiptMlNetProgram
         DeviceModel? deviceClassifier,
         PaddleOcrEngine? ocrEngine,
         UnifiedOcrEngine? unifiedOcrEngine,
+        string ocrMode,
         float scoreThreshold,
         string rectificationMode,
         out InferenceStageLatency stageLatency)
@@ -277,7 +290,7 @@ internal static class ReceiptMlNetProgram
         var detectorPostprocessMs = StopAndReadMilliseconds(stageStopwatch);
 
         double? paddleOcrMs = null;
-        if (ocrEngine is not null)
+        if (ocrEngine is not null && unifiedOcrEngine is null)
         {
             stageStopwatch.Restart();
             detections = EnrichWithOcr(rectified, detections, ocrEngine);
@@ -288,8 +301,24 @@ internal static class ReceiptMlNetProgram
         UnifiedOcrReadResult? unifiedOcr = null;
         if (unifiedOcrEngine is not null)
         {
-            unifiedOcr = unifiedOcrEngine.RecognizeReceipt(rectified, detections, out var measuredUnifiedOcrLatency);
+            unifiedOcr = unifiedOcrEngine.RecognizeReceipt(
+                rectified,
+                detections,
+                includeRecipient: ocrMode != "hybrid-recipient",
+                out var measuredUnifiedOcrLatency);
             unifiedOcrLatency = measuredUnifiedOcrLatency;
+        }
+
+        if (ocrMode == "hybrid-recipient")
+        {
+            if (ocrEngine is null || unifiedOcr is null)
+            {
+                throw new InvalidOperationException(
+                    "hybrid-recipient requires both verified Paddle OCR and architecture-v13 unified OCR sessions");
+            }
+            stageStopwatch.Restart();
+            unifiedOcr = PaddleRecipientHybrid.OverrideRecipient(rectified, detections, ocrEngine, unifiedOcr);
+            paddleOcrMs = StopAndReadMilliseconds(stageStopwatch);
         }
 
         stageStopwatch.Restart();
@@ -297,10 +326,10 @@ internal static class ReceiptMlNetProgram
         {
             detections = EnrichWithUnifiedOcr(detections, unifiedOcr);
         }
-        var fields = ocrEngine is not null
-            ? BuildFields(detections)
-            : unifiedOcr is not null
-                ? BuildUnifiedFields(detections, unifiedOcr)
+        var fields = unifiedOcr is not null
+            ? BuildUnifiedFields(detections, unifiedOcr)
+            : ocrEngine is not null
+                ? BuildFields(detections)
                 : null;
         // Detector and OCR boxes remain in rectified coordinates through all
         // crop operations.  Only the public bbox_image values are projected
@@ -350,7 +379,9 @@ internal static class ReceiptMlNetProgram
                 "Perspective photos still require an externally rectified input; automatic screen detection is intentionally outside this production mode.",
                 "bbox_image and both compatibility-named annotated JPGs use EXIF-upright source coordinates.",
                 ocrEngine is not null
-                    ? "OCR uses the verified PP-OCR ONNX delivery bundle on the selected rectified image."
+                    ? unifiedOcrEngine is not null
+                        ? "OCR uses architecture-v13 for amount/time/payment/status and the verified PP-OCR ONNX det/cls/SVTR_LCNet bundle only for the detected recipient row."
+                        : "OCR uses the verified PP-OCR ONNX delivery bundle on the selected rectified image."
                     : unifiedOcrEngine is not null
                         ? $"OCR uses the verified architecture-v{unifiedOcrEngine.ArchitectureVersion} unified ONNX reader in one session/run per receipt. Its current text/status contract is review-only: candidates are diagnostic and delivered values fail closed to review."
                         : "OCR field extraction is disabled; use --ocr onnx --ocr-bundle <delivery-directory> or --ocr unified --ocr-model <v12-or-v13-reader.onnx> to enable it.",
@@ -1624,7 +1655,7 @@ Usage:
   dotnet run --project dotnet/ReceiptMlNet.Cli/ReceiptMlNet.Cli.csproj -- \
     --detector <receipt_lrcnn_v1.onnx> \
     [--device-model <statusbar_device_v1.onnx>] \
-    [--ocr none|onnx|unified] \
+    [--ocr none|onnx|unified|hybrid-recipient] \
     [--ocr-bundle <paddle-ocr-delivery-directory>] \
     [--ocr-model <receipt_unified_field_reader_v12_or_v13.onnx>] \
     (--input <image-or-directory> | --input-list <txt>) --output <directory> \
@@ -1634,8 +1665,9 @@ Usage:
     [--require-complete] [--continue-on-error] [--skip-existing] [--limit 100]
 
 This .NET CLI runs the receipt/device ONNX models and can optionally run a
-verified PP-OCR delivery bundle (--ocr onnx) or a v12/v13 unified five-field
-OCR reader (--ocr unified). The two OCR modes are mutually exclusive. Unified OCR
+verified PP-OCR delivery bundle (--ocr onnx), a v12/v13 unified five-field
+OCR reader (--ocr unified), or both with PP-OCR restricted to recipient only
+(--ocr hybrid-recipient). Unified OCR
 requires its adjacent .labels.json and .contract.json sidecars and emits
 review-only delivery values until independently human-calibrated. It writes
 JSON and, by default, two annotated JPGs. It does not yet include perspective
@@ -1717,21 +1749,21 @@ perspective photos still require an externally rectified input.
         {
             throw new UsageException("Specify exactly one of --input or --input-list");
         }
-        if (ocrMode == "onnx" && string.IsNullOrWhiteSpace(ocrBundle))
+        if ((ocrMode is "onnx" or "hybrid-recipient") && string.IsNullOrWhiteSpace(ocrBundle))
         {
-            throw new UsageException("--ocr-bundle is required when --ocr onnx");
+            throw new UsageException("--ocr-bundle is required when --ocr onnx or hybrid-recipient");
         }
-        if (ocrMode == "unified" && string.IsNullOrWhiteSpace(ocrModel))
+        if ((ocrMode is "unified" or "hybrid-recipient") && string.IsNullOrWhiteSpace(ocrModel))
         {
-            throw new UsageException("--ocr-model is required when --ocr unified");
+            throw new UsageException("--ocr-model is required when --ocr unified or hybrid-recipient");
         }
-        if (ocrMode != "onnx" && !string.IsNullOrWhiteSpace(ocrBundle))
+        if (ocrMode is not ("onnx" or "hybrid-recipient") && !string.IsNullOrWhiteSpace(ocrBundle))
         {
-            throw new UsageException("--ocr-bundle requires --ocr onnx");
+            throw new UsageException("--ocr-bundle requires --ocr onnx or hybrid-recipient");
         }
-        if (ocrMode != "unified" && !string.IsNullOrWhiteSpace(ocrModel))
+        if (ocrMode is not ("unified" or "hybrid-recipient") && !string.IsNullOrWhiteSpace(ocrModel))
         {
-            throw new UsageException("--ocr-model requires --ocr unified");
+            throw new UsageException("--ocr-model requires --ocr unified or hybrid-recipient");
         }
         var parsedDevice = DeviceSetting.Parse(device);
         if (detectorIntraOpThreads is not null && parsedDevice.Requested != "cpu")
@@ -1744,11 +1776,11 @@ perspective photos still require an externally rectified input.
     private static string ParseOcrMode(string value)
     {
         var mode = value.ToLowerInvariant();
-        if (mode is "none" or "onnx" or "unified")
+        if (mode is "none" or "onnx" or "unified" or "hybrid-recipient")
         {
             return mode;
         }
-        throw new UsageException("--ocr must be none, onnx, or unified");
+        throw new UsageException("--ocr must be none, onnx, unified, or hybrid-recipient");
     }
 
     private static string ParseAnnotationMode(string value)
@@ -1874,6 +1906,7 @@ internal sealed record ErrorRecord(string Source, string ErrorType, string Messa
 internal sealed record InputWorkItem(string Source, string Output);
 internal sealed record InferenceSummary(
     string RequestedDevice,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? PaddleOcrProvider,
     [property: JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? UnifiedProvider,
     [property: JsonIgnore(Condition = JsonIgnoreCondition.Never)] int? DetectorIntraOpThreads,
     int Input,
