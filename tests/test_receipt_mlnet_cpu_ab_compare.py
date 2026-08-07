@@ -430,3 +430,18 @@ def test_cpu_ab_powershell_wrapper_parses_when_powershell_is_available() -> None
         text=True,
     )
     assert completed.returncode == 0, completed.stderr
+
+
+def test_cpu_ab_powershell_resolves_relative_paths_from_provider_location() -> None:
+    script = (
+        Path(__file__).resolve().parents[1]
+        / "scripts"
+        / "receipt-mlnet-cpu-ab-validate.ps1"
+    ).read_text(encoding="utf-8")
+
+    assert "GetUnresolvedProviderPathFromPSPath" in script
+    assert all(
+        "[IO.Path]::GetFullPath" not in line
+        for line in script.splitlines()
+        if not line.lstrip().startswith("#")
+    )

@@ -42,13 +42,24 @@ function Require-File([string]$Path, [string]$Description) {
     }
 }
 
+function Get-ProviderFullPath([string]$Path) {
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        throw "Cannot resolve an empty filesystem path."
+    }
+    # [IO.Path]::GetFullPath resolves relative paths from the host process
+    # working directory, which can remain on C: even when PowerShell's current
+    # location is the D: repository. Resolve through PowerShell's provider so
+    # CLI arguments follow the directory shown by Get-Location/the prompt.
+    return $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
+}
+
 function Get-Sha256([string]$Path) {
     return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 
 function Test-PathWithin([string]$Candidate, [string]$Parent) {
-    $candidateFull = [IO.Path]::GetFullPath($Candidate)
-    $parentFull = [IO.Path]::GetFullPath($Parent)
+    $candidateFull = Get-ProviderFullPath $Candidate
+    $parentFull = Get-ProviderFullPath $Parent
     if ($candidateFull.Equals($parentFull, [StringComparison]::OrdinalIgnoreCase)) {
         return $true
     }
@@ -59,7 +70,7 @@ function Test-PathWithin([string]$Candidate, [string]$Parent) {
 }
 
 function Get-FileEvidence([string]$Path, [string]$Description) {
-    $fullPath = [IO.Path]::GetFullPath($Path)
+    $fullPath = Get-ProviderFullPath $Path
     Require-File $fullPath $Description
     $item = Get-Item -LiteralPath $fullPath -Force
     return [ordered]@{
@@ -70,7 +81,7 @@ function Get-FileEvidence([string]$Path, [string]$Description) {
 }
 
 function Get-AppPayloadFiles([string]$AppRoot, [string]$Description) {
-    $root = [IO.Path]::GetFullPath($AppRoot)
+    $root = Get-ProviderFullPath $AppRoot
     if (-not (Test-Path -LiteralPath $root -PathType Container)) {
         throw "Missing ${Description} directory: $root"
     }
@@ -100,7 +111,7 @@ function Freeze-AppPayload(
     [string]$EvidenceRoot
 ) {
     $executableEvidence = Get-FileEvidence $Executable "$Variant executable"
-    $appRoot = [IO.Path]::GetFullPath((Split-Path -Parent $Executable))
+    $appRoot = Get-ProviderFullPath (Split-Path -Parent $Executable)
     $executableName = [IO.Path]::GetFileName($Executable)
     $managedName = [IO.Path]::ChangeExtension($executableName, ".dll")
     $depsName = [IO.Path]::ChangeExtension($executableName, ".deps.json")
@@ -115,7 +126,7 @@ function Freeze-AppPayload(
     }
     $rows = [Collections.Generic.List[object]]::new()
     foreach ($file in @(Get-AppPayloadFiles $appRoot "$Variant app payload")) {
-        $fullPath = [IO.Path]::GetFullPath([string]$file.FullName)
+        $fullPath = Get-ProviderFullPath ([string]$file.FullName)
         if (-not $fullPath.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
             throw "$Variant app payload file escapes its root: $fullPath"
         }
@@ -158,7 +169,7 @@ function Write-JsonNoBom([string]$Path, [object]$Payload, [int]$Depth = 12) {
 function Resolve-Python([string]$Requested) {
     if (-not [string]::IsNullOrWhiteSpace($Requested)) {
         if (Test-Path -LiteralPath $Requested -PathType Leaf) {
-            return [IO.Path]::GetFullPath($Requested)
+            return (Get-ProviderFullPath $Requested)
         }
         $requestedCommand = Get-Command $Requested -ErrorAction SilentlyContinue
         if ($null -eq $requestedCommand) {
@@ -171,7 +182,7 @@ function Resolve-Python([string]$Requested) {
         (Join-Path $repoRoot ".venv\Scripts\python.exe")
     )) {
         if (Test-Path -LiteralPath $candidate -PathType Leaf) {
-            return [IO.Path]::GetFullPath($candidate)
+            return (Get-ProviderFullPath $candidate)
         }
     }
     $pythonCommand = Get-Command python -ErrorAction SilentlyContinue
@@ -185,7 +196,7 @@ function Resolve-Python([string]$Requested) {
 }
 
 function Read-FixedInputs([string]$Path) {
-    $fullListPath = [IO.Path]::GetFullPath($Path)
+    $fullListPath = Get-ProviderFullPath $Path
     Require-File $fullListPath "input list"
     $listDirectory = Split-Path -Parent $fullListPath
     $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
@@ -205,7 +216,7 @@ function Read-FixedInputs([string]$Path) {
             Join-Path $listDirectory $entry
         }
         try {
-            $fullPath = [IO.Path]::GetFullPath($candidate)
+            $fullPath = Get-ProviderFullPath $candidate
         }
         catch {
             throw "Invalid input path at ${fullListPath}:${lineNumber}: $($_.Exception.Message)"
@@ -300,15 +311,15 @@ function Invoke-CpuRun(
 
 Require-File $analyzer "CPU A/B analyzer"
 $pythonExe = Resolve-Python $PythonExecutable
-$BaselineExecutable = [IO.Path]::GetFullPath($BaselineExecutable)
-$CandidateExecutable = [IO.Path]::GetFullPath($CandidateExecutable)
-$DetectorModel = [IO.Path]::GetFullPath($DetectorModel)
-$DeviceModel = [IO.Path]::GetFullPath($DeviceModel)
-$UnifiedModel = [IO.Path]::GetFullPath($UnifiedModel)
-$InputList = [IO.Path]::GetFullPath($InputList)
-$OutputRoot = [IO.Path]::GetFullPath($OutputRoot)
-$baselineAppRoot = [IO.Path]::GetFullPath((Split-Path -Parent $BaselineExecutable))
-$candidateAppRoot = [IO.Path]::GetFullPath((Split-Path -Parent $CandidateExecutable))
+$BaselineExecutable = Get-ProviderFullPath $BaselineExecutable
+$CandidateExecutable = Get-ProviderFullPath $CandidateExecutable
+$DetectorModel = Get-ProviderFullPath $DetectorModel
+$DeviceModel = Get-ProviderFullPath $DeviceModel
+$UnifiedModel = Get-ProviderFullPath $UnifiedModel
+$InputList = Get-ProviderFullPath $InputList
+$OutputRoot = Get-ProviderFullPath $OutputRoot
+$baselineAppRoot = Get-ProviderFullPath (Split-Path -Parent $BaselineExecutable)
+$candidateAppRoot = Get-ProviderFullPath (Split-Path -Parent $CandidateExecutable)
 
 foreach ($required in @(
     @{ Path = $BaselineExecutable; Description = "baseline executable" },
