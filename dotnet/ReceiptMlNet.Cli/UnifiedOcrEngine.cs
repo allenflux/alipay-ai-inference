@@ -74,6 +74,8 @@ internal sealed class UnifiedOcrEngine : IDisposable
         "date_ymd_hh_mm",
         "date_ymd_hh_mm_ss",
     ];
+    private static readonly string[] PaymentStructureClasses = ["unstructured", "card_tail4"];
+    private static readonly string[] PaymentParenthesesClasses = ["ascii", "fullwidth"];
 
     private readonly UnifiedOcrBundle _bundle;
     private readonly InferenceSession _session;
@@ -186,8 +188,7 @@ internal sealed class UnifiedOcrEngine : IDisposable
             }
             if (readable.Contains("payment_method_field"))
             {
-                candidates["payment_method_field"] = DecodeCtcCandidate(
-                    outputs["payment_logits"], _bundle.PaymentCharacters);
+                candidates["payment_method_field"] = DecodePaymentCandidate(outputs);
             }
             if (includeRecipient && readable.Contains("recipient_field"))
             {
@@ -391,9 +392,64 @@ internal sealed class UnifiedOcrEngine : IDisposable
             _bundle.TextReviewValue);
     }
 
+    private UnifiedOcrCandidate DecodePaymentCandidate(IReadOnlyDictionary<string, OrtOutput> outputs)
+    {
+        var ctc = DecodeCtc(outputs["payment_logits"], _bundle.PaymentCharacters);
+        if (!ReceiptFieldNormalizer.IsMixedPaymentCardParenthesesCandidate(ctc.Text))
+        {
+            return CreateCtcCandidate(ctc);
+        }
+        var prefix = DecodeCtc(outputs["payment_prefix_logits"], _bundle.PaymentCharacters);
+        var structure = DecodeClass(outputs["payment_structure_logits"]);
+        var parentheses = DecodeClass(outputs["payment_parentheses_logits"]);
+        var tailOutput = outputs["payment_tail_digit_logits"];
+        if (tailOutput.Shape.Length != 2 || tailOutput.Shape[0] != 4 || tailOutput.Shape[1] != 10)
+        {
+            throw new InvalidOperationException("Unified OCR payment-tail tensor has an invalid static shape");
+        }
+        var tailDigits = new int[4];
+        var componentConfidences = new List<float>
+        {
+            ctc.Confidence,
+            prefix.Confidence,
+            structure.Confidence,
+            parentheses.Confidence,
+        };
+        for (var index = 0; index < tailDigits.Length; index++)
+        {
+            var digit = ArgMax(tailOutput.Values.Span, index * 10, 10);
+            tailDigits[index] = digit.Index;
+            componentConfidences.Add(digit.Confidence);
+        }
+        var tail = string.Concat(
+            tailDigits.Select(value => value.ToString(System.Globalization.CultureInfo.InvariantCulture)));
+        var calibrated = ReceiptFieldNormalizer.TryRepairMixedPaymentCardParentheses(
+            ctc.Text,
+            prefix.Text,
+            tail,
+            PaymentStructureClasses[structure.Index],
+            PaymentParenthesesClasses[parentheses.Index]);
+        var structured = calibrated is null
+            ? null
+            : new StructuredRead(calibrated, componentConfidences.Min());
+        return new UnifiedOcrCandidate(
+            structured?.Text ?? ctc.Text,
+            structured?.Confidence ?? ctc.Confidence,
+            ctc.Text,
+            ctc.Confidence,
+            structured?.Text,
+            structured?.Confidence,
+            _bundle.TextReviewValue);
+    }
+
     private UnifiedOcrCandidate DecodeCtcCandidate(OrtOutput output, IReadOnlyList<string> characters)
     {
         var ctc = DecodeCtc(output, characters);
+        return CreateCtcCandidate(ctc);
+    }
+
+    private UnifiedOcrCandidate CreateCtcCandidate(CtcRead ctc)
+    {
         return new UnifiedOcrCandidate(
             ctc.Text,
             ctc.Confidence,

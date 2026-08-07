@@ -20,6 +20,9 @@ internal static class ReceiptFieldNormalizer
     private static readonly Regex TimePattern = new(
         @"(?<!\d)(\d{1,2}:\d{2}(?::\d{2})?)(?!\d)",
         RegexOptions.CultureInvariant);
+    private static readonly Regex MixedFullwidthPaymentCardTailPattern = new(
+        @"^(?<prefix>[^()（）]+(?:银行卡|储蓄卡|信用卡))（(?<tail>[0-9]{4})\)$",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
     private static readonly char[] FieldValueTrimCharacters = [' ', ':', '：', '-', '—'];
 
@@ -185,6 +188,47 @@ internal static class ReceiptFieldNormalizer
                         ? "bank_card"
                         : "other";
         return new NormalizedPaymentMethod(raw, kind);
+    }
+
+    /// <summary>
+    /// Repair only the observed mixed card-tail delimiter when all auxiliary
+    /// heads agree with the raw CTC prefix and four digits. Valid ASCII or
+    /// full-width pairs, the reverse mixed direction and character/digit
+    /// disagreements deliberately remain unchanged by returning null.
+    /// </summary>
+    public static string? TryRepairMixedPaymentCardParentheses(
+        string? rawCtc,
+        string? prefixCtc,
+        string? tailDigits,
+        string? structureClass,
+        string? parenthesesClass)
+    {
+        if (!IsMixedPaymentCardParenthesesCandidate(rawCtc)
+            || string.IsNullOrEmpty(prefixCtc)
+            || string.IsNullOrEmpty(tailDigits)
+            || !string.Equals(prefixCtc, prefixCtc.Trim(), StringComparison.Ordinal)
+            || !string.Equals(structureClass, "card_tail4", StringComparison.Ordinal)
+            || !string.Equals(parenthesesClass, "fullwidth", StringComparison.Ordinal))
+        {
+            return null;
+        }
+
+        var raw = rawCtc!;
+        var match = MixedFullwidthPaymentCardTailPattern.Match(raw);
+        if (!match.Success
+            || !string.Equals(match.Groups["prefix"].Value, prefixCtc, StringComparison.Ordinal)
+            || !string.Equals(match.Groups["tail"].Value, tailDigits, StringComparison.Ordinal))
+        {
+            return null;
+        }
+        return raw[..^1] + "）";
+    }
+
+    public static bool IsMixedPaymentCardParenthesesCandidate(string? rawCtc)
+    {
+        return !string.IsNullOrEmpty(rawCtc)
+            && string.Equals(rawCtc, rawCtc.Trim(), StringComparison.Ordinal)
+            && MixedFullwidthPaymentCardTailPattern.IsMatch(rawCtc);
     }
 
     private static bool IsBetterAmountCandidate(Match candidate, Match current)

@@ -105,6 +105,41 @@ def test_hybrid_routes_only_recipient_after_v13_and_keeps_review_policy() -> Non
     assert "RecipientDiagnostic = diagnostic" in router
 
 
+def test_payment_parenthesis_calibration_is_narrow_and_preserves_raw_ctc() -> None:
+    engine = _source("UnifiedOcrEngine.cs")
+    normalizer = _source("ReceiptFieldNormalizer.cs")
+
+    assert 'candidates["payment_method_field"] = DecodePaymentCandidate(outputs)' in engine
+    for output in (
+        'outputs["payment_logits"]',
+        'outputs["payment_prefix_logits"]',
+        'outputs["payment_tail_digit_logits"]',
+        'outputs["payment_structure_logits"]',
+        'outputs["payment_parentheses_logits"]',
+    ):
+        assert output in engine
+    assert "componentConfidences.Min()" in engine
+    assert "structured?.Text ?? ctc.Text" in engine
+    assert "ctc.Text,\n            ctc.Confidence,\n            structured?.Text" in engine
+    assert "TryRepairMixedPaymentCardParentheses" in engine
+
+    payment_decoder = engine.split(
+        "private UnifiedOcrCandidate DecodePaymentCandidate", 1
+    )[1].split("private UnifiedOcrCandidate DecodeCtcCandidate", 1)[0]
+    assert payment_decoder.index("IsMixedPaymentCardParenthesesCandidate") < payment_decoder.index(
+        'outputs["payment_prefix_logits"]'
+    )
+    assert "return CreateCtcCandidate(ctc);" in payment_decoder
+
+    assert "[^()（）]+(?:银行卡|储蓄卡|信用卡)" in normalizer
+    assert "（(?<tail>[0-9]{4})\\)$" in normalizer
+    assert '"card_tail4"' in normalizer
+    assert '"fullwidth"' in normalizer
+    assert 'match.Groups["prefix"].Value, prefixCtc' in normalizer
+    assert 'match.Groups["tail"].Value, tailDigits' in normalizer
+    assert 'return raw[..^1] + "）"' in normalizer
+
+
 def test_hybrid_retry_is_left_context_only_and_remains_fail_closed() -> None:
     image_ops = _source("UnifiedOcrImageOps.cs")
     router = _source("PaddleRecipientHybrid.cs")

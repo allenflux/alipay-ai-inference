@@ -11,6 +11,35 @@ internal static class Program
             AssertEqual(null, PaddleRecipientValueParser.Parse("\u5907\u6ce8 \u6536\u6b3e\u65b9 \u5546\u6237\u7532"), "middle label");
             AssertEqual(null, PaddleRecipientValueParser.Parse("\u6536\u6b3e\u65b9\uff1a"), "empty value");
             AssertEqual(null, PaddleRecipientValueParser.Parse(null), "null OCR");
+            AssertEqual(
+                "\u62db\u5546\u94f6\u884c\u50a8\u84c4\u5361\uff082551\uff09",
+                RepairPayment("\u62db\u5546\u94f6\u884c\u50a8\u84c4\u5361\uff082551)"),
+                "mixed full-width payment card tail is repaired with full agreement");
+            AssertTrue(
+                ReceiptFieldNormalizer.IsMixedPaymentCardParenthesesCandidate(
+                    "\u62db\u5546\u94f6\u884c\u50a8\u84c4\u5361\uff082551)"),
+                "mixed payment candidate enters the auxiliary consensus path");
+            AssertFalse(
+                ReceiptFieldNormalizer.IsMixedPaymentCardParenthesesCandidate(
+                    "\u62db\u5546\u94f6\u884c\u50a8\u84c4\u5361(2551)"),
+                "valid ASCII payment candidate stays on the fast path");
+            AssertFalse(
+                ReceiptFieldNormalizer.IsMixedPaymentCardParenthesesCandidate(
+                    "\u62db\u5546\u94f6\u884c\u50a8\u84c4\u5361\uff082551\uff09"),
+                "valid full-width payment candidate stays on the fast path");
+            AssertEqual(null, RepairPayment("\u62db\u5546\u94f6\u884c\u50a8\u84c4\u5361(2551)"), "valid ASCII payment parentheses");
+            AssertEqual(null, RepairPayment("\u62db\u5546\u94f6\u884c\u50a8\u84c4\u5361\uff082551\uff09"), "valid full-width payment parentheses");
+            AssertEqual(null, RepairPayment("\u62db\u5546\u94f6\u884c\u50a8\u84c4\u5361(2551\uff09"), "reverse mixed payment parentheses");
+            AssertEqual(null, RepairPayment("\u62db\u5546\u94f6\u884c\u50a8\u84c4\u5361\uff08255)", tail: "255"), "three-digit payment tail");
+            AssertEqual(null, RepairPayment("\u62db\u5546\u94f6\u884c\u50a8\u84c4\u5361\uff08\uff12\uff15\uff15\uff11)"), "full-width payment digits");
+            AssertEqual(null, RepairPayment("\u62db\u5546\u94f6\u884c\u50a8\u84c4\u5361\uff08255A)"), "letter in payment tail");
+            AssertEqual(null, RepairPayment("\u62db\u5546\u94f6\u884c\u50a8\u84c4\u5361\uff082551)tail"), "payment trailing text");
+            AssertEqual(null, RepairPayment(" \u62db\u5546\u94f6\u884c\u50a8\u84c4\u5361\uff082551)"), "payment leading whitespace");
+            AssertEqual(null, RepairPayment("\u62db\u5546(\u94f6\u884c)\u50a8\u84c4\u5361\uff082551)", prefix: "\u62db\u5546(\u94f6\u884c)\u50a8\u84c4\u5361"), "payment prefix with parentheses");
+            AssertEqual(null, RepairPayment("\u62db\u5546\u94f6\u884c\u50a8\u84c4\u5361\uff082551)", prefix: "\u5de5\u5546\u94f6\u884c\u50a8\u84c4\u5361"), "payment prefix disagreement");
+            AssertEqual(null, RepairPayment("\u62db\u5546\u94f6\u884c\u50a8\u84c4\u5361\uff082551)", tail: "2552"), "payment tail disagreement");
+            AssertEqual(null, RepairPayment("\u62db\u5546\u94f6\u884c\u50a8\u84c4\u5361\uff082551)", structure: "unstructured"), "payment structure disagreement");
+            AssertEqual(null, RepairPayment("\u62db\u5546\u94f6\u884c\u50a8\u84c4\u5361\uff082551)", style: "ascii"), "payment style disagreement");
             AssertAlternative(
                 "\u53f8\u6e90(**\u6e90)",
                 "pinyin_annotated_three_line",
@@ -472,6 +501,21 @@ internal static class Program
             lines,
             lineConfidences,
             recipientDetectorScore);
+    }
+
+    private static string? RepairPayment(
+        string raw,
+        string prefix = "\u62db\u5546\u94f6\u884c\u50a8\u84c4\u5361",
+        string tail = "2551",
+        string structure = "card_tail4",
+        string style = "fullwidth")
+    {
+        return ReceiptFieldNormalizer.TryRepairMixedPaymentCardParentheses(
+            raw,
+            prefix,
+            tail,
+            structure,
+            style);
     }
 
     private static PaddleRecipientAlternativeParseResult? ParsePair(
