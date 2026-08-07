@@ -63,28 +63,37 @@ internal static class PaddleRecipientHybrid
             : null;
         var verifiedAlternativeEnvelope = HasVerifiedUnlabelledMerchantRowLayout(
             source, detections, detection, paymentOverlapFraction: 0.45f);
+        PaddleRecipientAlternativeParseResult? firstAlternative = null;
+        bool? firstAlternativeGeometryAccepted = null;
         if (value is null
             && verifiedAlternativeEnvelope)
         {
-            var alternative = ParseCalibratedAlternative(
+            firstAlternative = ParseCalibratedAlternative(
                 firstRead,
                 detection.Score,
                 amountCandidate);
-            if (alternative is not null
-                && HasVerifiedCalibratedAlternativeRowLayout(
+            if (firstAlternative is not null)
+            {
+                firstAlternativeGeometryAccepted = HasVerifiedCalibratedAlternativeRowLayout(
                     source,
                     detections,
                     detection,
-                    alternative))
+                    firstAlternative);
+            }
+            if (firstAlternative is not null
+                && firstAlternativeGeometryAccepted is true)
             {
-                value = alternative.Value;
-                route = $"primary_{alternative.Route}";
+                value = firstAlternative.Value;
+                route = $"primary_{firstAlternative.Route}";
             }
         }
         string? retryRaw = null;
         int? retryLineCount = null;
         int? retryCropWidth = null;
         int? retryCropHeight = null;
+        PaddleOcrReadResult? retryReadEvidence = null;
+        PaddleRecipientAlternativeParseResult? retryAlternative = null;
+        bool? retryAlternativeGeometryAccepted = null;
 
         if (value is null)
         {
@@ -92,6 +101,7 @@ internal static class PaddleRecipientHybrid
             if (retryCrop is not null)
             {
                 var retryRead = paddleOcr.Recognize(retryCrop);
+                retryReadEvidence = retryRead;
                 retryRaw = retryRead.Text;
                 retryLineCount = retryRead.Lines.Count;
                 retryCropWidth = retryCrop.Width;
@@ -101,16 +111,20 @@ internal static class PaddleRecipientHybrid
                 if (retryValue is null
                     && verifiedAlternativeEnvelope)
                 {
-                    var retryAlternative = ParseCalibratedAlternative(
+                    retryAlternative = ParseCalibratedAlternative(
                         retryRead,
                         detection.Score,
                         amountCandidate);
-                    if (retryAlternative is not null
-                        && HasVerifiedCalibratedAlternativeRowLayout(
+                    if (retryAlternative is not null)
+                    {
+                        retryAlternativeGeometryAccepted = HasVerifiedCalibratedAlternativeRowLayout(
                             source,
                             detections,
                             detection,
-                            retryAlternative))
+                            retryAlternative);
+                    }
+                    if (retryAlternative is not null
+                        && retryAlternativeGeometryAccepted is true)
                     {
                         retryValue = retryAlternative.Value;
                         retryRoute = $"left_context_retry_{retryAlternative.Route}";
@@ -130,7 +144,14 @@ internal static class PaddleRecipientHybrid
             value is null
                 ? string.IsNullOrWhiteSpace(firstRead.Text) && string.IsNullOrWhiteSpace(retryRaw)
                     ? "ocr_empty"
-                    : "anchored_or_pair_parse_failed"
+                    : BuildFailureReason(
+                        verifiedAlternativeEnvelope,
+                        firstRead,
+                        firstAlternative,
+                        firstAlternativeGeometryAccepted,
+                        retryReadEvidence,
+                        retryAlternative,
+                        retryAlternativeGeometryAccepted)
                 : null,
             firstRead.Text,
             firstRead.Lines.Count,
@@ -157,6 +178,44 @@ internal static class PaddleRecipientHybrid
             null,
             unified.TextDeliveryValue);
         return unified with { Candidates = candidates, RecipientDiagnostic = diagnostic };
+    }
+
+    private static string BuildFailureReason(
+        bool verifiedAlternativeEnvelope,
+        PaddleOcrReadResult firstRead,
+        PaddleRecipientAlternativeParseResult? firstAlternative,
+        bool? firstAlternativeGeometryAccepted,
+        PaddleOcrReadResult? retryRead,
+        PaddleRecipientAlternativeParseResult? retryAlternative,
+        bool? retryAlternativeGeometryAccepted)
+    {
+        return string.Join(
+            ";",
+            "anchored_or_alternative_parse_failed",
+            $"alternative_envelope={verifiedAlternativeEnvelope}",
+            $"first={DescribeReadEvidence(firstRead, firstAlternative, firstAlternativeGeometryAccepted)}",
+            $"retry={DescribeReadEvidence(retryRead, retryAlternative, retryAlternativeGeometryAccepted)}");
+    }
+
+    private static string DescribeReadEvidence(
+        PaddleOcrReadResult? read,
+        PaddleRecipientAlternativeParseResult? alternative,
+        bool? geometryAccepted)
+    {
+        if (read is null)
+        {
+            return "none";
+        }
+        var lines = string.Join(
+            ",",
+            read.Lines.Select((line, index) =>
+                $"{index}:{line.Confidence.ToString("R", System.Globalization.CultureInfo.InvariantCulture)}:{line.Text}"));
+        return string.Join(
+            ",",
+            $"line_count={read.Lines.Count}",
+            $"alternative_route={alternative?.Route ?? "none"}",
+            $"geometry={geometryAccepted?.ToString() ?? "not_evaluated"}",
+            $"lines=[{lines}]");
     }
 
     private static PaddleRecipientAlternativeParseResult? ParseCalibratedAlternative(

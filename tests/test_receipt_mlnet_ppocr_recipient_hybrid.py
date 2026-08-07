@@ -58,7 +58,7 @@ def test_hybrid_routes_only_recipient_after_v13_and_keeps_review_policy() -> Non
     assert "PaddleRecipientValueParser.Parse(retryRead.Text)" in router
     assert "ParsePinyinAnnotatedRecipient" in router
     assert "ParseUnlabelledMerchantAmountPair" in router
-    assert 'route = $"primary_{alternative.Route}"' in router
+    assert 'route = $"primary_{firstAlternative.Route}"' in router
     assert 'retryRoute = $"left_context_retry_{retryAlternative.Route}"' in router
     assert "HasVerifiedUnlabelledMerchantRowLayout" in router
     assert "HasVerifiedUnlabelledMerchantRowGeometry" in router
@@ -110,7 +110,8 @@ def test_hybrid_retry_is_left_context_only_and_remains_fail_closed() -> None:
     assert router.count("ParseCalibratedAlternative(") == 3
     assert router.count("PaddleRecipientValueParser.ParsePinyinAnnotatedRecipient(") == 1
     assert router.count("PaddleRecipientValueParser.ParseUnlabelledMerchantAmountPair(") == 1
-    assert '"anchored_or_pair_parse_failed"' in router
+    assert '"anchored_or_alternative_parse_failed"' in router
+    assert "DescribeReadEvidence" in router
     assert '"ocr_empty"' in router
     assert "candidates.Remove(\"recipient_field\")" in router
 

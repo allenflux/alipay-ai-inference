@@ -32,6 +32,15 @@ internal static class Program
                 null,
                 ParsePinyin(["shou kuan fang", "\u53f8\u6e90(**\u6e90)", "\u6536\u6b3e\u65b9"], [0.90f, 0.70f, 0.90f], 0.95f),
                 "pinyin merchant line at 0.70");
+            AssertAlternative(
+                "\u5c0f\u8363\uff08**\u9f99\uff09",
+                "pinyin_annotated_three_line",
+                null,
+                ParsePinyin(
+                    ["shou kuan fang", "\u5c0f\u8363\uff08**\u9f99\uff09", "\u6536\u6b3e\u65b9"],
+                    [0.93031883f, 0.700153f, 0.9950261f],
+                    0.92100316f),
+                "exact calibrated pilot pinyin evidence");
             AssertAlternativeNull(
                 ParsePinyin(["shou kuan fang", "\u53f8\u6e90(**\u6e90)", "\u6536\u6b3e\u65b9"], [0.90f, 0.699f, 0.90f], 0.95f),
                 "pinyin merchant line below 0.70");
