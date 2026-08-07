@@ -171,8 +171,10 @@ internal sealed class UnifiedOcrEngine : IDisposable
                 _bundle.StatusRuntimePolicy,
                 _bundle.TextReviewValue,
                 _bundle.TextRuntimePolicy);
-            postprocessMs = StopAndReadMilliseconds(stageStopwatch);
         }
+        // Keep the historical stage boundary: output disposal is part of OCR
+        // postprocessing telemetry even though no tensor view escapes it.
+        postprocessMs = StopAndReadMilliseconds(stageStopwatch);
 
         stageLatency = new UnifiedOcrStageLatency(preprocessMs, inferenceMs, postprocessMs);
         return result;
