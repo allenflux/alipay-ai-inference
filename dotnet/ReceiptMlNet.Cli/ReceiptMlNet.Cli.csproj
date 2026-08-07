@@ -13,9 +13,10 @@
     <PackageReference Include="SixLabors.ImageSharp" Version="3.1.11" />
     <PackageReference Include="SixLabors.ImageSharp.Drawing" Version="2.1.7" />
     <!-- PP-OCR's DB post-process needs contours, min-area boxes and perspective crops. -->
-    <PackageReference Include="OpenCvSharp4" Version="4.10.0.20241108" />
+    <!-- Match the frozen PaddleOCR validation runtime's OpenCV 4.11 geometry exactly. -->
+    <PackageReference Include="OpenCvSharp4" Version="4.11.0.20250507" />
     <!-- The supported delivery target is Windows x64. This package supplies OpenCV native binaries. -->
-    <PackageReference Include="OpenCvSharp4.runtime.win" Version="4.10.0.20241108" />
+    <PackageReference Include="OpenCvSharp4.runtime.win" Version="4.11.0.20250507" />
     <!-- Managed polygon offsetting used by Paddle DB's unclip step. -->
     <PackageReference Include="Clipper2" Version="1.5.4" />
   </ItemGroup>
