@@ -11,10 +11,12 @@ internal static class Program
             VerifyNoneModeDoesNotCopyOrWarp();
             VerifyRgbMatByteOrder();
             VerifySmallImageIdentityWarp();
+            VerifyLandscapePixelRotation();
             VerifyToEvenMaxSideRounding();
             VerifyPortraitMaxSideAndBackProjection();
             VerifyLandscapeMaxSideAndBackProjection();
-            Console.WriteLine("PASS: full-image rectification dimensions, homographies, pixels, and box back-projection match the Python contract.");
+            VerifySquareDoesNotRotate();
+            Console.WriteLine("PASS: portrait orientation, full-image rectification dimensions, homographies, pixels, and box back-projection match the Python contract.");
             return 0;
         }
         catch (Exception error)
@@ -50,23 +52,43 @@ internal static class Program
         AssertEqual(7, result.Image.Height, "none height");
         AssertIdentity(result.Geometry().HOriginalToRectified, "none H_original_to_rectified");
         AssertIdentity(result.Geometry().HRectifiedToOriginal, "none H_rectified_to_original");
+        AssertEqual(0, result.Geometry().RotationDegrees, "none mode rotation");
         AssertBoxClose([1.25f, 2.5f, 11.0f, 6.0f], result.ProjectBoxToSource([1.25f, 2.5f, 11.0f, 6.0f]), 0.0f, "none box");
     }
 
     private static void VerifySmallImageIdentityWarp()
     {
-        using var source = CreatePattern(11, 7);
+        using var source = CreatePattern(7, 11);
         var expectedPixels = PixelBytes(source);
         using var result = ReceiptRectifier.Rectify(source, ReceiptRectifier.MaxSide1600Mode);
         Assert(!ReferenceEquals(source, result.Image), "max-side-1600 must execute WarpPerspective even below the limit");
-        AssertEqual(11, result.Image.Width, "small warp width");
-        AssertEqual(7, result.Image.Height, "small warp height");
+        AssertEqual(7, result.Image.Width, "small warp width");
+        AssertEqual(11, result.Image.Height, "small warp height");
         AssertSequenceEqual(expectedPixels, PixelBytes(result.Image), "small identity-warp pixels");
         var geometry = result.Geometry();
         AssertIdentity(geometry.HOriginalToRectified, "small H_original_to_rectified");
         AssertIdentity(geometry.HRectifiedToOriginal, "small H_rectified_to_original");
+        AssertEqual(0, geometry.RotationDegrees, "small portrait rotation");
         AssertEqual(ReceiptRectifier.MaxSide1600Mode, geometry.Rectification, "small mode");
         Assert(!geometry.ScreenDetected, "full-image mode must not claim screen detection");
+    }
+
+    private static void VerifyLandscapePixelRotation()
+    {
+        using var source = CreatePattern(3, 2);
+        using var expected = new Image<Rgb24>(2, 3);
+        expected[0, 0] = source[0, 1];
+        expected[1, 0] = source[0, 0];
+        expected[0, 1] = source[1, 1];
+        expected[1, 1] = source[1, 0];
+        expected[0, 2] = source[2, 1];
+        expected[1, 2] = source[2, 0];
+
+        using var result = ReceiptRectifier.Rectify(source, ReceiptRectifier.MaxSide1600Mode);
+        AssertEqual(2, result.Image.Width, "rotated pixel width");
+        AssertEqual(3, result.Image.Height, "rotated pixel height");
+        AssertEqual(90, result.Geometry().RotationDegrees, "landscape pixel rotation");
+        AssertSequenceEqual(PixelBytes(expected), PixelBytes(result.Image), "clockwise rotated pixels");
     }
 
     private static void VerifyPortraitMaxSideAndBackProjection()
@@ -84,7 +106,52 @@ internal static class Program
 
     private static void VerifyLandscapeMaxSideAndBackProjection()
     {
-        VerifyScaledCase(sourceWidth: 2556, sourceHeight: 1179, expectedWidth: 1600, expectedHeight: 738);
+        const int sourceWidth = 2556;
+        const int sourceHeight = 1179;
+        const int expectedWidth = 738;
+        const int expectedHeight = 1600;
+        using var source = CreatePattern(sourceWidth, sourceHeight);
+        using var result = ReceiptRectifier.Rectify(source, ReceiptRectifier.MaxSide1600Mode);
+        AssertEqual(expectedWidth, result.Image.Width, "landscape scaled width");
+        AssertEqual(expectedHeight, result.Image.Height, "landscape scaled height");
+
+        var scaleX = (expectedWidth - 1.0) / (sourceHeight - 1.0);
+        var scaleY = (expectedHeight - 1.0) / (sourceWidth - 1.0);
+        var geometry = result.Geometry();
+        AssertEqual(90, geometry.RotationDegrees, "landscape rotation");
+        AssertClose(0.0, geometry.HOriginalToRectified[0][0], 1e-8, "landscape H m00");
+        AssertClose(-scaleX, geometry.HOriginalToRectified[0][1], 1e-8, "landscape H m01");
+        AssertClose(expectedWidth - 1.0, geometry.HOriginalToRectified[0][2], 1e-8, "landscape H m02");
+        AssertClose(scaleY, geometry.HOriginalToRectified[1][0], 1e-8, "landscape H m10");
+        AssertClose(0.0, geometry.HOriginalToRectified[1][1], 1e-8, "landscape H m11");
+        AssertClose(0.0, geometry.HOriginalToRectified[1][2], 1e-8, "landscape H m12");
+        AssertClose(0.0, geometry.HRectifiedToOriginal[0][0], 1e-8, "landscape inverse m00");
+        AssertClose(1.0 / scaleY, geometry.HRectifiedToOriginal[0][1], 1e-8, "landscape inverse m01");
+        AssertClose(0.0, geometry.HRectifiedToOriginal[0][2], 1e-8, "landscape inverse m02");
+        AssertClose(-1.0 / scaleX, geometry.HRectifiedToOriginal[1][0], 1e-8, "landscape inverse m10");
+        AssertClose(0.0, geometry.HRectifiedToOriginal[1][1], 1e-8, "landscape inverse m11");
+        AssertClose(sourceHeight - 1.0, geometry.HRectifiedToOriginal[1][2], 1e-8, "landscape inverse m12");
+
+        var rectifiedBox = new[]
+        {
+            (float)((expectedWidth - 1) * 0.10),
+            (float)((expectedHeight - 1) * 0.20),
+            (float)((expectedWidth - 1) * 0.80),
+            (float)((expectedHeight - 1) * 0.90),
+        };
+        var expectedSourceBox = new[]
+        {
+            (float)(rectifiedBox[1] / scaleY),
+            (float)(sourceHeight - 1.0 - rectifiedBox[2] / scaleX),
+            (float)(rectifiedBox[3] / scaleY),
+            (float)(sourceHeight - 1.0 - rectifiedBox[0] / scaleX),
+        };
+        AssertBoxClose(expectedSourceBox, result.ProjectBoxToSource(rectifiedBox), 1e-3f, "landscape scaled box");
+    }
+
+    private static void VerifySquareDoesNotRotate()
+    {
+        VerifyScaledCase(sourceWidth: 9, sourceHeight: 9, expectedWidth: 9, expectedHeight: 9);
     }
 
     private static void VerifyScaledCase(int sourceWidth, int sourceHeight, int expectedWidth, int expectedHeight)
@@ -97,6 +164,7 @@ internal static class Program
         var expectedScaleX = (expectedWidth - 1.0) / (sourceWidth - 1.0);
         var expectedScaleY = (expectedHeight - 1.0) / (sourceHeight - 1.0);
         var geometry = result.Geometry();
+        AssertEqual(0, geometry.RotationDegrees, "portrait/square rotation");
         AssertClose(expectedScaleX, geometry.HOriginalToRectified[0][0], 1e-8, "H scale X");
         AssertClose(expectedScaleY, geometry.HOriginalToRectified[1][1], 1e-8, "H scale Y");
         AssertClose(1.0 / expectedScaleX, geometry.HRectifiedToOriginal[0][0], 1e-8, "H inverse scale X");

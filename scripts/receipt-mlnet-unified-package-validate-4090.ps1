@@ -469,6 +469,11 @@ if ($hasRecords -and $Rectification -ne "max-side-1600") {
 if ($hasRecords -and -not $IncludeDeviceModel) {
     throw "Formal end-to-end delivery validation requires -IncludeDeviceModel for the complete three-model pipeline."
 }
+$orientationRule = if ($Rectification -eq "max-side-1600") {
+    "exif_upright_landscape_clockwise_90"
+} else {
+    "none"
+}
 
 Assert-SafePathSyntax $RunDirectory "RunDirectory"
 Assert-SafePathSyntax $Output "Output"
@@ -1036,19 +1041,54 @@ try {
         foreach ($sizeName in @("source_size", "rectified_size")) {
             $sizeProperty = $geometry.PSObject.Properties[$sizeName]
             if ($null -eq $sizeProperty `
+                -or $null -eq $sizeProperty.Value `
                 -or [int]$sizeProperty.Value.width -le 0 `
                 -or [int]$sizeProperty.Value.height -le 0) {
                 throw "Result geometry has an invalid ${sizeName}: $resultPath"
             }
         }
         if ($Rectification -eq "max-side-1600") {
+            $rotationProperty = $geometry.PSObject.Properties["rotation_degrees"]
+            $screenDetectedProperty = $geometry.PSObject.Properties["screen_detected"]
+            if ($null -eq $rotationProperty `
+                -or $null -eq $rotationProperty.Value `
+                -or $null -eq $screenDetectedProperty `
+                -or $null -eq $screenDetectedProperty.Value `
+                -or $screenDetectedProperty.Value -isnot [bool]) {
+                throw "Result geometry omits typed rotation/screen evidence: $resultPath"
+            }
             $rectifiedMaximumSide = [Math]::Max(
                 [int]$geometry.rectified_size.width,
                 [int]$geometry.rectified_size.height)
+            $expectedRotationDegrees = if (
+                [int]$geometry.source_size.width -gt [int]$geometry.source_size.height
+            ) { 90 } else { 0 }
+            $expectedWidth = if ($expectedRotationDegrees -eq 90) {
+                [int]$geometry.source_size.height
+            } else {
+                [int]$geometry.source_size.width
+            }
+            $expectedHeight = if ($expectedRotationDegrees -eq 90) {
+                [int]$geometry.source_size.width
+            } else {
+                [int]$geometry.source_size.height
+            }
+            $expectedMaximumSide = [Math]::Max($expectedWidth, $expectedHeight)
+            if ($expectedMaximumSide -gt 1600) {
+                $scale = 1600.0 / $expectedMaximumSide
+                $expectedWidth = [Math]::Max(
+                    2,
+                    [int][Math]::Round($expectedWidth * $scale, [MidpointRounding]::ToEven))
+                $expectedHeight = [Math]::Max(
+                    2,
+                    [int][Math]::Round($expectedHeight * $scale, [MidpointRounding]::ToEven))
+            }
             if ($rectifiedMaximumSide -gt 1600 `
-                -or [int]$geometry.rotation_degrees -ne 0 `
-                -or [bool]$geometry.screen_detected) {
-                throw "Result geometry is not the fail-closed max-side-1600 full-image contract: $resultPath"
+                -or [int]$rotationProperty.Value -ne $expectedRotationDegrees `
+                -or [bool]$screenDetectedProperty.Value `
+                -or [int]$geometry.rectified_size.width -ne $expectedWidth `
+                -or [int]$geometry.rectified_size.height -ne $expectedHeight) {
+                throw "Result geometry is not the portrait-oriented fail-closed max-side-1600 full-image contract: $resultPath"
             }
             foreach ($matrixName in @("H_original_to_rectified", "H_rectified_to_original")) {
                 $matrixProperty = $geometry.PSObject.Properties[$matrixName]
@@ -1058,6 +1098,32 @@ try {
                 foreach ($matrixRow in @($matrixProperty.Value)) {
                     if (@($matrixRow).Count -ne 3) {
                         throw "Result geometry has a malformed ${matrixName}: $resultPath"
+                    }
+                    foreach ($matrixValue in @($matrixRow)) {
+                        if ($null -eq $matrixValue) {
+                            throw "Result geometry has a null ${matrixName} value: $resultPath"
+                        }
+                        $numericMatrixValue = [double]$matrixValue
+                        if ([double]::IsNaN($numericMatrixValue) `
+                            -or [double]::IsInfinity($numericMatrixValue)) {
+                            throw "Result geometry has a non-finite ${matrixName} value: $resultPath"
+                        }
+                    }
+                }
+            }
+            $forwardMatrix = @($geometry.PSObject.Properties["H_original_to_rectified"].Value)
+            $inverseMatrix = @($geometry.PSObject.Properties["H_rectified_to_original"].Value)
+            for ($matrixRowIndex = 0; $matrixRowIndex -lt 3; $matrixRowIndex++) {
+                for ($matrixColumnIndex = 0; $matrixColumnIndex -lt 3; $matrixColumnIndex++) {
+                    $matrixProduct = 0.0
+                    for ($matrixInnerIndex = 0; $matrixInnerIndex -lt 3; $matrixInnerIndex++) {
+                        $matrixProduct += `
+                            [double]$forwardMatrix[$matrixRowIndex][$matrixInnerIndex] * `
+                            [double]$inverseMatrix[$matrixInnerIndex][$matrixColumnIndex]
+                    }
+                    $expectedMatrixProduct = if ($matrixRowIndex -eq $matrixColumnIndex) { 1.0 } else { 0.0 }
+                    if ([Math]::Abs($matrixProduct - $expectedMatrixProduct) -gt 0.0001) {
+                        throw "Result geometry homographies are not mutual inverses: $resultPath"
                     }
                 }
             }
@@ -1273,8 +1339,10 @@ try {
         runtime_flavor = $RuntimeFlavor
         runtime_device = $runtimeDevice
         rectification = $Rectification
+        orientation_rule = $orientationRule
         geometry_audit = [ordered]@{
             requested_mode = $Rectification
+            orientation_rule = $orientationRule
             checked_results = $written
             matching_results = $written
             matrices_valid = $true
@@ -1323,6 +1391,7 @@ try {
         onnx_runtime_flavor = $RuntimeFlavor
         runtime_device = $runtimeDevice
         rectification = $Rectification
+        orientation_rule = $orientationRule
         prerequisites = if ($RuntimeFlavor -eq "cpu") {
             @("Microsoft.NETCore.App 8.x")
         }

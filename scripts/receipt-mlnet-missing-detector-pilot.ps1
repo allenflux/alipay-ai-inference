@@ -2,7 +2,9 @@
 param(
     [string]$TeacherRoot = "D:\alipay-ai-data\receipt-lite-teacher-120k-v1",
     [string]$RunDirectory,
-    [string]$FormalTag = "20260806-165128"
+    [string]$FormalTag = "20260806-165128",
+    [ValidateSet("absent", "recovered")]
+    [string]$ExpectedBaseline = "absent"
 )
 
 Set-StrictMode -Version Latest
@@ -68,7 +70,17 @@ foreach ($case in $cases) {
 }
 
 $tag = (Get-Date).ToUniversalTime().ToString("yyyyMMdd-HHmmss")
-$pilotRoot = Join-Path $dataRoot "delivery-validation\mlnet-missing-detector-pilot-$tag"
+$pilotPrefix = if ($ExpectedBaseline -eq "recovered") {
+    "mlnet-detector-orientation-recovery-pilot"
+} else {
+    "mlnet-missing-detector-pilot"
+}
+$pilotKind = if ($ExpectedBaseline -eq "recovered") {
+    "receipt_mlnet_detector_orientation_recovery_pilot_v1"
+} else {
+    "receipt_mlnet_missing_detector_pilot_v1"
+}
+$pilotRoot = Join-Path $dataRoot "delivery-validation\$pilotPrefix-$tag"
 if (Test-Path -LiteralPath $pilotRoot) {
     throw "Refusing to overwrite detector pilot: $pilotRoot"
 }
@@ -178,6 +190,35 @@ function Invoke-ThresholdPilot([string]$Name, [double]$Threshold) {
             -or [string]$result.model_contracts.unified_ocr_model_sha256 -ne $unifiedSha256) {
             throw "Detector pilot $Name result does not prove the requested geometry/model contracts."
         }
+        $expectedRotationDegrees = if (
+            [int]$result.geometry.source_size.width -gt [int]$result.geometry.source_size.height
+        ) { 90 } else { 0 }
+        $expectedWidth = if ($expectedRotationDegrees -eq 90) {
+            [int]$result.geometry.source_size.height
+        } else {
+            [int]$result.geometry.source_size.width
+        }
+        $expectedHeight = if ($expectedRotationDegrees -eq 90) {
+            [int]$result.geometry.source_size.width
+        } else {
+            [int]$result.geometry.source_size.height
+        }
+        $expectedMaximumSide = [Math]::Max($expectedWidth, $expectedHeight)
+        if ($expectedMaximumSide -gt 1600) {
+            $scale = 1600.0 / $expectedMaximumSide
+            $expectedWidth = [Math]::Max(
+                2,
+                [int][Math]::Round($expectedWidth * $scale, [MidpointRounding]::ToEven))
+            $expectedHeight = [Math]::Max(
+                2,
+                [int][Math]::Round($expectedHeight * $scale, [MidpointRounding]::ToEven))
+        }
+        if ([int]$result.geometry.rotation_degrees -ne $expectedRotationDegrees `
+            -or [bool]$result.geometry.screen_detected `
+            -or [int]$result.geometry.rectified_size.width -ne $expectedWidth `
+            -or [int]$result.geometry.rectified_size.height -ne $expectedHeight) {
+            throw "Detector pilot $Name result does not use teacher-compatible portrait orientation."
+        }
         $field = $result.fields.PSObject.Properties[[string]$case.ResultField].Value
         $detection = @($result.detections | Where-Object { [string]$_.label -eq [string]$case.Field })
         if ($detection.Count -gt 1) {
@@ -215,19 +256,33 @@ function Invoke-ThresholdPilot([string]$Name, [double]$Threshold) {
 }
 
 $baseline = Invoke-ThresholdPilot "threshold-050" 0.50
-foreach ($observation in $baseline.observations) {
-    if ([string]$observation.state -ne "absent" `
-        -or $null -ne $observation.candidate `
-        -or $null -ne $observation.detection_score) {
-        throw "Threshold 0.50 did not reproduce the formal missing detection for $($observation.field)."
+if ($ExpectedBaseline -eq "absent") {
+    foreach ($observation in $baseline.observations) {
+        if ([string]$observation.state -ne "absent" `
+            -or $null -ne $observation.candidate `
+            -or $null -ne $observation.detection_score) {
+            throw "Threshold 0.50 did not reproduce the formal missing detection for $($observation.field)."
+        }
+    }
+}
+else {
+    foreach ($observation in $baseline.observations) {
+        if ([string]$observation.state -in @("absent", "unreadable") `
+            -or [string]::IsNullOrWhiteSpace([string]$observation.candidate) `
+            -or $null -eq $observation.detection_score `
+            -or [double]$observation.detection_score -lt 0.50 `
+            -or $observation.exact -ne $true) {
+            throw "Threshold 0.50 did not recover the exact formal reference for $($observation.field)."
+        }
     }
 }
 $zeroThreshold = Invoke-ThresholdPilot "threshold-000" 0.0
 
 $report = [ordered]@{
     schema_version = 1
-    kind = "receipt_mlnet_missing_detector_pilot_v1"
+    kind = $pilotKind
     formal_tag = $FormalTag
+    expected_baseline = $ExpectedBaseline
     formal_evaluation = $formalEvaluation
     pilot_root = $pilotRoot
     runtime = "cpu"

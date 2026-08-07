@@ -4,13 +4,13 @@ using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.PixelFormats;
 
 /// <summary>
-/// Full-image-only rectification that mirrors geometry.py's
-/// full_image_quad + warp_quad(max_side=1600) path.
+/// Full-image-only rectification that mirrors geometry.py's deterministic
+/// portrait orientation plus full_image_quad + warp_quad(max_side=1600) path.
 ///
 /// This deliberately does not try to find a phone/screen boundary.  Production
-/// callers must provide an already upright full receipt image; EXIF orientation
-/// is applied by <see cref="ImagePipeline.LoadUprightRgb"/> before this class is
-/// called.
+/// callers provide an EXIF-upright full receipt image.  Landscape inputs are
+/// rotated 90 degrees clockwise before the cubic warp, matching the geometry
+/// used to train and evaluate the detector.
 /// </summary>
 internal static class ReceiptRectifier
 {
@@ -37,8 +37,11 @@ internal static class ReceiptRectifier
                 "--rectification max-side-1600 requires an EXIF-upright image at least 2x2 pixels");
         }
 
-        var outputWidth = source.Width;
-        var outputHeight = source.Height;
+        var rotationDegrees = source.Width > source.Height ? 90 : 0;
+        var rotatedWidth = rotationDegrees == 90 ? source.Height : source.Width;
+        var rotatedHeight = rotationDegrees == 90 ? source.Width : source.Height;
+        var outputWidth = rotatedWidth;
+        var outputHeight = rotatedHeight;
         var longestSide = Math.Max(outputWidth, outputHeight);
         if (longestSide > maxSide)
         {
@@ -50,24 +53,32 @@ internal static class ReceiptRectifier
         // Python full_image_quad uses endpoint pixel coordinates, not width and
         // height.  Point2f plus GetPerspectiveTransform therefore reproduces
         // cv2.getPerspectiveTransform(...astype(np.float32), ...astype(np.float32)).
-        var sourceQuad = FullImageQuad(source.Width, source.Height);
+        var sourceQuad = FullImageQuad(rotatedWidth, rotatedHeight);
         var destinationQuad = FullImageQuad(outputWidth, outputHeight);
-        using var originalToRectifiedMat = Cv2.GetPerspectiveTransform(sourceQuad, destinationQuad);
-        using var rectifiedToOriginalMat = new Mat();
-        var inverseStatus = Cv2.Invert(originalToRectifiedMat, rectifiedToOriginalMat, DecompTypes.LU);
-        if (inverseStatus == 0)
-        {
-            throw new InvalidOperationException("Full-image rectification homography is singular");
-        }
+        using var rotatedToRectifiedMat = Cv2.GetPerspectiveTransform(sourceQuad, destinationQuad);
+        var originalToRotated = RotationHomography(source.Height, rotationDegrees);
+        var originalToRectified = MultiplyMatrices(ReadMatrix(rotatedToRectifiedMat), originalToRotated);
+        var rectifiedToOriginal = InvertMatrix(originalToRectified);
 
         using var sourceMat = PaddleOcrImageOps.ToRgbMat(source);
+        using var rotatedMat = new Mat();
+        var warpSource = sourceMat;
+        if (rotationDegrees == 90)
+        {
+            // Keep the right-angle rotation as a discrete pixel operation.
+            // Python executes cv2.rotate first and only then applies the cubic
+            // warp; combining them would add an interpolation and change model
+            // input pixels.
+            Cv2.Rotate(sourceMat, rotatedMat, RotateFlags.Rotate90Clockwise);
+            warpSource = rotatedMat;
+        }
         using var rectifiedMat = new Mat();
         // Execute WarpPerspective even when the image already fits within 1600.
         // That is the observable pixel contract of Python warp_quad.
         Cv2.WarpPerspective(
-            sourceMat,
+            warpSource,
             rectifiedMat,
-            originalToRectifiedMat,
+            rotatedToRectifiedMat,
             new OpenCvSharp.Size(outputWidth, outputHeight),
             InterpolationFlags.Cubic,
             BorderTypes.Replicate);
@@ -78,9 +89,73 @@ internal static class ReceiptRectifier
             source.Width,
             source.Height,
             MaxSide1600Mode,
-            ReadMatrix(originalToRectifiedMat),
-            ReadMatrix(rectifiedToOriginalMat),
+            rotationDegrees,
+            originalToRectified,
+            rectifiedToOriginal,
             ownsImage: true);
+    }
+
+    private static double[,] RotationHomography(int height, int degrees)
+    {
+        return degrees switch
+        {
+            0 => new double[,]
+            {
+                { 1.0, 0.0, 0.0 },
+                { 0.0, 1.0, 0.0 },
+                { 0.0, 0.0, 1.0 },
+            },
+            90 => new double[,]
+            {
+                { 0.0, -1.0, height - 1.0 },
+                { 1.0, 0.0, 0.0 },
+                { 0.0, 0.0, 1.0 },
+            },
+            _ => throw new InvalidOperationException($"Unsupported production rotation: {degrees}"),
+        };
+    }
+
+    private static double[,] MultiplyMatrices(double[,] left, double[,] right)
+    {
+        var product = new double[3, 3];
+        for (var row = 0; row < 3; row++)
+        {
+            for (var column = 0; column < 3; column++)
+            {
+                for (var inner = 0; inner < 3; inner++)
+                {
+                    product[row, column] += left[row, inner] * right[inner, column];
+                }
+            }
+        }
+        return product;
+    }
+
+    private static double[,] InvertMatrix(double[,] matrix)
+    {
+        var a = matrix[0, 0];
+        var b = matrix[0, 1];
+        var c = matrix[0, 2];
+        var d = matrix[1, 0];
+        var e = matrix[1, 1];
+        var f = matrix[1, 2];
+        var g = matrix[2, 0];
+        var h = matrix[2, 1];
+        var i = matrix[2, 2];
+        var determinant = a * (e * i - f * h)
+            - b * (d * i - f * g)
+            + c * (d * h - e * g);
+        if (!double.IsFinite(determinant) || Math.Abs(determinant) < 1e-12)
+        {
+            throw new InvalidOperationException("Full-image rectification homography is singular");
+        }
+        var inverseScale = 1.0 / determinant;
+        return new double[,]
+        {
+            { (e * i - f * h) * inverseScale, (c * h - b * i) * inverseScale, (b * f - c * e) * inverseScale },
+            { (f * g - d * i) * inverseScale, (a * i - c * g) * inverseScale, (c * d - a * f) * inverseScale },
+            { (d * h - e * g) * inverseScale, (b * g - a * h) * inverseScale, (a * e - b * d) * inverseScale },
+        };
     }
 
     private static Point2f[] FullImageQuad(int width, int height)
@@ -138,6 +213,7 @@ internal sealed class ReceiptRectification : IDisposable
         int sourceWidth,
         int sourceHeight,
         string mode,
+        int rotationDegrees,
         double[,] originalToRectified,
         double[,] rectifiedToOriginal,
         bool ownsImage)
@@ -146,6 +222,7 @@ internal sealed class ReceiptRectification : IDisposable
         SourceWidth = sourceWidth;
         SourceHeight = sourceHeight;
         Mode = mode;
+        RotationDegrees = rotationDegrees;
         _originalToRectified = originalToRectified;
         _rectifiedToOriginal = rectifiedToOriginal;
         _ownsImage = ownsImage;
@@ -155,6 +232,7 @@ internal sealed class ReceiptRectification : IDisposable
     public int SourceWidth { get; }
     public int SourceHeight { get; }
     public string Mode { get; }
+    public int RotationDegrees { get; }
 
     public static ReceiptRectification Identity(Image<Rgb24> source)
     {
@@ -164,6 +242,7 @@ internal sealed class ReceiptRectification : IDisposable
             source.Width,
             source.Height,
             ReceiptRectifier.NoneMode,
+            rotationDegrees: 0,
             identity,
             IdentityMatrix(),
             ownsImage: false);
@@ -201,7 +280,7 @@ internal sealed class ReceiptRectification : IDisposable
             new ImageSize(SourceWidth, SourceHeight),
             new ImageSize(Image.Width, Image.Height),
             Mode,
-            RotationDegrees: 0,
+            RotationDegrees,
             ScreenDetected: false,
             FullImageQuadForJson(SourceWidth, SourceHeight),
             MatrixForJson(_originalToRectified),

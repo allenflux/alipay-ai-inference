@@ -1480,8 +1480,8 @@ v12 的 .NET 接入会使用与 Python 相同的冻结检测框裁图几何，�
 也会显示 OCR 文本。PP-OCR 的 `det/cls/rec` Session 每批只创建一次。`--ocr unified` 同样从检测框裁图，但直接
 运行单个 v12 字段 reader，不运行 PP-OCR 的 DB/cls/rec 流水线。
 
-生产参数 `--rectification max-side-1600` 已移植 Python 直接截图路径的 OpenCV 全图 cubic
-规范化和单应矩阵回投：检测/OCR 在规范化图上执行，JSON 框和两张兼容命名 JPG 均回投至
+生产参数 `--rectification max-side-1600` 已移植 Python 直接截图路径的确定性竖向规则
+（EXIF 摆正后横图顺时针旋转 90°）、OpenCV 全图 cubic 规范化和单应矩阵回投：检测/OCR 在规范化图上执行，JSON 框和两张兼容命名 JPG 均回投至
 EXIF 摆正后的源坐标。当前未实现的是自动 screen/quad 检测，因此带透视的照片原图仍须先做外部矫正。
 
 安装 [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0) 后，CPU 单图验证：

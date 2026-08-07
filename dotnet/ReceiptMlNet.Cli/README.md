@@ -241,9 +241,10 @@ It does not turn v12 candidates into delivered business values: current v12
 `fields.*.value` remains `review` until a separately calibrated artifact policy
 permits delivery.
 
-With `--rectification max-side-1600`, this runner ports Python's full-image
-OpenCV cubic normalization and homography projection for the direct-screenshot
-path. Detection and OCR run on that normalized image; JSON boxes and both
+With `--rectification max-side-1600`, this runner ports Python's deterministic
+portrait rule (EXIF-upright landscape inputs rotate 90 degrees clockwise),
+full-image OpenCV cubic normalization, and homography projection for the
+direct-screenshot path. Detection and OCR run on that normalized image; JSON boxes and both
 compatibility-named JPGs are projected back to EXIF-upright source coordinates.
 Automatic phone/screen quadrilateral detection is intentionally not included,
 so perspective photos still require external rectification before inference.

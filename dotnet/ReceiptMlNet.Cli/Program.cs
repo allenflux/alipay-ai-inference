@@ -326,7 +326,7 @@ internal static class ReceiptMlNetProgram
             new[]
             {
                 "This .NET CLI performs ONNX model inference.",
-                "EXIF orientation is applied before inference. Rectification mode max-side-1600 mirrors Python's full-image warp and does not detect or crop a phone/screen boundary.",
+                "EXIF orientation is applied before inference. Rectification mode max-side-1600 rotates landscape inputs 90 degrees clockwise, mirrors Python's full-image warp, and does not detect or crop a phone/screen boundary.",
                 "Perspective photos still require an externally rectified input; automatic screen detection is intentionally outside this production mode.",
                 "bbox_image and both compatibility-named annotated JPGs use EXIF-upright source coordinates.",
                 ocrEngine is not null
@@ -625,6 +625,7 @@ internal static class ReceiptMlNetProgram
                 || !document.RootElement.TryGetProperty("geometry", out var geometry)
                 || geometry.ValueKind != JsonValueKind.Object
                 || !HasJsonString(geometry, "rectification", rectificationMode)
+                || !HasCurrentRectificationGeometry(geometry, rectificationMode)
                 || !document.RootElement.TryGetProperty("model_contracts", out var contracts)
                 || contracts.ValueKind != JsonValueKind.Object)
             {
@@ -694,6 +695,55 @@ internal static class ReceiptMlNetProgram
                 || property.ValueKind == JsonValueKind.Null;
         }
         return HasJsonString(source, propertyName, expected);
+    }
+
+    private static bool HasCurrentRectificationGeometry(JsonElement geometry, string rectificationMode)
+    {
+        if (rectificationMode == ReceiptRectifier.NoneMode)
+        {
+            return true;
+        }
+        if (rectificationMode != ReceiptRectifier.MaxSide1600Mode
+            || !geometry.TryGetProperty("source_size", out var sourceSize)
+            || sourceSize.ValueKind != JsonValueKind.Object
+            || !sourceSize.TryGetProperty("width", out var sourceWidthProperty)
+            || !sourceWidthProperty.TryGetInt32(out var sourceWidth)
+            || !sourceSize.TryGetProperty("height", out var sourceHeightProperty)
+            || !sourceHeightProperty.TryGetInt32(out var sourceHeight)
+            || sourceWidth < 2
+            || sourceHeight < 2
+            || !geometry.TryGetProperty("rectified_size", out var rectifiedSize)
+            || rectifiedSize.ValueKind != JsonValueKind.Object
+            || !rectifiedSize.TryGetProperty("width", out var rectifiedWidthProperty)
+            || !rectifiedWidthProperty.TryGetInt32(out var rectifiedWidth)
+            || !rectifiedSize.TryGetProperty("height", out var rectifiedHeightProperty)
+            || !rectifiedHeightProperty.TryGetInt32(out var rectifiedHeight)
+            || !geometry.TryGetProperty("rotation_degrees", out var rotationProperty)
+            || !rotationProperty.TryGetInt32(out var rotationDegrees)
+            || !geometry.TryGetProperty("screen_detected", out var screenDetectedProperty)
+            || screenDetectedProperty.ValueKind != JsonValueKind.False)
+        {
+            return false;
+        }
+        // Invalidate old landscape outputs that used the same mode string but
+        // did not apply the teacher pipeline's deterministic portrait rule.
+        var expectedRotation = sourceWidth > sourceHeight ? 90 : 0;
+        var expectedWidth = expectedRotation == 90 ? sourceHeight : sourceWidth;
+        var expectedHeight = expectedRotation == 90 ? sourceWidth : sourceHeight;
+        var longestSide = Math.Max(expectedWidth, expectedHeight);
+        if (longestSide > ReceiptRectifier.MaximumSide)
+        {
+            var scale = (double)ReceiptRectifier.MaximumSide / longestSide;
+            expectedWidth = Math.Max(
+                2,
+                (int)Math.Round(expectedWidth * scale, MidpointRounding.ToEven));
+            expectedHeight = Math.Max(
+                2,
+                (int)Math.Round(expectedHeight * scale, MidpointRounding.ToEven));
+        }
+        return rotationDegrees == expectedRotation
+            && rectifiedWidth == expectedWidth
+            && rectifiedHeight == expectedHeight;
     }
 
     private static void EnsureCoreFields(IEnumerable<DetectionResult> detections)
@@ -1239,8 +1289,9 @@ requires its adjacent .labels.json and .contract.json sidecars and emits
 review-only delivery values until independently human-calibrated. It writes
 JSON and, by default, two annotated JPGs. It does not yet include perspective
 screen detection. --rectification max-side-1600 applies the Python-compatible
-full-image cubic warp after EXIF orientation and limits the longest side to
-1600; perspective photos still require an externally rectified input.
+portrait rule (landscape inputs rotate 90 degrees clockwise), then a full-image
+cubic warp after EXIF orientation, and limits the longest side to 1600;
+perspective photos still require an externally rectified input.
 """;
 
     public static CliOptions Parse(string[] args)

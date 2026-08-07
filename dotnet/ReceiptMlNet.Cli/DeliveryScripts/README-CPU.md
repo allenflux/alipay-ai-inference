@@ -5,7 +5,7 @@ This package runs the complete production path locally on Windows CPU:
 1. receipt field detector (also produces the review boxes);
 2. device type classifier;
 3. unified receipt OCR for amount, time, recipient, payment method, and status;
-4. full-image `max-side-1600` rectification and annotated review output.
+4. teacher-compatible portrait orientation (landscape rotates 90° clockwise), full-image `max-side-1600` rectification, and annotated review output.
 
 No Python, PaddleOCR, CUDA, or network service is used at runtime. Install the
 .NET 8 Runtime x64 (`Microsoft.NETCore.App 8.x`) before verification. The .NET 8

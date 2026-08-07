@@ -394,6 +394,61 @@ function Assert-DeclaredModelArtifacts(
     }
 }
 
+function Assert-ProductionGeometry([object]$Geometry, [string]$ResultPath) {
+    $sourceSizeProperty = if ($null -eq $Geometry) { $null } else { $Geometry.PSObject.Properties["source_size"] }
+    $rectifiedSizeProperty = if ($null -eq $Geometry) { $null } else { $Geometry.PSObject.Properties["rectified_size"] }
+    $rotationProperty = if ($null -eq $Geometry) { $null } else { $Geometry.PSObject.Properties["rotation_degrees"] }
+    $screenProperty = if ($null -eq $Geometry) { $null } else { $Geometry.PSObject.Properties["screen_detected"] }
+    if ($null -eq $sourceSizeProperty `
+        -or $null -eq $rectifiedSizeProperty `
+        -or $null -eq $rotationProperty `
+        -or $null -eq $screenProperty `
+        -or $null -eq $sourceSizeProperty.Value `
+        -or $null -eq $rectifiedSizeProperty.Value `
+        -or $null -eq $rotationProperty.Value `
+        -or $null -eq $screenProperty.Value `
+        -or $screenProperty.Value -isnot [bool] `
+        -or [int]$sourceSizeProperty.Value.width -lt 2 `
+        -or [int]$sourceSizeProperty.Value.height -lt 2 `
+        -or [int]$rectifiedSizeProperty.Value.width -lt 2 `
+        -or [int]$rectifiedSizeProperty.Value.height -lt 2) {
+        throw "Legacy result has incomplete max-side-1600 geometry evidence: $ResultPath"
+    }
+    $expectedRotationDegrees = if (
+        [int]$sourceSizeProperty.Value.width -gt [int]$sourceSizeProperty.Value.height
+    ) { 90 } else { 0 }
+    $expectedWidth = if ($expectedRotationDegrees -eq 90) {
+        [int]$sourceSizeProperty.Value.height
+    } else {
+        [int]$sourceSizeProperty.Value.width
+    }
+    $expectedHeight = if ($expectedRotationDegrees -eq 90) {
+        [int]$sourceSizeProperty.Value.width
+    } else {
+        [int]$sourceSizeProperty.Value.height
+    }
+    $expectedMaximumSide = [Math]::Max($expectedWidth, $expectedHeight)
+    if ($expectedMaximumSide -gt 1600) {
+        $scale = 1600.0 / $expectedMaximumSide
+        $expectedWidth = [Math]::Max(
+            2,
+            [int][Math]::Round($expectedWidth * $scale, [MidpointRounding]::ToEven))
+        $expectedHeight = [Math]::Max(
+            2,
+            [int][Math]::Round($expectedHeight * $scale, [MidpointRounding]::ToEven))
+    }
+    $rectifiedMaximumSide = [Math]::Max(
+        [int]$rectifiedSizeProperty.Value.width,
+        [int]$rectifiedSizeProperty.Value.height)
+    if ([int]$rotationProperty.Value -ne $expectedRotationDegrees `
+        -or [bool]$screenProperty.Value `
+        -or $rectifiedMaximumSide -gt 1600 `
+        -or [int]$rectifiedSizeProperty.Value.width -ne $expectedWidth `
+        -or [int]$rectifiedSizeProperty.Value.height -ne $expectedHeight) {
+        throw "Legacy result does not use the portrait-oriented full-image geometry contract: $ResultPath"
+    }
+}
+
 function Assert-ResultProvenanceAndPolicy(
     [object]$Result,
     [string]$ResultPath,
@@ -419,6 +474,7 @@ function Assert-ResultProvenanceAndPolicy(
         -or [string]::IsNullOrWhiteSpace([string]$sourceProperty.Value)) {
         throw "Legacy result does not prove the complete three-model ML.NET CPU path: $ResultPath"
     }
+    Assert-ProductionGeometry $geometryProperty.Value $ResultPath
     Assert-SafePathSyntax ([string]$sourceProperty.Value) "legacy result source"
     $resultSource = [IO.Path]::GetFullPath([string]$sourceProperty.Value)
     $expectedSourceFull = [IO.Path]::GetFullPath($ExpectedSource)
@@ -601,6 +657,7 @@ function Read-AcceptedProductionPackage([string]$PackageRoot) {
         -or [string]$config.onnx_runtime_flavor -ne "cpu" `
         -or [string]$config.runtime_device -ne "cpu" `
         -or [string]$config.rectification -ne "max-side-1600" `
+        -or [string]$config.orientation_rule -ne "exif_upright_landscape_clockwise_90" `
         -or [string]::IsNullOrWhiteSpace([string]$config.device_model) `
         -or [string]$config.text_delivery_policy -ne $requiredTextPolicy) {
         throw "Package is not an accepted complete three-model production CPU package."
@@ -610,6 +667,7 @@ function Read-AcceptedProductionPackage([string]$PackageRoot) {
         -or [string]$validation.runtime_flavor -ne "cpu" `
         -or [string]$validation.runtime_device -ne "cpu" `
         -or [string]$validation.rectification -ne "max-side-1600" `
+        -or [string]$validation.orientation_rule -ne "exif_upright_landscape_clockwise_90" `
         -or $validation.include_device_model -ne $true `
         -or $validation.end_to_end_evaluation.performed -ne $true `
         -or [string]$validation.end_to_end_evaluation.status -ne "accepted") {
@@ -884,6 +942,7 @@ try {
         runtime_flavor = [string]$sourceValidation.runtime_flavor
         runtime_device = [string]$sourceValidation.runtime_device
         rectification = [string]$sourceValidation.rectification
+        orientation_rule = [string]$sourceValidation.orientation_rule
         end_to_end_status = [string]$sourceValidation.end_to_end_evaluation.status
         models = $modelArtifactDeclaration
         source_evidence = [ordered]@{
