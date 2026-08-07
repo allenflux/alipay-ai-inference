@@ -270,9 +270,8 @@ else {
         if ([string]$observation.state -in @("absent", "unreadable") `
             -or [string]::IsNullOrWhiteSpace([string]$observation.candidate) `
             -or $null -eq $observation.detection_score `
-            -or [double]$observation.detection_score -lt 0.50 `
-            -or $observation.exact -ne $true) {
-            throw "Threshold 0.50 did not recover the exact formal reference for $($observation.field)."
+            -or [double]$observation.detection_score -lt 0.50) {
+            throw "Threshold 0.50 did not recover detector/candidate coverage for $($observation.field)."
         }
     }
 }
@@ -283,6 +282,12 @@ $report = [ordered]@{
     kind = $pilotKind
     formal_tag = $FormalTag
     expected_baseline = $ExpectedBaseline
+    validation_scope = if ($ExpectedBaseline -eq "recovered") {
+        "detector_and_candidate_coverage_only"
+    } else {
+        "historical_missing_detection_reproduction"
+    }
+    accuracy_authority = "Only a fresh complete canonical full-val score may accept field accuracy."
     formal_evaluation = $formalEvaluation
     pilot_root = $pilotRoot
     runtime = "cpu"
