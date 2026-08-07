@@ -23,6 +23,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $modeName = $Mode.ToLowerInvariant()
+$requiredFormalReceipts = 10016
 if ($modeName -eq "formal" -and $Limit -ne 0) {
     throw "Formal CPU A/B must use -Limit 0 so the complete validation split is evaluated."
 }
@@ -38,6 +39,54 @@ $parserContractProject = Join-Path $repositoryRoot (
 )
 $scorer = Join-Path $PSScriptRoot "receipt_mlnet_unified_evaluate.py"
 $comparator = Join-Path $PSScriptRoot "receipt-mlnet-hybrid-recipient-ab.py"
+
+function Get-Sha256([string]$Path) {
+    return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+
+function Write-CliAppClosureManifest([string]$AppRoot, [string]$ManifestPath) {
+    $root = [IO.Path]::GetFullPath($AppRoot)
+    if (-not (Test-Path -LiteralPath $root -PathType Container)) {
+        throw "Missing frozen CLI app directory: $root"
+    }
+    $rootPrefix = $root
+    if (-not $rootPrefix.EndsWith([IO.Path]::DirectorySeparatorChar.ToString())) {
+        $rootPrefix += [IO.Path]::DirectorySeparatorChar
+    }
+    $pending = New-Object System.Collections.Queue
+    $pending.Enqueue($root)
+    $rows = @()
+    while ($pending.Count -gt 0) {
+        $directory = [string]$pending.Dequeue()
+        foreach ($item in Get-ChildItem -LiteralPath $directory -Force) {
+            if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "Frozen CLI app contains a reparse point: $($item.FullName)"
+            }
+            if ($item.PSIsContainer) {
+                $pending.Enqueue($item.FullName)
+                continue
+            }
+            $fullPath = [IO.Path]::GetFullPath($item.FullName)
+            if (-not $fullPath.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+                throw "Frozen CLI app file escaped its root: $fullPath"
+            }
+            $rows += [pscustomobject][ordered]@{
+                path = $fullPath.Substring($rootPrefix.Length).Replace('\', '/')
+                sha256 = Get-Sha256 $fullPath
+                size_bytes = [long]$item.Length
+            }
+        }
+    }
+    $rows = @($rows | Sort-Object @{ Expression = { $_.path.ToLowerInvariant() } }, @{ Expression = { $_.path } })
+    if ($rows.Count -le 0) {
+        throw "Frozen CLI app closure is empty."
+    }
+    $json = ConvertTo-Json -InputObject @($rows) -Depth 5
+    [IO.File]::WriteAllText(
+        $ManifestPath,
+        $json + [Environment]::NewLine,
+        (New-Object Text.UTF8Encoding($false)))
+}
 
 if ([string]::IsNullOrWhiteSpace($DotnetExe)) {
     $dotnetCommand = Get-Command dotnet -ErrorAction SilentlyContinue
@@ -117,11 +166,15 @@ if (Test-Path -LiteralPath $OutputDirectory) {
 $outputParent = Split-Path -Parent $OutputDirectory
 New-Item -ItemType Directory -Path $outputParent -Force | Out-Null
 New-Item -ItemType Directory -Path $OutputDirectory | Out-Null
-$inputList = Join-Path $OutputDirectory "fixed-val-inputs.txt"
+$preparedInputList = Join-Path $OutputDirectory "prepared-full-val-inputs.txt"
+$inputList = Join-Path $OutputDirectory "fixed-selected-inputs.txt"
 $baselineOutput = Join-Path $OutputDirectory "baseline-v13"
 $hybridOutput = Join-Path $OutputDirectory "hybrid-recipient"
 $reportOutput = Join-Path $OutputDirectory "comparison"
 $scoreOutput = Join-Path $OutputDirectory "hybrid-val-score"
+$cliPublishDirectory = Join-Path $OutputDirectory "cli-app"
+$cliAssembly = Join-Path $cliPublishDirectory "ReceiptMlNet.Cli.dll"
+$cliClosureManifest = Join-Path $OutputDirectory "cli-app-closure.json"
 
 Write-Host "receipt_mlnet_hybrid_recipient_cpu_ab"
 Write-Host "  split=val (prepared by scorer; held-out test is never opened)"
@@ -135,10 +188,60 @@ if ($LASTEXITCODE -ne 0) {
     throw "PP-OCR recipient parser contract tests failed with exit code $LASTEXITCODE"
 }
 
-& $pythonExe $scorer prepare --records $Records --output $inputList --split val
+& $pythonExe $scorer prepare --records $Records --output $preparedInputList --split val
 if ($LASTEXITCODE -ne 0) {
     throw "Could not prepare fixed val input list; exit code $LASTEXITCODE"
 }
+$preparedInputs = @(
+    Get-Content -LiteralPath $preparedInputList -Encoding UTF8 |
+        ForEach-Object { $_.Trim() } |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and -not $_.StartsWith("#") }
+)
+if ($preparedInputs.Count -le 0) {
+    throw "Prepared fixed val input list is empty."
+}
+if (@($preparedInputs | Sort-Object -Unique).Count -ne $preparedInputs.Count) {
+    throw "Prepared fixed val input list contains duplicate sources."
+}
+if ($modeName -eq "formal" -and $preparedInputs.Count -ne $requiredFormalReceipts) {
+    throw "Formal CPU A/B requires exactly $requiredFormalReceipts prepared val receipts; got $($preparedInputs.Count)."
+}
+$selectedInputs = if ($Limit -gt 0) {
+    @($preparedInputs | Select-Object -First $Limit)
+}
+else {
+    @($preparedInputs)
+}
+if ($selectedInputs.Count -le 0) {
+    throw "Fixed selected input manifest would be empty."
+}
+if ($Limit -eq 0) {
+    Copy-Item -LiteralPath $preparedInputList -Destination $inputList
+}
+else {
+    [IO.File]::WriteAllLines(
+        $inputList,
+        [string[]]$selectedInputs,
+        (New-Object Text.UTF8Encoding($false)))
+}
+$inputManifestSha256 = Get-Sha256 $inputList
+
+Write-Host "mlnet_hybrid_ab_publish_frozen_cli"
+& $DotnetExe publish $project `
+    -c Release `
+    -r win-x64 `
+    --self-contained false `
+    "-p:OnnxRuntimeFlavor=cpu" `
+    -o $cliPublishDirectory
+if ($LASTEXITCODE -ne 0) {
+    throw "Could not publish the frozen hybrid CPU A/B CLI; exit code $LASTEXITCODE"
+}
+if (-not (Test-Path -LiteralPath $cliAssembly -PathType Leaf)) {
+    throw "Published ReceiptMlNet.Cli assembly is missing: $cliAssembly"
+}
+$cliAssemblySha256 = (Get-FileHash -LiteralPath $cliAssembly -Algorithm SHA256).Hash.ToLowerInvariant()
+Write-CliAppClosureManifest $cliPublishDirectory $cliClosureManifest
+$cliClosureManifestSha256 = Get-Sha256 $cliClosureManifest
 
 $common = @(
     "--detector", $DetectorModel,
@@ -159,26 +262,33 @@ if ($DetectorIntraOpThreads -gt 0) {
 
 Write-Host "mlnet_hybrid_ab_baseline"
 $baselineArguments = @(
-    "run", "--project", $project, "-c", "Release", "-p:OnnxRuntimeFlavor=cpu", "--",
     "--ocr", "unified", "--ocr-model", $UnifiedModel,
     "--output", $baselineOutput
 ) + $common
-& $DotnetExe @baselineArguments
+& $DotnetExe $cliAssembly @baselineArguments
 if ($LASTEXITCODE -ne 0) {
     throw "v13 CPU baseline failed with exit code $LASTEXITCODE"
 }
 
 Write-Host "mlnet_hybrid_ab_candidate"
 $hybridArguments = @(
-    "run", "--project", $project, "-c", "Release", "-p:OnnxRuntimeFlavor=cpu", "--",
     "--ocr", "hybrid-recipient",
     "--ocr-model", $UnifiedModel,
     "--ocr-bundle", $PaddleDeliveryBundle,
     "--output", $hybridOutput
 ) + $common
-& $DotnetExe @hybridArguments
+& $DotnetExe $cliAssembly @hybridArguments
 if ($LASTEXITCODE -ne 0) {
     throw "Hybrid recipient CPU candidate failed with exit code $LASTEXITCODE"
+}
+if ((Get-FileHash -LiteralPath $inputList -Algorithm SHA256).Hash.ToLowerInvariant() -ne $inputManifestSha256) {
+    throw "Fixed val input manifest changed during hybrid CPU A/B execution."
+}
+if ((Get-FileHash -LiteralPath $cliAssembly -Algorithm SHA256).Hash.ToLowerInvariant() -ne $cliAssemblySha256) {
+    throw "Frozen ReceiptMlNet.Cli assembly changed during hybrid CPU A/B execution."
+}
+if ((Get-Sha256 $cliClosureManifest) -ne $cliClosureManifestSha256) {
+    throw "Frozen CLI app closure manifest changed during hybrid CPU A/B execution."
 }
 
 $comparisonArguments = @(
@@ -188,6 +298,13 @@ $comparisonArguments = @(
     "--delivery", $PaddleDeliveryBundle,
     "--output", $reportOutput,
     "--mode", $modeName,
+    "--input-manifest", $inputList,
+    "--input-manifest-sha256", $inputManifestSha256,
+    "--cli-assembly", $cliAssembly,
+    "--cli-assembly-sha256", $cliAssemblySha256,
+    "--cli-app", $cliPublishDirectory,
+    "--cli-closure-manifest", $cliClosureManifest,
+    "--cli-closure-manifest-sha256", $cliClosureManifestSha256,
     "--max-p95-overhead-ms", "$MaxP95OverheadMs"
 )
 & $pythonExe @comparisonArguments
@@ -217,10 +334,35 @@ if ($LASTEXITCODE -ne 0) {
 
 $summary = Get-Content -LiteralPath (Join-Path $reportOutput "summary.json") -Raw -Encoding UTF8 | ConvertFrom-Json
 $score = Get-Content -LiteralPath (Join-Path $scoreOutput "summary.json") -Raw -Encoding UTF8 | ConvertFrom-Json
+$hybridManifestPath = [IO.Path]::GetFullPath((Join-Path $hybridOutput "inference_manifest.json"))
+$scoreManifestPath = [IO.Path]::GetFullPath([string]$score.manifest)
+$hybridManifestSha256 = (Get-FileHash -LiteralPath $hybridManifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
+$baselineRuntimeSummaryPath = [IO.Path]::GetFullPath((Join-Path $baselineOutput "inference_summary.json"))
+$hybridRuntimeSummaryPath = [IO.Path]::GetFullPath((Join-Path $hybridOutput "inference_summary.json"))
+$baselineRuntimeSummarySha256 = Get-Sha256 $baselineRuntimeSummaryPath
+$hybridRuntimeSummarySha256 = Get-Sha256 $hybridRuntimeSummaryPath
+if ([int]$summary.schema_version -ne 2 `
+    -or [string]$summary.input_set.input_manifest.sha256 -ne $inputManifestSha256 `
+    -or [string]$summary.cli_build.assembly.sha256 -ne $cliAssemblySha256 `
+    -or [string]$summary.cli_build.app_closure.closure_sha256 -ne $cliClosureManifestSha256 `
+    -or [string]$summary.run_summaries.baseline.sha256 -ne $baselineRuntimeSummarySha256 `
+    -or [string]$summary.run_summaries.hybrid.sha256 -ne $hybridRuntimeSummarySha256 `
+    -or -not ([IO.Path]::GetFullPath([string]$summary.run_manifests.hybrid.path)).Equals(
+        $hybridManifestPath,
+        [StringComparison]::OrdinalIgnoreCase) `
+    -or [string]$summary.run_manifests.hybrid.sha256 -ne $hybridManifestSha256 `
+    -or -not $scoreManifestPath.Equals($hybridManifestPath, [StringComparison]::OrdinalIgnoreCase) `
+    -or [string]$score.manifest_sha256 -ne $hybridManifestSha256) {
+    throw "Hybrid CPU A/B comparison and score are not schema/hash-bound to the frozen inputs, CLI and hybrid manifest."
+}
 $formalGateProperty = $score.PSObject.Properties["formal_delivery_gate"]
 if ($modeName -eq "formal") {
-    if ($null -eq $formalGateProperty -or $formalGateProperty.Value -ne $true) {
-        throw "Formal CPU A/B scorer evidence must declare formal_delivery_gate=true."
+    if ([int]$summary.records -ne $requiredFormalReceipts `
+        -or [int]$score.coverage.expected_receipts -ne $requiredFormalReceipts `
+        -or [int]$score.evaluation_scope.full_split_expected_receipts -ne $requiredFormalReceipts `
+        -or $null -eq $formalGateProperty `
+        -or $formalGateProperty.Value -ne $true) {
+        throw "Formal CPU A/B must schema-bind exactly $requiredFormalReceipts receipts and declare formal_delivery_gate=true."
     }
     if ($score.accepted -ne $true -or $score.acceptance.passed -ne $true) {
         throw "Formal CPU A/B scorer did not accept the complete validation split."

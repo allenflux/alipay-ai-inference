@@ -54,8 +54,20 @@ def test_hybrid_routes_only_recipient_after_v13_and_keeps_review_policy() -> Non
     assert "unified.TextDeliveryValue" in router
     assert "never falls back to the lower-accuracy v13 recipient branch" in router
     assert "CropRecipientRowLeftContext" in router
-    assert 'route = "left_context_retry"' in router
+    assert 'retryRoute = "left_context_retry"' in router
     assert "PaddleRecipientValueParser.Parse(retryRead.Text)" in router
+    assert "ParseUnlabelledMerchantAmountPair" in router
+    assert 'route = "primary_unlabelled_merchant_amount_pair"' in router
+    assert "HasVerifiedUnlabelledMerchantRowLayout" in router
+    assert "HasVerifiedUnlabelledMerchantRowGeometry" in router
+    assert "HasReliablePairLines" in router
+    assert 'amount.Candidate' in router
+    parser = _source("PaddleRecipientValueParser.cs")
+    assert 'recipientScore < 0.90f' in parser
+    assert 'amountCenterY < recipientCenterY' in parser
+    assert 'recipientCenterY < paymentCenterY' in parser
+    assert 'recipientBox[1] >= amountBox[3] - verticalTolerance' in parser
+    assert 'recipientBox[3] <= paymentBox[1] + verticalTolerance' in parser
     assert "RecipientDiagnostic = diagnostic" in router
 
 
@@ -67,7 +79,8 @@ def test_hybrid_retry_is_left_context_only_and_remains_fail_closed() -> None:
     assert "new Rectangle(0, top, right, bottom - top)" in retry
     assert router.count("paddleOcr.Recognize(") == 2
     assert router.count("PaddleRecipientValueParser.Parse(") == 2
-    assert '"anchor_parse_failed"' in router
+    assert router.count("PaddleRecipientValueParser.ParseUnlabelledMerchantAmountPair(") == 2
+    assert '"anchored_or_pair_parse_failed"' in router
     assert '"ocr_empty"' in router
     assert "candidates.Remove(\"recipient_field\")" in router
 
@@ -132,6 +145,22 @@ def test_recipient_parser_has_package_free_executable_contract_tests() -> None:
     assert r'PaddleRecipientValueParser.Parse("\u5546\u6237\u7532 \u6536\u6b3e\u65b9")' in harness
     assert r'PaddleRecipientValueParser.Parse("\u5907\u6ce8 \u6536\u6b3e\u65b9 \u5546\u6237\u7532")' in harness
     assert r'PaddleRecipientValueParser.Parse("\u6536\u6b3e\u65b9\uff1a")' in harness
+    assert "ParseUnlabelledMerchantAmountPair" in harness
+    assert r'["\u6296\u97f3\u7535\u5546\u5546\u5bb6", "\uffe5100.00"]' in harness
+    assert "reversed pair" in harness
+    assert "amount without currency mark" in harness
+    assert "non-recipient row label" in harness
+    assert "extra line" in harness
+    assert "product row" in harness
+    assert "amount mismatch" in harness
+    assert "OCR-confusable amount" in harness
+    assert "full four-digit amount" in harness
+    assert "four-digit amount mismatch" in harness
+    assert "shared-suffix amount mismatch" in harness
+    assert "strict row geometry" in harness
+    assert "amount overlap" in harness
+    assert "payment overlap" in harness
+    assert "low recipient detector confidence" in harness
 
 
 def test_paddle_bundle_conversion_is_dynamic_and_atomic() -> None:

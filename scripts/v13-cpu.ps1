@@ -1,16 +1,22 @@
 [CmdletBinding()]
 param(
-    [string]$TeacherRoot = "D:\alipay-ai-data\receipt-lite-teacher-120k-v1"
+    [string]$TeacherRoot = "D:\alipay-ai-data\receipt-lite-teacher-120k-v1",
+    [Parameter(Mandatory = $true)]
+    [string]$PaddleDeliveryBundle,
+    [Parameter(Mandatory = $true)]
+    [string]$HybridAbEvidence,
+    [string]$DotnetExe
 )
 
 # From the repository root:
-# powershell -ExecutionPolicy Bypass -File .\scripts\v13-cpu.ps1
+# powershell -ExecutionPolicy Bypass -File .\scripts\v13-cpu.ps1 -PaddleDeliveryBundle D:\path\to\ppocr-delivery -HybridAbEvidence D:\path\to\formal-ab
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-# This launcher intentionally exposes no floor, model, limit, or runtime
-# switches. The fixed values below are the production delivery contract.
+# Floors, sample counts, execution device and the v13 model remain fixed.  The
+# PP-OCR delivery, its formal A/B evidence and the .NET host are explicit byte/
+# runtime bindings rather than tuneable accuracy switches.
 $pilotCount = 100
 $formalCount = 10016
 $amountFloor = 0.7885
@@ -26,6 +32,25 @@ $scorer = Join-Path $PSScriptRoot "receipt_mlnet_unified_evaluate.py"
 $packager = Join-Path $PSScriptRoot "receipt-mlnet-unified-package-validate-4090.ps1"
 $detectorModel = Join-Path $repoRoot "artifacts\receipt_lrcnn_v1.onnx"
 $deviceModel = Join-Path $repoRoot "artifacts\statusbar_device_v1.onnx"
+
+if ([string]::IsNullOrWhiteSpace($DotnetExe)) {
+    $dotnetCommand = Get-Command dotnet -ErrorAction SilentlyContinue
+    if ($null -ne $dotnetCommand) {
+        $DotnetExe = $dotnetCommand.Source
+    }
+    else {
+        $portableDotnet = Join-Path $repoRoot "artifacts\dotnet8\dotnet.exe"
+        if (Test-Path -LiteralPath $portableDotnet -PathType Leaf) {
+            $DotnetExe = $portableDotnet
+        }
+    }
+}
+if ([string]::IsNullOrWhiteSpace($DotnetExe)) {
+    throw "Missing .NET 8 host. Install dotnet, place the portable host at artifacts\dotnet8\dotnet.exe, or pass -DotnetExe."
+}
+$DotnetExe = [IO.Path]::GetFullPath($DotnetExe)
+$PaddleDeliveryBundle = [IO.Path]::GetFullPath($PaddleDeliveryBundle)
+$HybridAbEvidence = [IO.Path]::GetFullPath($HybridAbEvidence)
 
 function Require-File([string]$Path, [string]$Description) {
     if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) {
@@ -79,22 +104,36 @@ function Assert-PassedGpuSummary(
     [string]$ModelSha256,
     [string]$RecordsSha256
 ) {
+    $failures = @(
+        $Summary.acceptance.failures |
+            ForEach-Object { [string]$_ } |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+    $nonRecipientFailures = @(
+        $failures |
+            Where-Object { -not $_.StartsWith("recipient_field:", [StringComparison]::Ordinal) }
+    )
+    $aggregateStateValid = (
+        ($Summary.acceptance.passed -eq $true -and $failures.Count -eq 0) `
+        -or ($Summary.acceptance.passed -eq $false `
+            -and $failures.Count -gt 0 `
+            -and $nonRecipientFailures.Count -eq 0)
+    )
     if ([string]$Summary.model_sha256 -ne $ModelSha256 `
         -or [string]$Summary.records_sha256 -ne $RecordsSha256 `
         -or [string]$Summary.evaluation_split -ne $Split `
         -or @($Summary.providers) -notcontains "CUDAExecutionProvider" `
         -or $Summary.acceptance.requested -ne $true `
-        -or $Summary.acceptance.passed -ne $true `
-        -or @($Summary.acceptance.failures).Count -ne 0 `
+        -or -not $aggregateStateValid `
+        -or $nonRecipientFailures.Count -ne 0 `
         -or [string]$Summary.status_text_policy.runtime_policy -ne "decode_and_normalize_review_only" `
         -or [string]$Summary.status_text_policy.review_value -ne "review") {
-        throw "$Split GPU summary is not accepted v13 evidence."
+        throw "$Split GPU summary is not accepted amount/time/payment/status v13 evidence."
     }
     foreach ($gate in @(
             @{ Field = "amount"; Metric = "raw_exact_match"; Acceptance = "min_amount_exact_match"; Floor = $amountFloor },
             @{ Field = "time"; Metric = "raw_exact_match"; Acceptance = "min_time_exact_match"; Floor = $timeFloor },
             @{ Field = "payment_method_field"; Metric = "raw_exact_match"; Acceptance = "min_payment_exact_match"; Floor = $paymentFloor },
-            @{ Field = "recipient_field"; Metric = "raw_exact_match"; Acceptance = "min_recipient_exact_match"; Floor = $recipientFloor },
             @{ Field = "transfer_status"; Metric = "ctc_raw_exact_match"; Acceptance = "min_status_exact_match"; Floor = $statusFloor }
         )) {
         $fieldProperty = $Summary.by_field.PSObject.Properties[[string]$gate.Field]
@@ -167,13 +206,11 @@ function Read-PassedV13Run([IO.FileInfo]$EvidenceFile) {
     )
     if ($valEvidence.Count -ne 1 `
         -or $valEvidence[0].evaluated -ne $true `
-        -or $valEvidence[0].accepted -ne $true `
         -or $testEvidence.Count -ne 1 `
         -or $testEvidence[0].evaluated -ne $true `
-        -or $testEvidence[0].accepted -ne $true `
         -or [double]$valEvidence[0].status_text_exact_match -lt $statusFloor `
         -or [double]$testEvidence[0].status_text_exact_match -lt $statusFloor) {
-        throw "Evidence does not contain accepted val and test status OCR results."
+        throw "Evidence does not contain evaluated val and test status OCR results."
     }
 
     $binding = $evidence.cpu_packaging
@@ -292,17 +329,86 @@ function Get-RawExactMetric([object]$Summary, [string]$Field) {
     return $value
 }
 
+function Assert-FiveFieldCoverage([object]$Summary, [int]$ExpectedRecords) {
+    foreach ($fieldName in @(
+            "amount",
+            "time",
+            "payment_method_field",
+            "recipient_field",
+            "transfer_status"
+        )) {
+        $fieldProperty = $Summary.by_field.PSObject.Properties[$fieldName]
+        if ($null -eq $fieldProperty `
+            -or $null -eq $fieldProperty.Value `
+            -or [int]$fieldProperty.Value.records -ne $ExpectedRecords `
+            -or [double]$fieldProperty.Value.candidate_coverage -ne 1.0) {
+            throw "Formal hybrid evaluation does not have complete $fieldName coverage."
+        }
+    }
+}
+
+function Assert-RecipientPpocrArtifact(
+    [object]$PackageEvidence,
+    [string]$DeliveryDirectory,
+    [string]$ExpectedContractSha256,
+    [string]$Description
+) {
+    $artifactProperty = $PackageEvidence.model_artifacts.PSObject.Properties["recipient_ppocr"]
+    if ($null -eq $artifactProperty -or $null -eq $artifactProperty.Value) {
+        throw "$Description has no recipient_ppocr model artifact."
+    }
+    $artifact = $artifactProperty.Value
+    $modelRoles = @($artifact.models.PSObject.Properties.Name)
+    if ([string]$artifact.kind -ne "paddle_ocr_v2_delivery" `
+        -or [string]$artifact.bundle_path -ne "models/recipient-ppocr" `
+        -or [string]$artifact.contract_path -ne "models/recipient-ppocr/paddle_ocr_delivery.contract.json" `
+        -or [string]$artifact.contract_sha256 -ne $ExpectedContractSha256 `
+        -or $modelRoles.Count -ne 3 `
+        -or $modelRoles -notcontains "det" `
+        -or $modelRoles -notcontains "cls" `
+        -or $modelRoles -notcontains "rec" `
+        -or $null -eq $artifact.dictionary) {
+        throw "$Description has an invalid recipient_ppocr artifact binding."
+    }
+    $deliveredContract = Join-Path $DeliveryDirectory "models\recipient-ppocr\paddle_ocr_delivery.contract.json"
+    Require-File $deliveredContract "$Description delivered PP-OCR contract"
+    if ((Get-Sha256 $deliveredContract) -ne $ExpectedContractSha256) {
+        throw "$Description delivered PP-OCR contract hash differs from its model_artifacts binding."
+    }
+}
+
 Require-Directory $TeacherRoot "teacher root"
+Require-Directory $PaddleDeliveryBundle "Paddle OCR recipient delivery bundle"
+Require-Directory $HybridAbEvidence "complete formal hybrid CPU A/B evidence"
 foreach ($required in @(
         @{ Path = $pythonExe; Description = "CUDA environment Python used for evidence tooling" },
         @{ Path = $normalizer; Description = "JSON normalizer" },
         @{ Path = $scorer; Description = "ML.NET scorer" },
         @{ Path = $packager; Description = "ML.NET package validator" },
+        @{ Path = $DotnetExe; Description = ".NET 8 host" },
         @{ Path = $detectorModel; Description = "receipt detector ONNX" },
         @{ Path = $deviceModel; Description = "device classifier ONNX" }
     )) {
     Require-File ([string]$required.Path) ([string]$required.Description)
 }
+
+$paddleContractPath = Join-Path $PaddleDeliveryBundle "paddle_ocr_delivery.contract.json"
+Require-File $paddleContractPath "Paddle OCR recipient delivery contract"
+if (Test-Path -LiteralPath (Join-Path $PaddleDeliveryBundle "paddle") -PathType Container) {
+    throw "Paddle OCR delivery must be pure ONNX and must not contain the native paddle directory."
+}
+$paddleContract = Read-GuardedJson $paddleContractPath
+$paddleRoles = @($paddleContract.models.PSObject.Properties.Name)
+if ([int]$paddleContract.schema_version -ne 1 `
+    -or [string]$paddleContract.kind -ne "paddle_ocr_v2_delivery" `
+    -or $paddleRoles.Count -ne 3 `
+    -or $paddleRoles -notcontains "det" `
+    -or $paddleRoles -notcontains "cls" `
+    -or $paddleRoles -notcontains "rec" `
+    -or $null -eq $paddleContract.dictionary) {
+    throw "Paddle OCR recipient delivery contract is incomplete."
+}
+$paddleContractSha256 = Get-Sha256 $paddleContractPath
 
 $selected = Find-LatestPassedV13Run
 Write-Host "v13_cpu_delivery_start"
@@ -311,6 +417,10 @@ Write-Host "  evidence=$($selected.EvidencePath)"
 Write-Host "  unified-model=$($selected.UnifiedModel)"
 Write-Host "  detector-model=$detectorModel"
 Write-Host "  device-model=$deviceModel"
+Write-Host "  recipient-ppocr=$PaddleDeliveryBundle"
+Write-Host "  recipient-ppocr-contract-sha256=$paddleContractSha256"
+Write-Host "  hybrid-ab-evidence=$HybridAbEvidence"
+Write-Host "  dotnet=$DotnetExe"
 
 $dataRoot = Split-Path -Parent ([IO.Path]::GetFullPath($TeacherRoot))
 $validationRoot = Join-Path $dataRoot "delivery-validation"
@@ -367,6 +477,8 @@ $commonArguments = @{
     RecipientFloor = $recipientFloor
     DetectorModel = $detectorModel
     DeviceModel = $deviceModel
+    PaddleDeliveryBundle = $PaddleDeliveryBundle
+    DotnetExe = $DotnetExe
 }
 
 $pilotArguments = @{}
@@ -381,18 +493,26 @@ Write-Host "v13_cpu_pilot_start"
 
 $pilotSummary = Read-GuardedJson (Join-Path $pilotOutput "inference_summary.json")
 $pilotValidation = Read-GuardedJson (Join-Path $pilotDelivery "evidence\package_validation.json")
+$pilotConfig = Read-GuardedJson (Join-Path $pilotDelivery "evidence\package_config.json")
 if ([int]$pilotSummary.input -ne $pilotCount `
     -or [int]$pilotSummary.written -ne $pilotCount `
     -or [int]$pilotSummary.errors -ne 0 `
     -or [string]$pilotSummary.requested_device -ne "cpu" `
     -or [string]$pilotSummary.unified_provider -ne "cpu" `
+    -or [string]$pilotSummary.paddle_ocr_provider -ne "cpu" `
+    -or [string]$pilotValidation.kind -ne "receipt_mlnet_hybrid_recipient_package_validation_v1" `
     -or [string]$pilotValidation.validation_scope -ne "candidate_smoke_only" `
     -or [string]$pilotValidation.unified_artifact_source.binding -ne "explicit_run_contained" `
     -or [int]$pilotValidation.unified_ocr_architecture_version -ne 13 `
     -or $pilotValidation.include_device_model -ne $true `
+    -or $null -eq $pilotValidation.model_artifacts.device `
+    -or $null -eq $pilotConfig.model_artifacts.device `
+    -or [string]$pilotConfig.kind -ne "receipt_mlnet_hybrid_recipient_candidate_smoke_package_v1" `
     -or -not (Test-Path -LiteralPath (Join-Path $pilotDelivery "SHA256SUMS.json") -PathType Leaf)) {
     throw "The 100-image complete three-model CPU pilot did not pass. Formal was not started."
 }
+Assert-RecipientPpocrArtifact $pilotValidation $pilotDelivery $paddleContractSha256 "Pilot validation"
+Assert-RecipientPpocrArtifact $pilotConfig $pilotDelivery $paddleContractSha256 "Pilot package config"
 Write-Host "v13_cpu_pilot_pass"
 Write-Host "  selected=$pilotCount"
 Write-Host "  errors=0"
@@ -405,6 +525,7 @@ foreach ($entry in $commonArguments.GetEnumerator()) {
 }
 $formalArguments["Records"] = $selected.Records
 $formalArguments["EndToEndEvaluationDir"] = $formalEvaluation
+$formalArguments["HybridAbEvidence"] = $HybridAbEvidence
 $formalArguments["Output"] = $formalOutput
 $formalArguments["DeliveryDir"] = $formalDelivery
 Write-Host "v13_cpu_formal_start"
@@ -423,6 +544,9 @@ $statusExact = Get-RawExactMetric $scoreSummary "transfer_status"
 $p50 = [double]$formalSummary.inference_latency_ms.p50
 $p95 = [double]$formalSummary.inference_latency_ms.p95
 $errors = [int]$formalSummary.errors
+Assert-FiveFieldCoverage $scoreSummary $formalCount
+Assert-RecipientPpocrArtifact $packageValidation $formalDelivery $paddleContractSha256 "Formal validation"
+Assert-RecipientPpocrArtifact $packageConfig $formalDelivery $paddleContractSha256 "Formal package config"
 $atomicPublished = (
     (Test-Path -LiteralPath $formalDelivery -PathType Container) `
     -and (Test-Path -LiteralPath (Join-Path $formalDelivery "SHA256SUMS.json") -PathType Leaf) `
@@ -430,17 +554,23 @@ $atomicPublished = (
     -and [string]$packageValidation.end_to_end_evaluation.status -eq "accepted" `
     -and [string]$packageValidation.unified_artifact_source.binding -eq "explicit_run_contained" `
     -and [string]$packageValidation.runtime_flavor -eq "cpu" `
+    -and [string]$packageValidation.kind -eq "receipt_mlnet_hybrid_recipient_package_validation_v1" `
     -and [int]$packageValidation.unified_ocr_architecture_version -eq 13 `
     -and $packageValidation.include_device_model -eq $true `
-    -and [string]$packageConfig.kind -eq "receipt_mlnet_unified_delivery_package_v1"
+    -and $null -ne $packageValidation.model_artifacts.device `
+    -and $null -ne $packageConfig.model_artifacts.device `
+    -and [string]$packageConfig.kind -eq "receipt_mlnet_hybrid_recipient_delivery_package_v1"
 )
+# Legacy receipt_mlnet_unified_delivery_package_v1 packages are explicitly not formal hybrid deliveries.
 
 if ([int]$formalSummary.input -ne $formalCount `
     -or [int]$formalSummary.written -ne $formalCount `
     -or $errors -ne 0 `
     -or [string]$formalSummary.requested_device -ne "cpu" `
     -or [string]$formalSummary.unified_provider -ne "cpu" `
+    -or [string]$formalSummary.paddle_ocr_provider -ne "cpu" `
     -or $scoreSummary.accepted -ne $true `
+    -or $scoreSummary.formal_delivery_gate -ne $true `
     -or $amountExact -lt $amountFloor `
     -or $timeExact -lt $timeFloor `
     -or $paymentExact -lt $paymentFloor `
@@ -455,11 +585,11 @@ if ([int]$formalSummary.input -ne $formalCount `
     -or $p50 -lt 0.0 `
     -or $p95 -lt $p50 `
     -or -not $atomicPublished) {
-    throw "Fresh 10016-image v13 CPU formal did not satisfy the fixed delivery contract."
+    throw "Fresh 10016-image v13 hybrid-recipient CPU formal did not satisfy the fixed delivery contract."
 }
 
 Write-Host ""
-Write-Host "V13_CPU_DELIVERY_PASS"
+Write-Host "V13_HYBRID_RECIPIENT_CPU_DELIVERY_PASS"
 Write-Host "  selected=$formalCount"
 Write-Host ("  amount_raw_exact={0:P2}" -f $amountExact)
 Write-Host ("  time_raw_exact={0:P2}" -f $timeExact)
@@ -469,6 +599,9 @@ Write-Host ("  status_raw_exact={0:P2}" -f $statusExact)
 Write-Host "  cpu_p50_ms=$p50"
 Write-Host "  cpu_p95_ms=$p95"
 Write-Host "  errors=$errors"
+Write-Host "  unified_provider=$($formalSummary.unified_provider)"
+Write-Host "  paddle_ocr_provider=$($formalSummary.paddle_ocr_provider)"
+Write-Host "  recipient_ppocr_contract_sha256=$paddleContractSha256"
 Write-Host "  output=$formalOutput"
 Write-Host "  evaluation=$formalEvaluation"
 Write-Host "  delivery=$formalDelivery"

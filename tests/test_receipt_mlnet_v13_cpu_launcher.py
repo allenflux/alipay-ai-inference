@@ -28,12 +28,16 @@ def test_launcher_has_one_short_command_and_auto_selects_latest_passed_v13_run()
     assert "Sort-Object LastWriteTimeUtc -Descending" in source
     assert 'receipt_unified_status_text_v13_guarded_validation_v1' in source
     assert 'receipt_unified_field_reader_v13' in source
-    assert '$valEvidence[0].accepted -ne $true' in source
-    assert '$testEvidence[0].accepted -ne $true' in source
+    assert '$valEvidence[0].accepted -ne $true' not in source
+    assert '$testEvidence[0].accepted -ne $true' not in source
     assert 'status_text_exact_match -lt $statusFloor' in source
     assert '$testSummaryPath = [IO.Path]::GetFullPath([string]$testEvidence[0].summary_path)' in source
     assert '[string]$testEvidence[0].summary_sha256 -ne $testSummarySha256' in source
     assert 'Assert-PassedGpuSummary $testSummary "test"' in source
+    assert 'StartsWith("recipient_field:"' in source
+    assert '$nonRecipientFailures.Count -ne 0' in source
+    assert 'Field = "recipient_field"; Metric = "raw_exact_match"' not in source
+    assert '$Summary.acceptance.passed -eq $false' in source
     assert 'Rejected candidates: ' in source
 
 

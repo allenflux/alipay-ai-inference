@@ -208,6 +208,35 @@ function Resolve-ContainedPackageFile(
     return $target
 }
 
+function Resolve-ContainedPackageDirectory(
+    [string]$PackageRoot,
+    [string]$RelativePath,
+    [string]$Description
+) {
+    if ([string]::IsNullOrWhiteSpace($RelativePath)) {
+        throw "Missing relative path for ${Description}."
+    }
+    Assert-SafePathSyntax $PackageRoot "package root"
+    Assert-SafePathSyntax $RelativePath $Description
+    $normalized = $RelativePath.Replace('/', [IO.Path]::DirectorySeparatorChar)
+    $segments = @($normalized.Split([IO.Path]::DirectorySeparatorChar))
+    if ([IO.Path]::IsPathRooted($normalized) `
+        -or $segments -contains "" `
+        -or $segments -contains "." `
+        -or $segments -contains "..") {
+        throw "Unsafe path for ${Description}: $RelativePath"
+    }
+    $rootFull = [IO.Path]::GetFullPath($PackageRoot)
+    $target = [IO.Path]::GetFullPath((Join-Path $rootFull $normalized))
+    if (-not (Test-PathWithin $target $rootFull) `
+        -or $target.Equals($rootFull, [StringComparison]::OrdinalIgnoreCase) `
+        -or -not (Test-Path -LiteralPath $target -PathType Container)) {
+        throw "Missing, unsafe, or non-contained ${Description}: $RelativePath"
+    }
+    Assert-NoReparsePointInExistingPath $target $Description
+    return $target
+}
+
 function Get-PackagePayloadFiles([string]$PackageRoot) {
     Assert-SafePathSyntax $PackageRoot "package root"
     $rootFull = [IO.Path]::GetFullPath($PackageRoot)
@@ -453,12 +482,201 @@ function Read-UnifiedModelEvidence(
     }
 }
 
+function Read-PaddleDeliveryFileEvidence(
+    [string]$PackageRoot,
+    [string]$BundlePath,
+    [object]$Record,
+    [string]$Description
+) {
+    $pathProperty = if ($null -eq $Record) { $null } else { $Record.PSObject.Properties["path"] }
+    $shaProperty = if ($null -eq $Record) { $null } else { $Record.PSObject.Properties["sha256"] }
+    $bytesProperty = if ($null -eq $Record) { $null } else { $Record.PSObject.Properties["size_bytes"] }
+    if ($null -eq $pathProperty -or $null -eq $shaProperty -or $null -eq $bytesProperty) {
+        throw "Paddle OCR delivery contract has an incomplete ${Description} record."
+    }
+    $relativeWithinBundle = [string]$pathProperty.Value
+    $bundleRelative = Get-RelativePackagePath $BundlePath $PackageRoot
+    $target = Resolve-ContainedPackageFile `
+        $PackageRoot ($bundleRelative + "/" + $relativeWithinBundle) $Description
+    if (-not (Test-PathWithin $target $BundlePath) `
+        -or $target.Equals($BundlePath, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Paddle OCR ${Description} escapes its contained delivery bundle."
+    }
+    $expectedSha256 = ([string]$shaProperty.Value).ToLowerInvariant()
+    $expectedBytes = [long]0
+    $bytesText = [Convert]::ToString($bytesProperty.Value, [Globalization.CultureInfo]::InvariantCulture)
+    if ($expectedSha256 -notmatch '^[0-9a-f]{64}$' `
+        -or -not [long]::TryParse(
+            $bytesText,
+            [Globalization.NumberStyles]::Integer,
+            [Globalization.CultureInfo]::InvariantCulture,
+            [ref]$expectedBytes) `
+        -or $expectedBytes -le 0 `
+        -or (Get-Sha256 $target) -ne $expectedSha256 `
+        -or (Get-Item -LiteralPath $target).Length -ne $expectedBytes) {
+        throw "Paddle OCR ${Description} does not match its delivery contract."
+    }
+    return [pscustomobject]@{
+        Path = $target
+        RelativePath = Get-RelativePackagePath $target $PackageRoot
+        Sha256 = $expectedSha256
+        SizeBytes = $expectedBytes
+    }
+}
+
+function Read-PaddleRecipientEvidence(
+    [string]$PackageRoot,
+    [object]$Declaration
+) {
+    if ($null -eq $Declaration `
+        -or [string]$Declaration.kind -ne "paddle_ocr_v2_delivery" `
+        -or [string]$Declaration.bundle_path -ne "models/recipient-ppocr" `
+        -or [string]$Declaration.contract_path -ne "models/recipient-ppocr/paddle_ocr_delivery.contract.json") {
+        throw "Package does not declare the fixed recipient-only PP-OCR delivery bundle."
+    }
+    $bundlePath = Resolve-ContainedPackageDirectory `
+        $PackageRoot ([string]$Declaration.bundle_path) "recipient PP-OCR bundle"
+    $contractPath = Resolve-ContainedPackageFile `
+        $PackageRoot ([string]$Declaration.contract_path) "recipient PP-OCR delivery contract"
+    if (-not [IO.Path]::GetDirectoryName($contractPath).Equals(
+            $bundlePath,
+            [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Recipient PP-OCR contract is not directly inside its declared bundle."
+    }
+    $contractSha256 = Get-Sha256 $contractPath
+    if ([string]$Declaration.contract_sha256 -ne $contractSha256) {
+        throw "Recipient PP-OCR config contract hash does not match the delivered contract."
+    }
+    $contract = Get-Content -LiteralPath $contractPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    $modelProperties = if ($null -eq $contract -or $null -eq $contract.models) {
+        @()
+    }
+    else {
+        @($contract.models.PSObject.Properties)
+    }
+    if ([int]$contract.schema_version -ne 1 `
+        -or [string]$contract.kind -ne "paddle_ocr_v2_delivery" `
+        -or $modelProperties.Count -ne 3 `
+        -or $null -eq $contract.models.PSObject.Properties["det"] `
+        -or $null -eq $contract.models.PSObject.Properties["cls"] `
+        -or $null -eq $contract.models.PSObject.Properties["rec"]) {
+        throw "Recipient PP-OCR delivery contract is not a complete det/cls/rec v1 bundle."
+    }
+    $forbiddenDependencies = @(
+        $contract.forbidden_runtime_dependencies |
+            ForEach-Object { [string]$_ }
+    )
+    foreach ($dependency in @("Python", "PaddlePaddle", "PaddleOCR", "paddle static graph files")) {
+        if ($forbiddenDependencies -notcontains $dependency) {
+            throw "Recipient PP-OCR contract does not forbid runtime dependency: $dependency"
+        }
+    }
+    $models = [ordered]@{}
+    $packageSizeBytes = [long]0
+    foreach ($role in @("det", "cls", "rec")) {
+        $models[$role] = Read-PaddleDeliveryFileEvidence `
+            $PackageRoot $bundlePath $contract.models.PSObject.Properties[$role].Value `
+            "recipient PP-OCR $role model"
+        $packageSizeBytes += [long]$models[$role].SizeBytes
+    }
+    $dictionary = Read-PaddleDeliveryFileEvidence `
+        $PackageRoot $bundlePath $contract.dictionary "recipient PP-OCR dictionary"
+    $packageSizeBytes += [long]$dictionary.SizeBytes
+    $declaredPackageSize = [long]0
+    $packageSizeText = [Convert]::ToString(
+        $contract.package_size_bytes,
+        [Globalization.CultureInfo]::InvariantCulture)
+    if (-not [long]::TryParse(
+            $packageSizeText,
+            [Globalization.NumberStyles]::Integer,
+            [Globalization.CultureInfo]::InvariantCulture,
+            [ref]$declaredPackageSize) `
+        -or $declaredPackageSize -le 0 `
+        -or $declaredPackageSize -ne $packageSizeBytes) {
+        throw "Recipient PP-OCR delivery contract package_size_bytes is inconsistent."
+    }
+    if ((Get-Sha256 $contractPath) -ne $contractSha256) {
+        throw "Recipient PP-OCR delivery contract changed during verification."
+    }
+    $expectedBundlePaths = @{
+        "paddle_ocr_delivery.contract.json" = $true
+    }
+    foreach ($record in @($models.det, $models.cls, $models.rec, $dictionary)) {
+        $expectedBundlePaths[(Get-RelativePackagePath $record.Path $bundlePath)] = $true
+    }
+    $actualBundlePaths = @{}
+    foreach ($file in Get-PackagePayloadFiles $bundlePath) {
+        $relativePath = Get-RelativePackagePath $file.FullName $bundlePath
+        $actualBundlePaths[$relativePath] = $true
+    }
+    $missingBundlePaths = @(
+        $expectedBundlePaths.Keys | Where-Object { -not $actualBundlePaths.ContainsKey($_) }
+    )
+    $extraBundlePaths = @(
+        $actualBundlePaths.Keys | Where-Object { -not $expectedBundlePaths.ContainsKey($_) }
+    )
+    if ($missingBundlePaths.Count -ne 0 -or $extraBundlePaths.Count -ne 0) {
+        throw "Recipient PP-OCR bundle is not closed over its contract, det/cls/rec ONNX files, and dictionary."
+    }
+    return [pscustomobject]@{
+        Kind = "paddle_ocr_v2_delivery"
+        BundlePath = $bundlePath
+        BundleRelativePath = Get-RelativePackagePath $bundlePath $PackageRoot
+        ContractPath = $contractPath
+        ContractRelativePath = Get-RelativePackagePath $contractPath $PackageRoot
+        ContractFileName = [IO.Path]::GetFileName($contractPath)
+        ContractSha256 = $contractSha256
+        Models = $models
+        Dictionary = $dictionary
+        PackageSizeBytes = $packageSizeBytes
+    }
+}
+
+function Assert-DeclaredPaddleRecipientArtifact(
+    [object]$Declaration,
+    [object]$PaddleEvidence,
+    [string]$Description
+) {
+    $declaredModelProperties = if ($null -eq $Declaration -or $null -eq $Declaration.models) {
+        @()
+    }
+    else {
+        @($Declaration.models.PSObject.Properties)
+    }
+    if ($null -eq $Declaration `
+        -or [string]$Declaration.kind -ne [string]$PaddleEvidence.Kind `
+        -or [string]$Declaration.bundle_path -ne [string]$PaddleEvidence.BundleRelativePath `
+        -or [string]$Declaration.contract_path -ne [string]$PaddleEvidence.ContractRelativePath `
+        -or [string]$Declaration.contract_sha256 -ne [string]$PaddleEvidence.ContractSha256 `
+        -or $declaredModelProperties.Count -ne 3) {
+        throw "$Description recipient PP-OCR declaration is incomplete or inconsistent."
+    }
+    foreach ($role in @("det", "cls", "rec")) {
+        $declaredProperty = $Declaration.models.PSObject.Properties[$role]
+        $expected = $PaddleEvidence.Models[$role]
+        if ($null -eq $declaredProperty `
+            -or $null -eq $declaredProperty.Value `
+            -or [string]$declaredProperty.Value.path -ne [string]$expected.RelativePath `
+            -or [string]$declaredProperty.Value.sha256 -ne [string]$expected.Sha256 `
+            -or [long]$declaredProperty.Value.size_bytes -ne [long]$expected.SizeBytes) {
+            throw "$Description recipient PP-OCR $role declaration does not match the delivered file."
+        }
+    }
+    if ($null -eq $Declaration.dictionary `
+        -or [string]$Declaration.dictionary.path -ne [string]$PaddleEvidence.Dictionary.RelativePath `
+        -or [string]$Declaration.dictionary.sha256 -ne [string]$PaddleEvidence.Dictionary.Sha256 `
+        -or [long]$Declaration.dictionary.size_bytes -ne [long]$PaddleEvidence.Dictionary.SizeBytes) {
+        throw "$Description recipient PP-OCR dictionary declaration does not match the delivered file."
+    }
+}
+
 function Assert-DeclaredModelArtifacts(
     [object]$Declaration,
     [string]$PackageRoot,
     [object]$DetectorEvidence,
     [object]$DeviceEvidence,
     [object]$UnifiedEvidence,
+    [object]$PaddleEvidence,
     [string]$Description
 ) {
     $versionedUnifiedBindingInvalid = $true
@@ -513,6 +731,650 @@ function Assert-DeclaredModelArtifacts(
         -or $versionedUnifiedBindingInvalid) {
         throw "$Description model artifact declaration does not match the delivered models and sidecars."
     }
+    $paddleDeclaration = $Declaration.PSObject.Properties["recipient_ppocr"]
+    if ($null -eq $paddleDeclaration -or $null -eq $paddleDeclaration.Value) {
+        throw "$Description does not bind the recipient PP-OCR delivery bundle."
+    }
+    Assert-DeclaredPaddleRecipientArtifact `
+        $paddleDeclaration.Value $PaddleEvidence $Description
+}
+
+function Assert-ContainedCliAppClosure(
+    [string]$PackageRoot,
+    [string]$ManifestPath,
+    [string]$ExpectedManifestSha256,
+    [int]$ExpectedFileCount
+) {
+    $appRoot = Resolve-ContainedPackageDirectory $PackageRoot "app" "CLI app closure"
+    if ($ExpectedManifestSha256 -cnotmatch '^[0-9a-f]{64}$' `
+        -or (Get-Sha256 $ManifestPath) -ne $ExpectedManifestSha256) {
+        throw "CLI app closure manifest does not match its lowercase SHA-256 binding."
+    }
+    $rows = @(Get-Content -LiteralPath $ManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json)
+    if ($rows.Count -le 0 -or $rows.Count -ne $ExpectedFileCount) {
+        throw "CLI app closure manifest file_count is empty or inconsistent."
+    }
+    $listed = @{}
+    $requiredBasenames = @{
+        "receiptmlnet.cli.exe" = $false
+        "receiptmlnet.cli.dll" = $false
+        "receiptmlnet.cli.deps.json" = $false
+        "receiptmlnet.cli.runtimeconfig.json" = $false
+        "microsoft.ml.onnxruntime.dll" = $false
+        "onnxruntime.dll" = $false
+        "opencvsharp.dll" = $false
+        "opencvsharpextern.dll" = $false
+    }
+    $previousSortKey = $null
+    foreach ($row in $rows) {
+        $propertyNames = @($row.PSObject.Properties.Name)
+        $sizeProperty = $row.PSObject.Properties["size_bytes"]
+        if ($propertyNames.Count -ne 3 `
+            -or $propertyNames -notcontains "path" `
+            -or $propertyNames -notcontains "sha256" `
+            -or $null -eq $sizeProperty `
+            -or $null -eq $sizeProperty.Value `
+            -or (($sizeProperty.Value -isnot [int]) -and ($sizeProperty.Value -isnot [long])) `
+            -or [long]$sizeProperty.Value -lt 0 `
+            -or [string]$row.sha256 -cnotmatch '^[0-9a-f]{64}$') {
+            throw "CLI app closure rows must contain exactly path, lowercase sha256, and non-negative integer size_bytes."
+        }
+        $target = Resolve-ContainedPackageFile $appRoot ([string]$row.path) "CLI app closure file"
+        $relative = Get-RelativePackagePath $target $appRoot
+        if ($relative -cne [string]$row.path) {
+            throw "CLI app closure path is not canonical: $($row.path)"
+        }
+        $key = $relative.ToLowerInvariant()
+        if ($listed.ContainsKey($key)) {
+            throw "Duplicate case-insensitive CLI app closure path: $relative"
+        }
+        $sortKey = $key + [char]0 + $relative
+        if ($null -ne $previousSortKey `
+            -and [StringComparer]::Ordinal.Compare($previousSortKey, $sortKey) -ge 0) {
+            throw "CLI app closure manifest paths are not canonically sorted."
+        }
+        $previousSortKey = $sortKey
+        $item = Get-Item -LiteralPath $target
+        if ([long]$item.Length -ne [long]$sizeProperty.Value `
+            -or (Get-Sha256 $target) -ne [string]$row.sha256) {
+            throw "CLI app closure file differs from its hash/size binding: $relative"
+        }
+        $listed[$key] = $relative
+        $basename = [IO.Path]::GetFileName($relative).ToLowerInvariant()
+        if ($requiredBasenames.ContainsKey($basename)) {
+            $requiredBasenames[$basename] = $true
+        }
+    }
+    $actual = @{}
+    foreach ($file in @(Get-PackagePayloadFiles $appRoot)) {
+        $relative = Get-RelativePackagePath $file.FullName $appRoot
+        $key = $relative.ToLowerInvariant()
+        if ($actual.ContainsKey($key)) {
+            throw "Duplicate case-insensitive delivered CLI app path: $relative"
+        }
+        $actual[$key] = $relative
+    }
+    $missing = @($listed.Keys | Where-Object { -not $actual.ContainsKey($_) })
+    $extra = @($actual.Keys | Where-Object { -not $listed.ContainsKey($_) })
+    if ($missing.Count -ne 0 -or $extra.Count -ne 0) {
+        throw "Delivered CLI app closure is not exact: missing=$($missing.Count), extra=$($extra.Count)."
+    }
+    $missingRequired = @($requiredBasenames.Keys | Where-Object { $requiredBasenames[$_] -ne $true })
+    if ($missingRequired.Count -ne 0) {
+        throw "Delivered CLI app closure lacks required managed/native payload: $($missingRequired -join ',')."
+    }
+    if ((Get-Sha256 $ManifestPath) -ne $ExpectedManifestSha256) {
+        throw "CLI app closure manifest changed during verification."
+    }
+    return [pscustomobject]@{
+        AppRoot = $appRoot
+        FileCount = $rows.Count
+        ClosureSha256 = $ExpectedManifestSha256
+    }
+}
+
+function Assert-HybridFormalEvidence(
+    [string]$PackageRoot,
+    [object]$Config,
+    [object]$Validation,
+    [object]$DetectorEvidence,
+    [object]$DeviceEvidence,
+    [object]$UnifiedEvidence,
+    [object]$PaddleEvidence
+) {
+    $requiredRecords = 10016
+    $configBindingProperty = $Config.PSObject.Properties["hybrid_ab_evidence"]
+    $validationBindingProperty = $Validation.PSObject.Properties["hybrid_formal_ab"]
+    if ($null -eq $configBindingProperty `
+        -or $null -eq $configBindingProperty.Value `
+        -or $null -eq $validationBindingProperty `
+        -or $null -eq $validationBindingProperty.Value) {
+        throw "Package config and validation must both bind the formal hybrid CPU A/B evidence."
+    }
+    $configBinding = $configBindingProperty.Value
+    $validationBinding = $validationBindingProperty.Value
+    foreach ($binding in @($configBinding, $validationBinding)) {
+        if ($binding.performed -ne $true `
+            -or [string]$binding.status -ne "accepted" `
+            -or [string]$binding.mode -ne "formal") {
+            throw "Hybrid CPU A/B binding is not an accepted formal run."
+        }
+    }
+
+    $requiredFiles = @(
+        @{
+            Key = "ComparisonSummary"
+            PathProperty = "comparison_summary"
+            HashProperty = "comparison_summary_sha256"
+            RelativePath = "evidence/hybrid-formal-ab-summary.json"
+        },
+        @{
+            Key = "ComparisonRows"
+            PathProperty = "comparison_comparisons"
+            HashProperty = "comparison_comparisons_sha256"
+            RelativePath = "evidence/hybrid-formal-ab-comparisons.jsonl"
+        },
+        @{
+            Key = "AccuracySummary"
+            PathProperty = "accuracy_summary"
+            HashProperty = "accuracy_summary_sha256"
+            RelativePath = "evidence/hybrid-formal-accuracy-summary.json"
+        },
+        @{
+            Key = "AccuracyRows"
+            PathProperty = "accuracy_comparisons"
+            HashProperty = "accuracy_comparisons_sha256"
+            RelativePath = "evidence/hybrid-formal-accuracy-comparisons.jsonl"
+        },
+        @{
+            Key = "InputManifest"
+            PathProperty = "input_manifest"
+            HashProperty = "input_manifest_sha256"
+            RelativePath = "evidence/hybrid-formal-fixed-inputs.txt"
+        },
+        @{
+            Key = "BaselineManifest"
+            PathProperty = "baseline_inference_manifest"
+            HashProperty = "baseline_inference_manifest_sha256"
+            RelativePath = "evidence/hybrid-formal-baseline-inference-manifest.json"
+        },
+        @{
+            Key = "HybridManifest"
+            PathProperty = "hybrid_inference_manifest"
+            HashProperty = "hybrid_inference_manifest_sha256"
+            RelativePath = "evidence/hybrid-formal-hybrid-inference-manifest.json"
+        },
+        @{
+            Key = "BaselineRuntimeSummary"
+            PathProperty = "baseline_runtime_summary"
+            HashProperty = "baseline_runtime_summary_sha256"
+            RelativePath = "evidence/hybrid-formal-baseline-inference-summary.json"
+        },
+        @{
+            Key = "HybridRuntimeSummary"
+            PathProperty = "hybrid_runtime_summary"
+            HashProperty = "hybrid_runtime_summary_sha256"
+            RelativePath = "evidence/hybrid-formal-hybrid-inference-summary.json"
+        },
+        @{
+            Key = "CliAppClosure"
+            PathProperty = "cli_app_closure_manifest"
+            HashProperty = "cli_app_closure_manifest_sha256"
+            RelativePath = "evidence/hybrid-formal-cli-app-closure.json"
+        }
+    )
+    $evidencePaths = @{}
+    foreach ($file in $requiredFiles) {
+        $pathName = [string]$file.PathProperty
+        $hashName = [string]$file.HashProperty
+        $configPathProperty = $configBinding.PSObject.Properties[$pathName]
+        $configHashProperty = $configBinding.PSObject.Properties[$hashName]
+        $validationPathProperty = $validationBinding.PSObject.Properties[$pathName]
+        $validationHashProperty = $validationBinding.PSObject.Properties[$hashName]
+        if ($null -eq $configPathProperty `
+            -or $null -eq $configHashProperty `
+            -or $null -eq $validationPathProperty `
+            -or $null -eq $validationHashProperty `
+            -or [string]$configPathProperty.Value -ne [string]$file.RelativePath `
+            -or [string]$validationPathProperty.Value -ne [string]$file.RelativePath `
+            -or [string]$configHashProperty.Value -cnotmatch '^[0-9a-f]{64}$' `
+            -or [string]$validationHashProperty.Value -cne [string]$configHashProperty.Value) {
+            throw "Package config/validation formal A/B file bindings disagree or are incomplete."
+        }
+        $resolvedPath = Resolve-ContainedPackageFile `
+            $PackageRoot ([string]$file.RelativePath) "formal hybrid CPU A/B evidence"
+        if ((Get-Item -LiteralPath $resolvedPath).Length -le 0 `
+            -or (Get-Sha256 $resolvedPath) -cne [string]$configHashProperty.Value) {
+            throw "Formal hybrid CPU A/B evidence does not match its contained hash binding."
+        }
+        $evidencePaths[[string]$file.Key] = $resolvedPath
+    }
+
+    $comparisonSummary = Get-Content `
+        -LiteralPath $evidencePaths["ComparisonSummary"] -Raw -Encoding UTF8 | ConvertFrom-Json
+    $comparisonFailures = @(
+        $comparisonSummary.failures |
+            ForEach-Object { [string]$_ } |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+    $p95Overhead = [double]$comparisonSummary.cpu.p95_overhead_ms
+    $p95Ceiling = [double]$comparisonSummary.cpu.max_p95_overhead_ms
+    $baselineP95 = [double]$comparisonSummary.cpu.baseline_inference_latency_ms.p95
+    $hybridP95 = [double]$comparisonSummary.cpu.hybrid_inference_latency_ms.p95
+    if ([int]$comparisonSummary.schema_version -ne 2 `
+        -or [string]$comparisonSummary.kind -ne "receipt_mlnet_hybrid_recipient_cpu_ab_v1" `
+        -or [string]$comparisonSummary.evaluation_mode -ne "formal" `
+        -or $comparisonSummary.accepted -ne $true `
+        -or $comparisonSummary.input_set_identical -ne $true `
+        -or $comparisonSummary.cli_summary_counts_verified -ne $true `
+        -or $comparisonFailures.Count -ne 0 `
+        -or [int]$comparisonSummary.records -ne $requiredRecords `
+        -or [int]$comparisonSummary.invariant_records -ne $requiredRecords `
+        -or [int]$comparisonSummary.input_set.records -ne $requiredRecords `
+        -or [int]$comparisonSummary.input_set.input_manifest.records -ne $requiredRecords `
+        -or [int]$comparisonSummary.run_manifests.baseline.records -ne $requiredRecords `
+        -or [int]$comparisonSummary.run_manifests.hybrid.records -ne $requiredRecords `
+        -or [string]$comparisonSummary.input_set.normalized_source_set_sha256 -notmatch '^[0-9a-f]{64}$' `
+        -or [string]$comparisonSummary.input_set.normalized_source_set_sha256 -ne `
+            [string]$comparisonSummary.input_set.input_manifest.normalized_source_set_sha256 `
+        -or [string]$comparisonSummary.input_set.normalized_source_set_sha256 -ne `
+            [string]$comparisonSummary.run_manifests.baseline.normalized_source_set_sha256 `
+        -or [string]$comparisonSummary.input_set.normalized_source_set_sha256 -ne `
+            [string]$comparisonSummary.run_manifests.hybrid.normalized_source_set_sha256 `
+        -or [string]$comparisonSummary.input_set.input_manifest.sha256 -notmatch '^[0-9a-f]{64}$' `
+        -or [long]$comparisonSummary.input_set.input_manifest.size_bytes -le 0 `
+        -or [string]$comparisonSummary.run_manifests.baseline.sha256 -notmatch '^[0-9a-f]{64}$' `
+        -or [long]$comparisonSummary.run_manifests.baseline.size_bytes -le 0 `
+        -or [string]$comparisonSummary.run_manifests.hybrid.sha256 -notmatch '^[0-9a-f]{64}$' `
+        -or [long]$comparisonSummary.run_manifests.hybrid.size_bytes -le 0 `
+        -or [string]$comparisonSummary.cli_build.assembly.sha256 -cnotmatch '^[0-9a-f]{64}$' `
+        -or [long]$comparisonSummary.cli_build.assembly.size_bytes -le 0 `
+        -or [double]$comparisonSummary.recipient_candidate_coverage -ne 1.0 `
+        -or [double]::IsNaN($p95Overhead) `
+        -or [double]::IsInfinity($p95Overhead) `
+        -or [double]::IsNaN($p95Ceiling) `
+        -or [double]::IsInfinity($p95Ceiling) `
+        -or [double]::IsNaN($baselineP95) `
+        -or [double]::IsInfinity($baselineP95) `
+        -or [double]::IsNaN($hybridP95) `
+        -or [double]::IsInfinity($hybridP95) `
+        -or $p95Ceiling -lt 0.0 `
+        -or $p95Ceiling -gt 250.0 `
+        -or $p95Overhead -gt $p95Ceiling `
+        -or $baselineP95 -lt 0.0 `
+        -or $hybridP95 -lt 0.0) {
+        throw "Formal hybrid CPU A/B comparison is not a clean 10016-record pass within the fixed p95 ceiling."
+    }
+    $baselineRuntimePath = $evidencePaths["BaselineRuntimeSummary"]
+    $hybridRuntimePath = $evidencePaths["HybridRuntimeSummary"]
+    $baselineRuntimeRecord = $comparisonSummary.run_summaries.baseline
+    $hybridRuntimeRecord = $comparisonSummary.run_summaries.hybrid
+    $baselineRuntimeSizeProperty = $baselineRuntimeRecord.PSObject.Properties["size_bytes"]
+    $hybridRuntimeSizeProperty = $hybridRuntimeRecord.PSObject.Properties["size_bytes"]
+    $baselineRuntimeItem = Get-Item -LiteralPath $baselineRuntimePath
+    $hybridRuntimeItem = Get-Item -LiteralPath $hybridRuntimePath
+    if ([string]::IsNullOrWhiteSpace([string]$baselineRuntimeRecord.path) `
+        -or [string]::IsNullOrWhiteSpace([string]$hybridRuntimeRecord.path) `
+        -or $null -eq $baselineRuntimeSizeProperty `
+        -or $null -eq $baselineRuntimeSizeProperty.Value `
+        -or (($baselineRuntimeSizeProperty.Value -isnot [int]) `
+            -and ($baselineRuntimeSizeProperty.Value -isnot [long])) `
+        -or $null -eq $hybridRuntimeSizeProperty `
+        -or $null -eq $hybridRuntimeSizeProperty.Value `
+        -or (($hybridRuntimeSizeProperty.Value -isnot [int]) `
+            -and ($hybridRuntimeSizeProperty.Value -isnot [long])) `
+        -or [string]$baselineRuntimeRecord.sha256 -cnotmatch '^[0-9a-f]{64}$' `
+        -or [long]$baselineRuntimeSizeProperty.Value -le 0 `
+        -or [string]$hybridRuntimeRecord.sha256 -cnotmatch '^[0-9a-f]{64}$' `
+        -or [long]$hybridRuntimeSizeProperty.Value -le 0 `
+        -or (Get-Sha256 $baselineRuntimePath) -ne [string]$baselineRuntimeRecord.sha256 `
+        -or (Get-Sha256 $hybridRuntimePath) -ne [string]$hybridRuntimeRecord.sha256 `
+        -or [long]$baselineRuntimeItem.Length -ne [long]$baselineRuntimeRecord.size_bytes `
+        -or [long]$hybridRuntimeItem.Length -ne [long]$hybridRuntimeRecord.size_bytes) {
+        throw "Formal hybrid CPU A/B runtime summaries do not match their hash/size bindings."
+    }
+    $baselineRuntime = Get-Content -LiteralPath $baselineRuntimePath -Raw -Encoding UTF8 | ConvertFrom-Json
+    $hybridRuntime = Get-Content -LiteralPath $hybridRuntimePath -Raw -Encoding UTF8 | ConvertFrom-Json
+    foreach ($runtime in @(
+            [pscustomobject]@{ Name = "baseline"; Summary = $baselineRuntime; Paddle = $null },
+            [pscustomobject]@{ Name = "hybrid"; Summary = $hybridRuntime; Paddle = "cpu" }
+        )) {
+        $paddleProviderProperty = $runtime.Summary.PSObject.Properties["paddle_ocr_provider"]
+        $runtimeP95 = [double]$runtime.Summary.inference_latency_ms.p95
+        if ([string]$runtime.Summary.requested_device -ne "cpu" `
+            -or [string]$runtime.Summary.unified_provider -ne "cpu" `
+            -or [int]$runtime.Summary.input -ne $requiredRecords `
+            -or [int]$runtime.Summary.written -ne $requiredRecords `
+            -or [int]$runtime.Summary.skipped -ne 0 `
+            -or [int]$runtime.Summary.errors -ne 0 `
+            -or [int]$runtime.Summary.inference_latency_ms.count -ne $requiredRecords `
+            -or [double]::IsNaN($runtimeP95) `
+            -or [double]::IsInfinity($runtimeP95) `
+            -or $runtimeP95 -lt 0.0 `
+            -or $null -eq $paddleProviderProperty `
+            -or ($null -eq $runtime.Paddle -and $null -ne $paddleProviderProperty.Value) `
+            -or ($null -ne $runtime.Paddle -and [string]$paddleProviderProperty.Value -ne "cpu")) {
+            throw "Formal hybrid CPU A/B $($runtime.Name) runtime summary is not a complete CPU run."
+        }
+    }
+    $rawBaselineP95 = [double]$baselineRuntime.inference_latency_ms.p95
+    $rawHybridP95 = [double]$hybridRuntime.inference_latency_ms.p95
+    $rawP95Overhead = $rawHybridP95 - $rawBaselineP95
+    if ($baselineP95 -ne $rawBaselineP95 `
+        -or $hybridP95 -ne $rawHybridP95 `
+        -or $p95Overhead -ne $rawP95Overhead `
+        -or $rawP95Overhead -gt $p95Ceiling) {
+        throw "Formal hybrid CPU A/B p95 values do not equal the contained runtime summaries."
+    }
+
+    $appClosure = $comparisonSummary.cli_build.app_closure
+    $closureManifestRecord = $appClosure.manifest
+    $closureFileCountProperty = $appClosure.PSObject.Properties["file_count"]
+    $closureManifestSizeProperty = $closureManifestRecord.PSObject.Properties["size_bytes"]
+    $closureManifestPath = $evidencePaths["CliAppClosure"]
+    $closureManifestItem = Get-Item -LiteralPath $closureManifestPath
+    if ([string]::IsNullOrWhiteSpace([string]$appClosure.root) `
+        -or [string]::IsNullOrWhiteSpace([string]$closureManifestRecord.path) `
+        -or $null -eq $closureFileCountProperty `
+        -or $null -eq $closureFileCountProperty.Value `
+        -or (($closureFileCountProperty.Value -isnot [int]) `
+            -and ($closureFileCountProperty.Value -isnot [long])) `
+        -or $null -eq $closureManifestSizeProperty `
+        -or $null -eq $closureManifestSizeProperty.Value `
+        -or (($closureManifestSizeProperty.Value -isnot [int]) `
+            -and ($closureManifestSizeProperty.Value -isnot [long])) `
+        -or [string]$appClosure.closure_sha256 -cnotmatch '^[0-9a-f]{64}$' `
+        -or [string]$closureManifestRecord.sha256 -cnotmatch '^[0-9a-f]{64}$' `
+        -or [string]$appClosure.closure_sha256 -ne [string]$closureManifestRecord.sha256 `
+        -or [string]$appClosure.closure_sha256 -ne (Get-Sha256 $closureManifestPath) `
+        -or [long]$closureManifestSizeProperty.Value -ne [long]$closureManifestItem.Length `
+        -or [int]$closureFileCountProperty.Value -le 0) {
+        throw "Formal hybrid CPU A/B CLI app closure digest, size, or file_count is inconsistent."
+    }
+    $verifiedClosure = Assert-ContainedCliAppClosure `
+        $PackageRoot $closureManifestPath ([string]$appClosure.closure_sha256) `
+        ([int]$closureFileCountProperty.Value)
+    if ([string]$comparisonSummary.artifact_hashes.detector_sha256 -ne [string]$DetectorEvidence.ModelSha256 `
+        -or [string]$comparisonSummary.artifact_hashes.detector_contract_sha256 -ne [string]$DetectorEvidence.ContractSha256 `
+        -or [string]$comparisonSummary.artifact_hashes.device_sha256 -ne [string]$DeviceEvidence.ModelSha256 `
+        -or [string]$comparisonSummary.artifact_hashes.device_contract_sha256 -ne [string]$DeviceEvidence.ContractSha256 `
+        -or [string]$comparisonSummary.artifact_hashes.unified_ocr_model_sha256 -ne [string]$UnifiedEvidence.ModelSha256 `
+        -or [string]$comparisonSummary.artifact_hashes.unified_ocr_labels_sha256 -ne [string]$UnifiedEvidence.LabelsSha256 `
+        -or [string]$comparisonSummary.artifact_hashes.unified_ocr_contract_sha256 -ne [string]$UnifiedEvidence.ContractSha256 `
+        -or [string]$comparisonSummary.paddle_delivery.contract_sha256 -ne [string]$PaddleEvidence.ContractSha256 `
+        -or [long]$comparisonSummary.paddle_delivery.package_size_bytes -ne `
+            [long]$PaddleEvidence.PackageSizeBytes) {
+        throw "Formal hybrid CPU A/B comparison is not bound to every delivered model."
+    }
+    $fixedInputRows = @(
+        Get-Content -LiteralPath $evidencePaths["InputManifest"] -Encoding UTF8 |
+            ForEach-Object { $_.Trim() } |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and -not $_.StartsWith("#") }
+    )
+    $baselineManifest = Get-Content `
+        -LiteralPath $evidencePaths["BaselineManifest"] -Raw -Encoding UTF8 | ConvertFrom-Json
+    $hybridManifest = Get-Content `
+        -LiteralPath $evidencePaths["HybridManifest"] -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ($fixedInputRows.Count -ne $requiredRecords `
+        -or @($fixedInputRows | Sort-Object -Unique).Count -ne $requiredRecords `
+        -or @($baselineManifest).Count -ne $requiredRecords `
+        -or @($hybridManifest).Count -ne $requiredRecords `
+        -or (Get-Sha256 $evidencePaths["InputManifest"]) -ne `
+            [string]$comparisonSummary.input_set.input_manifest.sha256 `
+        -or (Get-Sha256 $evidencePaths["BaselineManifest"]) -ne `
+            [string]$comparisonSummary.run_manifests.baseline.sha256 `
+        -or (Get-Sha256 $evidencePaths["HybridManifest"]) -ne `
+            [string]$comparisonSummary.run_manifests.hybrid.sha256) {
+        throw "Formal hybrid CPU A/B source and run manifests are not the contained 10016-record evidence."
+    }
+    $deliveredAssembly = Resolve-ContainedPackageFile `
+        $PackageRoot "app/ReceiptMlNet.Cli.dll" "ReceiptMlNet assembly bound by formal A/B"
+    $deliveredAssemblyItem = Get-Item -LiteralPath $deliveredAssembly
+    $deliveredAssemblySize = [long]$deliveredAssemblyItem.Length
+    if ([string]$comparisonSummary.cli_build.assembly.sha256 -cne (Get-Sha256 $deliveredAssembly) `
+        -or [long]$comparisonSummary.cli_build.assembly.size_bytes -ne `
+            $deliveredAssemblySize) {
+        throw "Formal hybrid CPU A/B comparison was not produced by the delivered CLI build."
+    }
+    foreach ($role in @("det", "cls", "rec")) {
+        $comparisonModel = $comparisonSummary.paddle_delivery.models.PSObject.Properties[$role].Value
+        $deliveredModel = $PaddleEvidence.Models[$role]
+        if ([string]$comparisonModel.path -ne (Get-RelativePackagePath $deliveredModel.Path $PaddleEvidence.BundlePath) `
+            -or [string]$comparisonModel.sha256 -ne [string]$deliveredModel.Sha256 `
+            -or [long]$comparisonModel.size_bytes -ne [long]$deliveredModel.SizeBytes) {
+            throw "Formal hybrid CPU A/B comparison PP-OCR $role binding is inconsistent."
+        }
+    }
+    if ([string]$comparisonSummary.paddle_delivery.dictionary.path -ne `
+            (Get-RelativePackagePath $PaddleEvidence.Dictionary.Path $PaddleEvidence.BundlePath) `
+        -or [string]$comparisonSummary.paddle_delivery.dictionary.sha256 -ne `
+            [string]$PaddleEvidence.Dictionary.Sha256 `
+        -or [long]$comparisonSummary.paddle_delivery.dictionary.size_bytes -ne `
+            [long]$PaddleEvidence.Dictionary.SizeBytes) {
+        throw "Formal hybrid CPU A/B comparison PP-OCR dictionary binding is inconsistent."
+    }
+
+    $accuracySummary = Get-Content `
+        -LiteralPath $evidencePaths["AccuracySummary"] -Raw -Encoding UTF8 | ConvertFrom-Json
+    $accuracyFailures = @(
+        $accuracySummary.failures |
+            ForEach-Object { [string]$_ } |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+    $requestedLimitProperty = $accuracySummary.evaluation_scope.PSObject.Properties["requested_limit"]
+    $maxStatusSafetyProperty = $accuracySummary.acceptance.PSObject.Properties["max_non_success_to_success"]
+    if ([int]$accuracySummary.schema_version -ne 1 `
+        -or [string]$accuracySummary.kind -ne "receipt_mlnet_unified_candidate_evaluation_v1" `
+        -or [string]$accuracySummary.evaluation_split -ne "val" `
+        -or [string]$accuracySummary.model_sha256 -ne [string]$UnifiedEvidence.ModelSha256 `
+        -or [string]$accuracySummary.manifest_sha256 -ne `
+            [string]$comparisonSummary.run_manifests.hybrid.sha256 `
+        -or $accuracySummary.formal_delivery_gate -ne $true `
+        -or $accuracySummary.accepted -ne $true `
+        -or $accuracySummary.acceptance.passed -ne $true `
+        -or $accuracySummary.acceptance.formal_delivery_gate -ne $true `
+        -or $accuracyFailures.Count -ne 0 `
+        -or [string]$accuracySummary.evaluation_scope.kind -ne "full_split" `
+        -or $null -eq $requestedLimitProperty `
+        -or $null -ne $requestedLimitProperty.Value `
+        -or [int]$accuracySummary.evaluation_scope.evaluated_expected_receipts -ne $requiredRecords `
+        -or [int]$accuracySummary.evaluation_scope.full_split_expected_receipts -ne $requiredRecords `
+        -or $accuracySummary.artifact_audit.all_results_match_model -ne $true `
+        -or [int]$accuracySummary.coverage.expected_receipts -ne $requiredRecords `
+        -or [int]$accuracySummary.coverage.matched_result_receipts -ne $requiredRecords `
+        -or [int]$accuracySummary.coverage.fully_scored_receipts -ne $requiredRecords `
+        -or [double]$accuracySummary.coverage.result_coverage -ne 1.0 `
+        -or [double]$accuracySummary.coverage.fully_scored_coverage -ne 1.0 `
+        -or $null -eq $maxStatusSafetyProperty `
+        -or $null -eq $maxStatusSafetyProperty.Value `
+        -or (($maxStatusSafetyProperty.Value -isnot [int]) `
+            -and ($maxStatusSafetyProperty.Value -isnot [long])) `
+        -or [int]$maxStatusSafetyProperty.Value -ne 0) {
+        throw "Formal hybrid CPU A/B accuracy is not a complete accepted 10016-record full-split score."
+    }
+    $fixedFloors = @(
+        @{ Field = "amount"; Floor = 0.7885 },
+        @{ Field = "time"; Floor = 0.9840 },
+        @{ Field = "payment_method_field"; Floor = 0.9325 },
+        @{ Field = "recipient_field"; Floor = 0.90 },
+        @{ Field = "transfer_status"; Floor = 0.90 }
+    )
+    foreach ($gate in $fixedFloors) {
+        $fieldName = [string]$gate.Field
+        $requiredFloor = [double]$gate.Floor
+        $metricProperty = $accuracySummary.by_field.PSObject.Properties[$fieldName]
+        $floorProperty = $accuracySummary.floors.PSObject.Properties[$fieldName]
+        if ($null -eq $metricProperty `
+            -or $null -eq $floorProperty `
+            -or [double]$floorProperty.Value -ne $requiredFloor `
+            -or [int]$metricProperty.Value.records -ne $requiredRecords `
+            -or [double]$metricProperty.Value.candidate_coverage -ne 1.0 `
+            -or [double]$metricProperty.Value.raw_exact_match -lt $requiredFloor) {
+            throw "Formal hybrid CPU A/B accuracy did not pass the fixed $fieldName floor with 100% candidate coverage."
+        }
+    }
+    if ([int]$accuracySummary.by_field.transfer_status.non_success_to_success -ne 0) {
+        throw "Formal hybrid CPU A/B status evidence crossed the zero non-success-to-success safety line."
+    }
+    $bindingProperties = @(
+        "source",
+        "records_sha256",
+        "expected_receipts",
+        "normalized_source_set_sha256",
+        "input_manifest_sha256",
+        "baseline_inference_manifest_sha256",
+        "hybrid_inference_manifest_sha256",
+        "score_manifest_sha256",
+        "cli_assembly",
+        "cli_assembly_sha256",
+        "cli_assembly_size_bytes",
+        "cli_app_closure_sha256",
+        "cli_app_closure_file_count",
+        "paddle_contract_sha256",
+        "paddle_package_size_bytes",
+        "invariant_records",
+        "recipient_candidate_coverage",
+        "cpu_p95_overhead_ms",
+        "max_cpu_p95_overhead_ms",
+        "recipient_exact_match"
+    )
+    foreach ($propertyName in $bindingProperties) {
+        $configProperty = $configBinding.PSObject.Properties[$propertyName]
+        $validationProperty = $validationBinding.PSObject.Properties[$propertyName]
+        if ($null -eq $configProperty `
+            -or $null -eq $validationProperty `
+            -or [string]$configProperty.Value -ne [string]$validationProperty.Value) {
+            throw "Package config/validation formal A/B scalar bindings disagree: $propertyName"
+        }
+    }
+    if ([string]$configBinding.records_sha256 -ne [string]$Config.records_sha256 `
+        -or [string]$configBinding.records_sha256 -ne [string]$Validation.end_to_end_evaluation.records_sha256 `
+        -or [string]$configBinding.records_sha256 -ne [string]$accuracySummary.records_sha256 `
+        -or [int]$configBinding.expected_receipts -ne $requiredRecords `
+        -or [string]$configBinding.normalized_source_set_sha256 -ne `
+            [string]$comparisonSummary.input_set.normalized_source_set_sha256 `
+        -or [string]$configBinding.input_manifest_sha256 -ne `
+            [string]$comparisonSummary.input_set.input_manifest.sha256 `
+        -or [string]$configBinding.baseline_inference_manifest_sha256 -ne `
+            [string]$comparisonSummary.run_manifests.baseline.sha256 `
+        -or [string]$configBinding.hybrid_inference_manifest_sha256 -ne `
+            [string]$comparisonSummary.run_manifests.hybrid.sha256 `
+        -or [string]$configBinding.baseline_runtime_summary_sha256 -ne `
+            [string]$comparisonSummary.run_summaries.baseline.sha256 `
+        -or [string]$configBinding.hybrid_runtime_summary_sha256 -ne `
+            [string]$comparisonSummary.run_summaries.hybrid.sha256 `
+        -or [string]$configBinding.score_manifest_sha256 -ne [string]$accuracySummary.manifest_sha256 `
+        -or [string]$configBinding.cli_assembly -ne "app/ReceiptMlNet.Cli.dll" `
+        -or [string]$configBinding.cli_assembly_sha256 -ne (Get-Sha256 $deliveredAssembly) `
+        -or [long]$configBinding.cli_assembly_size_bytes -ne $deliveredAssemblySize `
+        -or [string]$configBinding.cli_app_closure_manifest_sha256 -cne `
+            [string]$verifiedClosure.ClosureSha256 `
+        -or [string]$configBinding.cli_app_closure_sha256 -cne `
+            [string]$verifiedClosure.ClosureSha256 `
+        -or [int]$configBinding.cli_app_closure_file_count -ne [int]$verifiedClosure.FileCount `
+        -or [string]$validationBinding.cli_app_closure_sha256 -cne `
+            [string]$verifiedClosure.ClosureSha256 `
+        -or [int]$validationBinding.cli_app_closure_file_count -ne [int]$verifiedClosure.FileCount `
+        -or [string]$configBinding.paddle_contract_sha256 -ne [string]$PaddleEvidence.ContractSha256 `
+        -or [long]$configBinding.paddle_package_size_bytes -ne [long]$PaddleEvidence.PackageSizeBytes `
+        -or [int]$configBinding.invariant_records -ne $requiredRecords `
+        -or [double]$configBinding.recipient_candidate_coverage -ne 1.0 `
+        -or [double]$configBinding.cpu_p95_overhead_ms -ne $p95Overhead `
+        -or [double]$configBinding.max_cpu_p95_overhead_ms -ne $p95Ceiling `
+        -or [double]$configBinding.recipient_exact_match -ne `
+            [double]$accuracySummary.by_field.recipient_field.raw_exact_match) {
+        throw "Formal hybrid CPU A/B bindings do not agree with their scored and runtime evidence."
+    }
+}
+
+function Assert-FreshFormalAccuracyEvidence(
+    [object]$Summary,
+    [string]$ExpectedModelSha256,
+    [string]$ExpectedRecordsSha256,
+    [string]$ExpectedManifestSha256
+) {
+    $requiredRecords = 10016
+    $failures = @(
+        $Summary.failures |
+            ForEach-Object { [string]$_ } |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+    $acceptanceFailures = @(
+        $Summary.acceptance.failures |
+            ForEach-Object { [string]$_ } |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+    $requestedLimitProperty = $Summary.evaluation_scope.PSObject.Properties["requested_limit"]
+    $maxStatusSafetyProperty = $Summary.acceptance.PSObject.Properties["max_non_success_to_success"]
+    if ([int]$Summary.schema_version -ne 1 `
+        -or [string]$Summary.kind -ne "receipt_mlnet_unified_candidate_evaluation_v1" `
+        -or [string]$Summary.evaluation_split -ne "val" `
+        -or [string]$Summary.model_sha256 -ne $ExpectedModelSha256 `
+        -or [string]$Summary.records_sha256 -ne $ExpectedRecordsSha256 `
+        -or [string]$Summary.manifest_sha256 -ne $ExpectedManifestSha256 `
+        -or $Summary.formal_delivery_gate -ne $true `
+        -or $Summary.accepted -ne $true `
+        -or $Summary.acceptance.passed -ne $true `
+        -or $Summary.acceptance.formal_delivery_gate -ne $true `
+        -or $failures.Count -ne 0 `
+        -or $acceptanceFailures.Count -ne 0 `
+        -or [string]$Summary.evaluation_scope.kind -ne "full_split" `
+        -or $null -eq $requestedLimitProperty `
+        -or $null -ne $requestedLimitProperty.Value `
+        -or [int]$Summary.evaluation_scope.evaluated_expected_receipts -ne $requiredRecords `
+        -or [int]$Summary.evaluation_scope.full_split_expected_receipts -ne $requiredRecords `
+        -or $Summary.artifact_audit.all_results_match_model -ne $true `
+        -or [int]$Summary.coverage.expected_receipts -ne $requiredRecords `
+        -or [int]$Summary.coverage.matched_result_receipts -ne $requiredRecords `
+        -or [int]$Summary.coverage.fully_scored_receipts -ne $requiredRecords `
+        -or [double]$Summary.coverage.result_coverage -ne 1.0 `
+        -or [double]$Summary.coverage.fully_scored_coverage -ne 1.0 `
+        -or $null -eq $maxStatusSafetyProperty `
+        -or $null -eq $maxStatusSafetyProperty.Value `
+        -or (($maxStatusSafetyProperty.Value -isnot [int]) `
+            -and ($maxStatusSafetyProperty.Value -isnot [long])) `
+        -or [int]$maxStatusSafetyProperty.Value -ne 0) {
+        throw "Fresh package accuracy evidence is not an accepted 10016-record formal full-split result."
+    }
+
+    $fixedFloors = @(
+        @{ Field = "amount"; Floor = 0.7885 },
+        @{ Field = "time"; Floor = 0.9840 },
+        @{ Field = "payment_method_field"; Floor = 0.9325 },
+        @{ Field = "recipient_field"; Floor = 0.90 },
+        @{ Field = "transfer_status"; Floor = 0.90 }
+    )
+    foreach ($gate in $fixedFloors) {
+        $fieldName = [string]$gate.Field
+        $requiredFloor = [double]$gate.Floor
+        $metricProperty = $Summary.by_field.PSObject.Properties[$fieldName]
+        $floorProperty = $Summary.floors.PSObject.Properties[$fieldName]
+        if ($null -eq $metricProperty -or $null -eq $floorProperty) {
+            throw "Fresh package accuracy evidence is missing $fieldName metrics or its fixed floor."
+        }
+        $records = [int]$metricProperty.Value.records
+        $coverage = [double]$metricProperty.Value.candidate_coverage
+        $exactMatch = [double]$metricProperty.Value.raw_exact_match
+        if ([double]$floorProperty.Value -ne $requiredFloor `
+            -or $records -ne $requiredRecords `
+            -or [double]::IsNaN($coverage) `
+            -or [double]::IsInfinity($coverage) `
+            -or $coverage -ne 1.0 `
+            -or [double]::IsNaN($exactMatch) `
+            -or [double]::IsInfinity($exactMatch) `
+            -or $exactMatch -lt $requiredFloor) {
+            throw "Fresh package accuracy evidence did not pass the fixed $fieldName floor with 100% candidate coverage."
+        }
+    }
+    $statusSafetyProperty = `
+        $Summary.by_field.transfer_status.PSObject.Properties["non_success_to_success"]
+    if ($null -eq $statusSafetyProperty `
+        -or $null -eq $statusSafetyProperty.Value `
+        -or (($statusSafetyProperty.Value -isnot [int]) `
+            -and ($statusSafetyProperty.Value -isnot [long])) `
+        -or [int]$statusSafetyProperty.Value -ne 0) {
+        throw "Fresh package transfer-status evidence crossed the zero non-success-to-success safety line."
+    }
 }
 
 function Assert-AcceptedPackageBinding(
@@ -521,7 +1383,8 @@ function Assert-AcceptedPackageBinding(
     [object]$Validation,
     [object]$DetectorEvidence,
     [object]$DeviceEvidence,
-    [object]$UnifiedEvidence
+    [object]$UnifiedEvidence,
+    [object]$PaddleEvidence
 ) {
     $configDeclaration = $Config.PSObject.Properties["model_artifacts"]
     $validationDeclaration = $Validation.PSObject.Properties["model_artifacts"]
@@ -534,10 +1397,13 @@ function Assert-AcceptedPackageBinding(
     }
     Assert-DeclaredModelArtifacts `
         $configDeclaration.Value $PackageRoot `
-        $DetectorEvidence $DeviceEvidence $UnifiedEvidence "Package config"
+        $DetectorEvidence $DeviceEvidence $UnifiedEvidence $PaddleEvidence "Package config"
     Assert-DeclaredModelArtifacts `
         $validationDeclaration.Value $PackageRoot `
-        $DetectorEvidence $DeviceEvidence $UnifiedEvidence "Package validation"
+        $DetectorEvidence $DeviceEvidence $UnifiedEvidence $PaddleEvidence "Package validation"
+    Assert-HybridFormalEvidence `
+        $PackageRoot $Config $Validation `
+        $DetectorEvidence $DeviceEvidence $UnifiedEvidence $PaddleEvidence
 
     $onnxValidationPath = Resolve-ContainedPackageFile `
         $PackageRoot "evidence/onnx-validation-summary.json" "ONNX validation summary"
@@ -554,13 +1420,22 @@ function Assert-AcceptedPackageBinding(
             ForEach-Object { [string]$_ } |
             Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
     )
+    $nonRecipientOnnxFailures = @(
+        $onnxFailures |
+            Where-Object { -not $_.StartsWith("recipient_field:", [StringComparison]::Ordinal) }
+    )
     $endToEndFailures = @(
         $endToEndSummary.failures |
             ForEach-Object { [string]$_ } |
             Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
     )
     $manifestSha256 = Get-Sha256 $inferenceManifestPath
-    if ([string]$Validation.model_sha256 -ne [string]$UnifiedEvidence.ModelSha256 `
+    Assert-FreshFormalAccuracyEvidence `
+        $endToEndSummary ([string]$UnifiedEvidence.ModelSha256) `
+        ([string]$Config.records_sha256) $manifestSha256
+    if ([int]$onnxValidation.schema_version -ne 1 `
+        -or [int]$endToEndSummary.schema_version -ne 1 `
+        -or [string]$Validation.model_sha256 -ne [string]$UnifiedEvidence.ModelSha256 `
         -or [string]$Validation.end_to_end_evaluation.model_sha256 -ne [string]$UnifiedEvidence.ModelSha256 `
         -or [string]$Validation.onnx_validation.summary_sha256 -ne (Get-Sha256 $onnxValidationPath) `
         -or [string]$Validation.end_to_end_evaluation.summary_sha256 -ne (Get-Sha256 $endToEndSummaryPath) `
@@ -569,8 +1444,9 @@ function Assert-AcceptedPackageBinding(
         -or [string]$onnxValidation.model_sha256 -ne [string]$UnifiedEvidence.ModelSha256 `
         -or [string]$onnxValidation.evaluation_split -ne "val" `
         -or $onnxValidation.acceptance.requested -ne $true `
-        -or $onnxValidation.acceptance.passed -ne $true `
-        -or $onnxFailures.Count -ne 0 `
+        -or $nonRecipientOnnxFailures.Count -ne 0 `
+        -or ($onnxValidation.acceptance.passed -eq $true -and $onnxFailures.Count -ne 0) `
+        -or ($onnxValidation.acceptance.passed -ne $true -and $onnxFailures.Count -eq 0) `
         -or [string]$endToEndSummary.kind -ne "receipt_mlnet_unified_candidate_evaluation_v1" `
         -or [string]$endToEndSummary.evaluation_split -ne "val" `
         -or [string]$endToEndSummary.model_sha256 -ne [string]$UnifiedEvidence.ModelSha256 `
@@ -645,7 +1521,8 @@ function Assert-ResultProvenanceAndPolicy(
     [string]$ExpectedSource,
     [object]$DetectorEvidence,
     [object]$DeviceEvidence,
-    [object]$UnifiedEvidence
+    [object]$UnifiedEvidence,
+    [object]$PaddleEvidence
 ) {
     Assert-CurrentResultSemantics $Result $ResultPath
     $sourceProperty = if ($null -eq $Result) { $null } else { $Result.PSObject.Properties["source"] }
@@ -661,7 +1538,7 @@ function Assert-ResultProvenanceAndPolicy(
         -or $null -eq $deviceProperty.Value `
         -or $null -eq $contractsProperty `
         -or $null -eq $contractsProperty.Value) {
-        throw "Result does not prove the complete three-model ML.NET CPU path: $ResultPath"
+        throw "Result does not prove the complete detector/device/v13/PP-OCR CPU path: $ResultPath"
     }
     Assert-ProductionGeometry $geometryProperty.Value $ResultPath
     if ($null -eq $sourceProperty -or [string]::IsNullOrWhiteSpace([string]$sourceProperty.Value)) {
@@ -683,6 +1560,8 @@ function Assert-ResultProvenanceAndPolicy(
         device = [string]$DeviceEvidence.ContractFileName
         device_sha256 = [string]$DeviceEvidence.ModelSha256
         device_contract_sha256 = [string]$DeviceEvidence.ContractSha256
+        ocr_bundle = [string]$PaddleEvidence.ContractFileName
+        ocr_bundle_contract_sha256 = [string]$PaddleEvidence.ContractSha256
         unified_ocr_model = [string]$UnifiedEvidence.ModelFileName
         unified_ocr_contract = [string]$UnifiedEvidence.ContractFileName
         unified_ocr_model_sha256 = [string]$UnifiedEvidence.ModelSha256
@@ -826,23 +1705,30 @@ $config = Get-Content -LiteralPath $configPath -Raw -Encoding UTF8 | ConvertFrom
 $validation = Get-Content -LiteralPath $validationPath -Raw -Encoding UTF8 | ConvertFrom-Json
 $requiredTextPolicy = "review_only_pending_independent_human_truth_calibration"
 $requiredReviewValue = "review"
-if ([string]$config.kind -ne "receipt_mlnet_unified_delivery_package_v1" `
+if ([int]$config.schema_version -ne 1 `
+    -or [string]$config.kind -ne "receipt_mlnet_hybrid_recipient_delivery_package_v1" `
     -or [string]$config.validation_scope -ne "full_val_end_to_end_scored_cpu" `
     -or [string]$config.onnx_runtime_flavor -ne "cpu" `
     -or [string]$config.runtime_device -ne "cpu" `
     -or [string]$config.rectification -ne "max-side-1600" `
     -or [string]$config.orientation_rule -ne "exif_upright_landscape_clockwise_90" `
+    -or [string]$config.ocr_mode -ne "hybrid-recipient" `
     -or [string]::IsNullOrWhiteSpace([string]$config.device_model) `
     -or [string]$config.text_delivery_policy -ne $requiredTextPolicy) {
-    throw "This is not an accepted three-model production CPU package."
+    throw "This is not an accepted hybrid-recipient production CPU package."
 }
-if ([string]$validation.kind -ne "receipt_mlnet_unified_package_validation_v1" `
+if ([int]$validation.schema_version -ne 1 `
+    -or [string]$validation.kind -ne "receipt_mlnet_hybrid_recipient_package_validation_v1" `
     -or [string]$validation.validation_scope -ne "full_val_end_to_end_scored_cpu" `
     -or [string]$validation.runtime_flavor -ne "cpu" `
     -or [string]$validation.runtime_device -ne "cpu" `
     -or [string]$validation.rectification -ne "max-side-1600" `
     -or [string]$validation.orientation_rule -ne "exif_upright_landscape_clockwise_90" `
+    -or [string]$validation.ocr_mode -ne "hybrid-recipient" `
     -or $validation.include_device_model -ne $true `
+    -or [string]$validation.inference_summary.requested_device -ne "cpu" `
+    -or [string]$validation.inference_summary.unified_provider -ne "cpu" `
+    -or [string]$validation.inference_summary.paddle_ocr_provider -ne "cpu" `
     -or $validation.end_to_end_evaluation.performed -ne $true `
     -or [string]$validation.end_to_end_evaluation.status -ne "accepted") {
     throw "Delivery package evidence has not accepted the complete CPU full-val run."
@@ -908,13 +1794,19 @@ $unifiedEvidence = Read-UnifiedModelEvidence `
 if ([int]$unifiedEvidence.ArchitectureVersion -ne 13) {
     throw "This production entrypoint requires architecture-v13 visible transfer-status OCR. The package contains a legacy v12 status classifier; use a v13 delivery package."
 }
+$recipientDeclaration = $config.model_artifacts.PSObject.Properties["recipient_ppocr"]
+if ($null -eq $recipientDeclaration -or $null -eq $recipientDeclaration.Value) {
+    throw "Package config does not contain the recipient PP-OCR artifact declaration."
+}
+$paddleEvidence = Read-PaddleRecipientEvidence $packageRoot $recipientDeclaration.Value
 Assert-AcceptedPackageBinding `
-    $packageRoot $config $validation $detectorEvidence $deviceEvidence $unifiedEvidence
+    $packageRoot $config $validation `
+    $detectorEvidence $deviceEvidence $unifiedEvidence $paddleEvidence
 
 Write-Host ""
 Write-Host "============================================================" -ForegroundColor DarkCyan
 Write-Host " Receipt AI - Windows CPU batch verification" -ForegroundColor Cyan
-Write-Host " detector + device classifier + unified receipt OCR" -ForegroundColor DarkGray
+Write-Host " detector + device classifier + v13 OCR + recipient PP-OCR (pure ONNX)" -ForegroundColor DarkGray
 Write-Host "============================================================" -ForegroundColor DarkCyan
 Write-Host "Input : $InputDirectory"
 Write-Host "Output: $OutputDirectory"
@@ -925,8 +1817,9 @@ Write-Host ""
 $arguments = @(
     "--detector", $detector,
     "--device-model", $deviceModel,
-    "--ocr", "unified",
+    "--ocr", "hybrid-recipient",
     "--ocr-model", $unifiedModel,
+    "--ocr-bundle", $paddleEvidence.BundlePath,
     "--input", $InputDirectory,
     "--output", $OutputDirectory,
     "--device", "cpu",
@@ -961,6 +1854,7 @@ if ($null -eq $manifest) {
 }
 if ([string]$summary.requested_device -ne "cpu" `
     -or [string]$summary.unified_provider -ne "cpu" `
+    -or [string]$summary.paddle_ocr_provider -ne "cpu" `
     -or [int]$summary.input -ne $expectedBatchInputCount `
     -or [int]$summary.written -ne [int]$summary.input `
     -or [int]$summary.skipped -ne 0 `
@@ -994,7 +1888,8 @@ foreach ($record in $manifest) {
     $resultPath = Resolve-ContainedOutputFile $OutputDirectory ([string]$record.result) "batch result JSON"
     $result = Get-Content -LiteralPath $resultPath -Raw -Encoding UTF8 | ConvertFrom-Json
     Assert-ResultProvenanceAndPolicy `
-        $result $resultPath $manifestSource $detectorEvidence $deviceEvidence $unifiedEvidence
+        $result $resultPath $manifestSource `
+        $detectorEvidence $deviceEvidence $unifiedEvidence $paddleEvidence
     if ($Annotate -eq "all") {
         $null = Resolve-ContainedOutputFile `
             $OutputDirectory ([string]$record.annotated_rectified) "batch rectified annotation"
@@ -1021,6 +1916,8 @@ $detectorMeanMs = Get-NonNegativeFiniteDouble `
     $summary.stage_latency_ms.detector_inference.mean "detector mean latency"
 $unifiedMeanMs = Get-NonNegativeFiniteDouble `
     $summary.stage_latency_ms.unified_ocr_inference.mean "unified OCR mean latency"
+$paddleMeanMs = Get-NonNegativeFiniteDouble `
+    $summary.stage_latency_ms.paddle_ocr.mean "recipient PP-OCR mean latency"
 if ($p95LatencyMs -lt $p50LatencyMs) {
     throw "Batch inference p95 latency is below p50."
 }
@@ -1038,7 +1935,8 @@ Write-Host "BATCH RESULT" -ForegroundColor Green
 } | Format-List
 Write-Host ("Detector mean : {0:N2} ms" -f $detectorMeanMs)
 Write-Host ("Unified mean  : {0:N2} ms" -f $unifiedMeanMs)
+Write-Host ("PP-OCR mean   : {0:N2} ms" -f $paddleMeanMs)
 Write-Host "Results       : $OutputDirectory"
 Write-Host "Errors        : $errorsPath"
 Write-Host ""
-Write-Host "PASS: the complete three-model CPU pipeline wrote every selected receipt." -ForegroundColor Green
+Write-Host "PASS: the complete pure-ONNX detector/device/v13/PP-OCR CPU pipeline wrote every selected receipt." -ForegroundColor Green
