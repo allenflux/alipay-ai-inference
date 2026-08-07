@@ -122,9 +122,11 @@ def test_brief_diagnosis_omits_large_diagnostics(tmp_path: Path) -> None:
         next(line.removeprefix("mismatch=") for line in lines if line.startswith("mismatch="))
     )
     assert mismatch == {
+        "candidate_codepoints": ["U+94F6", "U+884C", "U+5361"],
         "candidate_present": True,
         "candidate_text": "银行卡",
         "missing_reason": None,
+        "reference_codepoints": ["U+4F59", "U+989D"],
         "reference_text": "余额",
         "source": r"D:\receipts\one.jpg",
     }

@@ -121,6 +121,14 @@ def _render(value: object) -> str:
     )
 
 
+def _codepoints(value: object) -> list[str] | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise DiagnosisError("diagnostic text must be a string or null")
+    return [f"U+{ord(character):04X}" for character in value]
+
+
 def _mismatch_payload(row: dict[str, Any]) -> dict[str, Any]:
     return {
         "raw_exact": False,
@@ -171,7 +179,9 @@ def diagnose(*, score_dir: Path, field: str, brief: bool = False) -> list[str]:
                 {
                     "source": row["source"],
                     "reference_text": row["reference_text"],
+                    "reference_codepoints": _codepoints(row["reference_text"]),
                     "candidate_text": row.get("candidate_text"),
+                    "candidate_codepoints": _codepoints(row.get("candidate_text")),
                     "candidate_present": row["candidate_present"],
                     "missing_reason": row.get("missing_reason"),
                 }
