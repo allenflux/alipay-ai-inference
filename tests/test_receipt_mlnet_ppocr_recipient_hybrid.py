@@ -56,18 +56,39 @@ def test_hybrid_routes_only_recipient_after_v13_and_keeps_review_policy() -> Non
     assert "CropRecipientRowLeftContext" in router
     assert 'retryRoute = "left_context_retry"' in router
     assert "PaddleRecipientValueParser.Parse(retryRead.Text)" in router
+    assert "ParsePinyinAnnotatedRecipient" in router
     assert "ParseUnlabelledMerchantAmountPair" in router
-    assert 'route = "primary_unlabelled_merchant_amount_pair"' in router
+    assert 'route = $"primary_{alternative.Route}"' in router
+    assert 'retryRoute = $"left_context_retry_{retryAlternative.Route}"' in router
     assert "HasVerifiedUnlabelledMerchantRowLayout" in router
     assert "HasVerifiedUnlabelledMerchantRowGeometry" in router
-    assert "HasReliablePairLines" in router
+    assert "ParseCalibratedAlternative" in router
     assert 'amount.Candidate' in router
+    assert "expectedReceiptAmount,\n                recipientDetectorScore);" in router
+    assert "expectedReceiptAmount,\n                read.Confidence);" not in router
     parser = _source("PaddleRecipientValueParser.cs")
-    assert 'recipientScore < 0.90f' in parser
+    assert 'recipientScore < 0.68f' in parser
+    assert 'amountScore < 0.80f' in parser
+    assert 'paymentScore < 0.80f' in parser
     assert 'amountCenterY < recipientCenterY' in parser
     assert 'recipientCenterY < paymentCenterY' in parser
     assert 'recipientBox[1] >= amountBox[3] - verticalTolerance' in parser
     assert 'recipientBox[3] <= paymentBox[1] + verticalTolerance' in parser
+    assert 'recipientDetectorScore < 0.90f' in parser
+    assert '!float.IsFinite(recipientDetectorScore)' in parser
+    assert 'line.Confidence < 0.80f' in parser
+    assert '"shoukuanfang"' in parser
+    assert '"pinyin_annotated_three_line"' in parser
+    assert '0 => 0.75f' in parser
+    assert '<= 1 => 0.68f' in parser
+    assert '<= 100 => 0.90f' in parser
+    assert '"unlabelled_cjk_amount_exact"' in parser
+    assert '"unlabelled_cjk_amount_within_one_fen"' in parser
+    assert '"unlabelled_cjk_amount_within_one_yuan"' in parser
+    assert '@"^[0-9]{2,8}$"' in parser
+    assert 'score < 0.95f' in parser
+    assert 'merchantNumber == expectedFen / 100L' in parser
+    assert '"unlabelled_numeric_amount_exact"' in parser
     assert "RecipientDiagnostic = diagnostic" in router
 
 
@@ -79,7 +100,9 @@ def test_hybrid_retry_is_left_context_only_and_remains_fail_closed() -> None:
     assert "new Rectangle(0, top, right, bottom - top)" in retry
     assert router.count("paddleOcr.Recognize(") == 2
     assert router.count("PaddleRecipientValueParser.Parse(") == 2
-    assert router.count("PaddleRecipientValueParser.ParseUnlabelledMerchantAmountPair(") == 2
+    assert router.count("ParseCalibratedAlternative(") == 3
+    assert router.count("PaddleRecipientValueParser.ParsePinyinAnnotatedRecipient(") == 1
+    assert router.count("PaddleRecipientValueParser.ParseUnlabelledMerchantAmountPair(") == 1
     assert '"anchored_or_pair_parse_failed"' in router
     assert '"ocr_empty"' in router
     assert "candidates.Remove(\"recipient_field\")" in router
@@ -145,22 +168,54 @@ def test_recipient_parser_has_package_free_executable_contract_tests() -> None:
     assert r'PaddleRecipientValueParser.Parse("\u5546\u6237\u7532 \u6536\u6b3e\u65b9")' in harness
     assert r'PaddleRecipientValueParser.Parse("\u5907\u6ce8 \u6536\u6b3e\u65b9 \u5546\u6237\u7532")' in harness
     assert r'PaddleRecipientValueParser.Parse("\u6536\u6b3e\u65b9\uff1a")' in harness
+    assert "ParsePinyinAnnotatedRecipient" in harness
     assert "ParseUnlabelledMerchantAmountPair" in harness
-    assert r'["\u6296\u97f3\u7535\u5546\u5546\u5bb6", "\uffe5100.00"]' in harness
+    assert "strict pinyin annotation route" in harness
+    assert "pinyin detector below 0.90" in harness
+    assert "pinyin detector is non-finite" in harness
+    assert "pinyin line below 0.80" in harness
+    assert "pinyin wrong line order" in harness
+    assert "pinyin annotation typo" in harness
+    assert "pinyin annotation contains non-letter noise" in harness
+    assert "pinyin value is not CJK" in harness
+    assert "pinyin trailing label is not exact" in harness
+    assert "pinyin extra line" in harness
+    assert "pinyin missing label line" in harness
+    assert "CJK exact amount at 0.75" in harness
+    assert "CJK exact amount below 0.75" in harness
+    assert "CJK one-fen drift at 0.68" in harness
+    assert "CJK one-fen drift below 0.68" in harness
+    assert "CJK one-yuan drift at 0.90" in harness
+    assert "CJK one-yuan drift below 0.90" in harness
+    assert "CJK drift above one yuan" in harness
     assert "reversed pair" in harness
     assert "amount without currency mark" in harness
     assert "non-recipient row label" in harness
     assert "extra line" in harness
+    assert "merchant line below 0.80" in harness
+    assert "amount line below 0.80" in harness
+    assert "non-finite pair line confidence" in harness
+    assert "pair confidence count mismatch" in harness
+    assert "non-finite pair detector score" in harness
+    assert "infinite pair detector score" in harness
     assert "product row" in harness
-    assert "amount mismatch" in harness
     assert "OCR-confusable amount" in harness
     assert "full four-digit amount" in harness
-    assert "four-digit amount mismatch" in harness
+    assert "four-digit amount mismatch above one yuan" in harness
     assert "shared-suffix amount mismatch" in harness
-    assert "strict row geometry" in harness
+    assert "numeric merchant exact amount at 0.95" in harness
+    assert "numeric merchant below 0.95" in harness
+    assert "numeric merchant too short" in harness
+    assert "numeric merchant too long" in harness
+    assert "numeric merchant not digits only" in harness
+    assert "numeric merchant amount not exact" in harness
+    assert "numeric merchant equals amount integer part" in harness
+    assert "zero-padded numeric merchant equals amount integer part" in harness
+    assert "strict row geometry at calibrated floors" in harness
     assert "amount overlap" in harness
     assert "payment overlap" in harness
-    assert "low recipient detector confidence" in harness
+    assert "recipient detector below 0.68 floor" in harness
+    assert "non-finite recipient detector score" in harness
 
 
 def test_paddle_bundle_conversion_is_dynamic_and_atomic() -> None:

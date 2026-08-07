@@ -11,8 +11,9 @@ internal static class PaddleRecipientHybrid
     /// <summary>
     /// Replace v13's recipient candidate with a strict PP-OCR det + angle-cls
     /// + SVTR_LCNet value.  The ordinary route requires a left recipient
-    /// label.  A known label-free layout is accepted only as an ordered
-    /// merchant/CNY-amount pair inside the detector-selected recipient row.
+    /// label.  Known label-free layouts are accepted only through the
+    /// calibrated pinyin-annotation or merchant/CNY-amount contracts inside
+    /// the detector-selected recipient row.
     /// It never falls back to the lower-accuracy v13 recipient branch.
     /// An absent or ambiguous row removes the recipient candidate.  A failed
     /// standard crop gets one deterministic left-context retry through the
@@ -63,15 +64,16 @@ internal static class PaddleRecipientHybrid
         var verifiedUnlabelledLayout = HasVerifiedUnlabelledMerchantRowLayout(
             source, detections, detection);
         if (value is null
-            && verifiedUnlabelledLayout
-            && HasReliablePairLines(firstRead))
+            && verifiedUnlabelledLayout)
         {
-            value = PaddleRecipientValueParser.ParseUnlabelledMerchantAmountPair(
-                firstRead.Lines.Select(line => line.Text).ToArray(),
+            var alternative = ParseCalibratedAlternative(
+                firstRead,
+                detection.Score,
                 amountCandidate);
-            if (value is not null)
+            if (alternative is not null)
             {
-                route = "primary_unlabelled_merchant_amount_pair";
+                value = alternative.Value;
+                route = $"primary_{alternative.Route}";
             }
         }
         string? retryRaw = null;
@@ -92,13 +94,17 @@ internal static class PaddleRecipientHybrid
                 var retryValue = PaddleRecipientValueParser.Parse(retryRead.Text);
                 var retryRoute = "left_context_retry";
                 if (retryValue is null
-                    && verifiedUnlabelledLayout
-                    && HasReliablePairLines(retryRead))
+                    && verifiedUnlabelledLayout)
                 {
-                    retryValue = PaddleRecipientValueParser.ParseUnlabelledMerchantAmountPair(
-                        retryRead.Lines.Select(line => line.Text).ToArray(),
+                    var retryAlternative = ParseCalibratedAlternative(
+                        retryRead,
+                        detection.Score,
                         amountCandidate);
-                    retryRoute = "left_context_retry_unlabelled_merchant_amount_pair";
+                    if (retryAlternative is not null)
+                    {
+                        retryValue = retryAlternative.Value;
+                        retryRoute = $"left_context_retry_{retryAlternative.Route}";
+                    }
                 }
                 if (retryValue is not null)
                 {
@@ -143,13 +149,22 @@ internal static class PaddleRecipientHybrid
         return unified with { Candidates = candidates, RecipientDiagnostic = diagnostic };
     }
 
-    private static bool HasReliablePairLines(PaddleOcrReadResult read)
+    private static PaddleRecipientAlternativeParseResult? ParseCalibratedAlternative(
+        PaddleOcrReadResult read,
+        float recipientDetectorScore,
+        string? expectedReceiptAmount)
     {
-        var nonEmptyLines = read.Lines
-            .Where(line => ReceiptFieldNormalizer.CleanText(line.Text).Length > 0)
-            .ToArray();
-        return nonEmptyLines.Length == 2
-            && nonEmptyLines.All(line => float.IsFinite(line.Confidence) && line.Confidence >= 0.80f);
+        var texts = read.Lines.Select(line => line.Text).ToArray();
+        var confidences = read.Lines.Select(line => line.Confidence).ToArray();
+        return PaddleRecipientValueParser.ParsePinyinAnnotatedRecipient(
+                texts,
+                confidences,
+                recipientDetectorScore)
+            ?? PaddleRecipientValueParser.ParseUnlabelledMerchantAmountPair(
+                texts,
+                confidences,
+                expectedReceiptAmount,
+                recipientDetectorScore);
     }
 
     private static bool HasVerifiedUnlabelledMerchantRowLayout(

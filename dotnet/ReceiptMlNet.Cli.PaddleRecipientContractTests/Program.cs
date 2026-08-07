@@ -11,79 +11,170 @@ internal static class Program
             AssertEqual(null, PaddleRecipientValueParser.Parse("\u5907\u6ce8 \u6536\u6b3e\u65b9 \u5546\u6237\u7532"), "middle label");
             AssertEqual(null, PaddleRecipientValueParser.Parse("\u6536\u6b3e\u65b9\uff1a"), "empty value");
             AssertEqual(null, PaddleRecipientValueParser.Parse(null), "null OCR");
-            AssertEqual(
+            AssertAlternative(
+                "\u53f8\u6e90(**\u6e90)",
+                "pinyin_annotated_three_line",
+                null,
+                ParsePinyin(["Sh\u014du ku\u01cen f\u0101ng", "\u53f8\u6e90(**\u6e90)", "\u6536\u6b3e\u65b9"], [0.80f, 0.91f, 0.80f], 0.90f),
+                "strict pinyin annotation route");
+            AssertAlternativeNull(
+                ParsePinyin(["shou kuan fang", "\u53f8\u6e90(**\u6e90)", "\u6536\u6b3e\u65b9"], [0.90f, 0.90f, 0.90f], 0.899f),
+                "pinyin detector below 0.90");
+            AssertAlternativeNull(
+                ParsePinyin(["shou kuan fang", "\u53f8\u6e90(**\u6e90)", "\u6536\u6b3e\u65b9"], [0.90f, 0.90f, 0.90f], float.NaN),
+                "pinyin detector is non-finite");
+            AssertAlternativeNull(
+                ParsePinyin(["shou kuan fang", "\u53f8\u6e90(**\u6e90)", "\u6536\u6b3e\u65b9"], [0.90f, 0.799f, 0.90f], 0.95f),
+                "pinyin line below 0.80");
+            AssertAlternativeNull(
+                ParsePinyin(["shou kuan fang", "\u6536\u6b3e\u65b9", "\u53f8\u6e90(**\u6e90)"], [0.90f, 0.90f, 0.90f], 0.95f),
+                "pinyin wrong line order");
+            AssertAlternativeNull(
+                ParsePinyin(["shou kuan ren", "\u53f8\u6e90(**\u6e90)", "\u6536\u6b3e\u65b9"], [0.90f, 0.90f, 0.90f], 0.95f),
+                "pinyin annotation typo");
+            AssertAlternativeNull(
+                ParsePinyin(["shou 1kuan fang", "\u53f8\u6e90(**\u6e90)", "\u6536\u6b3e\u65b9"], [0.90f, 0.90f, 0.90f], 0.95f),
+                "pinyin annotation contains non-letter noise");
+            AssertAlternativeNull(
+                ParsePinyin(["shou kuan fang", "merchant-123", "\u6536\u6b3e\u65b9"], [0.90f, 0.90f, 0.90f], 0.95f),
+                "pinyin value is not CJK");
+            AssertAlternativeNull(
+                ParsePinyin(["shou kuan fang", "\u53f8\u6e90(**\u6e90)", "\u6536\u6b3e\u4eba"], [0.90f, 0.90f, 0.90f], 0.95f),
+                "pinyin trailing label is not exact");
+            AssertAlternativeNull(
+                ParsePinyin(["shou kuan fang", "\u53f8\u6e90(**\u6e90)", "\u6536\u6b3e\u65b9", "\u5907\u6ce8"], [0.90f, 0.90f, 0.90f, 0.90f], 0.95f),
+                "pinyin extra line");
+            AssertAlternativeNull(
+                ParsePinyin(["shou kuan fang", "\u53f8\u6e90(**\u6e90)"], [0.90f, 0.90f], 0.95f),
+                "pinyin missing label line");
+
+            AssertAlternative(
                 "\u6296\u97f3\u7535\u5546\u5546\u5bb6",
-                PaddleRecipientValueParser.ParseUnlabelledMerchantAmountPair(
-                    ["\u6296\u97f3\u7535\u5546\u5546\u5bb6", "\uffe5100.00"],
-                    "100.00"),
-                "label-free merchant plus explicit CNY amount");
-            AssertEqual(
-                null,
-                PaddleRecipientValueParser.ParseUnlabelledMerchantAmountPair(
-                    ["\uffe5100.00", "\u6296\u97f3\u7535\u5546\u5546\u5bb6"],
-                    "100.00"),
+                "unlabelled_cjk_amount_exact",
+                0,
+                ParsePair("\u6296\u97f3\u7535\u5546\u5546\u5bb6", "\uffe5100.00", "100.00", 0.75f),
+                "CJK exact amount at 0.75");
+            AssertAlternativeNull(
+                ParsePair("\u6296\u97f3\u7535\u5546\u5546\u5bb6", "\uffe5100.00", "100.00", 0.749f),
+                "CJK exact amount below 0.75");
+            AssertAlternative(
+                "\u6296\u97f3\u7535\u5546\u5546\u5bb6",
+                "unlabelled_cjk_amount_within_one_fen",
+                1,
+                ParsePair("\u6296\u97f3\u7535\u5546\u5546\u5bb6", "\uffe5100.01", "100.00", 0.68f),
+                "CJK one-fen drift at 0.68");
+            AssertAlternativeNull(
+                ParsePair("\u6296\u97f3\u7535\u5546\u5546\u5bb6", "\uffe5100.01", "100.00", 0.679f),
+                "CJK one-fen drift below 0.68");
+            AssertAlternative(
+                "\u6296\u97f3\u7535\u5546\u5546\u5bb6",
+                "unlabelled_cjk_amount_within_one_yuan",
+                100,
+                ParsePair("\u6296\u97f3\u7535\u5546\u5546\u5bb6", "\uffe5101.00", "100.00", 0.90f),
+                "CJK one-yuan drift at 0.90");
+            AssertAlternativeNull(
+                ParsePair("\u6296\u97f3\u7535\u5546\u5546\u5bb6", "\uffe5101.00", "100.00", 0.899f),
+                "CJK one-yuan drift below 0.90");
+            AssertAlternativeNull(
+                ParsePair("\u6296\u97f3\u7535\u5546\u5546\u5bb6", "\uffe5101.01", "100.00", 0.99f),
+                "CJK drift above one yuan");
+            AssertAlternativeNull(
+                ParsePair("\uffe5100.00", "\u6296\u97f3\u7535\u5546\u5546\u5bb6", "100.00", 0.99f),
                 "reversed pair");
-            AssertEqual(
-                null,
-                PaddleRecipientValueParser.ParseUnlabelledMerchantAmountPair(
-                    ["\u6296\u97f3\u7535\u5546\u5546\u5bb6", "100.00"],
-                    "100.00"),
+            AssertAlternativeNull(
+                ParsePair("\u6296\u97f3\u7535\u5546\u5546\u5bb6", "100.00", "100.00", 0.99f),
                 "amount without currency mark");
-            AssertEqual(
-                null,
-                PaddleRecipientValueParser.ParseUnlabelledMerchantAmountPair(
-                    ["\u4ed8\u6b3e\u65b9\u5f0f", "\uffe5100.00"],
-                    "100.00"),
+            AssertAlternativeNull(
+                ParsePair("\u4ed8\u6b3e\u65b9\u5f0f", "\uffe5100.00", "100.00", 0.99f),
                 "non-recipient row label");
-            AssertEqual(
-                null,
+            AssertAlternativeNull(
                 PaddleRecipientValueParser.ParseUnlabelledMerchantAmountPair(
                     ["\u6296\u97f3\u7535\u5546\u5546\u5bb6", "\uffe5100.00", "\u5907\u6ce8"],
-                    "100.00"),
+                    [0.99f, 0.99f, 0.99f],
+                    "100.00",
+                    0.99f),
                 "extra line");
-            AssertEqual(
-                null,
-                PaddleRecipientValueParser.ParseUnlabelledMerchantAmountPair(
-                    ["\u5546\u54c1\u540d\u79f0", "\uffe5100.00"],
-                    "100.00"),
-                "product row");
-            AssertEqual(
-                null,
+            AssertAlternativeNull(
                 PaddleRecipientValueParser.ParseUnlabelledMerchantAmountPair(
                     ["\u6296\u97f3\u7535\u5546\u5546\u5bb6", "\uffe5100.00"],
-                    "99.00"),
-                "amount mismatch");
-            AssertEqual(
-                null,
+                    [0.799f, 0.99f],
+                    "100.00",
+                    0.99f),
+                "merchant line below 0.80");
+            AssertAlternativeNull(
                 PaddleRecipientValueParser.ParseUnlabelledMerchantAmountPair(
-                    ["\u6296\u97f3\u7535\u5546\u5546\u5bb6", "\uffe5OO"],
-                    "0.00"),
+                    ["\u6296\u97f3\u7535\u5546\u5546\u5bb6", "\uffe5100.00"],
+                    [0.99f, 0.799f],
+                    "100.00",
+                    0.99f),
+                "amount line below 0.80");
+            AssertAlternativeNull(
+                PaddleRecipientValueParser.ParseUnlabelledMerchantAmountPair(
+                    ["\u6296\u97f3\u7535\u5546\u5546\u5bb6", "\uffe5100.00"],
+                    [float.NaN, 0.99f],
+                    "100.00",
+                    0.99f),
+                "non-finite pair line confidence");
+            AssertAlternativeNull(
+                PaddleRecipientValueParser.ParseUnlabelledMerchantAmountPair(
+                    ["\u6296\u97f3\u7535\u5546\u5546\u5bb6", "\uffe5100.00"],
+                    [0.99f],
+                    "100.00",
+                    0.99f),
+                "pair confidence count mismatch");
+            AssertAlternativeNull(
+                PaddleRecipientValueParser.ParseUnlabelledMerchantAmountPair(
+                    ["\u6296\u97f3\u7535\u5546\u5546\u5bb6", "\uffe5100.00"],
+                    [0.99f, 0.99f],
+                    "100.00",
+                    float.NaN),
+                "non-finite pair detector score");
+            AssertAlternativeNull(
+                PaddleRecipientValueParser.ParseUnlabelledMerchantAmountPair(
+                    ["\u6296\u97f3\u7535\u5546\u5546\u5bb6", "\uffe5100.00"],
+                    [0.99f, 0.99f],
+                    "100.00",
+                    float.PositiveInfinity),
+                "infinite pair detector score");
+            AssertAlternativeNull(
+                ParsePair("\u5546\u54c1\u540d\u79f0", "\uffe5100.00", "100.00", 0.99f),
+                "product row");
+            AssertAlternativeNull(
+                ParsePair("\u6296\u97f3\u7535\u5546\u5546\u5bb6", "\uffe5OO", "0.00", 0.99f),
                 "OCR-confusable amount");
-            AssertEqual(
+            AssertAlternative(
                 "\u6296\u97f3\u7535\u5546\u5546\u5bb6",
-                PaddleRecipientValueParser.ParseUnlabelledMerchantAmountPair(
-                    ["\u6296\u97f3\u7535\u5546\u5546\u5bb6", "\uffe51000.00"],
-                    "1000.00"),
+                "unlabelled_cjk_amount_exact",
+                0,
+                ParsePair("\u6296\u97f3\u7535\u5546\u5546\u5bb6", "\uffe51000.00", "1000.00", 0.75f),
                 "full four-digit amount");
-            AssertEqual(
-                null,
-                PaddleRecipientValueParser.ParseUnlabelledMerchantAmountPair(
-                    ["\u6296\u97f3\u7535\u5546\u5546\u5bb6", "\uffe51000.00"],
-                    "2000.00"),
-                "four-digit amount mismatch");
-            AssertEqual(
-                null,
-                PaddleRecipientValueParser.ParseUnlabelledMerchantAmountPair(
-                    ["\u6296\u97f3\u7535\u5546\u5546\u5bb6", "\uffe51234.56"],
-                    "9994.56"),
+            AssertAlternativeNull(
+                ParsePair("\u6296\u97f3\u7535\u5546\u5546\u5bb6", "\uffe51000.00", "2000.00", 0.99f),
+                "four-digit amount mismatch above one yuan");
+            AssertAlternativeNull(
+                ParsePair("\u6296\u97f3\u7535\u5546\u5546\u5bb6", "\uffe51234.56", "9994.56", 0.99f),
                 "shared-suffix amount mismatch");
+
+            AssertAlternative(
+                "123456",
+                "unlabelled_numeric_amount_exact",
+                0,
+                ParsePair("123456", "\uffe5100.00", "100.00", 0.95f),
+                "numeric merchant exact amount at 0.95");
+            AssertAlternativeNull(ParsePair("123456", "\uffe5100.00", "100.00", 0.949f), "numeric merchant below 0.95");
+            AssertAlternativeNull(ParsePair("1", "\uffe5100.00", "100.00", 0.99f), "numeric merchant too short");
+            AssertAlternativeNull(ParsePair("123456789", "\uffe5100.00", "100.00", 0.99f), "numeric merchant too long");
+            AssertAlternativeNull(ParsePair("12A34", "\uffe5100.00", "100.00", 0.99f), "numeric merchant not digits only");
+            AssertAlternativeNull(ParsePair("123456", "\uffe5100.01", "100.00", 0.99f), "numeric merchant amount not exact");
+            AssertAlternativeNull(ParsePair("100", "\uffe5100.00", "100.00", 0.99f), "numeric merchant equals amount integer part");
+            AssertAlternativeNull(ParsePair("0100", "\uffe5100.00", "100.00", 0.99f), "zero-padded numeric merchant equals amount integer part");
             var amountBox = new[] { 200.0f, 300.0f, 550.0f, 420.0f };
             var recipientBox = new[] { 20.0f, 460.0f, 730.0f, 520.0f };
             var paymentBox = new[] { 180.0f, 550.0f, 720.0f, 610.0f };
             AssertTrue(
                 PaddleRecipientValueParser.HasVerifiedUnlabelledMerchantRowGeometry(
-                    750, 1000, 0.95f, recipientBox, 0.90f, amountBox, 0.90f, paymentBox),
-                "strict row geometry");
+                    750, 1000, 0.68f, recipientBox, 0.80f, amountBox, 0.80f, paymentBox),
+                "strict row geometry at calibrated floors");
             AssertFalse(
                 PaddleRecipientValueParser.HasVerifiedUnlabelledMerchantRowGeometry(
                     750,
@@ -108,8 +199,12 @@ internal static class Program
                 "payment overlap");
             AssertFalse(
                 PaddleRecipientValueParser.HasVerifiedUnlabelledMerchantRowGeometry(
-                    750, 1000, 0.89f, recipientBox, 0.90f, amountBox, 0.90f, paymentBox),
-                "low recipient detector confidence");
+                    750, 1000, 0.679f, recipientBox, 0.90f, amountBox, 0.90f, paymentBox),
+                "recipient detector below 0.68 floor");
+            AssertFalse(
+                PaddleRecipientValueParser.HasVerifiedUnlabelledMerchantRowGeometry(
+                    750, 1000, float.NaN, recipientBox, 0.90f, amountBox, 0.90f, paymentBox),
+                "non-finite recipient detector score");
             AssertFalse(
                 PaddleRecipientValueParser.HasVerifiedUnlabelledMerchantRowGeometry(
                     750, 1000, 0.95f, recipientBox, 0.79f, amountBox, 0.90f, paymentBox),
@@ -151,7 +246,7 @@ internal static class Program
                     0.90f,
                     paymentBox),
                 "non-finite geometry");
-            Console.WriteLine("PASS: PP-OCR recipient parsing is strict, label-anchored or amount-paired, and fail-closed.");
+            Console.WriteLine("PASS: PP-OCR recipient parsing is label-anchored or calibrated by pinyin/amount evidence and fail-closed.");
             return 0;
         }
         catch (Exception error)
@@ -166,6 +261,61 @@ internal static class Program
         if (!string.Equals(expected, actual, StringComparison.Ordinal))
         {
             throw new InvalidOperationException($"{label}: expected '{expected ?? "<null>"}', got '{actual ?? "<null>"}'");
+        }
+    }
+
+    private static PaddleRecipientAlternativeParseResult? ParsePinyin(
+        IReadOnlyList<string> lines,
+        IReadOnlyList<float> lineConfidences,
+        float recipientDetectorScore)
+    {
+        return PaddleRecipientValueParser.ParsePinyinAnnotatedRecipient(
+            lines,
+            lineConfidences,
+            recipientDetectorScore);
+    }
+
+    private static PaddleRecipientAlternativeParseResult? ParsePair(
+        string merchant,
+        string amount,
+        string expectedAmount,
+        float score)
+    {
+        return PaddleRecipientValueParser.ParseUnlabelledMerchantAmountPair(
+            [merchant, amount],
+            [0.99f, 0.99f],
+            expectedAmount,
+            score);
+    }
+
+    private static void AssertAlternative(
+        string expectedValue,
+        string expectedRoute,
+        long? expectedAmountDeltaFen,
+        PaddleRecipientAlternativeParseResult? actual,
+        string label)
+    {
+        if (actual is null
+            || !string.Equals(expectedValue, actual.Value, StringComparison.Ordinal)
+            || !string.Equals(expectedRoute, actual.Route, StringComparison.Ordinal)
+            || expectedAmountDeltaFen != actual.AmountDeltaFen)
+        {
+            throw new InvalidOperationException(
+                $"{label}: expected '{expectedValue}' via '{expectedRoute}' with delta "
+                + $"'{expectedAmountDeltaFen?.ToString() ?? "<null>"}', got "
+                + $"'{actual?.Value ?? "<null>"}' via '{actual?.Route ?? "<null>"}' with delta "
+                + $"'{actual?.AmountDeltaFen.ToString() ?? "<null>"}'");
+        }
+    }
+
+    private static void AssertAlternativeNull(
+        PaddleRecipientAlternativeParseResult? actual,
+        string label)
+    {
+        if (actual is not null)
+        {
+            throw new InvalidOperationException(
+                $"{label}: expected null, got '{actual.Value}' via '{actual.Route}'");
         }
     }
 

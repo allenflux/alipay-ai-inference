@@ -165,7 +165,9 @@ def _aggregate_pair_reasons(raw: object, line_count: object, expected: object) -
     return reasons
 
 
-def diagnose(comparison: Path, hybrid: Path) -> list[dict[str, Any]]:
+def diagnose(
+    comparison: Path, hybrid: Path, records: Path | None = None
+) -> list[dict[str, Any]]:
     comparison_rows = [
         json.loads(line)
         for line in (comparison / "comparisons.jsonl").read_text(encoding="utf-8-sig").splitlines()
@@ -179,6 +181,29 @@ def diagnose(comparison: Path, hybrid: Path) -> list[dict[str, Any]]:
         if not result_path.is_absolute():
             result_path = hybrid / result_path
         results[_source_key(record.get("source"))] = result_path
+    references: dict[str, dict[str, Any]] = {}
+    if records is not None:
+        for line in records.read_text(encoding="utf-8-sig").splitlines():
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            if record.get("split") != "val":
+                continue
+            slots = record.get("slots")
+            if not isinstance(slots, Mapping):
+                continue
+            recipient_slot = slots.get("recipient_field")
+            amount_slot = slots.get("amount")
+            references[_source_key(record.get("source"))] = {
+                "recipient": recipient_slot.get("text")
+                if isinstance(recipient_slot, Mapping)
+                else None,
+                "amount": (
+                    amount_slot.get("visible_text") or amount_slot.get("text")
+                )
+                if isinstance(amount_slot, Mapping)
+                else None,
+            }
 
     diagnostics: list[dict[str, Any]] = []
     for comparison_row in failed:
@@ -213,6 +238,7 @@ def diagnose(comparison: Path, hybrid: Path) -> list[dict[str, Any]]:
         diagnostics.append(
             {
                 "source": source,
+                "reference": references.get(_source_key(source)),
                 "failures": comparison_row.get("failures"),
                 "amount_candidate": expected_amount,
                 "recipient_score": _score(detections.get("recipient_field")),
@@ -235,8 +261,13 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--comparison", type=Path, required=True)
     parser.add_argument("--hybrid", type=Path, required=True)
+    parser.add_argument("--records", type=Path)
     args = parser.parse_args()
-    rows = diagnose(args.comparison.resolve(), args.hybrid.resolve())
+    rows = diagnose(
+        args.comparison.resolve(),
+        args.hybrid.resolve(),
+        args.records.resolve() if args.records is not None else None,
+    )
     for row in rows:
         print(json.dumps(row, ensure_ascii=False, separators=(",", ":")))
     print(json.dumps({"failed_records": len(rows)}, separators=(",", ":")))

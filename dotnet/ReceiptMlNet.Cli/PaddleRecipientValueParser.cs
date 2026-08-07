@@ -2,6 +2,11 @@
 /// Strict extraction contract shared by the PP-OCR recipient route and its
 /// package-free .NET contract test.
 /// </summary>
+internal sealed record PaddleRecipientAlternativeParseResult(
+    string Value,
+    string Route,
+    long? AmountDeltaFen = null);
+
 internal static class PaddleRecipientValueParser
 {
     private static readonly string[] RecipientLabels =
@@ -36,6 +41,9 @@ internal static class PaddleRecipientValueParser
     private static readonly System.Text.RegularExpressions.Regex ExpectedCnyAmountPattern = new(
         @"^(?:[\u00a5\uffe5]\s*)?(?<amount>(?:[0-9]+|[0-9]{1,3}(?:,[0-9]{3})+)(?:\.[0-9]{1,2})?)$",
         System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+    private static readonly System.Text.RegularExpressions.Regex NumericMerchantPattern = new(
+        @"^[0-9]{2,8}$",
+        System.Text.RegularExpressions.RegexOptions.CultureInvariant);
 
     /// <summary>
     /// Match the acceptance evaluator exactly: the visible row must begin
@@ -59,34 +67,105 @@ internal static class PaddleRecipientValueParser
     }
 
     /// <summary>
-    /// Some receipt layouts omit a visible recipient label.  Accept that
-    /// variant only when PP-OCR detects exactly two ordered lines in the
-    /// detector-selected recipient row: a CJK merchant name followed by an
-    /// explicit CNY amount.  The amount is structural corroboration and is
-    /// never returned as recipient text.  Any additional line, reversed
-    /// order, missing currency mark, known non-recipient label, or non-CJK
-    /// value remains fail-closed.
+    /// Accept the observed three-line pinyin annotation layout only when its
+    /// detector and every OCR line pass their independent floors.  The
+    /// normalised order is exactly "shou kuan fang", a CJK merchant value,
+    /// then the Chinese recipient label.  This does not relax the ordinary
+    /// left-label parser above.
     /// </summary>
-    public static string? ParseUnlabelledMerchantAmountPair(
+    public static PaddleRecipientAlternativeParseResult? ParsePinyinAnnotatedRecipient(
         IReadOnlyList<string>? rawLines,
-        string? expectedReceiptAmount)
+        IReadOnlyList<float>? rawLineConfidences,
+        float recipientDetectorScore)
     {
-        if (rawLines is null)
+        if (rawLines is null
+            || rawLines.Count != 3
+            || !float.IsFinite(recipientDetectorScore)
+            || recipientDetectorScore < 0.90f
+            || !TryPrepareLines(rawLines, rawLineConfidences, 3, out var lines))
         {
             return null;
         }
 
-        var lines = rawLines
-            .Select(ReceiptFieldNormalizer.CleanText)
-            .Where(line => line.Length > 0)
-            .ToArray();
-        if (lines.Length != 2
-            || !IsMerchantCandidate(lines[0])
-            || !IsExplicitCnyAmount(lines[1], expectedReceiptAmount))
+        if (lines.Any(line => line.Confidence < 0.80f)
+            || !string.Equals(NormalizePinyin(lines[0].Text), "shoukuanfang", StringComparison.Ordinal)
+            || !IsCjkMerchantCandidate(lines[1].Text)
+            || !string.Equals(lines[2].Text, RecipientLabels[0], StringComparison.Ordinal))
         {
             return null;
         }
-        return lines[0];
+        return new PaddleRecipientAlternativeParseResult(
+            lines[1].Text,
+            "pinyin_annotated_three_line");
+    }
+
+    /// <summary>
+    /// Some receipt layouts omit a visible recipient label.  Accept exactly
+    /// two ordered lines only: a merchant value followed by an explicit CNY
+    /// amount.  CJK names use calibrated aggregate-score tiers based on the
+    /// absolute amount difference in fen.  Numeric merchant identifiers have
+    /// a separate, deliberately narrower exact-amount contract.
+    /// </summary>
+    public static PaddleRecipientAlternativeParseResult? ParseUnlabelledMerchantAmountPair(
+        IReadOnlyList<string>? rawLines,
+        IReadOnlyList<float>? rawLineConfidences,
+        string? expectedReceiptAmount,
+        float? recipientDetectorScore)
+    {
+        if (rawLines is null
+            || rawLines.Count != 2
+            || !TryPrepareLines(rawLines, rawLineConfidences, 2, out var lines)
+            || lines.Any(line => line.Confidence < 0.80f)
+            || recipientDetectorScore is not { } score
+            || !float.IsFinite(score)
+            || !TryParseFullAmountFen(ExplicitCnyAmountPattern, lines[1].Text, out var observedFen)
+            || !TryParseFullAmountFen(ExpectedCnyAmountPattern, expectedReceiptAmount, out var expectedFen))
+        {
+            return null;
+        }
+
+        var amountDeltaFen = observedFen >= expectedFen
+            ? observedFen - expectedFen
+            : expectedFen - observedFen;
+        var merchant = lines[0].Text;
+        if (IsCjkMerchantCandidate(merchant))
+        {
+            var requiredScore = amountDeltaFen switch
+            {
+                0 => 0.75f,
+                <= 1 => 0.68f,
+                <= 100 => 0.90f,
+                _ => float.PositiveInfinity,
+            };
+            if (score < requiredScore)
+            {
+                return null;
+            }
+            var route = amountDeltaFen switch
+            {
+                0 => "unlabelled_cjk_amount_exact",
+                <= 1 => "unlabelled_cjk_amount_within_one_fen",
+                _ => "unlabelled_cjk_amount_within_one_yuan",
+            };
+            return new PaddleRecipientAlternativeParseResult(merchant, route, amountDeltaFen);
+        }
+
+        if (!NumericMerchantPattern.IsMatch(merchant)
+            || score < 0.95f
+            || amountDeltaFen != 0
+            || !long.TryParse(
+                merchant,
+                System.Globalization.NumberStyles.None,
+                System.Globalization.CultureInfo.InvariantCulture,
+                out var merchantNumber)
+            || merchantNumber == expectedFen / 100L)
+        {
+            return null;
+        }
+        return new PaddleRecipientAlternativeParseResult(
+            merchant,
+            "unlabelled_numeric_amount_exact",
+            amountDeltaFen);
     }
 
     /// <summary>
@@ -106,8 +185,11 @@ internal static class PaddleRecipientValueParser
     {
         if (sourceWidth < 2
             || sourceHeight < 2
-            || recipientScore < 0.90f
+            || !float.IsFinite(recipientScore)
+            || recipientScore < 0.68f
+            || !float.IsFinite(amountScore)
             || amountScore < 0.80f
+            || !float.IsFinite(paymentScore)
             || paymentScore < 0.80f
             || !IsFiniteBox(recipientBox)
             || !IsFiniteBox(amountBox)
@@ -132,7 +214,7 @@ internal static class PaddleRecipientValueParser
             && recipientBox[3] <= paymentBox[1] + verticalTolerance;
     }
 
-    private static bool IsMerchantCandidate(string value)
+    private static bool IsCjkMerchantCandidate(string value)
     {
         if (value.Length is < 2 or > 64
             || value.Contains('\u00a5')
@@ -145,11 +227,54 @@ internal static class PaddleRecipientValueParser
         return value.Any(character => character is >= '\u3400' and <= '\u9fff');
     }
 
-    private static bool IsExplicitCnyAmount(string value, string? expectedReceiptAmount)
+    private static bool TryPrepareLines(
+        IReadOnlyList<string>? rawLines,
+        IReadOnlyList<float>? rawLineConfidences,
+        int expectedCount,
+        out PreparedLine[] lines)
     {
-        return TryParseFullAmountFen(ExplicitCnyAmountPattern, value, out var observedFen)
-            && TryParseFullAmountFen(ExpectedCnyAmountPattern, expectedReceiptAmount, out var expectedFen)
-            && observedFen == expectedFen;
+        lines = [];
+        if (rawLines is null
+            || rawLineConfidences is null
+            || rawLines.Count != rawLineConfidences.Count)
+        {
+            return false;
+        }
+
+        lines = rawLines
+            .Select((text, index) => new PreparedLine(
+                ReceiptFieldNormalizer.CleanText(text),
+                rawLineConfidences[index]))
+            .Where(line => line.Text.Length > 0)
+            .ToArray();
+        return lines.Length == expectedCount
+            && lines.All(line => float.IsFinite(line.Confidence));
+    }
+
+    private static string NormalizePinyin(string value)
+    {
+        var decomposed = ReceiptFieldNormalizer.CleanText(value)
+            .ToLowerInvariant()
+            .Normalize(System.Text.NormalizationForm.FormD);
+        var output = new System.Text.StringBuilder(decomposed.Length);
+        foreach (var character in decomposed)
+        {
+            if (System.Globalization.CharUnicodeInfo.GetUnicodeCategory(character)
+                == System.Globalization.UnicodeCategory.NonSpacingMark)
+            {
+                continue;
+            }
+            if (character is >= 'a' and <= 'z')
+            {
+                output.Append(character);
+                continue;
+            }
+            if (!char.IsWhiteSpace(character))
+            {
+                return string.Empty;
+            }
+        }
+        return output.ToString();
     }
 
     private static bool TryParseFullAmountFen(
@@ -187,4 +312,6 @@ internal static class PaddleRecipientValueParser
             && box[2] > box[0]
             && box[3] > box[1];
     }
+
+    private sealed record PreparedLine(string Text, float Confidence);
 }
