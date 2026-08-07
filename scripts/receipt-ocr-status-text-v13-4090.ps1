@@ -134,8 +134,11 @@ function Get-StatusOovAudit([object]$Contract, [string]$Split) {
     $records = [int]$audit.records
     $oovRecords = [int]$audit.oov_records
     $oovCharacters = [int]$audit.oov_characters
-    if ($records -gt 0 -and ($oovRecords -ne 0 -or $oovCharacters -ne 0)) {
-        throw "v13 $Split status text has train-charset OOV: records=$oovRecords characters=$oovCharacters"
+    $maxPossibleExactMatch = if ($records -gt 0) {
+        [double]($records - $oovRecords) / [double]$records
+    }
+    else {
+        $null
     }
     return [ordered]@{
         split = $Split
@@ -143,8 +146,14 @@ function Get-StatusOovAudit([object]$Contract, [string]$Split) {
         oov_records = $oovRecords
         oov_characters = $oovCharacters
         checked = ($records -gt 0)
+        max_possible_exact_match = $maxPossibleExactMatch
         calibration_note = if ($records -gt 0) {
-            "visible status text present; zero OOV required and observed"
+            if ($oovRecords -eq 0 -and $oovCharacters -eq 0) {
+                "visible status text present; zero train-charset OOV observed"
+            }
+            else {
+                "held-out train-charset OOV is retained as an error; the exact-match floor remains mandatory"
+            }
         }
         else {
             "no visible status text in this split; no status OCR claim is made"
@@ -236,6 +245,17 @@ $valStatusAudit = Get-StatusOovAudit $datasetContract "val"
 $testStatusAudit = Get-StatusOovAudit $datasetContract "test"
 if ([int]$trainStatusAudit.visible_status_records -le 0 -or [int]$valStatusAudit.visible_status_records -le 0) {
     throw "v13 status-text training requires visible transfer status text in both train and val."
+}
+if ([int]$trainStatusAudit.oov_records -ne 0 -or [int]$trainStatusAudit.oov_characters -ne 0) {
+    throw "v13 train status text must have zero OOV against its own frozen charset."
+}
+foreach ($heldOutAudit in @($valStatusAudit, $testStatusAudit)) {
+    if ([int]$heldOutAudit.visible_status_records -gt 0 `
+        -and [double]$heldOutAudit.max_possible_exact_match -lt $StatusTextFloor) {
+        throw ("v13 {0} train-charset OOV makes the requested status exact floor impossible: " +
+            "max={1:P2}, floor={2:P2}") -f `
+            $heldOutAudit.split, [double]$heldOutAudit.max_possible_exact_match, $StatusTextFloor
+    }
 }
 
 $trainArgs = @(

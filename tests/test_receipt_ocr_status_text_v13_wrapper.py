@@ -79,7 +79,10 @@ def test_wrapper_fails_closed_on_visible_status_text_and_review_only_delivery() 
     assert "candidateContract.status_head_policy.runtime_policy -ne \"review_only\"" in source
     assert 'Get-StatusOovAudit $datasetContract "val"' in source
     assert 'Get-StatusOovAudit $datasetContract "test"' in source
-    assert "status text has train-charset OOV" in source
+    assert "train status text must have zero OOV" in source
+    assert "held-out train-charset OOV is retained as an error" in source
+    assert "max_possible_exact_match -lt $StatusTextFloor" in source
+    assert "train-charset OOV makes the requested status exact floor impossible" in source
     assert '"--max-non-success-to-success", "0"' in source
     assert "no pending/failed truth in this split; no non-success safety claim is made" in source
     assert "non_success_safety_calibrated" in source
