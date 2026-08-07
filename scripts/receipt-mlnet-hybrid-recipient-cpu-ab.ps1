@@ -24,6 +24,12 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $modeName = $Mode.ToLowerInvariant()
 $requiredFormalReceipts = 10016
+$expectedSelectionOrder = if ($modeName -eq "pilot") {
+    "deterministic_min16_field_quota_then_records_manifest_order"
+}
+else {
+    "first_unique_source_in_records_manifest_order"
+}
 if ($modeName -eq "formal" -and $Limit -ne 0) {
     throw "Formal CPU A/B must use -Limit 0 so the complete validation split is evaluated."
 }
@@ -206,23 +212,35 @@ if (@($preparedInputs | Sort-Object -Unique).Count -ne $preparedInputs.Count) {
 if ($modeName -eq "formal" -and $preparedInputs.Count -ne $requiredFormalReceipts) {
     throw "Formal CPU A/B requires exactly $requiredFormalReceipts prepared val receipts; got $($preparedInputs.Count)."
 }
-$selectedInputs = if ($Limit -gt 0) {
-    @($preparedInputs | Select-Object -First $Limit)
+if ($modeName -eq "pilot") {
+    & $pythonExe $scorer prepare `
+        --records $Records `
+        --output $inputList `
+        --split val `
+        --limit $Limit
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not prepare deterministic five-field pilot input list; exit code $LASTEXITCODE"
+    }
 }
 else {
-    @($preparedInputs)
+    Copy-Item -LiteralPath $preparedInputList -Destination $inputList
 }
+[string[]]$selectedInputs = @(
+    Get-Content -LiteralPath $inputList -Encoding UTF8 |
+        ForEach-Object { $_.Trim() } |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and -not $_.StartsWith("#") }
+)
 if ($selectedInputs.Count -le 0) {
     throw "Fixed selected input manifest would be empty."
 }
-if ($Limit -eq 0) {
-    Copy-Item -LiteralPath $preparedInputList -Destination $inputList
+if (@($selectedInputs | Sort-Object -Unique).Count -ne $selectedInputs.Count) {
+    throw "Fixed selected input manifest contains duplicate sources."
 }
-else {
-    [IO.File]::WriteAllLines(
-        $inputList,
-        [string[]]$selectedInputs,
-        (New-Object Text.UTF8Encoding($false)))
+if ($modeName -eq "pilot" -and $selectedInputs.Count -ne $Limit) {
+    throw "Pilot input preparation must produce exactly $Limit receipts; got $($selectedInputs.Count)."
+}
+if ($modeName -eq "formal" -and $selectedInputs.Count -ne $requiredFormalReceipts) {
+    throw "Formal input manifest must contain exactly $requiredFormalReceipts receipts."
 }
 $inputManifestSha256 = Get-Sha256 $inputList
 
@@ -251,10 +269,6 @@ $common = @(
     "--rectification", "max-side-1600",
     "--annotate", "none"
 )
-if ($Limit -gt 0) {
-    $common += "--limit"
-    $common += "$Limit"
-}
 if ($DetectorIntraOpThreads -gt 0) {
     $common += "--detector-intra-op-threads"
     $common += "$DetectorIntraOpThreads"
@@ -317,6 +331,8 @@ $scoreArguments = @(
     "--records", $Records,
     "--results", $hybridOutput,
     "--manifest", (Join-Path $hybridOutput "inference_manifest.json"),
+    "--input-list", $inputList,
+    "--input-list-sha256", $inputManifestSha256,
     "--model", $UnifiedModel,
     "--output", $scoreOutput,
     "--split", "val",
@@ -330,6 +346,9 @@ $scoreArguments = @(
 & $pythonExe @scoreArguments
 if ($LASTEXITCODE -ne 0) {
     throw "Hybrid recipient fixed-val accuracy gate failed with exit code $LASTEXITCODE"
+}
+if ((Get-Sha256 $inputList) -ne $inputManifestSha256) {
+    throw "Fixed val input manifest changed during hash-bound scoring."
 }
 
 $summary = Get-Content -LiteralPath (Join-Path $reportOutput "summary.json") -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -352,7 +371,15 @@ if ([int]$summary.schema_version -ne 2 `
         [StringComparison]::OrdinalIgnoreCase) `
     -or [string]$summary.run_manifests.hybrid.sha256 -ne $hybridManifestSha256 `
     -or -not $scoreManifestPath.Equals($hybridManifestPath, [StringComparison]::OrdinalIgnoreCase) `
-    -or [string]$score.manifest_sha256 -ne $hybridManifestSha256) {
+    -or [string]$score.manifest_sha256 -ne $hybridManifestSha256 `
+    -or -not ([IO.Path]::GetFullPath([string]$score.input_selection.path)).Equals(
+        ([IO.Path]::GetFullPath($inputList)),
+        [StringComparison]::OrdinalIgnoreCase) `
+    -or [string]$score.input_selection.sha256 -ne $inputManifestSha256 `
+    -or [int]$score.input_selection.records -ne $selectedInputs.Count `
+    -or [string]$score.input_selection.selection_order -ne $expectedSelectionOrder `
+    -or [string]$score.evaluation_scope.selection_order -ne $expectedSelectionOrder `
+    -or [string]$score.evaluation_scope.input_list_sha256 -ne $inputManifestSha256) {
     throw "Hybrid CPU A/B comparison and score are not schema/hash-bound to the frozen inputs, CLI and hybrid manifest."
 }
 $formalGateProperty = $score.PSObject.Properties["formal_delivery_gate"]
@@ -364,6 +391,20 @@ if ($modeName -eq "formal") {
         -or $formalGateProperty.Value -ne $true) {
         throw "Formal CPU A/B must schema-bind exactly $requiredFormalReceipts receipts and declare formal_delivery_gate=true."
     }
+    foreach ($fieldName in @(
+            "amount",
+            "time",
+            "payment_method_field",
+            "recipient_field",
+            "transfer_status"
+        )) {
+        $metricProperty = $score.by_field.PSObject.Properties[$fieldName]
+        if ($null -eq $metricProperty `
+            -or [int]$metricProperty.Value.records -ne $requiredFormalReceipts `
+            -or [double]$metricProperty.Value.candidate_coverage -ne 1.0) {
+            throw "Formal CPU A/B $fieldName evidence is not complete for all $requiredFormalReceipts receipts."
+        }
+    }
     if ($score.accepted -ne $true -or $score.acceptance.passed -ne $true) {
         throw "Formal CPU A/B scorer did not accept the complete validation split."
     }
@@ -373,7 +414,13 @@ else {
     $pilotThresholdProperty = $score.PSObject.Properties["pilot_thresholds_passed"]
     if ($null -eq $formalGateProperty -or $formalGateProperty.Value -ne $false `
         -or $null -eq $pilotThresholdProperty -or $pilotThresholdProperty.Value -ne $true `
-        -or $score.accepted -ne $false) {
+        -or $score.accepted -ne $false `
+        -or [int]$score.input_selection.records -ne $Limit `
+        -or [int]$score.by_field.amount.records -le 0 `
+        -or [int]$score.by_field.time.records -le 0 `
+        -or [int]$score.by_field.payment_method_field.records -le 0 `
+        -or [int]$score.by_field.recipient_field.records -le 0 `
+        -or [int]$score.by_field.transfer_status.records -le 0) {
         throw "Pilot scorer evidence is not explicitly partial/non-formal or its fixed thresholds failed."
     }
     $passLabel = "PILOT PASS"

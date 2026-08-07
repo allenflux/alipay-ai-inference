@@ -66,8 +66,9 @@ def test_cpu_ab_runs_same_val_inputs_through_v13_and_hybrid_on_cpu() -> None:
     source = CPU_AB.read_text(encoding="utf-8")
 
     assert "prepare --records $Records --output $preparedInputList --split val" in source
-    assert '@($preparedInputs | Select-Object -First $Limit)' in source
-    assert '[IO.File]::WriteAllLines(' in source
+    assert "--limit $Limit" in source
+    assert "$selectedInputs.Count -ne $Limit" in source
+    assert '$common += "--limit"' not in source
     assert '"--device", "cpu"' in source
     assert '"--device-model", $DeviceModel' in source
     assert '"--ocr", "unified"' in source
@@ -81,6 +82,9 @@ def test_cpu_ab_runs_same_val_inputs_through_v13_and_hybrid_on_cpu() -> None:
     assert '"--payment-floor", "0.9325"' in source
     assert '"--recipient-floor", "0.90"' in source
     assert '"--status-floor", "0.90"' in source
+    assert '"--input-list", $inputList' in source
+    assert '"--input-list-sha256", $inputManifestSha256' in source
+    assert "score.input_selection.sha256 -ne $inputManifestSha256" in source
     assert '[ValidateSet("pilot", "formal")]' in source
     assert '[double]$MaxP95OverheadMs = 250.0' in source
     assert '$modeName -eq "formal" -and $Limit -ne 0' in source

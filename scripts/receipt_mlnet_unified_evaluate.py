@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Prepare and score ML.NET v12/v13 unified-reader delivery runs.
 
-``prepare`` writes the unique source images for one manifest split. ``score``
-joins the C# inference manifest to its result JSON files, verifies that every
-result came from the requested unified ONNX artifact, and applies the same
-strict candidate/reference comparison used by the Python unified evaluator.
+``prepare`` writes either the complete unique source set or an exact,
+deterministic five-field-covered pilot selection. ``score`` hash-binds an
+explicit pilot list, joins the C# inference manifest to its result JSON files,
+verifies that every result came from the requested unified ONNX artifact, and
+applies the same strict candidate/reference comparison used by the Python
+unified evaluator.
 
 This evaluates the diagnostic ``candidate`` channel.  It does not promote the
 artifact's review-only business ``value`` or turn Paddle-derived labels into
@@ -52,10 +54,29 @@ FIELD_RESULT_KEYS = {
     "recipient_field": "recipient",
 }
 STATUS_RESULT_KEY = "transfer_status"
+PILOT_REQUIRED_FIELDS = (
+    "amount",
+    "time",
+    "payment_method_field",
+    "recipient_field",
+    "transfer_status",
+)
+PILOT_FIELD_QUOTA = 16
+PILOT_SELECTION_ORDER = "deterministic_min16_field_quota_then_records_manifest_order"
+FULL_SELECTION_ORDER = "first_unique_source_in_records_manifest_order"
 
 
 class EvaluationInputError(ValueError):
     """Raised when delivery evidence is malformed or ambiguous."""
+
+
+def _has_reference(entry: Mapping[str, Any], field: str) -> bool:
+    references = entry.get("references")
+    return (
+        isinstance(references, Mapping)
+        and isinstance(references.get(field), str)
+        and bool(references[field])
+    )
 
 
 def _load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -120,29 +141,126 @@ def _source_from_record(record: Mapping[str, Any], *, source: Path) -> str:
     return value
 
 
-def prepare_input_list(*, records_path: Path, output_path: Path, split: str = "val") -> dict[str, Any]:
+def _pilot_selection(
+    expected: Mapping[str, Mapping[str, Any]],
+    *,
+    limit: int,
+) -> tuple[list[str], dict[str, int], dict[str, int]]:
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+        raise EvaluationInputError("pilot input selection requires a positive limit")
+    if limit > len(expected):
+        raise EvaluationInputError(
+            f"pilot input limit {limit} exceeds {len(expected)} unique source(s)"
+        )
+
+    available = {
+        field: sum(_has_reference(entry, field) for entry in expected.values())
+        for field in PILOT_REQUIRED_FIELDS
+    }
+    missing_fields = [field for field, count in available.items() if count <= 0]
+    if missing_fields:
+        raise EvaluationInputError(
+            "pilot input selection has no validation reference for required field(s): "
+            + ", ".join(missing_fields)
+        )
+    quotas = {
+        field: min(PILOT_FIELD_QUOTA, available[field], limit)
+        for field in PILOT_REQUIRED_FIELDS
+    }
+    selected: list[str] = []
+    selected_set: set[str] = set()
+    coverage = {field: 0 for field in PILOT_REQUIRED_FIELDS}
+    ordered_keys = list(expected)
+
+    while any(coverage[field] < quotas[field] for field in PILOT_REQUIRED_FIELDS):
+        if len(selected) >= limit:
+            deficits = {
+                field: quotas[field] - coverage[field]
+                for field in PILOT_REQUIRED_FIELDS
+                if coverage[field] < quotas[field]
+            }
+            raise EvaluationInputError(
+                f"pilot limit {limit} cannot satisfy deterministic field quotas {deficits}"
+            )
+        best_key: str | None = None
+        best_gain = 0
+        for key in ordered_keys:
+            if key in selected_set:
+                continue
+            gain = sum(
+                _has_reference(expected[key], field) and coverage[field] < quotas[field]
+                for field in PILOT_REQUIRED_FIELDS
+            )
+            if gain > best_gain:
+                best_key = key
+                best_gain = gain
+        if best_key is None or best_gain <= 0:
+            raise EvaluationInputError("pilot field quotas cannot be satisfied by unique sources")
+        selected.append(best_key)
+        selected_set.add(best_key)
+        for field in PILOT_REQUIRED_FIELDS:
+            if _has_reference(expected[best_key], field):
+                coverage[field] += 1
+
+    for key in ordered_keys:
+        if len(selected) >= limit:
+            break
+        if key not in selected_set:
+            selected.append(key)
+            selected_set.add(key)
+            for field in PILOT_REQUIRED_FIELDS:
+                if _has_reference(expected[key], field):
+                    coverage[field] += 1
+    if len(selected) != limit or len(selected_set) != limit:
+        raise EvaluationInputError(
+            f"pilot selection produced {len(selected)} unique source(s), expected exactly {limit}"
+        )
+    if any(coverage[field] <= 0 for field in PILOT_REQUIRED_FIELDS):
+        raise EvaluationInputError("pilot selection did not cover every required field")
+    return selected, quotas, coverage
+
+
+def prepare_input_list(
+    *,
+    records_path: Path,
+    output_path: Path,
+    split: str = "val",
+    limit: int = 0,
+) -> dict[str, Any]:
     records_path = records_path.resolve()
-    sources: list[str] = []
-    seen: set[str] = set()
-    split_records = 0
-    for record in _load_jsonl(records_path):
-        if record.get("split") != split:
-            continue
-        split_records += 1
-        source = _source_from_record(record, source=records_path)
-        key = _source_key(source)
-        if key in seen:
-            continue
-        seen.add(key)
-        sources.append(source)
-    if not sources:
-        raise EvaluationInputError(f"{records_path}: no records with split={split!r} and a source")
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+        raise EvaluationInputError("limit must be a non-negative integer")
+    rows = _load_jsonl(records_path)
+    split_records = sum(record.get("split") == split for record in rows)
+    expected = _expected_receipts(
+        records_path,
+        split=split,
+        include_status_text=True,
+    )
+    quotas: dict[str, int] | None = None
+    if limit > 0:
+        selected_keys, quotas, selected_coverage = _pilot_selection(expected, limit=limit)
+        selection_order = PILOT_SELECTION_ORDER
+    else:
+        selected_keys = list(expected)
+        selected_coverage = {
+            field: sum(_has_reference(entry, field) for entry in expected.values())
+            for field in PILOT_REQUIRED_FIELDS
+        }
+        selection_order = FULL_SELECTION_ORDER
+    sources = [str(expected[key]["source"]) for key in selected_keys]
     _atomic_write_text(output_path, "".join(f"{source}\n" for source in sources))
     return {
         "records": split_records,
         "unique_sources": len(sources),
+        "full_unique_sources": len(expected),
         "split": split,
+        "limit": limit if limit > 0 else None,
+        "selection_order": selection_order,
+        "field_quotas": quotas,
+        "selected_field_reference_counts": selected_coverage,
         "output": output_path.resolve().as_posix(),
+        "output_sha256": _sha256(output_path),
     }
 
 
@@ -260,6 +378,48 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _load_bound_input_list(
+    path: Path,
+    *,
+    expected_sha256: str,
+) -> tuple[list[str], list[str], str]:
+    if not path.is_file():
+        raise EvaluationInputError(f"Explicit input list not found: {path}")
+    if not isinstance(expected_sha256, str) or re.fullmatch(
+        r"[0-9a-fA-F]{64}", expected_sha256
+    ) is None:
+        raise EvaluationInputError("input_list_sha256 must be a 64-character SHA-256")
+    payload = path.read_bytes()
+    actual_sha256 = hashlib.sha256(payload).hexdigest()
+    if actual_sha256 != expected_sha256.lower():
+        raise EvaluationInputError(
+            f"explicit input list SHA-256 mismatch: expected {expected_sha256.lower()}, "
+            f"observed {actual_sha256}"
+        )
+
+    sources: list[str] = []
+    keys: list[str] = []
+    seen: set[str] = set()
+    text = payload.decode("utf-8-sig")
+    for line_number, line in enumerate(text.splitlines(), start=1):
+        source = line.strip()
+        if not source:
+            raise EvaluationInputError(
+                f"explicit input list {path}:{line_number} contains an empty source"
+            )
+        key = _source_key(source)
+        if key in seen:
+            raise EvaluationInputError(
+                f"explicit input list {path}:{line_number} contains duplicate source {source!r}"
+            )
+        seen.add(key)
+        sources.append(source)
+        keys.append(key)
+    if not sources:
+        raise EvaluationInputError(f"explicit input list {path} is empty")
+    return sources, keys, actual_sha256
+
+
 def _resolve_result_path(raw: str, *, manifest_path: Path) -> Path:
     path = Path(raw)
     if path.is_absolute():
@@ -364,10 +524,15 @@ def _load_manifest_results(
     *,
     manifest_path: Path,
     model_sha256: str,
+    allowed_source_keys: set[str] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, Any], list[str]]:
     payload = _load_json(manifest_path, description="ML.NET inference manifest")
     if not isinstance(payload, list):
         raise EvaluationInputError(f"ML.NET inference manifest {manifest_path} must contain a JSON array")
+    if allowed_source_keys is not None and not payload:
+        raise EvaluationInputError(
+            f"ML.NET inference manifest {manifest_path} is empty for the bound input list"
+        )
 
     results: dict[str, dict[str, Any]] = {}
     integrity_failures: list[str] = []
@@ -379,18 +544,38 @@ def _load_manifest_results(
     invalid_result_files: list[dict[str, str]] = []
     duplicate_sources: list[str] = []
     usable_manifest_sources: set[str] = set()
+    seen_manifest_sources: set[str] = set()
 
     for index, item in enumerate(payload):
         if not isinstance(item, Mapping):
+            if allowed_source_keys is not None:
+                raise EvaluationInputError(
+                    f"ML.NET inference manifest {manifest_path}[{index}] is not an object"
+                )
             integrity_failures.append(f"manifest[{index}] is not an object")
             continue
         manifest_source = item.get("source")
         result_value = item.get("result")
         status = item.get("status")
         if not isinstance(manifest_source, str) or not manifest_source:
+            if allowed_source_keys is not None:
+                raise EvaluationInputError(
+                    f"ML.NET inference manifest {manifest_path}[{index}] has no source"
+                )
             integrity_failures.append(f"manifest[{index}] has no source")
             continue
         source_key = _source_key(manifest_source)
+        if source_key in seen_manifest_sources and allowed_source_keys is not None:
+            raise EvaluationInputError(
+                f"ML.NET inference manifest {manifest_path} contains duplicate source "
+                f"{manifest_source!r}"
+            )
+        seen_manifest_sources.add(source_key)
+        if allowed_source_keys is not None and source_key not in allowed_source_keys:
+            raise EvaluationInputError(
+                f"ML.NET inference manifest source {manifest_source!r} is outside the "
+                "hash-bound explicit input list"
+            )
         if status not in {"written", "skipped_existing"}:
             integrity_failures.append(f"manifest source {manifest_source!r} has incomplete status {status!r}")
             continue
@@ -545,6 +730,8 @@ def score_results(
     model_path: Path,
     output_dir: Path,
     manifest_path: Path | None = None,
+    input_list_path: Path | None = None,
+    input_list_sha256: str | None = None,
     split: str = "val",
     amount_floor: float = DEFAULT_AMOUNT_FLOOR,
     time_floor: float = DEFAULT_TIME_FLOOR,
@@ -558,6 +745,7 @@ def score_results(
     model_path = model_path.resolve()
     output_dir = output_dir.resolve()
     manifest_path = (manifest_path or (results_root / "inference_manifest.json")).resolve()
+    input_list_path = input_list_path.resolve() if input_list_path is not None else None
     for name, floor in {
         "amount_floor": amount_floor,
         "time_floor": time_floor,
@@ -571,6 +759,18 @@ def score_results(
             raise EvaluationInputError(f"{name} must be between 0 and 1")
     if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
         raise EvaluationInputError("limit must be a non-negative integer")
+    if (input_list_path is None) != (input_list_sha256 is None):
+        raise EvaluationInputError(
+            "input_list_path and input_list_sha256 must be provided together"
+        )
+    if limit > 0 and input_list_path is None:
+        raise EvaluationInputError(
+            "partial pilot scoring requires a hash-bound explicit input list"
+        )
+    if limit > 0 and status_floor is None:
+        raise EvaluationInputError(
+            "partial pilot scoring requires the transfer_status floor and five-field coverage"
+        )
     if not model_path.is_file():
         raise EvaluationInputError(f"Unified ONNX model not found: {model_path}")
     if not manifest_path.is_file():
@@ -586,15 +786,66 @@ def score_results(
         include_status_text=status_floor is not None,
     )
     full_expected_count = len(full_expected)
-    # ``prepare`` emits sources in the first-seen order of the records
-    # manifest.  Preserve that same order here so ``--limit N`` evaluates the
-    # exact prefix sent to the ML.NET ``--input-list`` invocation.  In
-    # particular, never choose a convenient prefix from the results that
-    # happened to be written successfully.
-    expected = dict(list(full_expected.items())[:limit]) if limit > 0 else full_expected
+    input_selection: dict[str, Any] | None = None
+    if input_list_path is not None:
+        input_sources, input_keys, observed_input_sha256 = _load_bound_input_list(
+            input_list_path,
+            expected_sha256=str(input_list_sha256),
+        )
+        unknown_sources = [
+            source for source, key in zip(input_sources, input_keys) if key not in full_expected
+        ]
+        if unknown_sources:
+            raise EvaluationInputError(
+                f"explicit input list contains {len(unknown_sources)} source(s) outside the "
+                f"{split} reference set: {unknown_sources[0]!r}"
+            )
+        if limit > 0:
+            if len(input_keys) != limit:
+                raise EvaluationInputError(
+                    f"pilot explicit input list has {len(input_keys)} source(s), expected exactly {limit}"
+                )
+            deterministic_keys, quotas, selected_field_counts = _pilot_selection(
+                full_expected,
+                limit=limit,
+            )
+            if input_keys != deterministic_keys:
+                raise EvaluationInputError(
+                    "pilot explicit input list does not match the deterministic field-quota "
+                    "selection order"
+                )
+            selection_order = PILOT_SELECTION_ORDER
+        else:
+            deterministic_keys = list(full_expected)
+            if input_keys != deterministic_keys:
+                raise EvaluationInputError(
+                    "full-split explicit input list must contain every source exactly once in "
+                    "records manifest order; explicit subsets are forbidden"
+                )
+            quotas = None
+            selected_field_counts = {
+                field: sum(
+                    _has_reference(full_expected[key], field) for key in deterministic_keys
+                )
+                for field in field_result_keys
+            }
+            selection_order = FULL_SELECTION_ORDER
+        expected = {key: full_expected[key] for key in input_keys}
+        input_selection = {
+            "path": input_list_path.as_posix(),
+            "sha256": observed_input_sha256,
+            "records": len(input_keys),
+            "selection_order": selection_order,
+            "field_quotas": quotas,
+            "field_reference_counts": selected_field_counts,
+        }
+    else:
+        expected = full_expected
+        selection_order = FULL_SELECTION_ORDER
     results, artifact_audit, integrity_failures = _load_manifest_results(
         manifest_path=manifest_path,
         model_sha256=model_sha256,
+        allowed_source_keys=set(expected) if input_selection is not None else None,
     )
 
     comparisons: list[dict[str, Any]] = []
@@ -765,6 +1016,7 @@ def score_results(
         "results_root": results_root.as_posix(),
         "manifest": manifest_path.as_posix(),
         "manifest_sha256": _sha256(manifest_path),
+        "input_selection": input_selection,
         "evaluation_split": split,
         "model": model_path.as_posix(),
         "model_sha256": model_sha256,
@@ -807,7 +1059,11 @@ def score_results(
             "requested_limit": limit,
             "evaluated_expected_receipts": len(expected),
             "full_split_expected_receipts": full_expected_count,
-            "selection_order": "first_unique_source_in_records_manifest_order",
+            "input_list_path": input_selection["path"] if input_selection is not None else None,
+            "input_list_sha256": (
+                input_selection["sha256"] if input_selection is not None else None
+            ),
+            "selection_order": selection_order,
             "formal_delivery_gate": False,
         }
         summary["formal_delivery_gate"] = False
@@ -817,8 +1073,8 @@ def score_results(
         summary["acceptance"]["formal_delivery_gate"] = False
         summary["acceptance"]["pilot_thresholds_passed"] = sample_thresholds_passed
         summary["warning"] = (
-            "partial_pilot: only the first "
-            f"{len(expected)} of {full_expected_count} expected {split} receipt source(s) were evaluated; "
+            "partial_pilot: a deterministic five-field-covered selection of "
+            f"{len(expected)} from {full_expected_count} expected {split} receipt source(s) was evaluated; "
             "formal_delivery_gate=false and this report cannot be accepted as delivery evidence. "
             "It compares ML.NET candidate text with unified manifest labels; Paddle-derived labels are not "
             "independently verified business truth, and business values remain review-only."
@@ -832,6 +1088,11 @@ def score_results(
             "requested_limit": None,
             "evaluated_expected_receipts": len(expected),
             "full_split_expected_receipts": full_expected_count,
+            "input_list_path": input_selection["path"] if input_selection is not None else None,
+            "input_list_sha256": (
+                input_selection["sha256"] if input_selection is not None else None
+            ),
+            "selection_order": selection_order,
             "formal_delivery_gate": sample_thresholds_passed,
         }
         summary["formal_delivery_gate"] = sample_thresholds_passed
@@ -850,11 +1111,26 @@ def _parser() -> argparse.ArgumentParser:
     prepare.add_argument("--records", type=Path, required=True, help="unified_fields.jsonl")
     prepare.add_argument("--output", type=Path, required=True, help="UTF-8 newline-delimited input list")
     prepare.add_argument("--split", default="val")
+    prepare.add_argument(
+        "--limit",
+        type=_limit,
+        default=0,
+        help="write exactly N deterministic five-field-covered pilot sources; 0 writes all",
+    )
 
     score = subparsers.add_parser("score", help="score ML.NET result JSON against v12/v13 manifest references")
     score.add_argument("--records", type=Path, required=True, help="unified_fields.jsonl")
     score.add_argument("--results", type=Path, required=True, help="ML.NET output root")
     score.add_argument("--manifest", type=Path, help="defaults to RESULTS/inference_manifest.json")
+    score.add_argument(
+        "--input-list",
+        type=Path,
+        help="hash-bound explicit input list; required for a partial pilot",
+    )
+    score.add_argument(
+        "--input-list-sha256",
+        help="expected SHA-256 of --input-list",
+    )
     score.add_argument("--model", type=Path, required=True, help="the delivered v12/v13 unified ONNX")
     score.add_argument("--output", type=Path, required=True, help="evaluation output directory")
     score.add_argument("--split", default="val")
@@ -871,7 +1147,7 @@ def _parser() -> argparse.ArgumentParser:
         "--limit",
         type=_limit,
         default=0,
-        help="evaluate only the first N expected sources in records/input-list order; 0 evaluates all",
+        help="evaluate an explicit deterministic N-source pilot; 0 evaluates the full split",
     )
     return parser
 
@@ -881,16 +1157,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.command == "prepare":
-            report = prepare_input_list(records_path=args.records, output_path=args.output, split=args.split)
+            report = prepare_input_list(
+                records_path=args.records,
+                output_path=args.output,
+                split=args.split,
+                limit=args.limit,
+            )
             print(
                 f"Wrote {report['unique_sources']} unique {report['split']} source(s) "
-                f"from {report['records']} record(s) to {args.output}"
+                f"from {report['records']} record(s) to {args.output}; "
+                f"selection_order={report['selection_order']}; sha256={report['output_sha256']}"
             )
             return 0
         summary = score_results(
             records_path=args.records,
             results_root=args.results,
             manifest_path=args.manifest,
+            input_list_path=args.input_list,
+            input_list_sha256=args.input_list_sha256,
             model_path=args.model,
             output_dir=args.output,
             split=args.split,

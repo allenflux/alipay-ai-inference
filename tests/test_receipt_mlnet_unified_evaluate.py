@@ -6,7 +6,12 @@ from pathlib import Path
 
 import pytest
 
-from scripts.receipt_mlnet_unified_evaluate import main, prepare_input_list, score_results
+from scripts.receipt_mlnet_unified_evaluate import (
+    EvaluationInputError,
+    main,
+    prepare_input_list,
+    score_results,
+)
 
 
 def _write_json(path: Path, value: object) -> None:
@@ -590,38 +595,80 @@ def test_cli_score_returns_one_after_writing_failed_report(tmp_path: Path) -> No
     assert (output / "summary.json").is_file()
 
 
-def test_score_limit_uses_records_prefix_without_counting_full_val_tail_missing(tmp_path: Path) -> None:
+def test_pilot_prepare_and_score_use_deterministic_hash_bound_five_field_selection(
+    tmp_path: Path,
+) -> None:
     model = tmp_path / "best.onnx"
-    model.write_bytes(b"unified-v12-model")
+    model.write_bytes(b"unified-v13-model")
     model_sha256 = hashlib.sha256(model.read_bytes()).hexdigest()
-    sources = [tmp_path / f"{name}.png" for name in ("first", "second", "third")]
+    sources = [tmp_path / f"receipt-{index:02d}.png" for index in range(40)]
     records = tmp_path / "unified_fields.jsonl"
     _write_jsonl(
         records,
         [
-            _record("first", sources[0], recipient="商户甲"),
-            _record("second", sources[1], recipient="商户乙"),
-            _record("third", sources[2], recipient="商户丙"),
+            _record(
+                f"receipt-{index:02d}",
+                source,
+                recipient=f"商户{index:02d}",
+                status="转账成功" if index >= 20 else None,
+            )
+            for index, source in enumerate(sources)
         ],
     )
+    input_list = tmp_path / "pilot-inputs.txt"
+    duplicate_input_list = tmp_path / "pilot-inputs-again.txt"
+
+    report = prepare_input_list(
+        records_path=records,
+        output_path=input_list,
+        limit=20,
+    )
+    duplicate_report = prepare_input_list(
+        records_path=records,
+        output_path=duplicate_input_list,
+        limit=20,
+    )
+
+    selected = input_list.read_text(encoding="utf-8").splitlines()
+    assert len(selected) == len(set(selected)) == 20
+    assert any(int(Path(source).stem.rsplit("-", 1)[1]) >= 20 for source in selected)
+    assert input_list.read_bytes() == duplicate_input_list.read_bytes()
+    assert report["output_sha256"] == duplicate_report["output_sha256"]
+    assert report["selection_order"] == (
+        "deterministic_min16_field_quota_then_records_manifest_order"
+    )
+    assert report["field_quotas"] == {
+        "amount": 16,
+        "time": 16,
+        "payment_method_field": 16,
+        "recipient_field": 16,
+        "transfer_status": 16,
+    }
+    assert report["selected_field_reference_counts"]["transfer_status"] == 16
+
     results = tmp_path / "results"
     manifest: list[dict[str, object]] = []
-    for index, source in enumerate(sources[:1]):
-        result_path = results / f"result-{index}.json"
+    source_indexes = {str(source): index for index, source in enumerate(sources)}
+    for result_index, selected_source in enumerate(selected):
+        source = Path(selected_source)
+        source_index = source_indexes[selected_source]
+        result_path = results / f"result-{result_index}.json"
+        candidates: dict[str, str | None] = {
+            "amount": "¥ 1,234.56",
+            "time": "2026-08-06 07:08:09",
+            "payment_method": "余额",
+            "recipient": f"商户{source_index:02d}",
+        }
+        if source_index >= 20:
+            candidates["transfer_status"] = "转账成功"
         _write_json(
             result_path,
-            _result(
-                source,
-                model_sha256,
-                amount="¥ 1,234.56",
-                time="2026-08-06 07:08:09",
-                payment_method="余额",
-                recipient="商户甲",
-            ),
+            _result(source, model_sha256, **candidates),
         )
         manifest.append({"source": str(source), "result": str(result_path), "status": "written"})
     _write_json(results / "inference_manifest.json", manifest)
     output = tmp_path / "evaluation"
+    input_sha256 = hashlib.sha256(input_list.read_bytes()).hexdigest()
 
     exit_code = main(
         [
@@ -634,8 +681,14 @@ def test_score_limit_uses_records_prefix_without_counting_full_val_tail_missing(
             str(model),
             "--output",
             str(output),
+            "--input-list",
+            str(input_list),
+            "--input-list-sha256",
+            input_sha256,
+            "--status-floor",
+            "0.90",
             "--limit",
-            "1",
+            "20",
         ]
     )
 
@@ -644,13 +697,23 @@ def test_score_limit_uses_records_prefix_without_counting_full_val_tail_missing(
     assert summary["kind"] == "receipt_mlnet_unified_candidate_partial_pilot_evaluation_v1"
     assert summary["evaluation_scope"] == {
         "kind": "partial_pilot",
-        "requested_limit": 1,
-        "evaluated_expected_receipts": 1,
-        "full_split_expected_receipts": 3,
-        "selection_order": "first_unique_source_in_records_manifest_order",
+        "requested_limit": 20,
+        "evaluated_expected_receipts": 20,
+        "full_split_expected_receipts": 40,
+        "input_list_path": input_list.resolve().as_posix(),
+        "input_list_sha256": input_sha256,
+        "selection_order": "deterministic_min16_field_quota_then_records_manifest_order",
         "formal_delivery_gate": False,
     }
-    assert summary["coverage"]["expected_receipts"] == 1
+    assert summary["input_selection"] == {
+        "path": input_list.resolve().as_posix(),
+        "sha256": input_sha256,
+        "records": 20,
+        "selection_order": "deterministic_min16_field_quota_then_records_manifest_order",
+        "field_quotas": report["field_quotas"],
+        "field_reference_counts": report["selected_field_reference_counts"],
+    }
+    assert summary["coverage"]["expected_receipts"] == 20
     assert summary["missing"]["result_receipts"] == 0
     assert summary["failures"] == []
     assert summary["pilot_thresholds_passed"] is True
@@ -662,5 +725,226 @@ def test_score_limit_uses_records_prefix_without_counting_full_val_tail_missing(
     assert "formal_delivery_gate=false" in summary["warning"]
 
     comparisons = [json.loads(line) for line in (output / "comparisons.jsonl").read_text(encoding="utf-8").splitlines()]
-    assert {row["id"] for row in comparisons} == {"first"}
-    assert len(comparisons) == 4
+    assert {row["source"] for row in comparisons} == set(selected)
+    assert summary["by_field"]["transfer_status"]["records"] == 16
+    assert len(comparisons) == 96
+
+
+def _write_bound_v13_fixture(
+    tmp_path: Path,
+) -> tuple[Path, Path, list[Path], Path, dict[str, Path]]:
+    model = tmp_path / "v13.onnx"
+    model.write_bytes(b"v13-model")
+    model_sha256 = hashlib.sha256(model.read_bytes()).hexdigest()
+    sources = [tmp_path / f"bound-{index}.png" for index in range(3)]
+    records = tmp_path / "bound-records.jsonl"
+    _write_jsonl(
+        records,
+        [
+            _record(
+                f"bound-{index}",
+                source,
+                recipient=f"商户{index}",
+                status="转账成功",
+            )
+            for index, source in enumerate(sources)
+        ],
+    )
+    results = tmp_path / "bound-results"
+    result_paths: dict[str, Path] = {}
+    manifest: list[dict[str, object]] = []
+    for index, source in enumerate(sources):
+        result_path = results / f"bound-{index}.json"
+        _write_json(
+            result_path,
+            _result(
+                source,
+                model_sha256,
+                amount="¥ 1,234.56",
+                time="2026-08-06 07:08:09",
+                payment_method="余额",
+                recipient=f"商户{index}",
+                transfer_status="转账成功",
+            ),
+        )
+        result_paths[str(source)] = result_path
+        manifest.append(
+            {"source": str(source), "result": str(result_path), "status": "written"}
+        )
+    manifest_path = results / "inference_manifest.json"
+    _write_json(manifest_path, manifest)
+    return model, records, sources, results, result_paths
+
+
+def test_pilot_prepare_rejects_missing_field_or_insufficient_unique_sources(
+    tmp_path: Path,
+) -> None:
+    records_without_status = tmp_path / "without-status.jsonl"
+    _write_jsonl(
+        records_without_status,
+        [_record("one", tmp_path / "one.png"), _record("two", tmp_path / "two.png")],
+    )
+    with pytest.raises(EvaluationInputError, match="transfer_status"):
+        prepare_input_list(
+            records_path=records_without_status,
+            output_path=tmp_path / "missing-field.txt",
+            limit=1,
+        )
+
+    records = tmp_path / "too-small.jsonl"
+    _write_jsonl(
+        records,
+        [_record("one", tmp_path / "only.png", status="转账成功")],
+    )
+    with pytest.raises(EvaluationInputError, match="exceeds 1 unique"):
+        prepare_input_list(
+            records_path=records,
+            output_path=tmp_path / "too-large.txt",
+            limit=2,
+        )
+
+
+@pytest.mark.parametrize(
+    ("contents", "message"),
+    [
+        ("\n", "empty source"),
+        ("{first}\n{first}\n", "duplicate source"),
+        ("{unknown}\n", "outside the val reference set"),
+        ("{second}\n", "does not match the deterministic"),
+    ],
+)
+def test_pilot_score_rejects_invalid_or_unbound_explicit_input_list(
+    tmp_path: Path,
+    contents: str,
+    message: str,
+) -> None:
+    model, records, sources, results, _ = _write_bound_v13_fixture(tmp_path)
+    input_list = tmp_path / "invalid-inputs.txt"
+    input_list.write_text(
+        contents.format(first=sources[0], second=sources[1], unknown=tmp_path / "unknown.png"),
+        encoding="utf-8",
+    )
+    input_sha256 = hashlib.sha256(input_list.read_bytes()).hexdigest()
+
+    with pytest.raises(EvaluationInputError, match=message):
+        score_results(
+            records_path=records,
+            results_root=results,
+            model_path=model,
+            output_dir=tmp_path / "invalid-evaluation",
+            input_list_path=input_list,
+            input_list_sha256=input_sha256,
+            status_floor=0.90,
+            limit=1,
+        )
+
+
+def test_pilot_score_requires_paired_input_list_hash_and_rejects_wrong_hash(
+    tmp_path: Path,
+) -> None:
+    model, records, _, results, _ = _write_bound_v13_fixture(tmp_path)
+    input_list = tmp_path / "pilot.txt"
+    prepare_input_list(records_path=records, output_path=input_list, limit=1)
+    input_sha256 = hashlib.sha256(input_list.read_bytes()).hexdigest()
+    common = {
+        "records_path": records,
+        "results_root": results,
+        "model_path": model,
+        "output_dir": tmp_path / "evaluation",
+        "status_floor": 0.90,
+        "limit": 1,
+    }
+
+    with pytest.raises(EvaluationInputError, match="provided together"):
+        score_results(**common, input_list_path=input_list)
+    with pytest.raises(EvaluationInputError, match="provided together"):
+        score_results(**common, input_list_sha256=input_sha256)
+    with pytest.raises(EvaluationInputError, match="hash-bound explicit input list"):
+        score_results(**common)
+    with pytest.raises(EvaluationInputError, match="SHA-256 mismatch"):
+        score_results(
+            **common,
+            input_list_path=input_list,
+            input_list_sha256="0" * 64,
+        )
+
+
+@pytest.mark.parametrize("manifest_kind", ["empty", "duplicate", "outside"])
+def test_bound_score_rejects_empty_duplicate_or_outside_inference_manifest(
+    tmp_path: Path,
+    manifest_kind: str,
+) -> None:
+    model, records, sources, results, result_paths = _write_bound_v13_fixture(tmp_path)
+    input_list = tmp_path / "pilot.txt"
+    prepare_input_list(records_path=records, output_path=input_list, limit=1)
+    input_sha256 = hashlib.sha256(input_list.read_bytes()).hexdigest()
+    if manifest_kind == "empty":
+        manifest: list[dict[str, object]] = []
+        message = "is empty for the bound input list"
+    elif manifest_kind == "duplicate":
+        manifest = [
+            {"source": str(sources[0]), "status": "failed"},
+            {"source": str(sources[0]), "status": "failed"},
+        ]
+        message = "contains duplicate source"
+    else:
+        manifest = [
+            {
+                "source": str(sources[1]),
+                "result": str(result_paths[str(sources[1])]),
+                "status": "written",
+            }
+        ]
+        message = "outside the hash-bound explicit input list"
+    _write_json(results / "inference_manifest.json", manifest)
+
+    with pytest.raises(EvaluationInputError, match=message):
+        score_results(
+            records_path=records,
+            results_root=results,
+            model_path=model,
+            output_dir=tmp_path / "manifest-evaluation",
+            input_list_path=input_list,
+            input_list_sha256=input_sha256,
+            status_floor=0.90,
+            limit=1,
+        )
+
+
+def test_formal_bound_input_list_must_be_complete_and_remains_formal(
+    tmp_path: Path,
+) -> None:
+    model, records, sources, results, _ = _write_bound_v13_fixture(tmp_path)
+    full_input_list = tmp_path / "full-inputs.txt"
+    report = prepare_input_list(records_path=records, output_path=full_input_list)
+    full_sha256 = hashlib.sha256(full_input_list.read_bytes()).hexdigest()
+
+    summary = score_results(
+        records_path=records,
+        results_root=results,
+        model_path=model,
+        output_dir=tmp_path / "formal-evaluation",
+        input_list_path=full_input_list,
+        input_list_sha256=full_sha256,
+        status_floor=0.90,
+    )
+
+    assert report["selection_order"] == "first_unique_source_in_records_manifest_order"
+    assert summary["accepted"] is True
+    assert summary["formal_delivery_gate"] is True
+    assert summary["evaluation_scope"]["kind"] == "full_split"
+    assert summary["evaluation_scope"]["input_list_sha256"] == full_sha256
+    assert summary["input_selection"]["records"] == 3
+
+    subset = tmp_path / "formal-subset.txt"
+    subset.write_text(str(sources[0]) + "\n", encoding="utf-8")
+    with pytest.raises(EvaluationInputError, match="explicit subsets are forbidden"):
+        score_results(
+            records_path=records,
+            results_root=results,
+            model_path=model,
+            output_dir=tmp_path / "formal-subset-evaluation",
+            input_list_path=subset,
+            input_list_sha256=hashlib.sha256(subset.read_bytes()).hexdigest(),
+            status_floor=0.90,
+        )

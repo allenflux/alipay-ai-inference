@@ -329,12 +329,31 @@ def test_launcher_freezes_one_published_cli_and_hard_counts_formal_set() -> None
     assert '"prepared-full-val-inputs.txt"' in source
     assert '"fixed-selected-inputs.txt"' in source
     assert "[string[]]$selectedInputs" in source
+    assert 'if ($modeName -eq "pilot")' in source
+    assert "--limit $Limit" in source
+    assert "$selectedInputs.Count -ne $Limit" in source
     assert "Copy-Item -LiteralPath $preparedInputList -Destination $inputList" in source
+    assert '$common += "--limit"' not in source
     assert "mlnet_hybrid_ab_publish_frozen_cli" in source
     assert "Write-CliAppClosureManifest $cliPublishDirectory $cliClosureManifest" in source
     assert "& $DotnetExe $cliAssembly @baselineArguments" in source
     assert "& $DotnetExe $cliAssembly @hybridArguments" in source
     assert '"--input-manifest-sha256", $inputManifestSha256' in source
+    assert '"--input-list", $inputList' in source
+    assert '"--input-list-sha256", $inputManifestSha256' in source
     assert '"--cli-assembly-sha256", $cliAssemblySha256' in source
     assert '"--cli-closure-manifest-sha256", $cliClosureManifestSha256' in source
+    assert "score.input_selection.sha256 -ne $inputManifestSha256" in source
+    assert "score.input_selection.records -ne $selectedInputs.Count" in source
     assert "[int]$score.coverage.expected_receipts -ne $requiredFormalReceipts" in source
+    assert "$score.by_field.PSObject.Properties[$fieldName]" in source
+    assert "[int]$metricProperty.Value.records -ne $requiredFormalReceipts" in source
+    assert "[double]$metricProperty.Value.candidate_coverage -ne 1.0" in source
+    for field_name in (
+        "amount",
+        "time",
+        "payment_method_field",
+        "recipient_field",
+        "transfer_status",
+    ):
+        assert f'"{field_name}"' in source
