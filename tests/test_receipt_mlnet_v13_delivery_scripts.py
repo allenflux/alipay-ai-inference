@@ -214,5 +214,6 @@ def test_delivery_powershell_parses_when_powershell_is_available(
         check=False,
         capture_output=True,
         text=True,
+        errors="replace",
     )
     assert completed.returncode == 0, completed.stderr
