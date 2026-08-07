@@ -12,7 +12,7 @@ def test_each_result_persists_an_explicit_cache_semantics_contract() -> None:
     program = (CLI / "Program.cs").read_text(encoding="utf-8")
     contract = (CLI / "ReceiptResultCacheContract.cs").read_text(encoding="utf-8")
 
-    assert 'SemanticsVersion = "status-review-only-visible-text-v1"' in contract
+    assert 'SemanticsVersion = "status-review-only-visible-text-negation-v2"' in contract
     assert 'root.TryGetProperty("result_schema_version"' in contract
     assert 'schemaVersion.ValueKind == JsonValueKind.Number' in contract
     assert 'root.TryGetProperty("result_semantics_version"' in contract

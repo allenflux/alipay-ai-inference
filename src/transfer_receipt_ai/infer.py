@@ -16,6 +16,7 @@ from .model import LRCNNPredictor
 from .ocr import PaddleOCRReader
 from .pipeline import ReceiptPipeline, write_receipt_result
 from .prepare import iter_image_paths, load_corrections, parse_max_side
+from .result_semantics import has_current_result_semantics
 from .status_style import (
     STATUS_STYLE_SCHEMA_VERSION,
     StatusStylePredictor,
@@ -164,7 +165,11 @@ def _committed_result_exists(
         payload = json.loads(result_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return False
-    if not isinstance(payload, dict) or not isinstance(payload.get("fields"), dict):
+    if (
+        not has_current_result_semantics(payload)
+        or not isinstance(payload, dict)
+        or not isinstance(payload.get("fields"), dict)
+    ):
         return False
     if payload.get("source") != source_path.resolve().as_posix():
         return False

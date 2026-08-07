@@ -35,6 +35,10 @@ from .render import (
     draw_original_circles,
     draw_rectified_circles,
 )
+from .result_semantics import (
+    RECEIPT_RESULT_SCHEMA_VERSION,
+    RECEIPT_RESULT_SEMANTICS_VERSION,
+)
 from .status_crops import crop_status_region
 from .status_style import (
     STATUS_STYLE_SCHEMA_VERSION,
@@ -80,13 +84,15 @@ class ReceiptResult:
 
     def as_dict(self) -> dict[str, object]:
         output: dict[str, object] = {
+            "result_schema_version": RECEIPT_RESULT_SCHEMA_VERSION,
+            "result_semantics_version": RECEIPT_RESULT_SEMANTICS_VERSION,
             "source": self.source_path,
             "geometry": self.rectification.manifest(),
             "fields": self.fields,
             "detections": [detection.as_dict() for detection in self.detections],
         }
-        # Keep the original v1 JSON byte-for-byte compatible at the schema
-        # level when the optional status-style model is not enabled.
+        # Optional status-style fields remain conditional; the explicit result
+        # versions above make resume-cache compatibility fail closed.
         if self.status_style is not None:
             output["status_style"] = self.status_style
         if self.tags is not None:

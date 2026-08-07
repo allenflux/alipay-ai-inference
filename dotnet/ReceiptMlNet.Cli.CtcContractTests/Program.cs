@@ -105,6 +105,17 @@ internal static class Program
         VerifyStatusText(characters, [5, 6, 7], "处理中", "pending");
         VerifyStatusText(characters, [1, 2, 8, 9], "转账失败", "failed");
         VerifyStatusText(characters, [7], "中", "unknown");
+        AssertEqual("unknown", ReceiptFieldNormalizer.NormalizeStatus("未转账成功"), "negated success");
+        AssertEqual("unknown", ReceiptFieldNormalizer.NormalizeStatus("没有转账成功"), "explicitly negated success");
+        AssertEqual("unknown", ReceiptFieldNormalizer.NormalizeStatus("未能支付成功"), "unable success");
+        AssertEqual("unknown", ReceiptFieldNormalizer.NormalizeStatus("不是交易成功"), "not a success");
+        AssertEqual("unknown", ReceiptFieldNormalizer.NormalizeStatus("转账成功与否"), "success uncertainty suffix");
+        AssertEqual("unknown", ReceiptFieldNormalizer.NormalizeStatus("转账成功不了"), "success negation suffix");
+        AssertEqual("unknown", ReceiptFieldNormalizer.NormalizeStatus("转账成功吗"), "success question suffix");
+        AssertEqual(
+            "unknown",
+            ReceiptFieldNormalizer.NormalizeStatus("无法确认该笔款项已经转账成功"),
+            "long-distance negated success");
     }
 
     private static void VerifyResultCacheSemantics()

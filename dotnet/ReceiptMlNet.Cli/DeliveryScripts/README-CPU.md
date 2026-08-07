@@ -11,6 +11,13 @@ No Python, PaddleOCR, CUDA, or network service is used at runtime. Install the
 .NET 8 Runtime x64 (`Microsoft.NETCore.App 8.x`) before verification. The .NET 8
 Desktop Runtime also satisfies this prerequisite.
 
+The production entrypoints require an architecture-v13 package, whose
+`status_text_logits` output reads the visible transfer-status text with CTC.
+They reject legacy v12 packages because v12 only has a status
+classifier and therefore cannot honestly label its status candidate as OCR.
+There is no production override for this check; use the base CLI directly for
+explicit legacy diagnostics.
+
 ## One image
 
 Open PowerShell in this package directory:

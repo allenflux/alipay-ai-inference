@@ -12,6 +12,7 @@ import pytest
 from PIL import Image
 
 from transfer_receipt_ai import ocr_unified
+from transfer_receipt_ai.ocr import normalize_status
 from transfer_receipt_ai.ocr_unified import (
     CHECKPOINT_SELECTION_RECIPIENT_PRIORITY,
     INIT_CHECKPOINT_MODE_STRICT,
@@ -92,10 +93,48 @@ def test_v13_status_phrase_extraction_deduplicates_but_rejects_ambiguity() -> No
         "否付款成功",
         "无转帐成功",
         "没有转账成功，转账成功",
+        "转账成功与否",
+        "转账成功不了",
+        "转账成功吗",
+        "无法确认该笔款项已经转账成功",
+        "这不是一笔真正的转账成功",
     ),
 )
-def test_v13_status_phrase_extraction_rejects_negated_success(paddle_text: str) -> None:
+def test_v13_status_phrase_extraction_rejects_negated_or_uncertain_success(
+    paddle_text: str,
+) -> None:
     assert _visible_status_cjk_match(paddle_text)[0] == ""
+
+
+@pytest.mark.parametrize(
+    "ocr_text",
+    (
+        "未转账成功",
+        "没有转账成功",
+        "未能支付成功",
+        "不是交易成功",
+        "否付款成功",
+        "无转帐成功",
+        "没有转账成功，转账成功",
+        "转账成功与否",
+        "转账成功不了",
+        "转账成功吗",
+        "无法确认该笔款项已经转账成功",
+        "这不是一笔真正的转账成功",
+    ),
+)
+def test_v13_runtime_normalizer_never_promotes_negated_or_uncertain_success(
+    ocr_text: str,
+) -> None:
+    assert normalize_status(ocr_text) == "unknown"
+
+
+@pytest.mark.parametrize(
+    "ocr_text",
+    ("转账成功", "交易成功", "付款成功", "支付成功", "转帐成功"),
+)
+def test_v13_runtime_normalizer_keeps_visible_positive_success(ocr_text: str) -> None:
+    assert normalize_status(ocr_text) == "success"
 
 
 @pytest.mark.parametrize(

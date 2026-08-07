@@ -96,3 +96,7 @@ def test_ctc_contract_harness_executes_status_text_normalization() -> None:
     assert '"转账成功", "success"' in harness
     assert '"处理中", "pending"' in harness
     assert '"转账失败", "failed"' in harness
+    assert 'NormalizeStatus("没有转账成功")' in harness
+    assert 'NormalizeStatus("转账成功与否")' in harness
+    assert 'NormalizeStatus("转账成功不了")' in harness
+    assert 'NormalizeStatus("无法确认该笔款项已经转账成功")' in harness

@@ -11,7 +11,7 @@ using System.Text.Json;
 internal static class ReceiptResultCacheContract
 {
     public const int SchemaVersion = 1;
-    public const string SemanticsVersion = "status-review-only-visible-text-v1";
+    public const string SemanticsVersion = "status-review-only-visible-text-negation-v2";
 
     public static bool IsCurrent(JsonElement root)
     {

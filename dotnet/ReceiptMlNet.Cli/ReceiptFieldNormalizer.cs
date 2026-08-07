@@ -9,6 +9,10 @@ using System.Text.RegularExpressions;
 /// </summary>
 internal static class ReceiptFieldNormalizer
 {
+    private static readonly string[] StatusSuccessPhrases =
+        ["\u8f6c\u8d26\u6210\u529f", "\u4ea4\u6613\u6210\u529f", "\u4ed8\u6b3e\u6210\u529f", "\u652f\u4ed8\u6210\u529f", "\u8f6c\u5e10\u6210\u529f"];
+    private static readonly string[] StatusSuccessBlockingTokens =
+        ["\u672a", "\u4e0d", "\u975e", "\u65e0", "\u5426", "\u6ca1", "\u6ca1\u6709", "\u672a\u80fd", "\u4e0d\u662f", "\u5e76\u672a", "\u5c1a\u672a", "\u4e0d\u80fd", "\u65e0\u6cd5", "\u6ca1\u80fd", "\u672a\u66fe", "\u4ece\u672a", "\u5e76\u975e", "\u5417", "\u4e48", "\u5f85\u786e\u8ba4", "\u5f85\u6838\u5b9e", "\u672a\u77e5", "\u4e0d\u786e\u5b9a", "\u7591\u4f3c"];
     private static readonly Regex WhitespacePattern = new(@"\s+", RegexOptions.CultureInvariant);
     private static readonly Regex AmountPattern = new(
         @"(?:[¥￥]\s*)?([0-9OoIl]{1,3}(?:,[0-9OoIl]{3})*(?:\.\d{1,2})?)",
@@ -152,8 +156,15 @@ internal static class ReceiptFieldNormalizer
         {
             return "pending";
         }
-        if (ContainsAny(compact, "转账成功", "交易成功", "付款成功", "支付成功", "转帐成功"))
+        if (ContainsAny(compact, StatusSuccessPhrases))
         {
+            // Treat any negation or uncertainty in the visible status string
+            // as conflicting evidence.  A bounded prefix window misses both
+            // suffixes and long-distance negation.
+            if (ContainsAny(compact, StatusSuccessBlockingTokens))
+            {
+                return "unknown";
+            }
             return "success";
         }
         return "unknown";

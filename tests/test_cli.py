@@ -7,12 +7,16 @@ from PIL import Image
 
 from receipt_inference import cli, models
 from transfer_receipt_ai.geometry import RectificationOptions, RectificationResult
-from transfer_receipt_ai.infer import _write_ocr_stage_artifacts
+from transfer_receipt_ai.infer import _committed_result_exists, _write_ocr_stage_artifacts
 from transfer_receipt_ai.model import Detection
 from transfer_receipt_ai.onnx_runtime import _preload_cuda_dlls, prepare_detector_input
 from transfer_receipt_ai.ocr import OCRResult
-from transfer_receipt_ai.ocr_enrich import run_ocr_enrichment
+from transfer_receipt_ai.ocr_enrich import _ocr_committed_result_exists, run_ocr_enrichment
 from transfer_receipt_ai.pipeline import ExtractedDetection, ReceiptPipeline, ReceiptResult, write_receipt_result
+from transfer_receipt_ai.result_semantics import (
+    RECEIPT_RESULT_SCHEMA_VERSION,
+    RECEIPT_RESULT_SEMANTICS_VERSION,
+)
 
 
 def test_default_model_uses_project_relative_checkpoint(monkeypatch, tmp_path) -> None:
@@ -219,10 +223,37 @@ def test_ocr_enrichment_writes_the_existing_result_bundle_shape(tmp_path) -> Non
 
     assert records[0]["status"] == "written"
     payload = json.loads((output_dir / "source.json").read_text(encoding="utf-8"))
+    assert payload["result_schema_version"] == RECEIPT_RESULT_SCHEMA_VERSION
+    assert payload["result_semantics_version"] == RECEIPT_RESULT_SEMANTICS_VERSION
     assert payload["fields"]["amount"]["normalized"] == "¥12.30"
     assert payload["detections"][0]["ocr"] == {"text": "¥12.30", "confidence": 0.99}
     assert (output_dir / "source_rectified_annotated.jpg").is_file()
     assert (output_dir / "source_original_annotated.jpg").is_file()
+
+
+def test_python_skip_existing_rejects_results_without_current_semantics(tmp_path) -> None:
+    source_path = tmp_path / "source.png"
+    source_path.write_bytes(b"source")
+    output_stem = tmp_path / "result"
+    result_path = output_stem.with_suffix(".json")
+    current_payload = {
+        "result_schema_version": RECEIPT_RESULT_SCHEMA_VERSION,
+        "result_semantics_version": RECEIPT_RESULT_SEMANTICS_VERSION,
+        "source": source_path.resolve().as_posix(),
+        "fields": {},
+        "detections": [{"ocr": {"text": "转账成功"}}],
+    }
+    result_path.write_text(json.dumps(current_payload), encoding="utf-8")
+
+    assert _committed_result_exists(source_path, output_stem, require_ocr_for_skip=True)
+    assert _ocr_committed_result_exists(source_path, output_stem)
+
+    stale_payload = dict(current_payload)
+    stale_payload.pop("result_semantics_version")
+    result_path.write_text(json.dumps(stale_payload), encoding="utf-8")
+
+    assert not _committed_result_exists(source_path, output_stem, require_ocr_for_skip=True)
+    assert not _ocr_committed_result_exists(source_path, output_stem)
 
 
 def test_ocr_enrichment_carries_detector_skip_records_without_stage_artifacts(tmp_path) -> None:

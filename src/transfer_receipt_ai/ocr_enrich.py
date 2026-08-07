@@ -13,6 +13,8 @@ from importlib import metadata
 from pathlib import Path
 from typing import Any
 
+from .result_semantics import has_current_result_semantics
+
 
 _STAGE_SCHEMA_VERSION = 1
 
@@ -124,7 +126,11 @@ def _ocr_committed_result_exists(source_path: Path, output_stem: Path) -> bool:
         payload = json.loads(result_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return False
-    if not isinstance(payload, dict) or not isinstance(payload.get("fields"), dict):
+    if (
+        not has_current_result_semantics(payload)
+        or not isinstance(payload, dict)
+        or not isinstance(payload.get("fields"), dict)
+    ):
         return False
     if payload.get("source") != source_path.resolve().as_posix():
         return False

@@ -48,8 +48,25 @@ function Get-NormalizedTransferStatus([string]$Text) {
     # UTF-8-without-BOM script. .NET Regex expands the Unicode escapes.
     if ($compact -match '\u5931\u8d25|\u672a\u6210\u529f|\u5df2\u64a4\u9500') { return "failed" }
     if ($compact -match '\u5904\u7406\u4e2d|\u5f85\u5904\u7406|\u8fdb\u884c\u4e2d') { return "pending" }
-    if ($compact -match '\u8f6c\u8d26\u6210\u529f|\u4ea4\u6613\u6210\u529f|\u4ed8\u6b3e\u6210\u529f|\u652f\u4ed8\u6210\u529f|\u8f6c\u5e10\u6210\u529f') { return "success" }
+    $successPattern = [regex]'\u8f6c\u8d26\u6210\u529f|\u4ea4\u6613\u6210\u529f|\u4ed8\u6b3e\u6210\u529f|\u652f\u4ed8\u6210\u529f|\u8f6c\u5e10\u6210\u529f'
+    if ($successPattern.IsMatch($compact)) {
+        if ($compact -match '\u672a|\u4e0d|\u975e|\u65e0|\u5426|\u6ca1|\u6ca1\u6709|\u672a\u80fd|\u4e0d\u662f|\u5e76\u672a|\u5c1a\u672a|\u4e0d\u80fd|\u65e0\u6cd5|\u6ca1\u80fd|\u672a\u66fe|\u4ece\u672a|\u5e76\u975e|\u5417|\u4e48|\u5f85\u786e\u8ba4|\u5f85\u6838\u5b9e|\u672a\u77e5|\u4e0d\u786e\u5b9a|\u7591\u4f3c') { return "unknown" }
+        return "success"
+    }
     return "unknown"
+}
+
+function Assert-CurrentResultSemantics([object]$Result, [string]$ResultPath) {
+    $schemaProperty = if ($null -eq $Result) { $null } else { $Result.PSObject.Properties["result_schema_version"] }
+    $semanticsProperty = if ($null -eq $Result) { $null } else { $Result.PSObject.Properties["result_semantics_version"] }
+    if ($null -eq $schemaProperty `
+        -or (($schemaProperty.Value -isnot [int]) -and ($schemaProperty.Value -isnot [long])) `
+        -or [long]$schemaProperty.Value -ne 1 `
+        -or $null -eq $semanticsProperty `
+        -or $semanticsProperty.Value -isnot [string] `
+        -or [string]$semanticsProperty.Value -ne "status-review-only-visible-text-negation-v2") {
+        throw "Result uses stale or malformed runtime semantics: $ResultPath"
+    }
 }
 
 function Assert-SafePathSyntax([string]$Path, [string]$Description) {
@@ -630,6 +647,7 @@ function Assert-ResultProvenanceAndPolicy(
     [object]$DeviceEvidence,
     [object]$UnifiedEvidence
 ) {
+    Assert-CurrentResultSemantics $Result $ResultPath
     $sourceProperty = if ($null -eq $Result) { $null } else { $Result.PSObject.Properties["source"] }
     $contractsProperty = if ($null -eq $Result) { $null } else { $Result.PSObject.Properties["model_contracts"] }
     $geometryProperty = if ($null -eq $Result) { $null } else { $Result.PSObject.Properties["geometry"] }
@@ -887,6 +905,9 @@ $deviceEvidence = Read-StandardModelEvidence `
     $packageRoot $deviceModel "statusbar_device_v1" "device classifier"
 $unifiedEvidence = Read-UnifiedModelEvidence `
     $packageRoot $unifiedModel $requiredTextPolicy $requiredReviewValue
+if ([int]$unifiedEvidence.ArchitectureVersion -ne 13) {
+    throw "This production entrypoint requires architecture-v13 visible transfer-status OCR. The package contains a legacy v12 status classifier; use a v13 delivery package."
+}
 Assert-AcceptedPackageBinding `
     $packageRoot $config $validation $detectorEvidence $deviceEvidence $unifiedEvidence
 

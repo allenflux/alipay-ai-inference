@@ -18,6 +18,7 @@ DELIVERY_SCRIPTS = (
     ROOT / "dotnet" / "ReceiptMlNet.Cli" / "DeliveryScripts" / "run-receipt-single-cpu.ps1",
     ROOT / "dotnet" / "ReceiptMlNet.Cli" / "DeliveryScripts" / "run-receipt-batch-cpu.ps1",
 )
+RUNTIME_ENTRYPOINTS = DELIVERY_SCRIPTS[1:]
 ALL_SCRIPTS = (PACKAGE_VALIDATOR, *DELIVERY_SCRIPTS)
 
 
@@ -34,6 +35,40 @@ def test_json_normalizer_accepts_windows_powershell_utf8_bom(tmp_path: Path) -> 
 
     assert completed.returncode == 0, completed.stderr
     assert json.loads(completed.stdout) == {"metric": None, "passed": True}
+
+
+@pytest.mark.parametrize("script_path", ALL_SCRIPTS, ids=lambda path: path.name)
+def test_status_normalizer_rejects_global_negation_or_uncertainty_before_success(
+    script_path: Path,
+) -> None:
+    script = script_path.read_text(encoding="utf-8")
+
+    normalizer = script.split("function Get-NormalizedTransferStatus", 1)[1].split("\n}", 1)[0]
+    success_gate = normalizer.index("$successPattern.IsMatch($compact)")
+    blocking_gate = normalizer.index("$compact -match", success_gate)
+    positive = normalizer.index('return "success"', blocking_gate)
+    assert success_gate < blocking_gate < positive
+    assert "$contextStart" not in normalizer
+    for token in (
+        r"\u672a",
+        r"\u6ca1\u6709",
+        r"\u4e0d\u662f",
+        r"\u65e0\u6cd5",
+        r"\u5426",
+        r"\u5417",
+    ):
+        assert token in script
+
+
+@pytest.mark.parametrize("script_path", ALL_SCRIPTS, ids=lambda path: path.name)
+def test_delivery_scripts_reject_stale_runtime_result_semantics(script_path: Path) -> None:
+    script = script_path.read_text(encoding="utf-8")
+
+    assert "function Assert-CurrentResultSemantics" in script
+    assert 'Properties["result_schema_version"]' in script
+    assert 'Properties["result_semantics_version"]' in script
+    assert 'status-review-only-visible-text-negation-v2' in script
+    assert "assert-currentresultsemantics $result $resultpath" in script.lower()
 
 
 @pytest.mark.parametrize("script_path", ALL_SCRIPTS, ids=lambda path: path.name)
@@ -76,6 +111,31 @@ def test_delivery_entrypoints_bind_v13_policy_and_keep_v12_legacy_declarations(
     assert "Get-NormalizedTransferStatus $rawStatus" in script
 
 
+@pytest.mark.parametrize("script_path", RUNTIME_ENTRYPOINTS, ids=lambda path: path.name)
+def test_runtime_entrypoints_require_v13_status_ocr_without_an_override(script_path: Path) -> None:
+    script = script_path.read_text(encoding="utf-8")
+
+    assert "AllowLegacyStatusClassifier" not in script
+    assert "ArchitectureVersion -ne 13)" in script
+    assert "requires architecture-v13 visible transfer-status OCR" in script
+
+
+def test_packagers_never_add_production_entrypoints_to_v12_packages() -> None:
+    validator = PACKAGE_VALIDATOR.read_text(encoding="utf-8")
+    generator = DELIVERY_SCRIPTS[0].read_text(encoding="utf-8")
+
+    architecture_assignment = validator.index(
+        "$unifiedArchitectureVersion = [int]$unifiedBundle.ArchitectureVersion"
+    )
+    inclusion_assignment = validator.index(
+        "$productionCpuEntrypointsRequested -and $unifiedArchitectureVersion -eq 13"
+    )
+    assert architecture_assignment < inclusion_assignment
+    assert "if ($includeProductionCpuEntrypoints)" in validator
+    assert "no entrypoints were generated for this legacy v12 package" in generator
+    assert "sourceEvidence.Unified.ArchitectureVersion -ne 13" in generator
+
+
 def test_single_image_entrypoint_labels_status_ocr_semantic_and_decision_separately() -> None:
     script = DELIVERY_SCRIPTS[1].read_text(encoding="utf-8")
 
@@ -84,6 +144,7 @@ def test_single_image_entrypoint_labels_status_ocr_semantic_and_decision_separat
     assert '"Normalized" = [string]$result.fields.transfer_status.normalized' in script
     assert '"Decision" = [string]$result.fields.transfer_status.state' in script
     assert "Get-NormalizedTransferStatus $rawStatus" in script
+    assert "requires architecture-v13 visible transfer-status OCR" in script
 
 
 def test_package_evidence_records_the_actual_unified_contract_version() -> None:

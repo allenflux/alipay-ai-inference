@@ -58,7 +58,14 @@ from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
-from .ocr import clean_text, extract_field_value, normalize_status, parse_anchored_recipient_row
+from .ocr import (
+    _STATUS_SUCCESS_BLOCKING_TOKENS,
+    _STATUS_SUCCESS_PHRASES,
+    clean_text,
+    extract_field_value,
+    normalize_status,
+    parse_anchored_recipient_row,
+)
 from .ocr_unified_targets import (
     parse_amount_aux_target,
     parse_amount_display_target,
@@ -142,10 +149,7 @@ STATUS_VISIBLE_CJK_TEXTS = frozenset(
     }
 )
 STATUS_SUCCESS_VISIBLE_CJK_TEXTS = frozenset(
-    {"转账成功", "交易成功", "付款成功", "支付成功", "转帐成功"}
-)
-_STATUS_SUCCESS_NEGATION_TOKENS = frozenset(
-    {"未", "不", "非", "无", "否", "没", "没有", "未能", "不是", "并未", "尚未", "不能", "无法", "没能", "未曾", "从未", "并非"}
+    _STATUS_SUCCESS_PHRASES
 )
 
 
@@ -203,12 +207,12 @@ def _visible_status_cjk_match(value: object) -> tuple[str, int]:
             start = segment.find(phrase)
             while start >= 0:
                 end = start + len(phrase)
-                # A negated success anywhere in the local visible context is
-                # conflicting evidence for the whole OCR string.  Do not let
-                # a second positive copy silently override it.
-                context = segment[max(0, start - 6) : start]
+                # A negated or uncertain success anywhere in the same visible
+                # CJK stream is conflicting evidence for the whole OCR string.
+                # This covers suffixes and long-distance context as well as a
+                # directly prefixed negation.
                 negated_success = phrase in STATUS_SUCCESS_VISIBLE_CJK_TEXTS and any(
-                    token in context for token in _STATUS_SUCCESS_NEGATION_TOKENS
+                    token in segment for token in _STATUS_SUCCESS_BLOCKING_TOKENS
                 )
                 if negated_success:
                     has_negated_success = True

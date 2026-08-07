@@ -450,13 +450,48 @@ def normalize_amount(raw_text: str) -> dict[str, object] | None:
     }
 
 
+_STATUS_SUCCESS_PHRASES = ("转账成功", "交易成功", "付款成功", "支付成功", "转帐成功")
+_STATUS_SUCCESS_BLOCKING_TOKENS = (
+    "未",
+    "不",
+    "非",
+    "无",
+    "否",
+    "没",
+    "没有",
+    "未能",
+    "不是",
+    "并未",
+    "尚未",
+    "不能",
+    "无法",
+    "没能",
+    "未曾",
+    "从未",
+    "并非",
+    "吗",
+    "么",
+    "待确认",
+    "待核实",
+    "未知",
+    "不确定",
+    "疑似",
+)
+
+
 def normalize_status(raw_text: str) -> str:
     compact = re.sub(r"\s+", "", raw_text)
     if any(token in compact for token in ("失败", "未成功", "已撤销")):
         return "failed"
     if any(token in compact for token in ("处理中", "待处理", "进行中")):
         return "pending"
-    if any(token in compact for token in ("转账成功", "交易成功", "付款成功", "支付成功", "转帐成功")):
+    if any(token in compact for token in _STATUS_SUCCESS_PHRASES):
+        # A status is positive only when the whole visible string has no
+        # negation or uncertainty marker.  Looking only immediately before the
+        # phrase misses suffixes such as "转账成功与否" / "转账成功不了" and
+        # long-distance context such as "无法确认该笔款项已经转账成功".
+        if any(token in compact for token in _STATUS_SUCCESS_BLOCKING_TOKENS):
+            return "unknown"
         return "success"
     return "unknown"
 
