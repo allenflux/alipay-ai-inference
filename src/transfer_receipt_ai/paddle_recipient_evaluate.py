@@ -51,6 +51,20 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _crop_sha256(image_rgb: np.ndarray) -> str:
+    """Return the dataset crop identity used by the source manifests.
+
+    The manifest's ``crop_sha256`` is intentionally a digest of the decoded
+    RGB shape and pixels, not of the PNG container bytes.  This keeps the
+    identity stable across lossless PNG metadata/encoder changes.
+    """
+
+    digest = hashlib.sha256()
+    digest.update(str(image_rgb.shape).encode("ascii"))
+    digest.update(image_rgb.tobytes(order="C"))
+    return digest.hexdigest()
+
+
 def _read_jsonl(path: Path) -> list[dict[str, object]]:
     source = Path(path).expanduser().resolve()
     if not source.is_file():
@@ -144,9 +158,12 @@ def _load_recipient_records(
             or any(character not in "0123456789abcdef" for character in declared_crop_hash)
         ):
             raise ValueError(f"{source}:{line_number}: bundle-bound evidence requires crop_sha256")
-        actual_crop_hash = _sha256(image_path)
+        with Image.open(image_path) as image_handle:
+            image_rgb = np.asarray(image_handle.convert("RGB")).copy()
+        actual_crop_hash = _crop_sha256(image_rgb)
         if declared_crop_hash is not None and declared_crop_hash != actual_crop_hash:
             raise ValueError(f"{source}:{line_number}: recipient crop SHA-256 differs from manifest")
+        actual_crop_file_hash = _sha256(image_path)
         selected.append(
             {
                 "id": receipt_id,
@@ -155,6 +172,7 @@ def _load_recipient_records(
                 "source": record.get("source"),
                 "result_json": record.get("result_json"),
                 "crop_sha256": actual_crop_hash,
+                "crop_file_sha256": actual_crop_file_hash,
                 "image": image_path.as_posix(),
                 "reference_text": reference_text,
                 "recipient_visible_text": reference_visible_text,
@@ -442,10 +460,12 @@ def evaluate_paddle_recipients(
     candidate_modes: Counter[str] = Counter()
     for number, record in enumerate(records, start=1):
         image_path = Path(str(record["image"]))
-        if _sha256(image_path) != record["crop_sha256"]:
+        if _sha256(image_path) != record["crop_file_sha256"]:
             raise ValueError(f"Recipient crop changed after manifest validation: {image_path}")
         with Image.open(image_path) as image:
             image_rgb = np.asarray(image.convert("RGB")).copy()
+        if _crop_sha256(image_rgb) != record["crop_sha256"]:
+            raise ValueError(f"Recipient crop pixels changed after manifest validation: {image_path}")
         started = perf_counter()
         result = _recognize_recipient(reader, image_rgb, skip_detection=skip_detection)
         elapsed_ms = (perf_counter() - started) * 1000.0

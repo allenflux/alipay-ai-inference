@@ -12,6 +12,8 @@ import tempfile
 from collections.abc import Mapping
 from pathlib import Path
 
+from PIL import Image
+
 
 EVALUATION_SCHEMA_VERSION = 1
 EVALUATION_KIND = "receipt_paddle_recipient_teacher_parity_v1"
@@ -26,6 +28,19 @@ def _sha256(path: Path) -> str:
     with path.open("rb") as stream:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
+    return digest.hexdigest()
+
+
+def _crop_sha256(path: Path) -> str:
+    """Recompute the decoded RGB pixel identity stored by the source dataset."""
+
+    with Image.open(path) as image:
+        rgb = image.convert("RGB")
+        shape = (rgb.height, rgb.width, 3)
+        pixels = rgb.tobytes()
+    digest = hashlib.sha256()
+    digest.update(str(shape).encode("ascii"))
+    digest.update(pixels)
     return digest.hexdigest()
 
 
@@ -153,8 +168,18 @@ def create_sample(
         if not isinstance(source, str) or not Path(source).is_file():
             raise ValueError(f"Missing comparison crop at {comparisons_path}:{line_number}")
         crop_sha256 = _require_sha256(row.get("crop_sha256"), f"comparison crop SHA-256 at line {line_number}")
-        if _sha256(Path(source)) != crop_sha256:
-            raise ValueError(f"Comparison crop hash mismatch at {comparisons_path}:{line_number}")
+        crop_file_sha256 = _require_sha256(
+            row.get("crop_file_sha256"),
+            f"comparison crop file SHA-256 at line {line_number}",
+        )
+        if _sha256(Path(source)) != crop_file_sha256:
+            raise ValueError(f"Comparison crop file hash mismatch at {comparisons_path}:{line_number}")
+        try:
+            actual_crop_sha256 = _crop_sha256(Path(source))
+        except OSError as error:
+            raise ValueError(f"Comparison decoded crop hash mismatch at {comparisons_path}:{line_number}") from error
+        if actual_crop_sha256 != crop_sha256:
+            raise ValueError(f"Comparison decoded crop hash mismatch at {comparisons_path}:{line_number}")
         rows.append(row)
     if len(rows) != expected_records or len(rows) != int(summary.get("records", -1)):
         raise ValueError("PP-OCR summary/comparison record counts differ")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import subprocess
@@ -12,6 +13,7 @@ from PIL import Image
 
 from transfer_receipt_ai.ocr import OCRResult, _extract_paddle_lines
 from transfer_receipt_ai.paddle_recipient_evaluate import (
+    _load_recipient_records,
     _verify_reader_matches_bundle,
     build_parser,
     evaluate_paddle_recipients,
@@ -38,6 +40,15 @@ def _record(receipt_id: str, *, split: str, text: str, image: str) -> dict[str, 
             }
         },
     }
+
+
+def _manifest_crop_sha256(path: Path) -> str:
+    with Image.open(path) as image:
+        pixels = np.asarray(image.convert("RGB")).copy()
+    digest = hashlib.sha256()
+    digest.update(str(pixels.shape).encode("ascii"))
+    digest.update(pixels.tobytes(order="C"))
+    return digest.hexdigest()
 
 
 class _FakeReader:
@@ -124,10 +135,46 @@ def test_paddle_recipient_evaluation_uses_value_extraction_and_writes_new_output
         (output / "comparisons.jsonl").read_bytes()
     ).hexdigest()
     assert all(len(row["crop_sha256"]) == 64 for row in rows)
+    assert all(len(row["crop_file_sha256"]) == 64 for row in rows)
+    assert all(row["crop_sha256"] != row["crop_file_sha256"] for row in rows)
     text = format_paddle_recipient_evaluation(summary)
     assert "anchored=1/2=50.00%" in text
     assert "mode=full_det_cls_rec; experimental=False; det=True; cls=True; rec=True" in text
     assert "active:gpu:0" in text
+
+
+def test_bundle_bound_manifest_uses_decoded_crop_identity_and_also_records_file_hash(tmp_path: Path) -> None:
+    crops = tmp_path / "crops"
+    crops.mkdir()
+    image = crops / "a.png"
+    Image.fromarray(np.full((5, 8, 3), 173, dtype=np.uint8), mode="RGB").save(image)
+    row = _record("val-a", split="val", text="商户甲", image="a.png")
+    row["slots"]["recipient_field"]["crop_sha256"] = _manifest_crop_sha256(image)
+    manifest = tmp_path / "unified_fields.jsonl"
+    _write_jsonl(manifest, [row])
+
+    records = _load_recipient_records(
+        manifest_path=manifest,
+        dataset_root=crops,
+        split="val",
+        limit=None,
+        require_crop_hash=True,
+    )
+
+    assert records[0]["crop_sha256"] == row["slots"]["recipient_field"]["crop_sha256"]
+    assert records[0]["crop_file_sha256"] == hashlib.sha256(image.read_bytes()).hexdigest()
+    assert records[0]["crop_sha256"] != records[0]["crop_file_sha256"]
+
+    row["slots"]["recipient_field"]["crop_sha256"] = hashlib.sha256(image.read_bytes()).hexdigest()
+    _write_jsonl(manifest, [row])
+    with pytest.raises(ValueError, match="crop SHA-256 differs"):
+        _load_recipient_records(
+            manifest_path=manifest,
+            dataset_root=crops,
+            split="val",
+            limit=None,
+            require_crop_hash=True,
+        )
 
 
 def test_paddle_recipient_skip_detection_is_explicit_and_keeps_strict_metrics(tmp_path: Path) -> None:

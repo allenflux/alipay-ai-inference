@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 import pytest
+from PIL import Image
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -112,6 +113,17 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _crop_sha256(path: Path) -> str:
+    with Image.open(path) as image:
+        rgb = image.convert("RGB")
+        shape = (rgb.height, rgb.width, 3)
+        pixels = rgb.tobytes()
+    digest = hashlib.sha256()
+    digest.update(str(shape).encode("ascii"))
+    digest.update(pixels)
+    return digest.hexdigest()
+
+
 def _write_bound_full_val_evidence(tmp_path: Path) -> tuple[Path, Path, str, Path]:
     audit_bundle = tmp_path / "audit"
     audit_bundle.mkdir()
@@ -132,7 +144,7 @@ def _write_bound_full_val_evidence(tmp_path: Path) -> tuple[Path, Path, str, Pat
     manifest.write_text('{"fixture":"trusted full manifest"}\n', encoding="utf-8")
     manifest_sha256 = _sha256(manifest)
     image = tmp_path / "crop.png"
-    image.write_bytes(b"immutable-crop")
+    Image.new("RGB", (8, 5), color=(17, 23, 42)).save(image)
     comparison = {
         "schema_version": 1,
         "kind": "receipt_paddle_recipient_teacher_parity_v1",
@@ -140,7 +152,8 @@ def _write_bound_full_val_evidence(tmp_path: Path) -> tuple[Path, Path, str, Pat
         "split": "val",
         "inference_mode": "full_det_cls_rec",
         "image": str(image.resolve()),
-        "crop_sha256": _sha256(image),
+        "crop_sha256": _crop_sha256(image),
+        "crop_file_sha256": _sha256(image),
         "anchored_value_exact": True,
     }
     evidence = tmp_path / "evidence"
@@ -220,7 +233,7 @@ def test_val_parity_sample_rejects_partial_unbound_or_tampered_evidence(tmp_path
     else:
         image.write_bytes(b"crop-was-changed")
 
-    with pytest.raises(ValueError, match="(unbounded|bundle identity|crop hash mismatch)"):
+    with pytest.raises(ValueError, match="(unbounded|bundle identity|crop (?:file )?hash mismatch)"):
         module.create_sample(
             evidence=evidence,
             output=tmp_path / "sample",
