@@ -77,6 +77,7 @@ MAX_REPORTED_DIFFERENCES = 200
 MINIMUM_THROUGHPUT_GAIN_PERCENT = 2.0
 MAXIMUM_P50_REGRESSION_PERCENT = 0.0
 MAXIMUM_P95_REGRESSION_PERCENT = 0.0
+MAXIMUM_DETECTOR_INTRA_OP_THREADS = 256
 
 
 class ValidationError(RuntimeError):
@@ -368,7 +369,7 @@ def _validate_input_selection(plan: Mapping[str, Any], fixed_inputs: Sequence[st
     return selection
 
 
-def _validate_cli_contract(plan: Mapping[str, Any]) -> None:
+def _validate_cli_contract(plan: Mapping[str, Any]) -> dict[str, int | None]:
     contract = _require_mapping(plan.get("cli_contract"), "CLI contract")
     exact = {
         "device": "cpu",
@@ -388,6 +389,30 @@ def _validate_cli_contract(plan: Mapping[str, Any]) -> None:
             raise ValidationError(
                 f"CLI protection setting {name} changed: expected {expected!r}, found {value!r}"
             )
+    thread_contract = _require_mapping(
+        contract.get("detector_intra_op_threads"),
+        "detector intra-op thread contract",
+    )
+    if set(thread_contract) != set(VARIANTS):
+        raise ValidationError(
+            "detector intra-op thread contract must contain exactly baseline and candidate"
+        )
+    baseline_threads = thread_contract.get("baseline")
+    candidate_threads = thread_contract.get("candidate")
+    if baseline_threads is not None:
+        raise ValidationError(
+            "baseline detector intra-op threads must remain null/default"
+        )
+    if (
+        isinstance(candidate_threads, bool)
+        or not isinstance(candidate_threads, int)
+        or not 1 <= candidate_threads <= MAXIMUM_DETECTOR_INTRA_OP_THREADS
+    ):
+        raise ValidationError(
+            "candidate detector intra-op threads must be an integer in "
+            f"[1, {MAXIMUM_DETECTOR_INTRA_OP_THREADS}]"
+        )
+    return {"baseline": None, "candidate": candidate_threads}
 
 
 def _validate_performance_gate(plan: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -411,7 +436,9 @@ def _validate_performance_gate(plan: Mapping[str, Any]) -> Mapping[str, Any]:
     return gate
 
 
-def _validate_plan(plan: Mapping[str, Any]) -> tuple[int, int, int]:
+def _validate_plan(
+    plan: Mapping[str, Any],
+) -> tuple[int, int, int, dict[str, int | None]]:
     if plan.get("schema_version") != 1 or plan.get("kind") != PLAN_KIND:
         raise ValidationError("unsupported CPU A/B plan schema/kind")
     repetitions = plan.get("repetitions")
@@ -423,9 +450,9 @@ def _validate_plan(plan: Mapping[str, Any]) -> tuple[int, int, int]:
         raise ValidationError("CPU A/B requires at least one warmup run per variant")
     if isinstance(warmup_limit, bool) or not isinstance(warmup_limit, int) or warmup_limit < 1:
         raise ValidationError("CPU A/B warmup_limit must be positive")
-    _validate_cli_contract(plan)
+    detector_thread_contract = _validate_cli_contract(plan)
     _validate_performance_gate(plan)
-    return repetitions, warmup_runs, warmup_limit
+    return repetitions, warmup_runs, warmup_limit, detector_thread_contract
 
 
 def _percentile(sorted_values: Sequence[float], quantile: float) -> float:
@@ -571,6 +598,7 @@ def _load_run(
     descriptor: Mapping[str, Any],
     expected_sources: Sequence[str],
     artifact_hashes: Mapping[str, str],
+    expected_detector_intra_op_threads: int | None,
 ) -> dict[str, Any]:
     run_id = descriptor.get("id")
     output_raw = descriptor.get("output_directory")
@@ -602,6 +630,22 @@ def _load_run(
         or len(manifest) != expected_count
     ):
         raise ValidationError(f"run {run_id} accounting/provider evidence is inconsistent")
+    actual_detector_threads = summary.get("detector_intra_op_threads")
+    if expected_detector_intra_op_threads is None:
+        if actual_detector_threads is not None:
+            raise ValidationError(
+                f"run {run_id} baseline unexpectedly set detector intra-op threads"
+            )
+    elif (
+        isinstance(actual_detector_threads, bool)
+        or not isinstance(actual_detector_threads, int)
+        or actual_detector_threads != expected_detector_intra_op_threads
+    ):
+        raise ValidationError(
+            f"run {run_id} detector intra-op thread summary differs from the frozen plan: "
+            f"expected={expected_detector_intra_op_threads!r} "
+            f"found={actual_detector_threads!r}"
+        )
 
     expected_by_key = {_path_key(source): source for source in expected_sources}
     results: dict[str, Mapping[str, Any]] = {}
@@ -863,7 +907,12 @@ def _evaluate_performance_gate(
 
 def analyze_plan(plan_path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     plan = _require_mapping(_load_json(plan_path, "CPU A/B plan"), "CPU A/B plan")
-    repetitions, warmup_runs, warmup_limit = _validate_plan(plan)
+    (
+        repetitions,
+        warmup_runs,
+        warmup_limit,
+        detector_thread_contract,
+    ) = _validate_plan(plan)
     fixed_inputs, _ = _read_fixed_inputs(plan)
     input_selection = _validate_input_selection(plan, fixed_inputs)
     if warmup_limit > len(fixed_inputs):
@@ -940,7 +989,22 @@ def analyze_plan(plan_path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]
         expected_sources = fixed_inputs[:warmup_limit] if key[0] == "warmup" else fixed_inputs
         if descriptor.get("expected_count") != len(expected_sources):
             raise ValidationError(f"run {descriptor.get('id')} expected_count changed")
-        loaded_runs[key] = _load_run(descriptor, expected_sources, artifact_hashes)
+        expected_detector_threads = detector_thread_contract[key[1]]
+        if (
+            "detector_intra_op_threads" not in descriptor
+            or type(descriptor.get("detector_intra_op_threads"))
+            is not type(expected_detector_threads)
+            or descriptor.get("detector_intra_op_threads") != expected_detector_threads
+        ):
+            raise ValidationError(
+                f"run {descriptor.get('id')} detector intra-op threads differ from the frozen CLI contract"
+            )
+        loaded_runs[key] = _load_run(
+            descriptor,
+            expected_sources,
+            artifact_hashes,
+            expected_detector_threads,
+        )
 
     reference_key = ("measured", "baseline", 1)
     reference = loaded_runs[reference_key]

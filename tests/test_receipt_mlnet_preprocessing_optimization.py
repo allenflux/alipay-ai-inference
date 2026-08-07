@@ -60,3 +60,15 @@ def test_unified_runtime_decodes_native_output_views_without_array_copies() -> N
     assert "denseTensor.Buffer" in engine
     assert "output.Values.Span" in engine
     assert "tensor.ToArray()" not in engine
+
+
+def test_detector_cpu_thread_tuning_is_explicit_and_auditable() -> None:
+    program = (ROOT / "dotnet" / "ReceiptMlNet.Cli" / "Program.cs").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'case "--detector-intra-op-threads"' in program
+    assert '--detector-intra-op-threads requires --device cpu' in program
+    assert "IntraOpNumThreads = intraOpThreads" in program
+    assert "options.DetectorIntraOpThreads" in program
+    assert "int? DetectorIntraOpThreads" in program

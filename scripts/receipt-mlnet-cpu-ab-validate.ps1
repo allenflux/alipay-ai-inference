@@ -22,6 +22,9 @@ param(
     [int]$WarmupImages = 8,
     [ValidateRange(3, 20)]
     [int]$Repetitions = 3,
+    [Parameter(Mandatory = $true)]
+    [ValidateRange(1, 256)]
+    [int]$CandidateDetectorIntraOpThreads,
     [string]$PythonExecutable
 )
 
@@ -238,7 +241,9 @@ function Read-FixedInputs([string]$Path) {
 function Assert-CompletedCpuRun(
     [string]$OutputDirectory,
     [int]$ExpectedCount,
-    [string]$RunId
+    [string]$RunId,
+    [AllowNull()]
+    [object]$ExpectedDetectorIntraOpThreads
 ) {
     $summaryPath = Join-Path $OutputDirectory "inference_summary.json"
     $manifestPath = Join-Path $OutputDirectory "inference_manifest.json"
@@ -248,12 +253,28 @@ function Assert-CompletedCpuRun(
     Require-File $errorsPath "$RunId errors file"
     $summary = Get-Content -LiteralPath $summaryPath -Raw -Encoding UTF8 | ConvertFrom-Json
     $errorText = Get-Content -LiteralPath $errorsPath -Raw -Encoding UTF8
+    $detectorThreadsProperty = $summary.PSObject.Properties["detector_intra_op_threads"]
+    $actualDetectorIntraOpThreads = if ($null -eq $detectorThreadsProperty) {
+        $null
+    }
+    else {
+        $detectorThreadsProperty.Value
+    }
+    $detectorThreadsMismatch = if ($null -eq $ExpectedDetectorIntraOpThreads) {
+        $null -ne $actualDetectorIntraOpThreads
+    }
+    else {
+        $null -eq $actualDetectorIntraOpThreads `
+            -or $actualDetectorIntraOpThreads -is [bool] `
+            -or [int]$actualDetectorIntraOpThreads -ne [int]$ExpectedDetectorIntraOpThreads
+    }
     if ([string]$summary.requested_device -ne "cpu" `
         -or [string]$summary.unified_provider -ne "cpu" `
         -or [int]$summary.input -ne $ExpectedCount `
         -or [int]$summary.written -ne $ExpectedCount `
         -or [int]$summary.skipped -ne 0 `
         -or [int]$summary.errors -ne 0 `
+        -or $detectorThreadsMismatch `
         -or -not [string]::IsNullOrWhiteSpace($errorText)) {
         throw "$RunId did not complete the fixed three-model CPU workload without errors."
     }
@@ -265,7 +286,8 @@ function Invoke-CpuRun(
     [string]$FixedInputList,
     [string]$Detector,
     [string]$Device,
-    [string]$Unified
+    [string]$Unified,
+    [int]$CandidateDetectorThreads
 ) {
     $variant = [string]$Descriptor.variant
     $executable = [string]$Variants[$variant]["executable"]["path"]
@@ -292,6 +314,13 @@ function Invoke-CpuRun(
     if ([string]$Descriptor.phase -eq "warmup") {
         $arguments += @("--limit", [string]$Descriptor.expected_count)
     }
+    $expectedDetectorThreads = $null
+    if ($variant -eq "candidate") {
+        $expectedDetectorThreads = $CandidateDetectorThreads
+        $arguments += @(
+            "--detector-intra-op-threads",
+            [string]$CandidateDetectorThreads)
+    }
 
     Write-Host (
         "[{0:D2}] {1} {2} iteration {3}; images={4}" -f `
@@ -306,7 +335,8 @@ function Invoke-CpuRun(
         throw "$($Descriptor.id) failed with exit code $exitCode; see $consoleLog"
     }
     Assert-CompletedCpuRun `
-        $outputDirectory ([int]$Descriptor.expected_count) ([string]$Descriptor.id)
+        $outputDirectory ([int]$Descriptor.expected_count) ([string]$Descriptor.id) `
+        $expectedDetectorThreads
 }
 
 Require-File $analyzer "CPU A/B analyzer"
@@ -435,6 +465,12 @@ foreach ($phaseSpec in @(
                 iteration = $iteration
                 execution_order = $executionOrder
                 expected_count = [int]$phaseSpec.Expected
+                detector_intra_op_threads = if ($variant -eq "candidate") {
+                    $CandidateDetectorIntraOpThreads
+                }
+                else {
+                    $null
+                }
                 output_directory = Join-Path $runContainer "output"
                 console_log = Join-Path $runContainer "console.log"
             })
@@ -472,6 +508,10 @@ $plan = [ordered]@{
         continue_on_error = $false
         skip_existing = $false
         includes_device_model = $true
+        detector_intra_op_threads = [ordered]@{
+            baseline = $null
+            candidate = $CandidateDetectorIntraOpThreads
+        }
     }
     performance_gate = [ordered]@{
         minimum_throughput_gain_percent = [double]2.0
@@ -496,13 +536,15 @@ if ($InputLimit -gt 0) {
 }
 Write-Host "Warmup      : $WarmupRuns x $warmupLimit image(s) per variant"
 Write-Host "Measured    : $Repetitions full repeat(s) per variant"
+Write-Host "Threads     : baseline=default; candidate detector intra-op=$CandidateDetectorIntraOpThreads"
 Write-Host "Output root : $OutputRoot"
 Write-Host ""
 
 foreach ($descriptor in @($runPlan | Sort-Object execution_order)) {
     Invoke-CpuRun `
         $descriptor $variants $fixedInputListPath `
-        $DetectorModel $DeviceModel $UnifiedModel
+        $DetectorModel $DeviceModel $UnifiedModel `
+        $CandidateDetectorIntraOpThreads
 }
 if ((Get-Sha256 $planPath) -ne $frozenPlanSha256) {
     throw "CPU A/B plan changed while the runs were executing."

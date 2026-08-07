@@ -7,6 +7,7 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using Microsoft.ML;
 using Microsoft.ML.Data;
+using Microsoft.ML.Transforms.Onnx;
 using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.PixelFormats;
 using SixLabors.ImageSharp.Processing;
@@ -98,7 +99,7 @@ internal static class ReceiptMlNetProgram
         File.WriteAllText(errorsPath, string.Empty, Encoding.UTF8);
 
         var device = DeviceSetting.Parse(options.Device);
-        var detector = new DetectorModel(options.DetectorPath, device);
+        var detector = new DetectorModel(options.DetectorPath, device, options.DetectorIntraOpThreads);
         var deviceClassifier = options.DeviceModelPath is null
             ? null
             : new DeviceModel(options.DeviceModelPath, device);
@@ -107,6 +108,7 @@ internal static class ReceiptMlNetProgram
         // 15.2 MiB for every receipt; never share this buffer across workers.
         var detectorInputBuffer = new float[ImagePipeline.DetectorTensorLength];
         Console.WriteLine($"Requested ONNX device: {device.Requested} (receipt detector{(deviceClassifier is null ? string.Empty : "/device model")})");
+        Console.WriteLine($"Detector intra-op threads: {(options.DetectorIntraOpThreads?.ToString(CultureInfo.InvariantCulture) ?? "runtime default")}");
         using var ocrEngine = ocrBundle is null ? null : new PaddleOcrEngine(ocrBundle, device);
         using var unifiedOcrEngine = unifiedOcrBundle is null ? null : new UnifiedOcrEngine(unifiedOcrBundle, device);
         if (ocrEngine is not null)
@@ -212,6 +214,7 @@ internal static class ReceiptMlNetProgram
         var summary = new InferenceSummary(
             device.Requested,
             unifiedOcrEngine?.ExecutionProvider,
+            options.DetectorIntraOpThreads,
             workItems.Count,
             writtenCount,
             skippedCount,
@@ -945,19 +948,22 @@ internal sealed class DetectorModel
 {
     private readonly PredictionEngine<DetectorInput, DetectorOutput> _engine;
 
-    public DetectorModel(string modelPath, DeviceSetting device)
+    public DetectorModel(string modelPath, DeviceSetting device, int? intraOpThreads)
     {
         var context = new MLContext(seed: 1);
         var fitData = context.Data.LoadFromEnumerable(new[]
         {
             new DetectorInput { Image = new float[ImagePipeline.DetectorTensorLength] },
         });
-        var pipeline = context.Transforms.ApplyOnnxModel(
-            outputColumnNames: new[] { "boxes", "labels", "scores" },
-            inputColumnNames: new[] { "image" },
-            modelFile: modelPath,
-            gpuDeviceId: device.GpuDeviceId,
-            fallbackToCpu: device.FallbackToCpu);
+        var pipeline = context.Transforms.ApplyOnnxModel(new OnnxOptions
+        {
+            OutputColumns = new[] { "boxes", "labels", "scores" },
+            InputColumns = new[] { "image" },
+            ModelFile = modelPath,
+            GpuDeviceId = device.GpuDeviceId,
+            FallbackToCpu = device.FallbackToCpu,
+            IntraOpNumThreads = intraOpThreads,
+        });
         var model = pipeline.Fit(fitData);
         _engine = context.Model.CreatePredictionEngine<DetectorInput, DetectorOutput>(model);
     }
@@ -1378,6 +1384,7 @@ internal sealed record CliOptions(
     bool RequireComplete,
     bool ContinueOnError,
     bool SkipExisting,
+    int? DetectorIntraOpThreads,
     int? Limit)
 {
     public const string Usage = """
@@ -1391,6 +1398,7 @@ Usage:
     (--input <image-or-directory> | --input-list <txt>) --output <directory> \
     [--device auto|cpu|cuda:0] [--score-threshold 0.50] [--annotate all|flagged|none] \
     [--rectification none|max-side-1600] \
+    [--detector-intra-op-threads <positive-integer>] \
     [--require-complete] [--continue-on-error] [--skip-existing] [--limit 100]
 
 This .NET CLI runs the receipt/device ONNX models and can optionally run a
@@ -1422,6 +1430,7 @@ perspective photos still require an externally rectified input.
         var requireComplete = false;
         var continueOnError = false;
         var skipExisting = false;
+        int? detectorIntraOpThreads = null;
         int? limit = null;
 
         for (var index = 0; index < args.Length; index++)
@@ -1444,6 +1453,13 @@ perspective photos still require an externally rectified input.
                     {
                         throw new UsageException("--score-threshold must be between 0 and 1");
                     }
+                    break;
+                case "--detector-intra-op-threads":
+                    if (!int.TryParse(NextValue(args, ref index), NumberStyles.None, CultureInfo.InvariantCulture, out var parsedDetectorThreads) || parsedDetectorThreads <= 0)
+                    {
+                        throw new UsageException("--detector-intra-op-threads must be a positive integer");
+                    }
+                    detectorIntraOpThreads = parsedDetectorThreads;
                     break;
                 case "--limit":
                     if (!int.TryParse(NextValue(args, ref index), NumberStyles.None, CultureInfo.InvariantCulture, out var parsedLimit) || parsedLimit <= 0)
@@ -1485,8 +1501,12 @@ perspective photos still require an externally rectified input.
         {
             throw new UsageException("--ocr-model requires --ocr unified");
         }
-        _ = DeviceSetting.Parse(device);
-        return new CliOptions(detector, deviceModel, ocrMode, ocrBundle, ocrModel, input, inputList, output, device, scoreThreshold, annotationMode, rectification, requireComplete, continueOnError, skipExisting, limit);
+        var parsedDevice = DeviceSetting.Parse(device);
+        if (detectorIntraOpThreads is not null && parsedDevice.Requested != "cpu")
+        {
+            throw new UsageException("--detector-intra-op-threads requires --device cpu");
+        }
+        return new CliOptions(detector, deviceModel, ocrMode, ocrBundle, ocrModel, input, inputList, output, device, scoreThreshold, annotationMode, rectification, requireComplete, continueOnError, skipExisting, detectorIntraOpThreads, limit);
     }
 
     private static string ParseOcrMode(string value)
@@ -1621,6 +1641,7 @@ internal sealed record InputWorkItem(string Source, string Output);
 internal sealed record InferenceSummary(
     string RequestedDevice,
     [property: JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? UnifiedProvider,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.Never)] int? DetectorIntraOpThreads,
     int Input,
     int Written,
     int Skipped,

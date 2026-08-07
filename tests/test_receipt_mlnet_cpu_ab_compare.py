@@ -103,6 +103,7 @@ def _write_run(
     *,
     inference_ms: float,
     total_seconds: float,
+    detector_intra_op_threads: int | None,
 ) -> None:
     manifest: list[dict[str, object]] = []
     stage_template = {
@@ -140,6 +141,7 @@ def _write_run(
     summary = {
         "requested_device": "cpu",
         "unified_provider": "cpu",
+        "detector_intra_op_threads": detector_intra_op_threads,
         "input": len(sources),
         "written": len(sources),
         "skipped": 0,
@@ -196,6 +198,7 @@ def _fixture_plan(tmp_path: Path) -> Path:
                     artifact_hashes,
                     inference_ms=speed,
                     total_seconds=seconds,
+                    detector_intra_op_threads=16 if variant == "candidate" else None,
                 )
                 runs.append(
                     {
@@ -205,6 +208,9 @@ def _fixture_plan(tmp_path: Path) -> Path:
                         "iteration": iteration,
                         "execution_order": execution_order,
                         "expected_count": len(expected_sources),
+                        "detector_intra_op_threads": (
+                            16 if variant == "candidate" else None
+                        ),
                         "output_directory": str(output),
                         "console_log": str(output.parent / "console.log"),
                     }
@@ -238,6 +244,10 @@ def _fixture_plan(tmp_path: Path) -> Path:
             "continue_on_error": False,
             "skip_existing": False,
             "includes_device_model": True,
+            "detector_intra_op_threads": {
+                "baseline": None,
+                "candidate": 16,
+            },
         },
         "performance_gate": {
             # Windows PowerShell 5.1 ConvertTo-Json emits whole-valued doubles
@@ -264,6 +274,10 @@ def test_cpu_ab_accepts_exact_predictions_and_reports_pooled_performance(tmp_pat
     assert report["accepted"] is True
     assert differences == []
     assert report["prediction_consistency"]["compared_runs"] == 7
+    assert report["cli_contract"]["detector_intra_op_threads"] == {
+        "baseline": None,
+        "candidate": 16,
+    }
     assert report["performance"]["baseline"]["repetitions"] == 3
     assert report["performance"]["candidate"]["total_images"] == 6
     assert (
@@ -377,6 +391,77 @@ def test_cpu_ab_rejects_a_changed_threshold_or_cpu_contract(tmp_path: Path) -> N
         compare.analyze_plan(plan_path)
 
 
+@pytest.mark.parametrize("changed_value", [None, 0, -1, True, "16", 257])
+def test_cpu_ab_rejects_invalid_candidate_detector_thread_contract(
+    tmp_path: Path,
+    changed_value: object,
+) -> None:
+    plan_path = _fixture_plan(tmp_path)
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    plan["cli_contract"]["detector_intra_op_threads"]["candidate"] = changed_value
+    _write_json(plan_path, plan)
+
+    with pytest.raises(compare.ValidationError, match="candidate detector intra-op threads"):
+        compare.analyze_plan(plan_path)
+
+
+def test_cpu_ab_rejects_threading_the_baseline(tmp_path: Path) -> None:
+    plan_path = _fixture_plan(tmp_path)
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    plan["cli_contract"]["detector_intra_op_threads"]["baseline"] = 16
+    _write_json(plan_path, plan)
+
+    with pytest.raises(compare.ValidationError, match="baseline detector intra-op threads"):
+        compare.analyze_plan(plan_path)
+
+
+def test_cpu_ab_rejects_candidate_thread_summary_mismatch(tmp_path: Path) -> None:
+    plan_path = _fixture_plan(tmp_path)
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    candidate_run = next(
+        row
+        for row in plan["runs"]
+        if row["phase"] == "measured"
+        and row["variant"] == "candidate"
+        and row["iteration"] == 1
+    )
+    summary_path = Path(candidate_run["output_directory"]) / "inference_summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["detector_intra_op_threads"] = 12
+    _write_json(summary_path, summary)
+
+    with pytest.raises(compare.ValidationError, match="summary differs from the frozen plan"):
+        compare.analyze_plan(plan_path)
+
+
+def test_cpu_ab_rejects_baseline_thread_summary_override(tmp_path: Path) -> None:
+    plan_path = _fixture_plan(tmp_path)
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    baseline_run = next(
+        row
+        for row in plan["runs"]
+        if row["phase"] == "warmup" and row["variant"] == "baseline"
+    )
+    summary_path = Path(baseline_run["output_directory"]) / "inference_summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["detector_intra_op_threads"] = 16
+    _write_json(summary_path, summary)
+
+    with pytest.raises(compare.ValidationError, match="baseline unexpectedly set"):
+        compare.analyze_plan(plan_path)
+
+
+def test_cpu_ab_rejects_run_descriptor_thread_mismatch(tmp_path: Path) -> None:
+    plan_path = _fixture_plan(tmp_path)
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    candidate_run = next(row for row in plan["runs"] if row["variant"] == "candidate")
+    candidate_run["detector_intra_op_threads"] = 12
+    _write_json(plan_path, plan)
+
+    with pytest.raises(compare.ValidationError, match="frozen CLI contract"):
+        compare.analyze_plan(plan_path)
+
+
 @pytest.mark.parametrize("changed_value", [1.99, True, "2"])
 def test_cpu_ab_rejects_a_changed_or_non_numeric_performance_gate(
     tmp_path: Path,
@@ -462,3 +547,18 @@ def test_cpu_ab_powershell_resolves_relative_paths_from_provider_location() -> N
         for line in script.splitlines()
         if not line.lstrip().startswith("#")
     )
+
+
+def test_cpu_ab_powershell_applies_detector_threads_only_to_candidate() -> None:
+    script = (
+        Path(__file__).resolve().parents[1]
+        / "scripts"
+        / "receipt-mlnet-cpu-ab-validate.ps1"
+    ).read_text(encoding="utf-8")
+
+    assert "[ValidateRange(1, 256)]" in script
+    assert "[int]$CandidateDetectorIntraOpThreads" in script
+    assert 'if ($variant -eq "candidate")' in script
+    assert '"--detector-intra-op-threads"' in script
+    assert "baseline = $null" in script
+    assert "candidate = $CandidateDetectorIntraOpThreads" in script
