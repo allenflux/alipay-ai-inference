@@ -10,6 +10,7 @@ from pathlib import Path
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--run", required=True, type=Path)
+    parser.add_argument("--compact", action="store_true")
     args = parser.parse_args()
 
     records_path = args.run / "manifest-v13" / "unified_fields.jsonl"
@@ -27,6 +28,20 @@ def main() -> int:
             if not isinstance(audit, dict) or audit.get("decision") != "missing":
                 continue
             missing += 1
+            if args.compact:
+                print(
+                    "|".join(
+                        (
+                            str(missing),
+                            str(record.get("split", "")),
+                            str(status.get("class_name", "")),
+                            str(audit.get("reason", "")),
+                            json.dumps(audit.get("paddle_text"), ensure_ascii=True),
+                            json.dumps(audit.get("record_text"), ensure_ascii=True),
+                        )
+                    )
+                )
+                continue
             print(
                 json.dumps(
                     {
