@@ -13,7 +13,10 @@ internal static class Program
     {
         PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
         DefaultIgnoreCondition = JsonIgnoreCondition.Never,
-        WriteIndented = true,
+        // records.jsonl must contain exactly one complete JSON object per line.
+        // Pretty-printing here would split every record across several lines
+        // and make the fail-closed Python parity reader reject the evidence.
+        WriteIndented = false,
     };
 
     private static int Main(string[] args)

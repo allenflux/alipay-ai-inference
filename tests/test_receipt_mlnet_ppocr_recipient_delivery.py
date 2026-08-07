@@ -15,6 +15,7 @@ PACKAGE = ROOT / "scripts" / "receipt-ocr-ppocrv4-recipient-onnx-package.ps1"
 CPU_AB = ROOT / "scripts" / "receipt-mlnet-hybrid-recipient-cpu-ab.ps1"
 SAMPLE = ROOT / "scripts" / "receipt-ppocr-val-parity-sample.py"
 COMPARATOR = ROOT / "scripts" / "receipt-mlnet-hybrid-recipient-ab.py"
+DOTNET_PARITY_PROGRAM = ROOT / "dotnet" / "ReceiptMlNet.Cli.PaddleParity" / "Program.cs"
 
 
 def _load_module(path: Path, name: str):
@@ -52,6 +53,12 @@ def test_conversion_launchers_are_val_only_dynamic_and_paddle_free_at_delivery()
         "Move-Item -LiteralPath $deliveryStage -Destination $DeliveryDirectory"
     )
     assert "--split test" not in package
+
+
+def test_dotnet_parity_emits_single_line_jsonl_records() -> None:
+    source = DOTNET_PARITY_PROGRAM.read_text(encoding="utf-8")
+    assert "WriteIndented = false" in source
+    assert "writer.WriteLine(JsonSerializer.Serialize(record, JsonOptions))" in source
 
 
 def test_cpu_ab_runs_same_val_inputs_through_v13_and_hybrid_on_cpu() -> None:
