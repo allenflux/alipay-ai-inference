@@ -160,15 +160,34 @@ def diagnose(*, data_root: Path, tag: str) -> list[str]:
             result_path = Path(str(result_path_value)) if isinstance(result_path_value, str) else None
             result_field: Mapping[str, Any] = {}
             matching_detection: Mapping[str, Any] = {}
+            result_geometry: Mapping[str, Any] = {}
             if result_path is not None and result_path.is_file():
                 result = _load_json(result_path, "result JSON")
                 result_field = _mapping(_mapping(result.get("fields")).get(FIELD_RESULT_KEYS[field]))
+                result_geometry = _mapping(result.get("geometry"))
                 detections = result.get("detections")
                 if isinstance(detections, list):
                     matching_detection = next(
                         (
                             detection
                             for detection in detections
+                            if isinstance(detection, Mapping) and detection.get("label") == field
+                        ),
+                        {},
+                    )
+            teacher_path_value = comparison.get("teacher_result_json")
+            teacher_path = Path(str(teacher_path_value)) if isinstance(teacher_path_value, str) else None
+            teacher_geometry: Mapping[str, Any] = {}
+            teacher_detection: Mapping[str, Any] = {}
+            if teacher_path is not None and teacher_path.is_file():
+                teacher = _load_json(teacher_path, "teacher result JSON")
+                teacher_geometry = _mapping(teacher.get("geometry"))
+                teacher_detections = teacher.get("detections")
+                if isinstance(teacher_detections, list):
+                    teacher_detection = next(
+                        (
+                            detection
+                            for detection in teacher_detections
                             if isinstance(detection, Mapping) and detection.get("label") == field
                         ),
                         {},
@@ -182,6 +201,15 @@ def diagnose(*, data_root: Path, tag: str) -> list[str]:
                 f"structured={_render(result_field.get('structured_candidate'))} "
                 f"detector_score={matching_detection.get('score')} "
                 f"bbox={_render(matching_detection.get('bbox_image'))}"
+            )
+            lines.append(
+                f"missing_geometry field={field} "
+                f"reference_detector_score={comparison.get('reference_detector_score')} "
+                f"reference_bbox_rectified={_render(comparison.get('reference_bbox_rectified'))} "
+                f"teacher_detection_score={teacher_detection.get('score')} "
+                f"teacher_detection_bbox={_render(teacher_detection.get('bbox_image'))} "
+                f"teacher_geometry={_render(teacher_geometry)} "
+                f"result_geometry={_render(result_geometry)}"
             )
     return lines
 
