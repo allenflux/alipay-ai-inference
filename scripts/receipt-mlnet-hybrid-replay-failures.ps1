@@ -122,6 +122,7 @@ $evidence = foreach ($row in @($manifest)) {
     }
 }
 
+$evidenceCount = @($evidence).Count
 Write-Host "HYBRID FAILED-SOURCE CPU REPLAY"
-Write-Host ("  records={0}; output={1}" -f $evidence.Count, $OutputDirectory)
+Write-Host ("  records={0}; output={1}" -f $evidenceCount, $OutputDirectory)
 $evidence | ConvertTo-Json -Depth 6 -Compress
