@@ -5207,6 +5207,7 @@ def _checkpoint_selection_policy(
     checkpoint_min_amount_candidate_exact: float | None,
     checkpoint_min_time_candidate_exact: float | None,
     checkpoint_min_payment_candidate_exact: float | None,
+    status_text_only_fine_tune: bool = False,
 ) -> dict[str, object]:
     """Validate and freeze a training-only best-checkpoint policy.
 
@@ -5214,7 +5215,9 @@ def _checkpoint_selection_policy(
     ``best.pt``.  It does not alter the model graph, preprocessing, decoder,
     or ONNX/session ABI.  The three mature text fields receive caller-supplied
     validation floors so an experiment cannot trade them away for a higher
-    recipient score.
+    recipient score.  A v13 status-text-only run additionally places raw
+    visible-status CTC exact immediately after the existing status-safety
+    guard and ahead of semantically normalized metrics.
     """
     if checkpoint_selection not in CHECKPOINT_SELECTION_MODES:
         allowed = ", ".join(sorted(CHECKPOINT_SELECTION_MODES))
@@ -5224,6 +5227,19 @@ def _checkpoint_selection_policy(
         "time": checkpoint_min_time_candidate_exact,
         "payment_method_field": checkpoint_min_payment_candidate_exact,
     }
+    if status_text_only_fine_tune and not _is_v13(config):
+        raise ValueError("status-text CTC checkpoint priority is supported only by architecture v13")
+    status_text_selection = (
+        {
+            "status_text_ctc_priority": True,
+            "selection_metric": (
+                "status_safety_then_transfer_status_raw_ctc_exact_then_"
+                "legacy_balanced_validation_score"
+            ),
+        }
+        if status_text_only_fine_tune
+        else {}
+    )
     if checkpoint_selection == CHECKPOINT_SELECTION_BALANCED:
         supplied = [field for field, value in raw_minima.items() if value is not None]
         if supplied:
@@ -5234,6 +5250,7 @@ def _checkpoint_selection_policy(
             "mode": CHECKPOINT_SELECTION_BALANCED,
             "protected_minimum_candidate_exact": {},
             "selection_metric": "legacy_balanced_validation_score",
+            **status_text_selection,
         }
     if not _uses_recipient_protocol(config):
         raise ValueError("checkpoint_selection=recipient_priority requires architecture v9, v10, v11, or v12")
@@ -5256,6 +5273,17 @@ def _checkpoint_selection_policy(
         "mode": CHECKPOINT_SELECTION_RECIPIENT_PRIORITY,
         "protected_minimum_candidate_exact": minima,
         "selection_metric": "recipient_exact_after_protected_candidate_exact_floors",
+        **(
+            {
+                **status_text_selection,
+                "selection_metric": (
+                    "status_safety_then_transfer_status_raw_ctc_exact_then_"
+                    "recipient_exact_after_protected_candidate_exact_floors"
+                ),
+            }
+            if status_text_only_fine_tune
+            else {}
+        ),
     }
 
 
@@ -5276,6 +5304,23 @@ def _validation_candidate_exact(validation: Mapping[str, object], field: str) ->
     return exact_match
 
 
+def _validation_ctc_exact(validation: Mapping[str, object], field: str) -> float:
+    """Read a finite raw visible-text CTC exact score from validation metrics."""
+    by_field = validation.get("ctc_by_field")
+    if not isinstance(by_field, Mapping):
+        raise ValueError("validation raw CTC metrics are missing")
+    metrics = by_field.get(field)
+    if not isinstance(metrics, Mapping):
+        raise ValueError(f"validation raw CTC metrics are missing for {field}")
+    try:
+        exact_match = float(metrics.get("exact_match"))
+    except (TypeError, ValueError):
+        raise ValueError(f"validation raw CTC exact metric is invalid for {field}") from None
+    if not math.isfinite(exact_match) or not 0.0 <= exact_match <= 1.0:
+        raise ValueError(f"validation raw CTC exact metric is invalid for {field}")
+    return exact_match
+
+
 def _checkpoint_selection_score(
     validation: Mapping[str, object],
     *,
@@ -5292,11 +5337,24 @@ def _checkpoint_selection_score(
     mode = policy.get("mode")
     if mode not in CHECKPOINT_SELECTION_MODES:
         raise ValueError("checkpoint selection policy mode is invalid")
+    status_text_ctc_priority = policy.get("status_text_ctc_priority", False)
+    if not isinstance(status_text_ctc_priority, bool):
+        raise ValueError("checkpoint selection status-text CTC priority flag is invalid")
     status_safety = (
         -float(validation["status_non_success_to_success"])
-        if bool(status_policy.get("training_enabled"))
+        if bool(status_policy.get("training_enabled")) or status_text_ctc_priority
         else 0.0
     )
+    status_text_raw_exact: float | None = None
+    if status_text_ctc_priority:
+        if not _is_v13(config):
+            raise ValueError("status-text CTC checkpoint priority requires architecture v13")
+        # v13 semantic normalization intentionally accepts variants such as
+        # `成功` as the success class.  best.pt must nevertheless prefer the
+        # epoch that transcribes the complete visible string (`转账成功`), so
+        # raw CTC exact follows the existing non-success->success safety guard
+        # but precedes every normalized semantic/candidate metric.
+        status_text_raw_exact = _validation_ctc_exact(validation, "transfer_status")
     if mode == CHECKPOINT_SELECTION_RECIPIENT_PRIORITY:
         if not _uses_recipient_protocol(config):
             raise ValueError("recipient-priority checkpoint policy requires a recipient protocol")
@@ -5317,15 +5375,18 @@ def _checkpoint_selection_score(
         if failures:
             return None, failures
         verifier_score = validation.get("verifier_macro_exact_match")
+        score = (
+            status_safety,
+            _validation_candidate_exact(validation, "recipient_field"),
+            float(validation["candidate_text_macro_exact_match"] or -1.0),
+            float(validation["candidate_text_exact_match"]),
+            float(verifier_score) if verifier_score is not None else -1.0,
+            -float(validation["loss"]),
+        )
         return (
-            (
-                status_safety,
-                _validation_candidate_exact(validation, "recipient_field"),
-                float(validation["candidate_text_macro_exact_match"] or -1.0),
-                float(validation["candidate_text_exact_match"]),
-                float(verifier_score) if verifier_score is not None else -1.0,
-                -float(validation["loss"]),
-            ),
+            (score[0], status_text_raw_exact, *score[1:])
+            if status_text_raw_exact is not None
+            else score,
             [],
         )
     # v6+ runtime may choose a valid structured time candidate (and v8 a
@@ -5338,24 +5399,30 @@ def _checkpoint_selection_score(
             if validation["verifier_macro_exact_match"] is not None
             else -1.0
         )
+        score = (
+            status_safety,
+            float(validation["candidate_text_macro_exact_match"] or -1.0),
+            float(validation["candidate_text_exact_match"]),
+            verifier_score,
+            -float(validation["loss"]),
+        )
         return (
-            (
-                status_safety,
-                float(validation["candidate_text_macro_exact_match"] or -1.0),
-                float(validation["candidate_text_exact_match"]),
-                verifier_score,
-                -float(validation["loss"]),
-            ),
+            (score[0], status_text_raw_exact, *score[1:])
+            if status_text_raw_exact is not None
+            else score,
             [],
         )
+    score = (
+        status_safety,
+        float(validation["delivery_exact_overall"]),
+        float(validation["exact_match"]),
+        -1.0,
+        -float(validation["loss"]),
+    )
     return (
-        (
-            status_safety,
-            float(validation["delivery_exact_overall"]),
-            float(validation["exact_match"]),
-            -1.0,
-            -float(validation["loss"]),
-        ),
+        (score[0], status_text_raw_exact, *score[1:])
+        if status_text_raw_exact is not None
+        else score,
         [],
     )
 
@@ -6221,14 +6288,16 @@ def _validate_validation_every(
     *,
     config: UnifiedReaderConfig,
     recipient_only_fine_tune: bool,
+    status_text_only_fine_tune: bool = False,
     init_checkpoint_mode: str,
 ) -> None:
     """Validate the deliberately narrow sparse-full-validation escape hatch.
 
     A full five-field validation is the evidence for the financial guardrails,
     so ordinary training continues to validate every epoch.  The only safe
-    exception is the v12 recipient-private warm-start route: its non-recipient
-    parameters are frozen and separately byte-checked before every planned
+    exceptions are the v12 recipient-private warm-start route and the v13
+    status-text-only route.  In each case every tensor outside the private
+    trainable head is frozen and separately byte-checked before every planned
     full validation.  Keeping the restriction here, before dataset/output
     work begins, prevents a typo from silently weakening another recipe.
     """
@@ -6236,14 +6305,16 @@ def _validate_validation_every(
         raise ValueError("validation_every must be a positive integer")
     if validation_every == 1:
         return
-    if not (
+    recipient_private_safe = (
         _is_v12(config)
         and recipient_only_fine_tune
         and init_checkpoint_mode in RECIPIENT_ONLY_INIT_CHECKPOINT_MODES
-    ):
+    )
+    status_text_private_safe = _is_v13(config) and status_text_only_fine_tune
+    if not (recipient_private_safe or status_text_private_safe):
         raise ValueError(
-            "validation_every > 1 is supported only by v12 recipient_only_fine_tune "
-            "with a recipient-only expansion init checkpoint mode"
+            "validation_every > 1 is supported only by guarded v12 recipient_only_fine_tune "
+            "or v13 status_text_only_fine_tune"
         )
 
 
@@ -6443,6 +6514,7 @@ def train_unified_reader(
         validation_every,
         config=config,
         recipient_only_fine_tune=recipient_only_fine_tune,
+        status_text_only_fine_tune=status_text_only_fine_tune,
         init_checkpoint_mode=init_checkpoint_mode,
     )
     recipient_sampling_weights, recipient_sampling_policy = _recipient_training_sample_weights(
@@ -6505,6 +6577,7 @@ def train_unified_reader(
         checkpoint_min_amount_candidate_exact=checkpoint_min_amount_candidate_exact,
         checkpoint_min_time_candidate_exact=checkpoint_min_time_candidate_exact,
         checkpoint_min_payment_candidate_exact=checkpoint_min_payment_candidate_exact,
+        status_text_only_fine_tune=status_text_only_fine_tune,
     )
     if epochs <= 0 or batch_size <= 0:
         raise ValueError("epochs and batch_size must be positive")
@@ -6934,7 +7007,7 @@ def train_unified_reader(
             "frozen_legacy_output_count": len(V12_ONNX_OUTPUT_NAMES),
             "source_train_records": len(train_records),
             "status_text_train_records": len(training_records),
-            "full_validation_schedule": "every_epoch",
+            "full_validation_schedule": "epoch_1_every_n_and_final_epoch",
             "validation_every": validation_every,
         }
     if bool(status_policy["training_enabled"]):
@@ -10792,7 +10865,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=1,
         help=(
             "Run full five-field validation every N epochs, always including epoch 1 and the final epoch. "
-            "Values above 1 are restricted to the guarded v12 recipient-only expansion warm start."
+            "Values above 1 are restricted to the guarded v12 recipient-only expansion or v13 "
+            "status-text-only warm start."
         ),
     )
     train.add_argument(

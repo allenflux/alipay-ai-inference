@@ -12,6 +12,8 @@ param(
     [int]$Epochs = 30,
     [ValidateRange(1, 64)]
     [int]$BatchSize = 12,
+    [ValidateRange(1, 80)]
+    [int]$ValidationEvery = 4,
     [ValidateRange(0.000001, 1.0)]
     [double]$LearningRate = 0.001,
     [ValidateRange(0.0, 1.0)]
@@ -294,7 +296,7 @@ $trainArgs = @(
     "--structured-loss-weight", "1.0",
     "--amount-format-min-confidence", "0.80",
     "--payment-bank-prefix-min-support", "3",
-    "--validation-every", "1",
+    "--validation-every", "$ValidationEvery",
     "--seed", "42",
     "--num-workers", "$NumWorkers",
     "--prefetch-factor", "$PrefetchFactor",
@@ -326,8 +328,12 @@ if ([string]$trainingSummary.kind -ne "receipt_unified_field_reader_v13" `
     -or [string]$fineTune.mode -ne "status_text_only_v13" `
     -or [string]$fineTune.trainable_parameter_prefix -ne "status_text_" `
     -or [int]$fineTune.frozen_legacy_output_count -ne 15 `
+    -or [string]$fineTune.full_validation_schedule -ne "epoch_1_every_n_and_final_epoch" `
+    -or [int]$fineTune.validation_every -ne $ValidationEvery `
     -or $runtime.uses_cuda -ne $true `
     -or $runtime.status_text_only_training -ne $true `
+    -or [string]$runtime.full_validation_schedule -ne "epoch_1_every_n_and_final_epoch" `
+    -or [int]$runtime.validation_every -ne $ValidationEvery `
     -or -not ([string]$runtime.device).StartsWith("cuda", [StringComparison]::OrdinalIgnoreCase) `
     -or [string]$trainingSummary.status_text_runtime_policy -ne $requiredStatusTextPolicy) {
     throw "Training summary does not prove a CUDA-only additive v12-to-v13 status-head fine-tune."
@@ -345,12 +351,23 @@ $bestRecord = @($trainingSummary.records | Where-Object { [int]$_.epoch -eq $bes
 if ($bestRecord.Count -ne 1 -or $bestRecord[0].checkpoint_selection_eligible -ne $true) {
     throw "Training did not select one floor-eligible best checkpoint."
 }
+$expectedSelectionMetric = "status_safety_then_transfer_status_raw_ctc_exact_then_recipient_exact_after_protected_candidate_exact_floors"
+$expectedStatusSafetyScore = 0.0 - [double]$bestRecord[0].val_status_non_success_to_success
+if ($trainingSummary.checkpoint_selection_policy.status_text_ctc_priority -ne $true `
+    -or [string]$trainingSummary.checkpoint_selection_policy.selection_metric -ne $expectedSelectionMetric `
+    -or $null -eq $bestRecord[0].val_ctc_by_field.transfer_status `
+    -or [double]$bestRecord[0].checkpoint_selection_score[0] -ne $expectedStatusSafetyScore `
+    -or [double]$bestRecord[0].checkpoint_selection_score[1] -ne `
+        [double]$bestRecord[0].val_ctc_by_field.transfer_status.exact_match) {
+    throw "Best checkpoint selection does not retain status safety before raw visible-status CTC exact match."
+}
 $bestMetrics = $bestRecord[0].val_candidate_text_by_field
 if ([double]$bestMetrics.amount.exact_match -lt $amountFloor `
     -or [double]$bestMetrics.time.exact_match -lt $timeFloor `
     -or [double]$bestMetrics.payment_method_field.exact_match -lt $paymentFloor `
-    -or [double]$bestMetrics.recipient_field.exact_match -lt $recipientFloor) {
-    throw "Best checkpoint does not retain all four protected candidate-exact floors."
+    -or [double]$bestMetrics.recipient_field.exact_match -lt $recipientFloor `
+    -or [double]$bestRecord[0].val_ctc_by_field.transfer_status.exact_match -lt $StatusTextFloor) {
+    throw "Best checkpoint does not retain the four protected fields plus visible-status CTC floor."
 }
 
 Invoke-Python @(

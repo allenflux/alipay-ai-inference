@@ -13,6 +13,8 @@ from PIL import Image
 
 from transfer_receipt_ai import ocr_unified
 from transfer_receipt_ai.ocr_unified import (
+    CHECKPOINT_SELECTION_RECIPIENT_PRIORITY,
+    INIT_CHECKPOINT_MODE_STRICT,
     KIND_V12,
     KIND_V13,
     STATUS_CLASSES,
@@ -25,13 +27,19 @@ from transfer_receipt_ai.ocr_unified import (
     V6_TIME_CHARACTERS,
     V8_AMOUNT_CHARACTERS,
     UnifiedReaderConfig,
+    _assert_non_status_text_parameter_bytes,
     _batch_loss,
+    _checkpoint_selection_policy,
+    _checkpoint_selection_score,
     _comparison_metrics,
+    _is_full_validation_epoch,
     _load_onnx_artifact_details,
+    _non_status_text_parameter_bytes,
     _parameter_only_initialization,
     _status_text_only_legacy_label_override,
     _unified_acceptance_failures,
     _validate_ctc_capacity,
+    _validate_validation_every,
     _validate_status_text_oov_audit,
     build_unified_reader,
     export_unified_onnx,
@@ -426,6 +434,152 @@ def test_v13_status_acceptance_uses_visible_ctc_exact_not_only_semantic_normaliz
         status_visible_text_ctc=True,
     )
     assert failures == ["transfer_status: ctc_raw_exact_match=0.5000 < 0.9000"]
+
+
+def _v13_checkpoint_validation(
+    *,
+    status_raw_ctc: float,
+    status_semantic: float,
+    recipient: float,
+    macro: float,
+    unsafe_status_to_success: int = 0,
+) -> dict[str, object]:
+    candidate_scores = {
+        "amount": 0.80,
+        "time": 0.99,
+        "payment_method_field": 0.94,
+        "recipient_field": recipient,
+        "transfer_status": status_semantic,
+    }
+    return {
+        "loss": 0.2,
+        "candidate_text_macro_exact_match": macro,
+        "candidate_text_exact_match": macro,
+        "verifier_macro_exact_match": 0.9,
+        "status_non_success_to_success": unsafe_status_to_success,
+        "candidate_text_by_field": {
+            field: {"records": 100, "exact_matches": round(score * 100), "exact_match": score}
+            for field, score in candidate_scores.items()
+        },
+        "ctc_by_field": {
+            "transfer_status": {
+                "records": 100,
+                "exact_matches": round(status_raw_ctc * 100),
+                "exact_match": status_raw_ctc,
+            }
+        },
+    }
+
+
+def test_v13_status_only_checkpoint_selection_prefers_complete_visible_ctc_text() -> None:
+    policy = _checkpoint_selection_policy(
+        config=_tiny_config(13),
+        checkpoint_selection=CHECKPOINT_SELECTION_RECIPIENT_PRIORITY,
+        checkpoint_min_amount_candidate_exact=0.80,
+        checkpoint_min_time_candidate_exact=0.98,
+        checkpoint_min_payment_candidate_exact=0.94,
+        status_text_only_fine_tune=True,
+    )
+    # The prefix/suffix variant looks better after semantic normalization and
+    # on every legacy tie-breaker, but it transcribes less visible text.
+    variant_score, variant_failures = _checkpoint_selection_score(
+        _v13_checkpoint_validation(
+            status_raw_ctc=0.80,
+            status_semantic=1.0,
+            recipient=1.0,
+            macro=1.0,
+        ),
+        config=_tiny_config(13),
+        status_policy={"training_enabled": False},
+        policy=policy,
+    )
+    complete_score, complete_failures = _checkpoint_selection_score(
+        _v13_checkpoint_validation(
+            status_raw_ctc=0.90,
+            status_semantic=0.90,
+            recipient=0.90,
+            macro=0.90,
+        ),
+        config=_tiny_config(13),
+        status_policy={"training_enabled": False},
+        policy=policy,
+    )
+
+    assert variant_failures == complete_failures == []
+    assert policy["status_text_ctc_priority"] is True
+    assert policy["selection_metric"].startswith(
+        "status_safety_then_transfer_status_raw_ctc_exact_then_"
+    )
+    assert variant_score is not None and variant_score[:2] == (0.0, 0.80)
+    assert complete_score is not None and complete_score[:2] == (0.0, 0.90)
+    assert complete_score > variant_score
+
+    unsafe_complete_score, unsafe_failures = _checkpoint_selection_score(
+        _v13_checkpoint_validation(
+            status_raw_ctc=1.0,
+            status_semantic=1.0,
+            recipient=1.0,
+            macro=1.0,
+            unsafe_status_to_success=1,
+        ),
+        config=_tiny_config(13),
+        # Visible-text safety is independent of the legacy three-class head.
+        # A dataset may contain pending/failed truth without all three legacy
+        # classes being trainable, so v13 must still rank this epoch unsafe.
+        status_policy={"training_enabled": False},
+        policy=policy,
+    )
+    assert unsafe_failures == []
+    assert unsafe_complete_score is not None and unsafe_complete_score[:2] == (-1.0, 1.0)
+    assert variant_score > unsafe_complete_score
+
+
+def test_v13_status_only_sparse_validation_keeps_first_periodic_and_final_epochs() -> None:
+    _validate_validation_every(
+        4,
+        config=_tiny_config(13),
+        recipient_only_fine_tune=False,
+        status_text_only_fine_tune=True,
+        init_checkpoint_mode=INIT_CHECKPOINT_MODE_STRICT,
+    )
+    assert [
+        epoch
+        for epoch in range(1, 13)
+        if _is_full_validation_epoch(epoch=epoch, epochs=12, validation_every=4)
+    ] == [1, 4, 8, 12]
+
+    with pytest.raises(ValueError, match="v13 status_text_only_fine_tune"):
+        _validate_validation_every(
+            4,
+            config=_tiny_config(13),
+            recipient_only_fine_tune=False,
+            status_text_only_fine_tune=False,
+            init_checkpoint_mode=INIT_CHECKPOINT_MODE_STRICT,
+        )
+
+
+def test_v13_status_only_sparse_validation_byte_audits_every_frozen_tensor() -> None:
+    torch, model = _model(_tiny_config(13), status_text_vocab_size=6)
+    frozen = _non_status_text_parameter_bytes(model)
+
+    with torch.no_grad():
+        next(
+            parameter
+            for name, parameter in model.named_parameters()
+            if name.startswith("status_text_")
+        ).add_(1.0)
+    # The private head is the sole trainable surface and is intentionally not
+    # part of the frozen v12-compatible byte audit.
+    _assert_non_status_text_parameter_bytes(model, frozen)
+
+    with torch.no_grad():
+        next(
+            parameter
+            for name, parameter in model.named_parameters()
+            if not name.startswith("status_text_")
+        ).add_(1.0)
+    with pytest.raises(AssertionError, match="mutated frozen v12 parameters"):
+        _assert_non_status_text_parameter_bytes(model, frozen)
 
 
 def test_v13_status_oov_audit_fails_closed() -> None:

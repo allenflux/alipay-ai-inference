@@ -46,6 +46,11 @@ def test_wrapper_is_cuda_only_status_head_training_from_wide_v12() -> None:
     assert "initialization.source_config.recipient_input_width -ne 1536" in source
     assert "$runtime.uses_cuda -ne $true" in source
     assert "$runtime.status_text_only_training -ne $true" in source
+    assert "[int]$ValidationEvery = 4" in source
+    assert '"--validation-every", "$ValidationEvery"' in source
+    assert 'fineTune.full_validation_schedule -ne "epoch_1_every_n_and_final_epoch"' in source
+    assert "fineTune.validation_every -ne $ValidationEvery" in source
+    assert "runtime.validation_every -ne $ValidationEvery" in source
 
 
 def test_wrapper_freezes_old_15_outputs_and_preserves_four_field_floors() -> None:
@@ -87,6 +92,12 @@ def test_wrapper_fails_closed_on_visible_status_text_and_review_only_delivery() 
     assert '"--max-non-success-to-success", "0"' in source
     assert "no pending/failed truth in this split; no non-success safety claim is made" in source
     assert "non_success_safety_calibrated" in source
+    assert "status_safety_then_transfer_status_raw_ctc_exact_then_recipient_exact_after_protected_candidate_exact_floors" in source
+    assert "checkpoint_selection_policy.status_text_ctc_priority -ne $true" in source
+    assert "checkpoint_selection_score[0] -ne $expectedStatusSafetyScore" in source
+    assert "checkpoint_selection_score[1]" in source
+    assert "val_ctc_by_field.transfer_status.exact_match" in source
+    assert "val_ctc_by_field.transfer_status.exact_match -lt $StatusTextFloor" in source
 
 
 def test_wrapper_exports_and_evaluates_but_delegates_cpu_packaging() -> None:
