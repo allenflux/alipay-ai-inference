@@ -42,6 +42,7 @@ def test_wrapper_is_cuda_only_status_head_training_from_wide_v12() -> None:
     assert '"--init-checkpoint", $SeedCheckpoint' in source
     assert '"--init-checkpoint-mode", "strict"' in source
     assert 'initialization.mode -ne "parameter_only_v12_to_v13_status_text_expansion"' in source
+    assert 'financial_label_policy.mode -ne "checkpoint_legacy_label_maps_status_text_only_v1"' in source
     assert "initialization.source_config.recipient_input_width -ne 1536" in source
     assert "$runtime.uses_cuda -ne $true" in source
     assert "$runtime.status_text_only_training -ne $true" in source

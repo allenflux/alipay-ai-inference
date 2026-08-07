@@ -29,7 +29,9 @@ from transfer_receipt_ai.ocr_unified import (
     _comparison_metrics,
     _load_onnx_artifact_details,
     _parameter_only_initialization,
+    _status_text_only_legacy_label_override,
     _unified_acceptance_failures,
+    _validate_ctc_capacity,
     _validate_status_text_oov_audit,
     build_unified_reader,
     export_unified_onnx,
@@ -260,6 +262,10 @@ def _v12_seed_payload(config: UnifiedReaderConfig, state_dict: object) -> dict[s
             "recipient_train_records": 1,
             "train_records": 1,
         },
+        "recipient_oov_by_split": {
+            split: {"records": 1, "oov_records": 0}
+            for split in ("train", "val", "test")
+        },
         "status_classes": list(STATUS_CLASSES),
         "payment_bank_prefix_classes": ["__other__", "银行"],
         "epoch": 4,
@@ -315,6 +321,63 @@ def test_v12_to_v13_warmstart_adds_only_status_text_parameters(tmp_path: Path) -
     for name, value in fresh_status.items():
         assert torch.equal(state[name], value)
     assert set(state) == set(target.state_dict())
+
+
+def test_status_text_only_locks_all_legacy_label_maps_to_v12_seed(tmp_path: Path) -> None:
+    torch = pytest.importorskip("torch")
+    source_config = _tiny_config(12)
+    _, source = _model(source_config)
+    checkpoint = tmp_path / "v12.pt"
+    torch.save(_v12_seed_payload(source_config, source.state_dict()), checkpoint)
+
+    payment, banks, recipient, policy = _status_text_only_legacy_label_override(
+        init_checkpoint=checkpoint,
+        config=_tiny_config(13),
+        amount_characters=list(V8_AMOUNT_CHARACTERS),
+        time_characters=list(V6_TIME_CHARACTERS),
+        payment_characters=["新", "字"],
+        recipient_characters=["新", "户"],
+        payment_bank_prefix_classes=["__other__", "新银行"],
+        torch=torch,
+    )
+
+    assert payment == ["卡", "行", "银", "储"]
+    assert banks == ["__other__", "银行"]
+    assert recipient == ["商", "户"]
+    assert policy["mode"] == "checkpoint_legacy_label_maps_status_text_only_v1"
+    assert policy["payment_character_map"]["data_derived_count"] == 2
+    assert policy["recipient_character_map"]["effective_count"] == 2
+    assert policy["seed_recipient_oov_by_split"]["train"] == {
+        "records": 1,
+        "oov_records": 0,
+    }
+
+
+def test_status_text_only_treats_new_train_recipient_glyphs_as_frozen_head_oov() -> None:
+    record = {
+        "id": "train-new-recipient",
+        "split": "train",
+        "slots": {
+            "recipient_field": {"text": "新户"},
+            "transfer_status": {"text": "转账成功", "class_name": "success"},
+        },
+    }
+    config = _tiny_config(13)
+    with pytest.raises(ValueError, match="recipient_field charset"):
+        _validate_ctc_capacity(
+            [record],
+            config=config,
+            recipient_characters=["商", "户"],
+            status_text_characters=sorted(set("转账成功")),
+        )
+
+    _validate_ctc_capacity(
+        [record],
+        config=config,
+        recipient_characters=["商", "户"],
+        status_text_characters=sorted(set("转账成功")),
+        allow_frozen_recipient_train_oov=True,
+    )
 
 
 def test_v13_contract_constants_are_additive_and_review_only() -> None:

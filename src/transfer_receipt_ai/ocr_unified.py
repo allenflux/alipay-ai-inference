@@ -2447,6 +2447,35 @@ def _recipient_oov_by_split(
     }
 
 
+def _validated_recipient_oov_audit(
+    value: object, *, source: str
+) -> dict[str, dict[str, int]]:
+    """Validate the frozen recipient audit persisted by a seed artifact."""
+    if not isinstance(value, Mapping) or set(value) != {"train", "val", "test"}:
+        raise ValueError(f"{source} recipient OOV audit is invalid")
+    result: dict[str, dict[str, int]] = {}
+    for split in ("train", "val", "test"):
+        audit = value[split]
+        if not isinstance(audit, Mapping) or set(audit) != {"records", "oov_records"}:
+            raise ValueError(f"{source} recipient OOV audit is invalid")
+        records = audit.get("records")
+        oov_records = audit.get("oov_records")
+        if (
+            isinstance(records, bool)
+            or not isinstance(records, int)
+            or isinstance(oov_records, bool)
+            or not isinstance(oov_records, int)
+            or records < 0
+            or oov_records < 0
+            or oov_records > records
+        ):
+            raise ValueError(f"{source} recipient OOV audit is invalid")
+        result[split] = {"records": records, "oov_records": oov_records}
+    if result["train"]["oov_records"] != 0:
+        raise ValueError(f"{source} recipient train split must not contain OOV characters")
+    return result
+
+
 def _status_text_charset(records: Iterable[Mapping[str, object]]) -> list[str]:
     """Freeze v13's visible transfer-status CTC alphabet from train only."""
     characters = sorted(
@@ -2609,6 +2638,7 @@ def _validate_ctc_capacity(
     config: UnifiedReaderConfig,
     recipient_characters: Sequence[str] | None = None,
     status_text_characters: Sequence[str] | None = None,
+    allow_frozen_recipient_train_oov: bool = False,
 ) -> None:
     for record in records:
         fields = ("amount", "time", "payment_method_field", "recipient_field") if _uses_recipient_protocol(config) else (
@@ -2645,6 +2675,11 @@ def _validate_ctc_capacity(
                 field not in {"recipient_field", "transfer_status"}
                 or str(record["split"]) == "train"
             )
+            if field == "recipient_field" and allow_frozen_recipient_train_oov:
+                # Status-text-only v13 never optimizes the frozen recipient
+                # head. New train-manifest glyphs are current-data OOV audit
+                # evidence, not labels that need to fit the seed's row map.
+                validate_characters = False
             if characters is not None and validate_characters and any(character not in characters for character in text):
                 raise ValueError(
                     f"CTC target has a character outside the architecture v{config.architecture_version} {field} charset: "
@@ -5580,6 +5615,102 @@ def _recipient_only_expansion_label_override(
     )
 
 
+def _status_text_only_legacy_label_override(
+    *,
+    init_checkpoint: Path,
+    config: UnifiedReaderConfig,
+    amount_characters: Sequence[str],
+    time_characters: Sequence[str],
+    payment_characters: Sequence[str],
+    recipient_characters: Sequence[str] | None,
+    payment_bank_prefix_classes: Sequence[str] | None,
+    torch: Any,
+) -> tuple[list[str], list[str], list[str], dict[str, object]]:
+    """Keep every v12-compatible label row locked during v13 head-only training.
+
+    Rebuilding a manifest with newer filtering code can add, remove, or reorder
+    payment/recipient labels even when it originates from the same flat teacher
+    file.  A status-only run freezes all legacy parameters, so interpreting
+    those rows with newly derived maps would corrupt the old 15 outputs before
+    the optimiser even starts.  Load the exact maps from the seed instead and
+    retain fresh-data differences only as OOV/evaluation evidence.
+    """
+    if not _is_v13(config):
+        raise ValueError("status-text legacy label override requires architecture v13")
+    if recipient_characters is None or payment_bank_prefix_classes is None:
+        raise ValueError("status-text-only v13 requires recipient and payment bank label maps")
+    checkpoint_path = Path(init_checkpoint).resolve()
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(checkpoint_path)
+    payload = _load_checkpoint(checkpoint_path, torch=torch)
+    source_config = _checkpoint_config(payload)
+    if _is_v12(source_config):
+        source_values = asdict(source_config)
+        source_values["architecture_version"] = 13
+        if source_values != asdict(config):
+            changed = [
+                key
+                for key in sorted(asdict(config))
+                if source_values.get(key) != asdict(config).get(key)
+            ]
+            raise ValueError(
+                "v12 status-text expansion may change only architecture_version; incompatible config fields: "
+                + ", ".join(changed)
+            )
+    elif source_config != config:
+        raise ValueError("v13 status-text seed config does not match the requested training config")
+    (
+        source_amount_characters,
+        source_time_characters,
+        source_payment_characters,
+        source_recipient_characters,
+        source_status_classes,
+        source_payment_bank_prefix_classes,
+    ) = _checkpoint_labels(payload, config=source_config)
+    for label, source_values, current_values in (
+        ("amount character map", source_amount_characters, amount_characters),
+        ("time character map", source_time_characters, time_characters),
+        ("status class map", source_status_classes, STATUS_CLASSES),
+    ):
+        if list(source_values) != list(current_values):
+            raise ValueError(f"init checkpoint {label} does not match the current training data")
+    if source_recipient_characters is None or source_payment_bank_prefix_classes is None:
+        raise ValueError("status-text seed has no complete v12 legacy label maps")
+    seed_recipient_oov = _validated_recipient_oov_audit(
+        payload.get("recipient_oov_by_split"),
+        source="status-text seed checkpoint",
+    )
+    return (
+        list(source_payment_characters),
+        list(source_payment_bank_prefix_classes),
+        list(source_recipient_characters),
+        {
+            "mode": "checkpoint_legacy_label_maps_status_text_only_v1",
+            "reason": (
+                "status-text-only v13 freezes every legacy parameter, so all v12-compatible output-row "
+                "semantics remain locked to the seed checkpoint"
+            ),
+            "seed_recipient_oov_by_split": seed_recipient_oov,
+            "payment_character_map": _label_map_provenance(
+                source_payment_characters,
+                data_derived_values=payment_characters,
+            ),
+            "payment_bank_prefix_class_map": _label_map_provenance(
+                source_payment_bank_prefix_classes,
+                data_derived_values=payment_bank_prefix_classes,
+            ),
+            "recipient_character_map": {
+                **_label_map_provenance(
+                    source_recipient_characters,
+                    data_derived_values=recipient_characters,
+                ),
+                "effective_count": len(source_recipient_characters),
+                "effective_sha256": _label_map_sha256(source_recipient_characters),
+            },
+        },
+    )
+
+
 def _recipient_classifier_unicode_expansion_state(
     *,
     source_state_dict: Mapping[str, object],
@@ -6466,7 +6597,29 @@ def train_unified_reader(
     )
     payment_bank_prefix_counts = dict(data_derived_payment_bank_prefix_counts)
     financial_label_policy: dict[str, object] | None = None
-    if init_checkpoint_mode in RECIPIENT_ONLY_INIT_CHECKPOINT_MODES:
+    if status_text_only_fine_tune:
+        assert init_checkpoint is not None
+        assert payment_bank_prefix_classes is not None
+        (
+            payment_characters,
+            payment_bank_prefix_classes,
+            recipient_characters,
+            financial_label_policy,
+        ) = _status_text_only_legacy_label_override(
+            init_checkpoint=init_checkpoint,
+            config=config,
+            amount_characters=amount_characters,
+            time_characters=time_characters,
+            payment_characters=data_derived_payment_characters,
+            recipient_characters=recipient_characters,
+            payment_bank_prefix_classes=data_derived_payment_bank_prefix_classes,
+            torch=torch,
+        )
+        payment_bank_prefix_counts = _payment_bank_prefix_retained_counts(
+            train_records,
+            classes=payment_bank_prefix_classes,
+        )
+    elif init_checkpoint_mode in RECIPIENT_ONLY_INIT_CHECKPOINT_MODES:
         assert init_checkpoint is not None
         assert payment_bank_prefix_classes is not None
         (
@@ -6505,6 +6658,7 @@ def train_unified_reader(
         config=config,
         recipient_characters=recipient_characters,
         status_text_characters=status_text_characters,
+        allow_frozen_recipient_train_oov=status_text_only_fine_tune,
     )
     status_to_id = {name: index for index, name in enumerate(STATUS_CLASSES)}
     payment_oov = _payment_oov_by_split(records, payment_characters=set(payment_characters))
@@ -6513,6 +6667,23 @@ def train_unified_reader(
         if recipient_characters is not None
         else None
     )
+    if status_text_only_fine_tune:
+        if not isinstance(financial_label_policy, Mapping) or recipient_oov is None:
+            raise AssertionError("status-text-only legacy label policy was not initialized")
+        seed_recipient_oov = _validated_recipient_oov_audit(
+            financial_label_policy.get("seed_recipient_oov_by_split"),
+            source="status-text legacy label policy",
+        )
+        financial_label_policy = {
+            **financial_label_policy,
+            "current_data_payment_oov_by_split": payment_oov,
+            "current_data_recipient_oov_by_split": recipient_oov,
+        }
+        # The deployed recipient head and character rows are byte-for-byte
+        # frozen from the seed. Preserve its already validated artifact audit
+        # at the top level so Python/.NET bundle invariants stay unchanged;
+        # current rebuilt-manifest differences remain explicit above.
+        recipient_oov = seed_recipient_oov
     status_text_oov = (
         _status_text_oov_by_split(records, characters=status_text_characters)
         if status_text_characters is not None

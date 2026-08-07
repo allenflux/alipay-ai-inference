@@ -322,6 +322,7 @@ if ([string]$trainingSummary.kind -ne "receipt_unified_field_reader_v13" `
     -or [int]$initialization.frozen_legacy_output_count -ne 15 `
     -or [int]$initialization.copied_legacy_tensor_count -le 0 `
     -or [int]$initialization.new_status_text_tensor_count -le 0 `
+    -or [string]$initialization.financial_label_policy.mode -ne "checkpoint_legacy_label_maps_status_text_only_v1" `
     -or [string]$fineTune.mode -ne "status_text_only_v13" `
     -or [string]$fineTune.trainable_parameter_prefix -ne "status_text_" `
     -or [int]$fineTune.frozen_legacy_output_count -ne 15 `
