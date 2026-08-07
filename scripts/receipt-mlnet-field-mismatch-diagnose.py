@@ -147,7 +147,7 @@ def _mismatch_payload(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def diagnose(*, score_dir: Path, field: str) -> list[str]:
+def diagnose(*, score_dir: Path, field: str, brief: bool = False) -> list[str]:
     comparison_field = FIELD_ALIASES[field]
     comparisons_path = score_dir / "comparisons.jsonl"
     rows = _load_comparisons(comparisons_path)
@@ -164,7 +164,22 @@ def diagnose(*, score_dir: Path, field: str) -> list[str]:
         f"score_dir={score_dir}",
         f"field={field} comparison_field={comparison_field}",
     ]
-    lines.extend(f"mismatch={_render(_mismatch_payload(row))}" for row in mismatches)
+    if brief:
+        lines.extend(
+            "mismatch="
+            + _render(
+                {
+                    "source": row["source"],
+                    "reference_text": row["reference_text"],
+                    "candidate_text": row.get("candidate_text"),
+                    "candidate_present": row["candidate_present"],
+                    "missing_reason": row.get("missing_reason"),
+                }
+            )
+            for row in mismatches
+        )
+    else:
+        lines.extend(f"mismatch={_render(_mismatch_payload(row))}" for row in mismatches)
     lines.append(
         "summary="
         + _render(
@@ -195,13 +210,18 @@ def _parser() -> argparse.ArgumentParser:
         choices=tuple(FIELD_ALIASES),
         help="public field name; use payment for payment_method_field",
     )
+    parser.add_argument(
+        "--brief",
+        action="store_true",
+        help="print only source/reference/candidate fields for each mismatch",
+    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
-        for line in diagnose(score_dir=args.score_dir, field=args.field):
+        for line in diagnose(score_dir=args.score_dir, field=args.field, brief=args.brief):
             print(line)
     except (DiagnosisError, OSError) as exception:
         print(f"diagnosis_error={exception}")

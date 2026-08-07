@@ -108,6 +108,28 @@ def test_payment_diagnosis_prints_only_strict_mismatches_and_summary(tmp_path: P
     assert comparisons.read_bytes() == original
 
 
+def test_brief_diagnosis_omits_large_diagnostics(tmp_path: Path) -> None:
+    comparisons = tmp_path / "score" / "comparisons.jsonl"
+    _write_rows(comparisons, [_row()])
+
+    lines = MODULE.diagnose(
+        score_dir=comparisons.parent,
+        field="payment",
+        brief=True,
+    )
+
+    mismatch = json.loads(
+        next(line.removeprefix("mismatch=") for line in lines if line.startswith("mismatch="))
+    )
+    assert mismatch == {
+        "candidate_present": True,
+        "candidate_text": "银行卡",
+        "missing_reason": None,
+        "reference_text": "余额",
+        "source": r"D:\receipts\one.jpg",
+    }
+
+
 @pytest.mark.parametrize(
     ("contents", "message"),
     [
