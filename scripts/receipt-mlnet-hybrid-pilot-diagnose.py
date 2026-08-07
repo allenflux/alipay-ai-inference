@@ -95,7 +95,7 @@ def _geometry_reasons(
     payment = detections.get("payment_method_field")
     reasons: list[str] = []
     for name, record, floor in (
-        ("recipient", recipient, 0.90),
+        ("recipient", recipient, 0.68),
         ("amount", amount, 0.80),
         ("payment", payment, 0.80),
     ):
@@ -109,7 +109,7 @@ def _geometry_reasons(
     recipient_box = _box(recipient)
     amount_box = _box(amount)
     payment_box = _box(payment)
-    if reasons or recipient_box is None or amount_box is None or payment_box is None:
+    if recipient_box is None or amount_box is None or payment_box is None:
         return reasons
     recipient_width = recipient_box[2] - recipient_box[0]
     recipient_height = recipient_box[3] - recipient_box[1]
