@@ -9,10 +9,23 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 WRAPPER = ROOT / "scripts" / "receipt-ocr-status-text-v13-4090.ps1"
+LAUNCHER = ROOT / "scripts" / "receipt-ocr-status-cjk-v13-run.ps1"
 
 
 def _source() -> str:
     return WRAPPER.read_text(encoding="utf-8")
+
+
+def test_short_launcher_binds_the_audited_dataset_seed_and_fixed_status_floor() -> None:
+    source = LAUNCHER.read_text(encoding="utf-8")
+
+    assert "paddle-teacher-labels-5field-recipient95-v12-r3-4090-r1" in source
+    assert '"pseudo_labels.jsonl"' in source
+    assert "unified-run-v12-r3-4090-paddle-fit-open-text-joint-wide1536-20260806-114954" in source
+    assert '"best.pt"' in source
+    assert "StatusTextFloor = 0.90" in source
+    assert '"receipt-ocr-status-text-v13-4090.ps1"' in source
+    assert "& $wrapper @runnerArgs" in source
 
 
 def test_wrapper_builds_v13_from_existing_flat_records_without_teacher_inference() -> None:
