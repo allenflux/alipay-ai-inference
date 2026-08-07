@@ -35,6 +35,22 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+if ($null -eq ("ReceiptMlNetPathNativeMethods" -as [type])) {
+    Add-Type -TypeDefinition @"
+using System.Runtime.InteropServices;
+using System.Text;
+
+public static class ReceiptMlNetPathNativeMethods
+{
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern uint QueryDosDevice(
+        string lpDeviceName,
+        StringBuilder lpTargetPath,
+        int ucchMax);
+}
+"@
+}
+
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $pythonExe = Join-Path $repoRoot ".venv-cu126\Scripts\python.exe"
 $normalizer = Join-Path $PSScriptRoot "normalize_json_summary.py"
@@ -53,66 +69,103 @@ if ([string]::IsNullOrWhiteSpace($DeviceModel)) {
     $DeviceModel = Join-Path $repoRoot "artifacts\statusbar_device_v1.onnx"
 }
 
-$RunDirectory = [IO.Path]::GetFullPath($RunDirectory)
-$Output = [IO.Path]::GetFullPath($Output)
-$DeliveryDir = [IO.Path]::GetFullPath($DeliveryDir)
-$DetectorModel = [IO.Path]::GetFullPath($DetectorModel)
-$DeviceModel = [IO.Path]::GetFullPath($DeviceModel)
-$hasRecords = -not [string]::IsNullOrWhiteSpace($Records)
-$hasEndToEndEvaluationDir = -not [string]::IsNullOrWhiteSpace($EndToEndEvaluationDir)
-
-if ([string]::IsNullOrWhiteSpace($InputPath) -eq [string]::IsNullOrWhiteSpace($InputList)) {
-    throw "Specify exactly one of -Input or -InputList."
-}
-if ($hasRecords -ne $hasEndToEndEvaluationDir) {
-    throw "Specify -Records and -EndToEndEvaluationDir together, or omit both for candidate smoke only."
-}
-if ($hasRecords -and [string]::IsNullOrWhiteSpace($InputList)) {
-    throw "End-to-end scoring requires -InputList prepared from the same records."
-}
-if ($hasRecords -and $Limit -ne 0) {
-    throw "Formal end-to-end scoring requires the complete val input list; -Limit is smoke-only."
-}
-if ($hasRecords -and $RuntimeFlavor -ne "cpu") {
-    throw "Formal end-to-end delivery validation requires -RuntimeFlavor cpu; GPU is benchmark/smoke only."
-}
-if ($hasRecords -and $Rectification -ne "max-side-1600") {
-    throw "Formal end-to-end delivery validation requires -Rectification max-side-1600."
-}
-if ($hasRecords -and -not $IncludeDeviceModel) {
-    throw "Formal end-to-end delivery validation requires -IncludeDeviceModel for the complete three-model pipeline."
-}
-if ($hasRecords) {
-    $Records = [IO.Path]::GetFullPath($Records)
-    $EndToEndEvaluationDir = [IO.Path]::GetFullPath($EndToEndEvaluationDir)
-    if (-not (Test-Path -LiteralPath $Records -PathType Leaf)) {
-        throw "Missing end-to-end evaluation records: $Records"
-    }
-    if (-not (Test-Path -LiteralPath $endToEndScorer -PathType Leaf)) {
-        throw "Missing ML.NET end-to-end scorer: $endToEndScorer"
-    }
-    if (Test-Path -LiteralPath $EndToEndEvaluationDir) {
-        throw "Refusing to reuse an existing end-to-end evaluation directory: $EndToEndEvaluationDir"
-    }
-}
-if (Test-Path -LiteralPath $DeliveryDir) {
-    throw "Refusing to overwrite an existing delivery directory: $DeliveryDir"
-}
-if (Test-Path -LiteralPath $Output) {
-    throw "Refusing to mix validation evidence with an existing output path: $Output"
-}
-
 function Get-Sha256([string]$Path) {
     return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 
 function Require-File([string]$Path, [string]$Description) {
+    Assert-SafePathSyntax $Path $Description
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
         throw "Missing ${Description}: $Path"
+    }
+    Assert-NoReparsePointInExistingPath $Path $Description
+}
+
+function Assert-SafePathSyntax([string]$Path, [string]$Description) {
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        throw "Missing ${Description} path."
+    }
+    $aliasProbe = $Path.Replace('/', '\')
+    foreach ($devicePrefix in @('\\?\', '\\.\', '\??\', '\\??\')) {
+        if ($aliasProbe.StartsWith($devicePrefix, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "${Description} must not use a Windows device-path alias: $Path"
+        }
+    }
+    if ($aliasProbe.StartsWith('\', [StringComparison]::Ordinal) `
+        -and -not $aliasProbe.StartsWith('\\', [StringComparison]::Ordinal)) {
+        throw "${Description} must not use a current-drive rooted path: $Path"
+    }
+    if ($Path -match '^[A-Za-z]:($|[^\\/])') {
+        throw "${Description} must not use a drive-relative path: $Path"
+    }
+
+    $segments = @($Path.Split([char[]]@('\', '/')))
+    for ($index = 0; $index -lt $segments.Count; $index++) {
+        $segment = [string]$segments[$index]
+        if ([string]::IsNullOrEmpty($segment)) {
+            continue
+        }
+        if ($index -eq 0 -and $segment -match '^[A-Za-z]:$') {
+            continue
+        }
+        if ($segment -in @('.', '..')) {
+            continue
+        }
+        if ($segment.Contains(':')) {
+            throw "${Description} must not use an alternate data stream or path alias: $Path"
+        }
+        $canonicalSegment = $segment.TrimEnd([char[]]@('.', ' '))
+        if ($canonicalSegment.Length -ne $segment.Length) {
+            throw "${Description} must not contain a trailing dot or space: $Path"
+        }
+        if ($canonicalSegment -match '^(?i:con|prn|aux|nul|clock\$|conin\$|conout\$|com[1-9]|lpt[1-9])(?:[ .].*)?$') {
+            throw "${Description} contains a reserved Windows device name: $Path"
+        }
+    }
+}
+
+function Assert-NoReparsePointInExistingPath([string]$Path, [string]$Description) {
+    Assert-SafePathSyntax $Path $Description
+    $current = [IO.Path]::GetFullPath($Path)
+    if ($current -match '^[A-Za-z]:[\\/]') {
+        $driveName = $current.Substring(0, 2)
+        $targetBuffer = [Text.StringBuilder]::new(32768)
+        $queryLength = [ReceiptMlNetPathNativeMethods]::QueryDosDevice(
+            $driveName,
+            $targetBuffer,
+            $targetBuffer.Capacity)
+        if ($queryLength -eq 0) {
+            $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            throw "${Description} drive mapping could not be verified: $driveName (Win32 error $errorCode)"
+        }
+        $driveTarget = $targetBuffer.ToString()
+        if ($driveTarget.StartsWith('\??\', [StringComparison]::OrdinalIgnoreCase) `
+            -or $driveTarget.StartsWith('\DosDevices\', [StringComparison]::OrdinalIgnoreCase) `
+            -or $driveTarget.StartsWith('\GLOBAL??\', [StringComparison]::OrdinalIgnoreCase)) {
+            throw "${Description} must not traverse a substituted DOS drive: $driveName -> $driveTarget"
+        }
+    }
+    while (-not [string]::IsNullOrWhiteSpace($current)) {
+        if (Test-Path -LiteralPath $current) {
+            $item = Get-Item -LiteralPath $current -Force
+            if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "${Description} must not traverse a reparse point: $($item.FullName)"
+            }
+        }
+        $parent = [IO.Path]::GetDirectoryName($current)
+        if ([string]::IsNullOrWhiteSpace($parent) `
+            -or $parent.Equals($current, [StringComparison]::OrdinalIgnoreCase)) {
+            break
+        }
+        $current = $parent
     }
 }
 
 function Test-PathWithin([string]$Candidate, [string]$Parent) {
+    Assert-SafePathSyntax $Candidate "candidate path"
+    Assert-SafePathSyntax $Parent "parent path"
+    $Candidate = [IO.Path]::GetFullPath($Candidate)
+    $Parent = [IO.Path]::GetFullPath($Parent)
     if ($Candidate.Equals($Parent, [StringComparison]::OrdinalIgnoreCase)) {
         return $true
     }
@@ -121,6 +174,214 @@ function Test-PathWithin([string]$Candidate, [string]$Parent) {
         $parentPrefix += [IO.Path]::DirectorySeparatorChar
     }
     return $Candidate.StartsWith($parentPrefix, [StringComparison]::OrdinalIgnoreCase)
+}
+
+function Get-RelativePackagePath([string]$Path, [string]$PackageRoot) {
+    Assert-SafePathSyntax $Path "package payload"
+    Assert-SafePathSyntax $PackageRoot "package root"
+    $pathFull = [IO.Path]::GetFullPath($Path)
+    $rootFull = [IO.Path]::GetFullPath($PackageRoot)
+    $rootPrefix = $rootFull
+    if (-not $rootPrefix.EndsWith([IO.Path]::DirectorySeparatorChar.ToString(), [StringComparison]::Ordinal)) {
+        $rootPrefix += [IO.Path]::DirectorySeparatorChar
+    }
+    if (-not $pathFull.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Path is outside the delivery package: $pathFull"
+    }
+    return $pathFull.Substring($rootPrefix.Length).Replace('\', '/')
+}
+
+function Resolve-ContainedPackageFile(
+    [string]$PackageRoot,
+    [string]$RelativePath,
+    [string]$Description
+) {
+    if ([string]::IsNullOrWhiteSpace($RelativePath)) {
+        throw "Missing relative path for ${Description}."
+    }
+    Assert-SafePathSyntax $PackageRoot "package root"
+    Assert-SafePathSyntax $RelativePath $Description
+    $normalized = $RelativePath.Replace('/', [IO.Path]::DirectorySeparatorChar)
+    $segments = @($normalized.Split([IO.Path]::DirectorySeparatorChar))
+    if ([IO.Path]::IsPathRooted($normalized) `
+        -or $segments -contains "" `
+        -or $segments -contains "." `
+        -or $segments -contains "..") {
+        throw "Unsafe path for ${Description}: $RelativePath"
+    }
+    $rootFull = [IO.Path]::GetFullPath($PackageRoot)
+    $target = [IO.Path]::GetFullPath((Join-Path $rootFull $normalized))
+    if (-not (Test-PathWithin $target $rootFull) `
+        -or $target.Equals($rootFull, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Path for ${Description} escapes the delivery package: $RelativePath"
+    }
+    Require-File $target $Description
+    Assert-NoReparsePointInExistingPath $target $Description
+    return $target
+}
+
+function Get-PackagePayloadFiles([string]$PackageRoot) {
+    Assert-SafePathSyntax $PackageRoot "package root"
+    $rootFull = [IO.Path]::GetFullPath($PackageRoot)
+    if (-not (Test-Path -LiteralPath $rootFull -PathType Container)) {
+        throw "Missing delivery package directory: $rootFull"
+    }
+    Assert-NoReparsePointInExistingPath $rootFull "package root"
+
+    $pending = New-Object System.Collections.Queue
+    $pending.Enqueue($rootFull)
+    $files = @()
+    while ($pending.Count -gt 0) {
+        $directory = [string]$pending.Dequeue()
+        foreach ($item in Get-ChildItem -LiteralPath $directory -Force) {
+            Assert-SafePathSyntax $item.FullName "package payload"
+            if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "Delivery package contains a reparse point: $($item.FullName)"
+            }
+            if ($item.PSIsContainer) {
+                $pending.Enqueue($item.FullName)
+            }
+            else {
+                $files += $item
+            }
+        }
+    }
+    return @($files)
+}
+
+function Assert-PackageIntegrity([string]$PackageRoot) {
+    Assert-SafePathSyntax $PackageRoot "package root"
+    $PackageRoot = [IO.Path]::GetFullPath($PackageRoot)
+    Assert-NoReparsePointInExistingPath $PackageRoot "package root"
+    $hashManifestPath = Join-Path $PackageRoot "SHA256SUMS.json"
+    Require-File $hashManifestPath "delivery package hash manifest"
+    $hashRows = Get-Content -LiteralPath $hashManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ($null -eq $hashRows) {
+        throw "Delivery package hash manifest is empty."
+    }
+
+    $listedPaths = @{}
+    $hashRowCount = 0
+    foreach ($row in $hashRows) {
+        $hashRowCount++
+        $pathProperty = $row.PSObject.Properties["path"]
+        $shaProperty = $row.PSObject.Properties["sha256"]
+        $bytesProperty = $row.PSObject.Properties["bytes"]
+        if ($null -eq $pathProperty -or $null -eq $shaProperty -or $null -eq $bytesProperty) {
+            throw "Delivery package hash manifest contains an incomplete row."
+        }
+        $relativePath = [string]$pathProperty.Value
+        $target = Resolve-ContainedPackageFile $PackageRoot $relativePath "delivery package hash target"
+        $canonicalPath = Get-RelativePackagePath $target $PackageRoot
+        if ($canonicalPath.Equals("SHA256SUMS.json", [StringComparison]::OrdinalIgnoreCase)) {
+            throw "SHA256SUMS.json must not contain a self-reference."
+        }
+        $pathKey = $canonicalPath.ToLowerInvariant()
+        if ($listedPaths.ContainsKey($pathKey)) {
+            throw "Duplicate path in delivery package hash manifest: $relativePath"
+        }
+
+        $expectedHash = ([string]$shaProperty.Value).ToLowerInvariant()
+        if ($expectedHash -notmatch '^[0-9a-f]{64}$') {
+            throw "Invalid SHA-256 in delivery package hash manifest: $relativePath"
+        }
+        $expectedBytes = [long]0
+        $bytesText = [Convert]::ToString($bytesProperty.Value, [Globalization.CultureInfo]::InvariantCulture)
+        if (-not [long]::TryParse(
+                $bytesText,
+                [Globalization.NumberStyles]::Integer,
+                [Globalization.CultureInfo]::InvariantCulture,
+                [ref]$expectedBytes) `
+            -or $expectedBytes -lt 0) {
+            throw "Invalid byte count in delivery package hash manifest: $relativePath"
+        }
+        if ((Get-Sha256 $target) -ne $expectedHash `
+            -or (Get-Item -LiteralPath $target).Length -ne $expectedBytes) {
+            throw "Delivery package integrity check failed: $relativePath"
+        }
+        $listedPaths[$pathKey] = $canonicalPath
+    }
+    if ($hashRowCount -le 0) {
+        throw "Delivery package hash manifest is empty."
+    }
+
+    $actualPaths = @{}
+    foreach ($file in Get-PackagePayloadFiles $PackageRoot) {
+        if ($file.FullName.Equals($hashManifestPath, [StringComparison]::OrdinalIgnoreCase)) {
+            continue
+        }
+        $canonicalPath = Get-RelativePackagePath $file.FullName $PackageRoot
+        $pathKey = $canonicalPath.ToLowerInvariant()
+        if ($actualPaths.ContainsKey($pathKey)) {
+            throw "Duplicate canonical file path in delivery package: $canonicalPath"
+        }
+        $actualPaths[$pathKey] = $canonicalPath
+    }
+    $missingPaths = @($listedPaths.Keys | Where-Object { -not $actualPaths.ContainsKey($_) })
+    $extraPaths = @($actualPaths.Keys | Where-Object { -not $listedPaths.ContainsKey($_) })
+    if ($missingPaths.Count -ne 0 -or $extraPaths.Count -ne 0) {
+        throw "Delivery package hash manifest is not closed: missing=$($missingPaths.Count), extra=$($extraPaths.Count)."
+    }
+}
+
+function Get-SafeDirectoryFiles([string]$Root, [string]$Description) {
+    Assert-SafePathSyntax $Root $Description
+    $rootFull = [IO.Path]::GetFullPath($Root)
+    if (-not (Test-Path -LiteralPath $rootFull -PathType Container)) {
+        throw "Missing ${Description}: $rootFull"
+    }
+    Assert-NoReparsePointInExistingPath $rootFull $Description
+    $pending = New-Object System.Collections.Queue
+    $pending.Enqueue($rootFull)
+    while ($pending.Count -gt 0) {
+        $directory = [string]$pending.Dequeue()
+        foreach ($item in Get-ChildItem -LiteralPath $directory -Force) {
+            Assert-SafePathSyntax $item.FullName $Description
+            if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "${Description} contains a reparse point: $($item.FullName)"
+            }
+            if ($item.PSIsContainer) {
+                $pending.Enqueue($item.FullName)
+            }
+            else {
+                Write-Output $item
+            }
+        }
+    }
+}
+
+function Resolve-ContainedOutputFile(
+    [string]$OutputRoot,
+    [string]$Path,
+    [string]$Description,
+    [bool]$RequireExisting = $true
+) {
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        throw "Missing ${Description} path."
+    }
+    Assert-SafePathSyntax $OutputRoot "output root"
+    Assert-SafePathSyntax $Path $Description
+    $outputRootFull = [IO.Path]::GetFullPath($OutputRoot)
+    $target = if ([IO.Path]::IsPathRooted($Path)) {
+        [IO.Path]::GetFullPath($Path)
+    }
+    else {
+        [IO.Path]::GetFullPath((Join-Path $outputRootFull $Path))
+    }
+    if (-not (Test-PathWithin $target $outputRootFull) `
+        -or $target.Equals($outputRootFull, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "${Description} path escapes the output directory: $Path"
+    }
+    if ($RequireExisting) {
+        Require-File $target $Description
+    }
+    elseif (Test-Path -LiteralPath $target) {
+        Require-File $target $Description
+    }
+    else {
+        Assert-NoReparsePointInExistingPath $target $Description
+    }
+    return $target
 }
 
 function Read-NormalizedJson([string]$Path) {
@@ -132,9 +393,12 @@ function Read-NormalizedJson([string]$Path) {
 }
 
 function Assert-StandardModelContract([string]$ModelPath, [string]$ExpectedKind) {
+    Assert-SafePathSyntax $ModelPath "$ExpectedKind ONNX"
     $contractPath = [IO.Path]::ChangeExtension($ModelPath, ".contract.json")
     Require-File $ModelPath "$ExpectedKind ONNX"
     Require-File $contractPath "$ExpectedKind contract"
+    Assert-NoReparsePointInExistingPath $ModelPath "$ExpectedKind ONNX"
+    Assert-NoReparsePointInExistingPath $contractPath "$ExpectedKind contract"
     $contract = Get-Content -LiteralPath $contractPath -Raw -Encoding UTF8 | ConvertFrom-Json
     if ([string]$contract.kind -ne $ExpectedKind) {
         throw "Unexpected model kind in ${contractPath}: $($contract.kind); expected $ExpectedKind"
@@ -148,11 +412,15 @@ function Assert-StandardModelContract([string]$ModelPath, [string]$ExpectedKind)
 }
 
 function Assert-UnifiedBundle([string]$ModelPath) {
+    Assert-SafePathSyntax $ModelPath "unified OCR ONNX"
     $labelsPath = [IO.Path]::ChangeExtension($ModelPath, ".labels.json")
     $contractPath = [IO.Path]::ChangeExtension($ModelPath, ".contract.json")
     Require-File $ModelPath "unified OCR ONNX"
     Require-File $labelsPath "unified OCR labels"
     Require-File $contractPath "unified OCR contract"
+    Assert-NoReparsePointInExistingPath $ModelPath "unified OCR ONNX"
+    Assert-NoReparsePointInExistingPath $labelsPath "unified OCR labels"
+    Assert-NoReparsePointInExistingPath $contractPath "unified OCR contract"
 
     $contract = Get-Content -LiteralPath $contractPath -Raw -Encoding UTF8 | ConvertFrom-Json
     if ([string]$contract.kind -ne "receipt_unified_field_reader_v12") {
@@ -176,14 +444,82 @@ function Assert-UnifiedBundle([string]$ModelPath) {
     return @($labelsPath, $contractPath)
 }
 
+$hasRecords = -not [string]::IsNullOrWhiteSpace($Records)
+$hasEndToEndEvaluationDir = -not [string]::IsNullOrWhiteSpace($EndToEndEvaluationDir)
+$includeProductionCpuEntrypoints = $hasRecords -and $RuntimeFlavor -eq "cpu"
+
+if ([string]::IsNullOrWhiteSpace($InputPath) -eq [string]::IsNullOrWhiteSpace($InputList)) {
+    throw "Specify exactly one of -Input or -InputList."
+}
+if ($hasRecords -ne $hasEndToEndEvaluationDir) {
+    throw "Specify -Records and -EndToEndEvaluationDir together, or omit both for candidate smoke only."
+}
+if ($hasRecords -and [string]::IsNullOrWhiteSpace($InputList)) {
+    throw "End-to-end scoring requires -InputList prepared from the same records."
+}
+if ($hasRecords -and $Limit -ne 0) {
+    throw "Formal end-to-end scoring requires the complete val input list; -Limit is smoke-only."
+}
+if ($hasRecords -and $RuntimeFlavor -ne "cpu") {
+    throw "Formal end-to-end delivery validation requires -RuntimeFlavor cpu; GPU is benchmark/smoke only."
+}
+if ($hasRecords -and $Rectification -ne "max-side-1600") {
+    throw "Formal end-to-end delivery validation requires -Rectification max-side-1600."
+}
+if ($hasRecords -and -not $IncludeDeviceModel) {
+    throw "Formal end-to-end delivery validation requires -IncludeDeviceModel for the complete three-model pipeline."
+}
+
+Assert-SafePathSyntax $RunDirectory "RunDirectory"
+Assert-SafePathSyntax $Output "Output"
+Assert-SafePathSyntax $DeliveryDir "DeliveryDir"
+Assert-SafePathSyntax $DetectorModel "DetectorModel"
+Assert-SafePathSyntax $DeviceModel "DeviceModel"
+$RunDirectory = [IO.Path]::GetFullPath($RunDirectory)
+$Output = [IO.Path]::GetFullPath($Output)
+$DeliveryDir = [IO.Path]::GetFullPath($DeliveryDir)
+$DetectorModel = [IO.Path]::GetFullPath($DetectorModel)
+$DeviceModel = [IO.Path]::GetFullPath($DeviceModel)
+Assert-NoReparsePointInExistingPath $RunDirectory "RunDirectory"
+Assert-NoReparsePointInExistingPath $Output "Output"
+Assert-NoReparsePointInExistingPath $DeliveryDir "DeliveryDir"
+Assert-NoReparsePointInExistingPath $DetectorModel "DetectorModel"
+Assert-NoReparsePointInExistingPath $DeviceModel "DeviceModel"
+
+if ($hasRecords) {
+    Assert-SafePathSyntax $Records "Records"
+    Assert-SafePathSyntax $EndToEndEvaluationDir "EndToEndEvaluationDir"
+    $Records = [IO.Path]::GetFullPath($Records)
+    $EndToEndEvaluationDir = [IO.Path]::GetFullPath($EndToEndEvaluationDir)
+    Assert-NoReparsePointInExistingPath $Records "Records"
+    Assert-NoReparsePointInExistingPath $EndToEndEvaluationDir "EndToEndEvaluationDir"
+    if (-not (Test-Path -LiteralPath $Records -PathType Leaf)) {
+        throw "Missing end-to-end evaluation records: $Records"
+    }
+    if (-not (Test-Path -LiteralPath $endToEndScorer -PathType Leaf)) {
+        throw "Missing ML.NET end-to-end scorer: $endToEndScorer"
+    }
+    if (Test-Path -LiteralPath $EndToEndEvaluationDir) {
+        throw "Refusing to reuse an existing end-to-end evaluation directory: $EndToEndEvaluationDir"
+    }
+}
+if (Test-Path -LiteralPath $DeliveryDir) {
+    throw "Refusing to overwrite an existing delivery directory: $DeliveryDir"
+}
+if (Test-Path -LiteralPath $Output) {
+    throw "Refusing to mix validation evidence with an existing output path: $Output"
+}
+
 Require-File $pythonExe "project Python interpreter"
 Require-File $normalizer "JSON normalizer"
 Require-File $projectFile "ML.NET project"
 Require-File $preprocessingContractTestProject "ML.NET preprocessing contract test project"
 Require-File $rectificationContractTestProject "ML.NET rectification contract test project"
-Require-File $singleCpuEntrypoint "single-image production CPU entrypoint"
-Require-File $batchCpuEntrypoint "batch production CPU entrypoint"
-Require-File $cpuDeliveryReadme "production CPU delivery README"
+if ($includeProductionCpuEntrypoints) {
+    Require-File $singleCpuEntrypoint "single-image production CPU entrypoint"
+    Require-File $batchCpuEntrypoint "batch production CPU entrypoint"
+    Require-File $cpuDeliveryReadme "production CPU delivery README"
+}
 
 $unifiedModel = Join-Path $RunDirectory "best.onnx"
 $unifiedSidecars = Assert-UnifiedBundle $unifiedModel
@@ -296,10 +632,12 @@ $resolvedInput = $null
 $resolvedInputList = $null
 $inputRecords = @()
 if (-not [string]::IsNullOrWhiteSpace($InputPath)) {
+    Assert-SafePathSyntax $InputPath "Input"
     $resolvedInput = [IO.Path]::GetFullPath($InputPath)
     if (-not (Test-Path -LiteralPath $resolvedInput)) {
         throw "Input does not exist: $resolvedInput"
     }
+    Assert-NoReparsePointInExistingPath $resolvedInput "Input"
     $supportedExtensions = @(".png", ".jpg", ".jpeg", ".bmp", ".webp")
     if (Test-Path -LiteralPath $resolvedInput -PathType Leaf) {
         if ($supportedExtensions -notcontains [IO.Path]::GetExtension($resolvedInput).ToLowerInvariant()) {
@@ -309,15 +647,17 @@ if (-not [string]::IsNullOrWhiteSpace($InputPath)) {
     }
     else {
         $availableRecords = @(
-            Get-ChildItem -LiteralPath $resolvedInput -Recurse -File |
+            Get-SafeDirectoryFiles $resolvedInput "input image directory" |
                 Where-Object { $supportedExtensions -contains $_.Extension.ToLowerInvariant() }
         ).Count
         $expectedRecords = if ($Limit -gt 0) { [Math]::Min($availableRecords, $Limit) } else { $availableRecords }
     }
 }
 else {
+    Assert-SafePathSyntax $InputList "InputList"
     $resolvedInputList = [IO.Path]::GetFullPath($InputList)
     Require-File $resolvedInputList "input list"
+    Assert-NoReparsePointInExistingPath $resolvedInputList "InputList"
     $listRoot = Split-Path -Parent $resolvedInputList
     $seenInputRecords = @{}
     $supportedExtensions = @(".png", ".jpg", ".jpeg", ".bmp", ".webp")
@@ -326,11 +666,13 @@ else {
         if ([string]::IsNullOrWhiteSpace($candidate) -or $candidate.StartsWith("#", [StringComparison]::Ordinal)) {
             continue
         }
+        Assert-SafePathSyntax $candidate "input-list image"
         if (-not [IO.Path]::IsPathRooted($candidate)) {
             $candidate = Join-Path $listRoot $candidate
         }
         $candidate = [IO.Path]::GetFullPath($candidate)
         Require-File $candidate "input-list image"
+        Assert-NoReparsePointInExistingPath $candidate "input-list image"
         if ($supportedExtensions -notcontains [IO.Path]::GetExtension($candidate).ToLowerInvariant()) {
             throw "Input-list file has an unsupported image extension: $candidate"
         }
@@ -351,8 +693,9 @@ if ((Test-PathWithin $Output $DeliveryDir) -or (Test-PathWithin $DeliveryDir $Ou
     throw "Output and DeliveryDir must be separate, non-nested paths."
 }
 if ($hasRecords) {
-    if ($EndToEndEvaluationDir.Equals($Output, [StringComparison]::OrdinalIgnoreCase)) {
-        throw "EndToEndEvaluationDir must not be the same path as Output."
+    if ((Test-PathWithin $EndToEndEvaluationDir $Output) `
+        -or (Test-PathWithin $Output $EndToEndEvaluationDir)) {
+        throw "EndToEndEvaluationDir and Output must be separate, non-nested paths."
     }
     if ((Test-PathWithin $EndToEndEvaluationDir $DeliveryDir) -or (Test-PathWithin $DeliveryDir $EndToEndEvaluationDir)) {
         throw "EndToEndEvaluationDir and DeliveryDir must be separate, non-nested paths."
@@ -369,6 +712,7 @@ if ([string]::IsNullOrWhiteSpace($deliveryParent)) {
     throw "DeliveryDir must have a parent directory."
 }
 New-Item -ItemType Directory -Path $deliveryParent -Force | Out-Null
+Assert-NoReparsePointInExistingPath $deliveryParent "delivery parent"
 $stagingRoot = Join-Path $deliveryParent (".receipt-mlnet-unified-staging-" + [Guid]::NewGuid().ToString("N"))
 $appDirectory = Join-Path $stagingRoot "app"
 $modelDirectory = Join-Path $stagingRoot "models"
@@ -404,10 +748,13 @@ try {
             if ([string]::IsNullOrWhiteSpace($candidate) -or $candidate.StartsWith("#", [StringComparison]::Ordinal)) {
                 continue
             }
+            Assert-SafePathSyntax $candidate "canonical val input"
             if (-not [IO.Path]::IsPathRooted($candidate)) {
                 $candidate = Join-Path $formalListRoot $candidate
             }
             $candidate = [IO.Path]::GetFullPath($candidate)
+            Require-File $candidate "canonical val input"
+            Assert-NoReparsePointInExistingPath $candidate "canonical val input"
             if (-not $formalExpectedSet.ContainsKey($candidate)) {
                 $formalExpectedSet[$candidate] = $true
                 $formalExpectedRecords += $candidate
@@ -477,9 +824,11 @@ try {
     Copy-Item -LiteralPath $unifiedLabels -Destination $unifiedDirectory
     Copy-Item -LiteralPath $unifiedContract -Destination $unifiedDirectory
     Copy-Item -LiteralPath $onnxValidationSummary -Destination (Join-Path $evidenceDirectory "onnx-validation-summary.json")
-    Copy-Item -LiteralPath $singleCpuEntrypoint -Destination $stagingRoot
-    Copy-Item -LiteralPath $batchCpuEntrypoint -Destination $stagingRoot
-    Copy-Item -LiteralPath $cpuDeliveryReadme -Destination $stagingRoot
+    if ($includeProductionCpuEntrypoints) {
+        Copy-Item -LiteralPath $singleCpuEntrypoint -Destination $stagingRoot
+        Copy-Item -LiteralPath $batchCpuEntrypoint -Destination $stagingRoot
+        Copy-Item -LiteralPath $cpuDeliveryReadme -Destination $stagingRoot
+    }
 
     $executable = Join-Path $appDirectory "ReceiptMlNet.Cli.exe"
     Require-File $executable "published ML.NET executable"
@@ -523,6 +872,9 @@ try {
     Require-File $manifestPath "ML.NET inference manifest"
     Require-File $errorsPath "ML.NET inference errors"
     Require-File $runtimeSummaryPath "ML.NET inference summary"
+    Assert-NoReparsePointInExistingPath $manifestPath "ML.NET inference manifest"
+    Assert-NoReparsePointInExistingPath $errorsPath "ML.NET inference errors"
+    Assert-NoReparsePointInExistingPath $runtimeSummaryPath "ML.NET inference summary"
     # Windows PowerShell 5.1 emits a JSON top-level array as one pipeline
     # object. Do not wrap the command itself in @(...), which would report a
     # batch of N records as Count=1; retain the decoded array and use its own
@@ -606,7 +958,21 @@ try {
     $manifestSourceSet = @{}
     $resultEvidenceRows = @()
     foreach ($manifestRecord in $allManifest) {
+        Assert-SafePathSyntax ([string]$manifestRecord.source) "inference manifest source"
         $manifestSource = [IO.Path]::GetFullPath([string]$manifestRecord.source)
+        Require-File $manifestSource "inference manifest source"
+        Assert-NoReparsePointInExistingPath $manifestSource "inference manifest source"
+        if ($null -ne $resolvedInput) {
+            if ((Test-Path -LiteralPath $resolvedInput -PathType Leaf) `
+                -and -not $manifestSource.Equals($resolvedInput, [StringComparison]::OrdinalIgnoreCase)) {
+                throw "Inference manifest source does not match the requested input file: $manifestSource"
+            }
+            if ((Test-Path -LiteralPath $resolvedInput -PathType Container) `
+                -and (-not (Test-PathWithin $manifestSource $resolvedInput) `
+                    -or $manifestSource.Equals($resolvedInput, [StringComparison]::OrdinalIgnoreCase))) {
+                throw "Inference manifest source escapes the requested input directory: $manifestSource"
+            }
+        }
         if ($manifestSourceSet.ContainsKey($manifestSource)) {
             throw "Inference manifest contains a duplicate source: $manifestSource"
         }
@@ -615,9 +981,30 @@ try {
         if ([double]::IsNaN($inferenceMs) -or [double]::IsInfinity($inferenceMs) -or $inferenceMs -lt 0.0) {
             throw "Manifest inference_ms is invalid for source: $manifestSource"
         }
-        $resultPath = [string]$manifestRecord.result
-        Require-File $resultPath "ML.NET receipt result"
+        $resultPath = Resolve-ContainedOutputFile `
+            $Output ([string]$manifestRecord.result) "ML.NET receipt result"
+        foreach ($annotation in @(
+                @{ Property = "annotated_rectified"; Description = "ML.NET rectified annotation" },
+                @{ Property = "annotated_original"; Description = "ML.NET original annotation" }
+            )) {
+            $annotationPropertyName = [string]$annotation.Property
+            $annotationProperty = $manifestRecord.PSObject.Properties[$annotationPropertyName]
+            $annotationValue = if ($null -eq $annotationProperty) { $null } else { [string]$annotationProperty.Value }
+            $null = Resolve-ContainedOutputFile `
+                $Output $annotationValue ([string]$annotation.Description) ($Annotate -eq "all")
+        }
         $result = Get-Content -LiteralPath $resultPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        $resultSourceProperty = if ($null -eq $result) { $null } else { $result.PSObject.Properties["source"] }
+        if ($null -eq $resultSourceProperty `
+            -or [string]::IsNullOrWhiteSpace([string]$resultSourceProperty.Value)) {
+            throw "Result has no source path: $resultPath"
+        }
+        Assert-SafePathSyntax ([string]$resultSourceProperty.Value) "result source"
+        $resultSource = [IO.Path]::GetFullPath([string]$resultSourceProperty.Value)
+        Assert-NoReparsePointInExistingPath $resultSource "result source"
+        if (-not $resultSource.Equals($manifestSource, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Result source does not match its inference manifest source: $resultPath"
+        }
         if ([string]$result.inference_engine -ne "mlnet") {
             throw "Unexpected inference engine in result: $resultPath"
         }
@@ -751,6 +1138,10 @@ try {
         $endToEndComparisonsPath = Join-Path $EndToEndEvaluationDir "comparisons.jsonl"
         Require-File $endToEndSummaryPath "ML.NET end-to-end evaluation summary"
         Require-File $endToEndComparisonsPath "ML.NET end-to-end comparisons"
+        Assert-NoReparsePointInExistingPath `
+            $endToEndSummaryPath "ML.NET end-to-end evaluation summary"
+        Assert-NoReparsePointInExistingPath `
+            $endToEndComparisonsPath "ML.NET end-to-end comparisons"
         $endToEndSummary = Read-NormalizedJson $endToEndSummaryPath
         $scoreFailures = @($endToEndSummary.failures | ForEach-Object { [string]$_ } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
         if ($scoreExitCode -ne 0) {
@@ -762,6 +1153,10 @@ try {
         }
         if ([string]$endToEndSummary.model_sha256 -ne $unifiedModelSha256) {
             throw "ML.NET end-to-end score is not bound to the delivered best.onnx."
+        }
+        if ([string]$endToEndSummary.records_sha256 -ne (Get-Sha256 $Records) `
+            -or [string]$endToEndSummary.manifest_sha256 -ne (Get-Sha256 $manifestPath)) {
+            throw "ML.NET end-to-end score is not bound to the requested records and inference manifest."
         }
         if ($endToEndSummary.accepted -ne $true -or $endToEndSummary.acceptance.passed -ne $true -or $scoreFailures.Count -ne 0) {
             throw "ML.NET end-to-end score did not pass: $($scoreFailures -join '; ')"
@@ -829,6 +1224,39 @@ try {
         }
     }
 
+    $modelArtifactEvidence = [ordered]@{
+        detector = [ordered]@{
+            kind = "receipt_lrcnn_v1"
+            model_path = "models/$([IO.Path]::GetFileName($DetectorModel))"
+            model_sha256 = $detectorModelSha256
+            contract_path = "models/$([IO.Path]::GetFileName($detectorContract))"
+            contract_sha256 = $detectorContractSha256
+        }
+        device = if ($IncludeDeviceModel) {
+            [ordered]@{
+                kind = "statusbar_device_v1"
+                model_path = "models/$([IO.Path]::GetFileName($DeviceModel))"
+                model_sha256 = $deviceModelSha256
+                contract_path = "models/$([IO.Path]::GetFileName($deviceContract))"
+                contract_sha256 = $deviceContractSha256
+            }
+        }
+        else {
+            $null
+        }
+        unified_ocr = [ordered]@{
+            kind = "receipt_unified_field_reader_v12"
+            model_path = "models/unified/$([IO.Path]::GetFileName($unifiedModel))"
+            model_sha256 = $unifiedModelSha256
+            labels_path = "models/unified/$([IO.Path]::GetFileName($unifiedLabels))"
+            labels_sha256 = $unifiedLabelsSha256
+            contract_path = "models/unified/$([IO.Path]::GetFileName($unifiedContract))"
+            contract_sha256 = $unifiedContractSha256
+            text_delivery_policy = $textDeliveryPolicy
+            review_value = $textReviewValue
+        }
+    }
+
     $packageValidation = [ordered]@{
         schema_version = 1
         kind = "receipt_mlnet_unified_package_validation_v1"
@@ -841,6 +1269,7 @@ try {
         include_device_model = [bool]$IncludeDeviceModel
         annotate = $Annotate
         model_sha256 = $unifiedModelSha256
+        model_artifacts = $modelArtifactEvidence
         runtime_flavor = $RuntimeFlavor
         runtime_device = $runtimeDevice
         rectification = $Rectification
@@ -866,6 +1295,7 @@ try {
         onnx_validation = [ordered]@{
             providers = $providers
             accepted = [bool]$summary.acceptance.passed
+            summary_sha256 = Get-Sha256 $onnxValidationSummary
             fields = $validatedMetrics
         }
     }
@@ -909,26 +1339,26 @@ try {
         detector_model = [IO.Path]::GetFileName($DetectorModel)
         device_model = if ($IncludeDeviceModel) { [IO.Path]::GetFileName($DeviceModel) } else { $null }
         unified_model = "models/unified/$([IO.Path]::GetFileName($unifiedModel))"
-        production_entrypoints = @(
+        text_delivery_policy = $textDeliveryPolicy
+        text_review_value = $textReviewValue
+        model_artifacts = $modelArtifactEvidence
+    }
+    if ($includeProductionCpuEntrypoints) {
+        $packageConfig["production_entrypoints"] = @(
             [IO.Path]::GetFileName($singleCpuEntrypoint),
             [IO.Path]::GetFileName($batchCpuEntrypoint)
         )
-        delivery_readme = [IO.Path]::GetFileName($cpuDeliveryReadme)
-        text_delivery_policy = $textDeliveryPolicy
+        $packageConfig["delivery_readme"] = [IO.Path]::GetFileName($cpuDeliveryReadme)
     }
     $packageConfig | ConvertTo-Json -Depth 8 |
         Set-Content -LiteralPath (Join-Path $evidenceDirectory "package_config.json") -Encoding UTF8
 
     $hashRows = @(
-        Get-ChildItem -LiteralPath $stagingRoot -Recurse -File |
+        Get-PackagePayloadFiles $stagingRoot |
             Sort-Object FullName |
             ForEach-Object {
-                $relativePath = $_.FullName.Substring($stagingRoot.Length)
-                while ($relativePath.StartsWith("\", [StringComparison]::Ordinal) -or $relativePath.StartsWith("/", [StringComparison]::Ordinal)) {
-                    $relativePath = $relativePath.Substring(1)
-                }
                 [ordered]@{
-                    path = $relativePath.Replace('\', '/')
+                    path = Get-RelativePackagePath $_.FullName $stagingRoot
                     sha256 = Get-Sha256 $_.FullName
                     bytes = $_.Length
                 }
@@ -936,11 +1366,14 @@ try {
     )
     ConvertTo-Json -InputObject @($hashRows) -Depth 5 |
         Set-Content -LiteralPath (Join-Path $stagingRoot "SHA256SUMS.json") -Encoding UTF8
+    Assert-PackageIntegrity $stagingRoot
 
     if (Test-Path -LiteralPath $DeliveryDir) {
         throw "Delivery directory appeared during validation; refusing to overwrite it: $DeliveryDir"
     }
-    Move-Item -LiteralPath $stagingRoot -Destination $DeliveryDir
+    Assert-NoReparsePointInExistingPath $stagingRoot "staging delivery package"
+    Assert-NoReparsePointInExistingPath $DeliveryDir "DeliveryDir"
+    [IO.Directory]::Move($stagingRoot, $DeliveryDir)
     $published = $true
 
     Write-Host "inference_summary"
@@ -966,6 +1399,16 @@ try {
 }
 finally {
     if (-not $published -and (Test-Path -LiteralPath $stagingRoot)) {
-        Remove-Item -LiteralPath $stagingRoot -Recurse -Force
+        $cleanupSafe = $true
+        try {
+            Assert-NoReparsePointInExistingPath $stagingRoot "staging delivery package cleanup"
+        }
+        catch {
+            $cleanupSafe = $false
+            Write-Warning "Refusing to recurse into an unsafe staging cleanup path: $($_.Exception.Message)"
+        }
+        if ($cleanupSafe) {
+            Remove-Item -LiteralPath $stagingRoot -Recurse -Force
+        }
     }
 }
