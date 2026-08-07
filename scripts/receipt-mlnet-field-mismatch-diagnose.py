@@ -121,12 +121,40 @@ def _render(value: object) -> str:
     )
 
 
-def _codepoints(value: object) -> list[str] | None:
-    if value is None:
-        return None
-    if not isinstance(value, str):
-        raise DiagnosisError("diagnostic text must be a string or null")
+def _codepoints(value: str) -> list[str]:
     return [f"U+{ord(character):04X}" for character in value]
+
+
+def _text_difference(reference: str, candidate: object) -> dict[str, Any] | None:
+    if candidate is None:
+        return None
+    if not isinstance(candidate, str):
+        raise DiagnosisError("diagnostic candidate text must be a string or null")
+    prefix = 0
+    shared_length = min(len(reference), len(candidate))
+    while prefix < shared_length and reference[prefix] == candidate[prefix]:
+        prefix += 1
+    suffix = 0
+    while (
+        suffix < len(reference) - prefix
+        and suffix < len(candidate) - prefix
+        and reference[len(reference) - suffix - 1]
+        == candidate[len(candidate) - suffix - 1]
+    ):
+        suffix += 1
+    reference_end = len(reference) - suffix if suffix else len(reference)
+    candidate_end = len(candidate) - suffix if suffix else len(candidate)
+    reference_segment = reference[prefix:reference_end]
+    candidate_segment = candidate[prefix:candidate_end]
+    return {
+        "first_difference_index": prefix,
+        "reference_length": len(reference),
+        "candidate_length": len(candidate),
+        "reference_segment": reference_segment,
+        "reference_codepoints": _codepoints(reference_segment),
+        "candidate_segment": candidate_segment,
+        "candidate_codepoints": _codepoints(candidate_segment),
+    }
 
 
 def _mismatch_payload(row: dict[str, Any]) -> dict[str, Any]:
@@ -179,9 +207,10 @@ def diagnose(*, score_dir: Path, field: str, brief: bool = False) -> list[str]:
                 {
                     "source": row["source"],
                     "reference_text": row["reference_text"],
-                    "reference_codepoints": _codepoints(row["reference_text"]),
                     "candidate_text": row.get("candidate_text"),
-                    "candidate_codepoints": _codepoints(row.get("candidate_text")),
+                    "difference": _text_difference(
+                        row["reference_text"], row.get("candidate_text")
+                    ),
                     "candidate_present": row["candidate_present"],
                     "missing_reason": row.get("missing_reason"),
                 }

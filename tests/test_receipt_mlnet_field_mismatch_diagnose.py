@@ -122,13 +122,32 @@ def test_brief_diagnosis_omits_large_diagnostics(tmp_path: Path) -> None:
         next(line.removeprefix("mismatch=") for line in lines if line.startswith("mismatch="))
     )
     assert mismatch == {
-        "candidate_codepoints": ["U+94F6", "U+884C", "U+5361"],
         "candidate_present": True,
         "candidate_text": "银行卡",
+        "difference": {
+            "candidate_codepoints": ["U+94F6", "U+884C", "U+5361"],
+            "candidate_length": 3,
+            "candidate_segment": "银行卡",
+            "first_difference_index": 0,
+            "reference_codepoints": ["U+4F59", "U+989D"],
+            "reference_length": 2,
+            "reference_segment": "余额",
+        },
         "missing_reason": None,
-        "reference_codepoints": ["U+4F59", "U+989D"],
         "reference_text": "余额",
         "source": r"D:\receipts\one.jpg",
+    }
+
+
+def test_text_difference_isolates_mixed_closing_parenthesis() -> None:
+    assert MODULE._text_difference("储蓄卡（1234）", "储蓄卡（1234)") == {
+        "candidate_codepoints": ["U+0029"],
+        "candidate_length": 9,
+        "candidate_segment": ")",
+        "first_difference_index": 8,
+        "reference_codepoints": ["U+FF09"],
+        "reference_length": 9,
+        "reference_segment": "）",
     }
 
 
