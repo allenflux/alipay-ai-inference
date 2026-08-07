@@ -1,5 +1,4 @@
 using Microsoft.ML.OnnxRuntime;
-using Microsoft.ML.OnnxRuntime.Tensors;
 using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.PixelFormats;
 
@@ -65,6 +64,7 @@ internal sealed class UnifiedOcrEngine : IDisposable
     private readonly InferenceSession _session;
     private readonly float[] _fieldValues;
     private readonly float[] _recipientValues;
+    private readonly UnifiedOcrRuntimeBuffers _runtime;
 
     public UnifiedOcrEngine(UnifiedOcrBundle bundle, DeviceSetting requestedDevice)
     {
@@ -79,6 +79,11 @@ internal sealed class UnifiedOcrEngine : IDisposable
         try
         {
             VerifyRuntimeAbi();
+            _runtime = UnifiedOcrRuntimeBuffers.Create(
+                _session,
+                bundle,
+                _fieldValues,
+                _recipientValues);
         }
         catch
         {
@@ -112,27 +117,24 @@ internal sealed class UnifiedOcrEngine : IDisposable
         // only from the separate high-resolution input below.
         WriteRecipient(byLabel.GetValueOrDefault("recipient_field"), source, _recipientValues, readable);
 
-        var fieldTensor = new DenseTensor<float>(_fieldValues, [5, 1, _bundle.FieldHeight, _bundle.FieldWidth]);
-        var recipientTensor = new DenseTensor<float>(_recipientValues, [1, 1, _bundle.RecipientHeight, _bundle.RecipientWidth]);
-        var inputs = new[]
-        {
-            NamedOnnxValue.CreateFromTensor(FieldImagesInput, fieldTensor),
-            NamedOnnxValue.CreateFromTensor(RecipientValueInput, recipientTensor),
-        };
         var preprocessMs = StopAndReadMilliseconds(stageStopwatch);
 
         UnifiedOcrReadResult result;
         double inferenceMs;
         double postprocessMs;
         stageStopwatch.Restart();
-        using (IDisposableReadOnlyCollection<DisposableNamedOnnxValue> runtimeOutputs = _session.Run(inputs))
+        // The verified v12 ABI has fixed input/output shapes. The engine owns
+        // one set of pinned OrtValues and one binding for its whole lifetime,
+        // so this serial call creates neither input nor output wrappers.
+        _runtime.Binding.SynchronizeBoundInputs();
+        _session.RunWithBinding(_runtime.RunOptions, _runtime.Binding);
+        _runtime.Binding.SynchronizeBoundOutputs();
+        inferenceMs = StopAndReadMilliseconds(stageStopwatch);
+        stageStopwatch.Restart();
         {
-            inferenceMs = StopAndReadMilliseconds(stageStopwatch);
-            stageStopwatch.Restart();
-            // DisposableNamedOnnxValue already exposes ORT's native CPU output
-            // memory through DenseTensor.Buffer. Decode while that collection
-            // is alive instead of copying every output tensor to a new array.
-            var outputs = ReadOutputViews(runtimeOutputs);
+            // Decode while the engine-owned output OrtValues and their pinned
+            // managed buffers are alive. No output view may escape this engine.
+            var outputs = _runtime.Outputs;
 
             var candidates = new Dictionary<string, UnifiedOcrCandidate>(StringComparer.Ordinal);
             if (readable.Contains("amount"))
@@ -172,8 +174,6 @@ internal sealed class UnifiedOcrEngine : IDisposable
                 _bundle.TextReviewValue,
                 _bundle.TextRuntimePolicy);
         }
-        // Keep the historical stage boundary: output disposal is part of OCR
-        // postprocessing telemetry even though no tensor view escapes it.
         postprocessMs = StopAndReadMilliseconds(stageStopwatch);
 
         stageLatency = new UnifiedOcrStageLatency(preprocessMs, inferenceMs, postprocessMs);
@@ -186,7 +186,13 @@ internal sealed class UnifiedOcrEngine : IDisposable
         return Math.Round(stopwatch.Elapsed.TotalMilliseconds, 4);
     }
 
-    public void Dispose() => _session.Dispose();
+    public void Dispose()
+    {
+        // The binding retains native references to every OrtValue. Release it
+        // first, then unpin the buffers, and only then close the session.
+        _runtime.Dispose();
+        _session.Dispose();
+    }
 
     private void WriteField(
         DetectionResult? detection,
@@ -240,36 +246,6 @@ internal sealed class UnifiedOcrEngine : IDisposable
             destinationOffset: 0,
             leftCropFraction: _bundle.RecipientLeftTrim);
         readable.Add("recipient_field");
-    }
-
-    private Dictionary<string, OrtOutput> ReadOutputViews(IDisposableReadOnlyCollection<DisposableNamedOnnxValue> runtimeOutputs)
-    {
-        var names = runtimeOutputs.Select(output => output.Name).ToArray();
-        if (!HasExactNames(names, UnifiedOcrBundle.OutputNames))
-        {
-            throw new InvalidOperationException(
-                $"Unified OCR runtime outputs differ from its v12 contract: [{string.Join(',', names)}]");
-        }
-
-        var output = new Dictionary<string, OrtOutput>(StringComparer.Ordinal);
-        foreach (var namedValue in runtimeOutputs)
-        {
-            var tensor = namedValue.AsTensor<float>();
-            if (tensor is not DenseTensor<float> denseTensor)
-            {
-                throw new InvalidOperationException(
-                    $"Unified OCR runtime output {namedValue.Name} is not a dense CPU tensor");
-            }
-            var shape = tensor.Dimensions.ToArray();
-            if (!_bundle.OutputShapes.TryGetValue(namedValue.Name, out var expected)
-                || !shape.SequenceEqual(expected))
-            {
-                throw new InvalidOperationException(
-                    $"Unified OCR runtime output {namedValue.Name} has invalid static shape [{string.Join(',', shape)}]");
-            }
-            output.Add(namedValue.Name, new OrtOutput(denseTensor.Buffer, shape));
-        }
-        return output;
     }
 
     private UnifiedOcrCandidate DecodeAmount(IReadOnlyDictionary<string, OrtOutput> outputs)
@@ -599,6 +575,128 @@ internal sealed class UnifiedOcrEngine : IDisposable
         {
             provider = "cpu (auto fallback)";
             return new InferenceSession(modelPath);
+        }
+    }
+
+    /// <summary>
+    /// Owns the fixed v12 ABI values for the lifetime of the serial engine.
+    /// OrtValue pins each managed array until disposal; the binding is created
+    /// once and never rebound while receipt inference is in progress.
+    /// </summary>
+    private sealed class UnifiedOcrRuntimeBuffers : IDisposable
+    {
+        private readonly OrtValue[] _inputValues;
+        private readonly OrtValue[] _outputValues;
+        private bool _disposed;
+
+        private UnifiedOcrRuntimeBuffers(
+            RunOptions runOptions,
+            OrtIoBinding binding,
+            OrtValue[] inputValues,
+            OrtValue[] outputValues,
+            IReadOnlyDictionary<string, OrtOutput> outputs)
+        {
+            RunOptions = runOptions;
+            Binding = binding;
+            _inputValues = inputValues;
+            _outputValues = outputValues;
+            Outputs = outputs;
+        }
+
+        public RunOptions RunOptions { get; }
+        public OrtIoBinding Binding { get; }
+        public IReadOnlyDictionary<string, OrtOutput> Outputs { get; }
+
+        public static UnifiedOcrRuntimeBuffers Create(
+            InferenceSession session,
+            UnifiedOcrBundle bundle,
+            float[] fieldValues,
+            float[] recipientValues)
+        {
+            var inputValues = new List<OrtValue>(InputNames.Length);
+            var outputValues = new List<OrtValue>(UnifiedOcrBundle.OutputNames.Length);
+            var outputs = new Dictionary<string, OrtOutput>(StringComparer.Ordinal);
+            OrtIoBinding? binding = null;
+            RunOptions? runOptions = null;
+            try
+            {
+                inputValues.Add(OrtValue.CreateTensorValueFromMemory(
+                    fieldValues,
+                    [5, 1, bundle.FieldHeight, bundle.FieldWidth]));
+                inputValues.Add(OrtValue.CreateTensorValueFromMemory(
+                    recipientValues,
+                    [1, 1, bundle.RecipientHeight, bundle.RecipientWidth]));
+
+                foreach (var outputName in UnifiedOcrBundle.OutputNames)
+                {
+                    var shape = bundle.OutputShapes[outputName].ToArray();
+                    var buffer = new float[GetElementCount(shape, outputName)];
+                    outputValues.Add(OrtValue.CreateTensorValueFromMemory(
+                        buffer,
+                        shape.Select(value => (long)value).ToArray()));
+                    outputs.Add(outputName, new OrtOutput(buffer, shape));
+                }
+
+                binding = session.CreateIoBinding();
+                binding.BindInput(FieldImagesInput, inputValues[0]);
+                binding.BindInput(RecipientValueInput, inputValues[1]);
+                for (var index = 0; index < UnifiedOcrBundle.OutputNames.Length; index++)
+                {
+                    binding.BindOutput(UnifiedOcrBundle.OutputNames[index], outputValues[index]);
+                }
+                runOptions = new RunOptions();
+
+                return new UnifiedOcrRuntimeBuffers(
+                    runOptions,
+                    binding,
+                    inputValues.ToArray(),
+                    outputValues.ToArray(),
+                    outputs);
+            }
+            catch
+            {
+                runOptions?.Dispose();
+                binding?.Dispose();
+                DisposeValues(outputValues);
+                DisposeValues(inputValues);
+                throw;
+            }
+        }
+
+        public void Dispose()
+        {
+            if (_disposed)
+            {
+                return;
+            }
+            _disposed = true;
+            Binding.Dispose();
+            RunOptions.Dispose();
+            DisposeValues(_outputValues);
+            DisposeValues(_inputValues);
+        }
+
+        private static int GetElementCount(IReadOnlyList<int> shape, string outputName)
+        {
+            var count = 1;
+            foreach (var dimension in shape)
+            {
+                if (dimension <= 0)
+                {
+                    throw new InvalidOperationException(
+                        $"Unified OCR runtime output {outputName} has a non-static shape");
+                }
+                count = checked(count * dimension);
+            }
+            return count;
+        }
+
+        private static void DisposeValues(IReadOnlyList<OrtValue> values)
+        {
+            for (var index = values.Count - 1; index >= 0; index--)
+            {
+                values[index].Dispose();
+            }
         }
     }
 

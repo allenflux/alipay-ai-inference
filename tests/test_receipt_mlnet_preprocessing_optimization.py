@@ -51,15 +51,60 @@ def test_csharp_contract_harness_compares_legacy_and_optimized_float_bits() -> N
     assert "VerifyCase(1179, 2556, reusableDetectorBuffer, reusableStatusbarBuffer)" in harness
 
 
-def test_unified_runtime_decodes_native_output_views_without_array_copies() -> None:
+def test_unified_runtime_reuses_bound_input_and_output_ort_values() -> None:
     engine = (
         ROOT / "dotnet" / "ReceiptMlNet.Cli" / "UnifiedOcrEngine.cs"
     ).read_text(encoding="utf-8")
 
-    assert "ReadOutputViews(runtimeOutputs)" in engine
-    assert "denseTensor.Buffer" in engine
+    constructor = _between(
+        engine,
+        "public UnifiedOcrEngine(UnifiedOcrBundle bundle, DeviceSetting requestedDevice)",
+        "public string ExecutionProvider",
+    )
+    recognize = _between(
+        engine,
+        "public UnifiedOcrReadResult RecognizeReceipt(",
+        "private static double StopAndReadMilliseconds(",
+    )
+    runtime = _between(
+        engine,
+        "private sealed class UnifiedOcrRuntimeBuffers : IDisposable",
+        "private sealed record OrtOutput",
+    )
+
+    assert constructor.count("UnifiedOcrRuntimeBuffers.Create(") == 1
+    assert runtime.count("OrtValue.CreateTensorValueFromMemory(") == 3
+    assert runtime.count("binding.BindInput(") == 2
+    assert "binding.BindOutput(UnifiedOcrBundle.OutputNames[index], outputValues[index])" in runtime
+    assert recognize.count("_session.RunWithBinding(_runtime.RunOptions, _runtime.Binding)") == 1
+    assert "var outputs = _runtime.Outputs" in recognize
     assert "output.Values.Span" in engine
     assert "tensor.ToArray()" not in engine
+    assert "NamedOnnxValue" not in engine
+    assert "DisposableNamedOnnxValue" not in engine
+    assert "DenseTensor<float>" not in engine
+
+
+def test_unified_runtime_keeps_bound_values_alive_and_disposes_binding_first() -> None:
+    engine = (
+        ROOT / "dotnet" / "ReceiptMlNet.Cli" / "UnifiedOcrEngine.cs"
+    ).read_text(encoding="utf-8")
+    runtime = _between(
+        engine,
+        "private sealed class UnifiedOcrRuntimeBuffers : IDisposable",
+        "private sealed record OrtOutput",
+    )
+    dispose = _between(runtime, "public void Dispose()", "private static int GetElementCount(")
+
+    assert "private readonly OrtValue[] _inputValues;" in runtime
+    assert "private readonly OrtValue[] _outputValues;" in runtime
+    assert "public IReadOnlyDictionary<string, OrtOutput> Outputs { get; }" in runtime
+    assert dispose.index("Binding.Dispose();") < dispose.index(
+        "DisposeValues(_outputValues);"
+    )
+    assert dispose.index("DisposeValues(_outputValues);") < dispose.index(
+        "DisposeValues(_inputValues);"
+    )
 
 
 def test_detector_cpu_thread_tuning_is_explicit_and_auditable() -> None:
