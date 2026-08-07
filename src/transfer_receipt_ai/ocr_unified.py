@@ -40,7 +40,13 @@ import numpy as np
 from PIL import Image
 
 from .onnx_runtime import _preload_cuda_dlls, onnx_providers
-from .ocr import clean_text, extract_field_value, normalize_payment_method, parse_anchored_recipient_row
+from .ocr import (
+    clean_text,
+    extract_field_value,
+    normalize_payment_method,
+    normalize_status,
+    parse_anchored_recipient_row,
+)
 from .recipient_beam import CharacterNGramLanguageModel, decode_ctc_prefix_beam
 from .recipient_audit import (
     DEFAULT_CUT_RADIUS as RECIPIENT_AUDIT_DEFAULT_CUT_RADIUS,
@@ -52,6 +58,7 @@ from .ocr_unified_dataset import KIND_V9 as DATASET_KIND_V9
 from .ocr_unified_dataset import KIND_V10 as DATASET_KIND_V10
 from .ocr_unified_dataset import KIND_V11 as DATASET_KIND_V11
 from .ocr_unified_dataset import KIND_V12 as DATASET_KIND_V12
+from .ocr_unified_dataset import KIND_V13 as DATASET_KIND_V13
 from .ocr_unified_dataset import SLOT_ORDER, STATUS_CLASSES, V9_SLOT_ORDER
 from .ocr_unified_targets import (
     AMOUNT_AUX_FORMAT,
@@ -121,6 +128,7 @@ KIND_V9 = "receipt_unified_field_reader_v9"
 KIND_V10 = "receipt_unified_field_reader_v10"
 KIND_V11 = "receipt_unified_field_reader_v11"
 KIND_V12 = "receipt_unified_field_reader_v12"
+KIND_V13 = "receipt_unified_field_reader_v13"
 # Keep the public/default alias on the established four-slot protocol.
 # Five-slot v9 is deliberately opt-in: callers must select ``architecture=v9``
 # rather than silently changing an existing v8 training or deployment path.
@@ -128,7 +136,19 @@ KIND_V12 = "receipt_unified_field_reader_v12"
 # independently loadable.
 KIND = KIND_V8
 SUPPORTED_KINDS = frozenset(
-    (KIND_V3, KIND_V4, KIND_V5, KIND_V6, KIND_V7, KIND_V8, KIND_V9, KIND_V10, KIND_V11, KIND_V12)
+    (
+        KIND_V3,
+        KIND_V4,
+        KIND_V5,
+        KIND_V6,
+        KIND_V7,
+        KIND_V8,
+        KIND_V9,
+        KIND_V10,
+        KIND_V11,
+        KIND_V12,
+        KIND_V13,
+    )
 )
 # Kept as the frozen v3-v5 shared charset.  Do not append v6 symbols here:
 # old ONNX sidecars/checkpoints must remain loadable byte-for-byte.
@@ -143,6 +163,7 @@ V8_AMOUNT_CHARACTERS = tuple("0123456789.-")
 NUMERIC_BLANK_INDEX = 0
 PAYMENT_BLANK_INDEX = 0
 RECIPIENT_BLANK_INDEX = 0
+STATUS_TEXT_BLANK_INDEX = 0
 PAYMENT_BANK_OTHER_CLASS = "__other__"
 
 # v5 keeps these structural pieces deliberately small and fixed.  They are
@@ -223,6 +244,9 @@ V11_ONNX_OUTPUT_NAMES = V9_ONNX_OUTPUT_NAMES
 # v12 deliberately keeps the v9-v11 output ABI unchanged.  The only graph
 # change is an additional *input* dedicated to the recipient value view.
 V12_ONNX_OUTPUT_NAMES = V9_ONNX_OUTPUT_NAMES
+# v13 is the first status-text OCR protocol.  Preserve every v12 output in
+# its frozen order and append one visible-text CTC tensor.
+V13_ONNX_OUTPUT_NAMES = V12_ONNX_OUTPUT_NAMES + ("status_text_logits",)
 # Only these output tensors use CTC.  The remaining v5 tensors are ordinary
 # fixed-position / classification logits and deliberately have no blank index.
 # Keeping this distinction in one place prevents the delivery contract loader
@@ -233,6 +257,7 @@ CTC_ONNX_BLANK_INDICES = {
     "payment_logits": PAYMENT_BLANK_INDEX,
     "payment_prefix_logits": PAYMENT_BLANK_INDEX,
     "recipient_logits": RECIPIENT_BLANK_INDEX,
+    "status_text_logits": STATUS_TEXT_BLANK_INDEX,
 }
 
 # Match the project-wide fixed-graph export tolerance.  The unified reader
@@ -305,6 +330,15 @@ V12_TEXT_DELIVERY_REASON = (
     "Recipient CTC uses a dedicated high-resolution anchored value view and all current labels are "
     "Paddle-derived. Emit review until a group-isolated human-truth calibration accepts the full five-field policy."
 )
+V13_TEXT_DELIVERY_POLICY = V12_TEXT_DELIVERY_POLICY
+V13_TEXT_DELIVERY_REASON = (
+    "Visible transfer-status CTC and all financial/recipient heads are student-model outputs trained from "
+    "teacher labels. Decode and normalize status text for review, but emit review as the business value until "
+    "an independent group-isolated human-truth calibration accepts status delivery."
+)
+STATUS_TEXT_RUNTIME_POLICY = "decode_and_normalize_review_only"
+STATUS_TEXT_TARGET = "visible_transfer_status_text"
+STATUS_TEXT_CHARSET_SOURCE = "train_only_visible_transfer_status_text"
 
 
 def _uses_structured_heads(config: "UnifiedReaderConfig") -> bool:
@@ -346,14 +380,23 @@ def _is_v12(config: "UnifiedReaderConfig") -> bool:
     return config.architecture_version == 12
 
 
+def _is_v13(config: "UnifiedReaderConfig") -> bool:
+    return config.architecture_version == 13
+
+
+def _uses_v12_recipient_topology(config: "UnifiedReaderConfig") -> bool:
+    """Return whether the frozen v12 private recipient branch is present."""
+    return _is_v12(config) or _is_v13(config)
+
+
 def _uses_high_resolution_recipient_input(config: "UnifiedReaderConfig") -> bool:
     """Return whether a reader has v12's second static recipient input."""
-    return _is_v12(config)
+    return _uses_v12_recipient_topology(config)
 
 
 def _uses_recipient_protocol(config: "UnifiedReaderConfig") -> bool:
     """Return whether this artifact has the additive fifth CTC input/output."""
-    return config.architecture_version in {9, 10, 11, 12}
+    return config.architecture_version in {9, 10, 11, 12, 13}
 
 
 def _recipient_target_mode(config: "UnifiedReaderConfig") -> str | None:
@@ -364,7 +407,7 @@ def _recipient_target_mode(config: "UnifiedReaderConfig") -> str | None:
         return "visible_recipient_line_then_extract_value"
     if _is_v11(config):
         return "anchored_recipient_value_with_value_view_crop"
-    if _is_v12(config):
+    if _uses_v12_recipient_topology(config):
         return "anchored_recipient_value_with_dedicated_high_resolution_value_view"
     return None
 
@@ -373,7 +416,7 @@ def _recipient_charset_source(config: "UnifiedReaderConfig") -> str | None:
     """Return the immutable origin of the fifth-head training alphabet."""
     if _is_v10(config):
         return "train_only_visible_recipient_line"
-    if _is_v11(config) or _is_v12(config):
+    if _is_v11(config) or _uses_v12_recipient_topology(config):
         return "train_only_anchored_recipient_value"
     if _is_v9(config):
         return "train_only_visible_recipient_text"
@@ -384,7 +427,7 @@ def _recipient_input_preprocess(config: "UnifiedReaderConfig") -> str | None:
     """Return the fifth-slot visual policy recorded in an artifact contract."""
     if _is_v11(config):
         return "left_trim_then_centered_aspect_resize"
-    if _is_v12(config):
+    if _uses_v12_recipient_topology(config):
         return "left_trim_then_centered_aspect_resize_high_resolution"
     if _is_v10(config):
         return "centered_aspect_resize_full_visible_row"
@@ -433,10 +476,14 @@ def _text_delivery_policy(config: "UnifiedReaderConfig") -> tuple[str, str]:
         return V11_TEXT_DELIVERY_POLICY, V11_TEXT_DELIVERY_REASON
     if config.architecture_version == 12:
         return V12_TEXT_DELIVERY_POLICY, V12_TEXT_DELIVERY_REASON
+    if config.architecture_version == 13:
+        return V13_TEXT_DELIVERY_POLICY, V13_TEXT_DELIVERY_REASON
     return V5_TEXT_DELIVERY_POLICY, V5_TEXT_DELIVERY_REASON
 
 
 def _onnx_output_names(config: "UnifiedReaderConfig") -> tuple[str, ...]:
+    if _is_v13(config):
+        return V13_ONNX_OUTPUT_NAMES
     if _uses_recipient_protocol(config):
         return V9_ONNX_OUTPUT_NAMES
     if _is_v8(config):
@@ -452,7 +499,7 @@ def _onnx_export_atol(
     config: "UnifiedReaderConfig | None" = None,
 ) -> float:
     """Use narrowly validated ORT tolerances for raw CTC heads only."""
-    if config is not None and (_is_v11(config) or _is_v12(config)) and output_name in CTC_ONNX_BLANK_INDICES:
+    if config is not None and (_is_v11(config) or _uses_v12_recipient_topology(config)) and output_name in CTC_ONNX_BLANK_INDICES:
         return ONNX_EXPORT_V11_CTC_LOGITS_ATOL
     if output_name == "payment_logits":
         return ONNX_EXPORT_PAYMENT_LOGITS_ATOL
@@ -472,9 +519,9 @@ def _onnx_export_max_abs_cap(
     # from Torch while retaining every greedy CTC decision.  It is checked by
     # exact per-position argmax parity on both export probes plus the full
     # delivery-ONNX evaluator, rather than by a misleading raw-logit cap.
-    if config is not None and _is_v12(config) and output_name == "recipient_logits":
+    if config is not None and _uses_v12_recipient_topology(config) and output_name == "recipient_logits":
         return None
-    if config is not None and (_is_v11(config) or _is_v12(config)) and output_name in CTC_ONNX_BLANK_INDICES:
+    if config is not None and (_is_v11(config) or _uses_v12_recipient_topology(config)) and output_name in CTC_ONNX_BLANK_INDICES:
         return ONNX_EXPORT_V11_CTC_LOGITS_ATOL
     return None
 
@@ -485,9 +532,9 @@ def _onnx_export_mean_abs_cap(
     config: "UnifiedReaderConfig | None" = None,
 ) -> float | None:
     """Reject a broad v11/v12 CTC-logit shift even when no greedy decision flips."""
-    if config is not None and _is_v12(config) and output_name == "recipient_logits":
+    if config is not None and _uses_v12_recipient_topology(config) and output_name == "recipient_logits":
         return None
-    if config is not None and (_is_v11(config) or _is_v12(config)) and output_name in CTC_ONNX_BLANK_INDICES:
+    if config is not None and (_is_v11(config) or _uses_v12_recipient_topology(config)) and output_name in CTC_ONNX_BLANK_INDICES:
         return ONNX_EXPORT_V11_CTC_LOGITS_MEAN_ABS_CAP
     return None
 
@@ -507,7 +554,11 @@ def _onnx_export_requires_raw_logit_close(
     CUDA ONNX evaluator.  All other outputs retain their numeric parity
     requirement.
     """
-    return not (config is not None and _is_v12(config) and output_name == "recipient_logits")
+    return not (
+        config is not None
+        and _uses_v12_recipient_topology(config)
+        and output_name == "recipient_logits"
+    )
 
 
 def _v12_recipient_export_probe(recipient_value_image: Any, *, torch: Any) -> Any:
@@ -555,6 +606,8 @@ def _kind_for_architecture(architecture_version: int) -> str:
         return KIND_V11
     if architecture_version == 12:
         return KIND_V12
+    if architecture_version == 13:
+        return KIND_V13
     raise ValueError(f"Unsupported unified reader architecture v{architecture_version}")
 
 
@@ -583,6 +636,8 @@ def _architecture_for_kind(kind: object) -> int:
         return 11
     if kind == KIND_V12:
         return 12
+    if kind == KIND_V13:
+        return 13
     raise ValueError(f"Unsupported unified OCR artifact kind: {kind!r}")
 
 
@@ -629,8 +684,8 @@ class UnifiedReaderConfig:
     amount_format_min_confidence: float = 0.90
 
     def validate(self) -> None:
-        if self.architecture_version not in {3, 4, 5, 6, 7, 8, 9, 10, 11, 12}:
-            raise ValueError("architecture_version must be 3, 4, 5, 6, 7, 8, 9, 10, 11, or 12")
+        if self.architecture_version not in {3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13}:
+            raise ValueError("architecture_version must be 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, or 13")
         if self.image_height < 16 or self.image_width < 64 or self.image_width % 4:
             raise ValueError("image_height must be >=16 and image_width must be a multiple of 4 >=64")
         if self.base_channels < 8:
@@ -643,29 +698,29 @@ class UnifiedReaderConfig:
         # It is deliberately v11/v12-only: letting a caller change it for a
         # v9 or v10 artifact would produce a state dict that claims an older
         # protocol while having different learned tensors/pixels.
-        if self.architecture_version not in {11, 12} and self.recipient_hidden_size is not None:
-            raise ValueError("recipient_hidden_size is supported only by architecture v11 or v12")
+        if self.architecture_version not in {11, 12, 13} and self.recipient_hidden_size is not None:
+            raise ValueError("recipient_hidden_size is supported only by architecture v11, v12, or v13")
         if not 1 <= self.pooled_width <= 32:
             raise ValueError("pooled_width must be between 1 and 32")
         if not math.isfinite(self.amount_format_min_confidence) or not 0.0 <= self.amount_format_min_confidence <= 1.0:
             raise ValueError("amount_format_min_confidence must be between 0 and 1")
         if not math.isfinite(self.recipient_value_left_trim) or not 0.0 <= self.recipient_value_left_trim < 1.0:
             raise ValueError("recipient_value_left_trim must be in [0, 1)")
-        if self.architecture_version not in {11, 12} and not math.isclose(
+        if self.architecture_version not in {11, 12, 13} and not math.isclose(
             self.recipient_value_left_trim, 0.30, rel_tol=0.0, abs_tol=1e-12
         ):
-            raise ValueError("recipient_value_left_trim is supported only by architecture v11 or v12")
+            raise ValueError("recipient_value_left_trim is supported only by architecture v11, v12, or v13")
         if self.recipient_input_height < 16 or self.recipient_input_width < 64 or self.recipient_input_width % 4:
             raise ValueError("recipient_input_height must be >=16 and recipient_input_width a multiple of 4 >=64")
         if self.recipient_branch_channels is not None and self.recipient_branch_channels < 8:
             raise ValueError("recipient_branch_channels must be at least 8 when supplied")
-        if self.architecture_version != 12 and (
+        if self.architecture_version not in {12, 13} and (
             self.recipient_input_height != 128
             or self.recipient_input_width != 1024
             or self.recipient_branch_channels is not None
             or self.recipient_open_text_layers != 0
         ):
-            raise ValueError("recipient high-resolution input settings are supported only by architecture v12")
+            raise ValueError("recipient high-resolution input settings are supported only by architecture v12 or v13")
         if self.recipient_open_text_layers < 0 or self.recipient_open_text_layers > 6:
             raise ValueError("recipient_open_text_layers must be between 0 and 6")
         if self.recipient_open_text_heads <= 0:
@@ -681,13 +736,13 @@ def _recipient_hidden_size(config: UnifiedReaderConfig) -> int:
     """Return the frozen recipient branch width for this architecture."""
     if config.recipient_hidden_size is not None:
         return int(config.recipient_hidden_size)
-    return 192 if _is_v11(config) or _is_v12(config) else config.payment_hidden_size
+    return 192 if _is_v11(config) or _uses_v12_recipient_topology(config) else config.payment_hidden_size
 
 
 def _recipient_branch_channels(config: UnifiedReaderConfig) -> int:
     """Return v12's deliberately narrow private recipient visual width."""
-    if not _is_v12(config):
-        raise ValueError("recipient_branch_channels is defined only for architecture v12")
+    if not _uses_v12_recipient_topology(config):
+        raise ValueError("recipient_branch_channels is defined only for architecture v12 or v13")
     return int(config.recipient_branch_channels or 16)
 
 
@@ -1347,7 +1402,7 @@ def _recipient_artifact_metadata(
     metadata: dict[str, object] = {
         "recipient_input_preprocess": _recipient_input_preprocess(config),
     }
-    if _is_v11(config) or _is_v12(config):
+    if _is_v11(config) or _uses_v12_recipient_topology(config):
         metadata.update(
             {
                 "recipient_value_left_trim": config.recipient_value_left_trim,
@@ -1369,7 +1424,7 @@ def _recipient_artifact_metadata(
             metadata["recipient_train_augmentation_policy"] = _validate_recipient_train_augmentation_policy(
                 recipient_train_augmentation_policy
             )
-    if _is_v12(config):
+    if _uses_v12_recipient_topology(config):
         metadata.update(
             {
                 "recipient_input_name": "recipient_value_image",
@@ -1483,6 +1538,7 @@ def build_unified_reader(
     config: UnifiedReaderConfig,
     payment_bank_prefix_vocab_size: int | None = None,
     recipient_vocab_size: int | None = None,
+    status_text_vocab_size: int | None = None,
 ) -> Any:
     """Return the shared-trunk reader used for training and ONNX export.
 
@@ -1511,7 +1567,9 @@ def build_unified_reader(
     if _uses_modern_protocol(config) and (payment_bank_prefix_vocab_size is None or payment_bank_prefix_vocab_size < 2):
         raise ValueError("v6/v7/v8 needs payment_bank_prefix_vocab_size including __other__ plus one class")
     if _uses_recipient_protocol(config) and (recipient_vocab_size is None or recipient_vocab_size < 2):
-        raise ValueError("v9/v10/v11/v12 needs recipient_vocab_size including CTC blank plus at least one character")
+        raise ValueError("v9-v13 needs recipient_vocab_size including CTC blank plus at least one character")
+    if _is_v13(config) and (status_text_vocab_size is None or status_text_vocab_size < 2):
+        raise ValueError("v13 needs status_text_vocab_size including CTC blank plus at least one character")
     torch, nn = _require_torch()
 
     class DepthwiseBlock(nn.Module):
@@ -1606,6 +1664,19 @@ def build_unified_reader(
                 self.payment_ctc_vertical_reducer = VerticalTextReducer(fourth, feature_height)
                 self.payment_ctc_sequence = nn.GRU(fourth, config.payment_hidden_size, bidirectional=True)
                 self.payment_ctc_classifier = nn.Linear(config.payment_hidden_size * 2, payment_vocab_size)
+
+                if _is_v13(config):
+                    # This is intentionally additive to the frozen v12
+                    # topology.  It consumes the existing status crop feature
+                    # map but owns every trainable reducer/RNN/classifier
+                    # parameter, allowing a v12 -> v13 head-only warm start.
+                    self.status_text_vertical_reducer = VerticalTextReducer(fourth, feature_height)
+                    self.status_text_sequence = nn.GRU(
+                        fourth, config.numeric_hidden_size, bidirectional=True
+                    )
+                    self.status_text_classifier = nn.Linear(
+                        config.numeric_hidden_size * 2, int(status_text_vocab_size)
+                    )
 
                 if _uses_recipient_protocol(config):
                     # A recipient is open Chinese text, not a closed merchant
@@ -1844,6 +1915,10 @@ def build_unified_reader(
 
             status_features = self.status_pool(encoded[:, 2]).flatten(1)
             status_logits = self.status_classifier(status_features)
+            if _is_v13(config):
+                status_text_features = self.status_text_vertical_reducer(encoded[:, 2]).permute(2, 0, 1)
+                status_text_sequence, _ = self.status_text_sequence(status_text_features)
+                status_text_logits = self.status_text_classifier(status_text_sequence)
             if self.architecture_version >= 6:
                 if _uses_v8_protocol(config):
                     amount_summary = torch.cat((amount_ctc_hidden[0], amount_ctc_hidden[1]), dim=1)
@@ -1902,7 +1977,10 @@ def build_unified_reader(
                         payment_parentheses_logits,
                     )
                     if _uses_recipient_protocol(config):
-                        return v8_outputs + (recipient_logits,)
+                        recipient_outputs = v8_outputs + (recipient_logits,)
+                        if _is_v13(config):
+                            return recipient_outputs + (status_text_logits,)
+                        return recipient_outputs
                     return v8_outputs
                 return (
                     amount_logits,
@@ -2049,6 +2127,16 @@ def _parse_slot(
         class_name = slot.get("class_name")
         if class_name not in STATUS_CLASSES:
             raise ValueError(f"{records_path}:{line_number}: status class must be one of {','.join(STATUS_CLASSES)}")
+        text = slot.get("text")
+        if text is not None:
+            if not isinstance(text, str) or not text or clean_text(text) != text:
+                raise ValueError(f"{records_path}:{line_number}: status CTC target must be clean non-empty text")
+            if any(not character.isprintable() for character in text):
+                raise ValueError(f"{records_path}:{line_number}: status CTC target contains a non-printable character")
+            if normalize_status(text) != class_name:
+                raise ValueError(
+                    f"{records_path}:{line_number}: status CTC target does not normalize to class_name"
+                )
     return slot
 
 
@@ -2140,7 +2228,9 @@ def load_records(
         config.validate()
     slot_order = _slot_order(config) if config is not None else SLOT_ORDER
     expected_dataset_kind = (
-        DATASET_KIND_V12
+        DATASET_KIND_V13
+        if config is not None and _is_v13(config)
+        else DATASET_KIND_V12
         if config is not None and _is_v12(config)
         else DATASET_KIND_V11
         if config is not None and _is_v11(config)
@@ -2154,12 +2244,33 @@ def load_records(
     if not records_path.is_file():
         raise FileNotFoundError(records_path)
     contract_path = records_path.parent / "dataset.contract.json"
+    contract_status_text_characters: list[str] | None = None
     if contract_path.is_file():
         contract = _load_json_object(contract_path)
         if contract.get("schema_version") != SCHEMA_VERSION or contract.get("kind") != expected_dataset_kind:
             raise ValueError(f"{contract_path}: unsupported unified dataset contract")
         if contract.get("slot_order") != list(slot_order) or contract.get("status_classes") != list(STATUS_CLASSES):
             raise ValueError(f"{contract_path}: slot order or status classes do not match the unified reader")
+        if config is not None and _is_v13(config):
+            raw_status_characters = contract.get("status_text_charset")
+            if (
+                contract.get("status_text_target") != STATUS_TEXT_TARGET
+                or contract.get("status_text_charset_source") != STATUS_TEXT_CHARSET_SOURCE
+                or not isinstance(raw_status_characters, list)
+                or not raw_status_characters
+                or raw_status_characters != sorted(raw_status_characters)
+                or len(set(raw_status_characters)) != len(raw_status_characters)
+                or not all(
+                    isinstance(character, str)
+                    and len(character) == 1
+                    and character.isprintable()
+                    for character in raw_status_characters
+                )
+                or contract.get("status_text_charset_sha256")
+                != hashlib.sha256("".join(raw_status_characters).encode("utf-8")).hexdigest()
+            ):
+                raise ValueError(f"{contract_path}: v13 status-text dataset contract is invalid")
+            contract_status_text_characters = list(raw_status_characters)
     dataset_root = (dataset_root if dataset_root is not None else records_path.parent).resolve()
     if not dataset_root.is_dir():
         raise NotADirectoryError(dataset_root)
@@ -2227,7 +2338,7 @@ def load_records(
                     records_path=records_path,
                     line_number=line_number,
                 )
-            if config is not None and (_is_v11(config) or _is_v12(config)):
+            if config is not None and (_is_v11(config) or _uses_v12_recipient_topology(config)):
                 _validate_anchored_recipient_slot(
                     parsed_slots.get("recipient_field"),
                     records_path=records_path,
@@ -2260,6 +2371,21 @@ def load_records(
             )
     if not records:
         raise ValueError("No unified receipt records found")
+    if config is not None and _is_v13(config) and contract_status_text_characters is not None:
+        observed_status_characters = sorted(
+            {
+                character
+                for record in records
+                if record["split"] == "train"
+                for text in [_slot_text(record, "transfer_status")]
+                if text is not None
+                for character in text
+            }
+        )
+        if observed_status_characters != contract_status_text_characters:
+            raise ValueError(
+                f"{contract_path}: v13 status-text charset does not match train manifest labels"
+            )
     return records
 
 
@@ -2316,6 +2442,53 @@ def _recipient_oov_by_split(
         split: {
             "records": int(counters[split]["records"]),
             "oov_records": int(counters[split]["oov_records"]),
+        }
+        for split in ("train", "val", "test")
+    }
+
+
+def _status_text_charset(records: Iterable[Mapping[str, object]]) -> list[str]:
+    """Freeze v13's visible transfer-status CTC alphabet from train only."""
+    characters = sorted(
+        {
+            character
+            for record in records
+            for text in [_slot_text(record, "transfer_status")]
+            if text is not None
+            for character in text
+        }
+    )
+    if not characters:
+        raise ValueError("No visible transfer_status CTC labels remain in the training split")
+    return characters
+
+
+def _status_text_oov_by_split(
+    records: Iterable[Mapping[str, object]], *, characters: Sequence[str]
+) -> dict[str, dict[str, object]]:
+    known = set(characters)
+    counters: dict[str, Counter[str]] = {split: Counter() for split in ("train", "val", "test")}
+    examples: dict[str, list[dict[str, object]]] = {split: [] for split in ("train", "val", "test")}
+    for record in records:
+        text = _slot_text(record, "transfer_status")
+        if text is None:
+            continue
+        split = str(record["split"])
+        counters[split]["records"] += 1
+        unknown = sorted(set(text) - known)
+        if unknown:
+            counters[split]["oov_records"] += 1
+            counters[split]["oov_characters"] += len(unknown)
+            if len(examples[split]) < 20:
+                examples[split].append(
+                    {"id": record["id"], "characters": "".join(unknown), "text": text}
+                )
+    return {
+        split: {
+            "records": int(counters[split]["records"]),
+            "oov_records": int(counters[split]["oov_records"]),
+            "oov_characters": int(counters[split]["oov_characters"]),
+            "examples": examples[split],
         }
         for split in ("train", "val", "test")
     }
@@ -2435,6 +2608,7 @@ def _validate_ctc_capacity(
     *,
     config: UnifiedReaderConfig,
     recipient_characters: Sequence[str] | None = None,
+    status_text_characters: Sequence[str] | None = None,
 ) -> None:
     for record in records:
         fields = ("amount", "time", "payment_method_field", "recipient_field") if _uses_recipient_protocol(config) else (
@@ -2442,6 +2616,8 @@ def _validate_ctc_capacity(
             "time",
             "payment_method_field",
         )
+        if _is_v13(config):
+            fields = (*fields, "transfer_status")
         for field in fields:
             text = _ctc_slot_text(record, field, config=config)
             if text is None:
@@ -2453,15 +2629,22 @@ def _validate_ctc_capacity(
                 if field == "time"
                 else recipient_characters
                 if field == "recipient_field"
+                else status_text_characters
+                if field == "transfer_status"
                 else None
             )
             if field == "recipient_field" and characters is None:
-                raise ValueError("v9/v10/v11/v12 recipient CTC validation needs a train-only recipient charset")
+                raise ValueError("v9-v13 recipient CTC validation needs a train-only recipient charset")
+            if field == "transfer_status" and characters is None:
+                raise ValueError("v13 status CTC validation needs a train-only status-text charset")
             # Validation/test recipient OOV is intentional evidence for a
             # train-only Unicode alphabet.  It must not make the manifest
             # unloadable; those rows are scored/reviewed later.  Train labels,
             # by contrast, must always be encodable.
-            validate_characters = field != "recipient_field" or str(record["split"]) == "train"
+            validate_characters = (
+                field not in {"recipient_field", "transfer_status"}
+                or str(record["split"]) == "train"
+            )
             if characters is not None and validate_characters and any(character not in characters for character in text):
                 raise ValueError(
                     f"CTC target has a character outside the architecture v{config.architecture_version} {field} charset: "
@@ -2494,7 +2677,11 @@ def _input_tensor(record: Mapping[str, object], *, config: UnifiedReaderConfig) 
             # long left-side label and the merchant value retain balanced
             # resolution; fixed-position numeric fields keep their v8/v9
             # right alignment unchanged.
-            if (_is_v10(config) or _is_v11(config) or _is_v12(config)) and field == "recipient_field":
+            if (
+                _is_v10(config)
+                or _is_v11(config)
+                or _uses_v12_recipient_topology(config)
+            ) and field == "recipient_field":
                 right_align = False
             # v12's fifth legacy slot remains part of the static input ABI but
             # is intentionally blank.  Its recipient CTC path receives the
@@ -2511,7 +2698,8 @@ def _input_tensor(record: Mapping[str, object], *, config: UnifiedReaderConfig) 
                 # aligned.  The trim is frozen in the ONNX model config.
                 left_crop_fraction=(
                     config.recipient_value_left_trim
-                    if (_is_v11(config) or _is_v12(config)) and field == "recipient_field"
+                    if (_is_v11(config) or _uses_v12_recipient_topology(config))
+                    and field == "recipient_field"
                     else 0.0
                 ),
             )
@@ -2790,6 +2978,10 @@ def _unpack_reader_outputs(outputs: object, *, config: UnifiedReaderConfig) -> d
     """Give training/evaluation named tensors while preserving v3/v4 tuples."""
     if not isinstance(outputs, tuple):
         raise ValueError("Unified reader must return a tuple of tensors")
+    if _is_v13(config):
+        if len(outputs) != len(V13_ONNX_OUTPUT_NAMES):
+            raise ValueError("Unified v13 reader must return sixteen output tensors")
+        return {name: value for name, value in zip(V13_ONNX_OUTPUT_NAMES, outputs)}
     if _uses_recipient_protocol(config):
         if len(outputs) != len(V9_ONNX_OUTPUT_NAMES):
             raise ValueError("Unified v9-v12 reader must return fifteen output tensors")
@@ -4048,6 +4240,8 @@ def _batch_loss(
     payment_to_id: Mapping[str, int],
     recipient_logits: Any | None = None,
     recipient_to_id: Mapping[str, int] | None = None,
+    status_text_logits: Any | None = None,
+    status_text_to_id: Mapping[str, int] | None = None,
     payment_bank_prefix_classes: Sequence[str] | None,
     payment_bank_class_weights: Any | None,
     status_to_id: Mapping[str, int],
@@ -4055,6 +4249,7 @@ def _batch_loss(
     status_enabled: bool,
     payment_loss_weight: float,
     recipient_loss_weight: float,
+    status_text_loss_weight: float = 1.0,
     config: UnifiedReaderConfig,
     structured_outputs: Mapping[str, Any] | None,
     ctc_loss_weight: float,
@@ -4064,6 +4259,7 @@ def _batch_loss(
     allow_empty: bool = False,
     collect_metrics: bool = True,
     recipient_only: bool = False,
+    status_text_only: bool = False,
 ) -> tuple[Any | None, dict[str, dict[str, float | int]] | None]:
     """Return one batch loss and, when requested, detached diagnostics.
 
@@ -4073,6 +4269,39 @@ def _batch_loss(
     validation/audit paths may still request the exact historical diagnostics;
     the hot training path deliberately opts out.
     """
+    if recipient_only and status_text_only:
+        raise ValueError("recipient_only and status_text_only are mutually exclusive")
+    if status_text_only:
+        if not _is_v13(config):
+            raise ValueError("status_text_only loss is supported only by architecture v13")
+        if status_text_logits is None or status_text_to_id is None:
+            raise ValueError("status_text_only loss requires status text logits and a train-only charset")
+        status_text_loss, status_text_used, status_text_oov = _ctc_loss(
+            status_text_logits,
+            labels=[_slot_text(record, "transfer_status") for record in records],
+            character_to_id=status_text_to_id,
+            torch=torch,
+        )
+        if status_text_loss is None:
+            if not allow_empty:
+                raise ValueError("A status-text-only training batch has no visible status label")
+            return None, None if not collect_metrics else {
+                "transfer_status_text": {
+                    "loss": math.nan,
+                    "used": status_text_used,
+                    "oov": status_text_oov,
+                }
+            }
+        loss = status_text_loss * status_text_loss_weight * ctc_loss_weight
+        if not collect_metrics:
+            return loss, None
+        return loss, {
+            "transfer_status_text": {
+                "loss": float(status_text_loss.detach().cpu()),
+                "used": status_text_used,
+                "oov": status_text_oov,
+            }
+        }
     if recipient_only:
         if not _is_v12(config):
             raise ValueError("recipient_only loss is supported only by architecture v12")
@@ -4135,6 +4364,17 @@ def _batch_loss(
         )
     else:
         recipient_loss, recipient_used, recipient_oov = None, 0, 0
+    if _is_v13(config):
+        if status_text_logits is None or status_text_to_id is None:
+            raise ValueError("Unified v13 loss requires status text logits and a train-only charset")
+        status_text_loss, status_text_used, status_text_oov = _ctc_loss(
+            status_text_logits,
+            labels=[_slot_text(record, "transfer_status") for record in records],
+            character_to_id=status_text_to_id,
+            torch=torch,
+        )
+    else:
+        status_text_loss, status_text_used, status_text_oov = None, 0, 0
     if status_enabled:
         if status_criterion is None:
             raise ValueError("status_criterion is required when status_enabled is true")
@@ -4356,6 +4596,8 @@ def _batch_loss(
             pieces.append(payment_loss * payment_loss_weight * ctc_loss_weight)
         if recipient_loss is not None:
             pieces.append(recipient_loss * recipient_loss_weight * ctc_loss_weight)
+        if status_text_loss is not None:
+            pieces.append(status_text_loss * status_text_loss_weight * ctc_loss_weight)
         if amount_length_loss is not None:
             pieces.append(amount_length_loss * structured_loss_weight)
         if amount_digits_loss is not None:
@@ -4406,6 +4648,8 @@ def _batch_loss(
             pieces.append(payment_loss * payment_loss_weight)
         if recipient_loss is not None:
             pieces.append(recipient_loss * recipient_loss_weight)
+        if status_text_loss is not None:
+            pieces.append(status_text_loss * status_text_loss_weight)
     if status_loss is not None:
         pieces.append(status_loss)
     if not pieces:
@@ -4430,6 +4674,11 @@ def _batch_loss(
             "oov": recipient_oov,
         },
         "transfer_status": {"loss": float(status_loss.detach().cpu()) if status_loss is not None else math.nan, "used": status_used, "oov": 0},
+        "transfer_status_text": {
+            "loss": float(status_text_loss.detach().cpu()) if status_text_loss is not None else math.nan,
+            "used": status_text_used,
+            "oov": status_text_oov,
+        },
         "amount_structured": {
             "sign_loss": float(amount_sign_loss.detach().cpu()) if amount_sign_loss is not None else math.nan,
             "length_loss": float(amount_length_loss.detach().cpu()) if amount_length_loss is not None else math.nan,
@@ -4482,6 +4731,8 @@ def _evaluate_model(
     payment_to_id: Mapping[str, int],
     recipient_characters: Sequence[str] | None,
     recipient_to_id: Mapping[str, int] | None,
+    status_text_characters: Sequence[str] | None,
+    status_text_to_id: Mapping[str, int] | None,
     payment_bank_prefix_classes: Sequence[str] | None,
     payment_bank_class_weights: Any | None,
     status_to_id: Mapping[str, int],
@@ -4489,9 +4740,11 @@ def _evaluate_model(
     status_enabled: bool,
     payment_loss_weight: float,
     recipient_loss_weight: float,
+    status_text_loss_weight: float,
     ctc_loss_weight: float,
     structured_loss_weight: float,
     torch: Any,
+    status_text_only: bool = False,
 ) -> dict[str, object]:
     """Evaluate every available reader head without discarding held-out OOV labels."""
     model.eval()
@@ -4502,14 +4755,14 @@ def _evaluate_model(
     label_total = 0
     slot_order = _slot_order(config)
     counters: dict[str, Counter[str]] = {field: Counter() for field in slot_order}
-    ctc_counters: dict[str, Counter[str]] = {
-        field: Counter()
-        for field in (("amount", "time", "payment_method_field", "recipient_field") if _uses_recipient_protocol(config) else (
-            "amount",
-            "time",
-            "payment_method_field",
-        ))
-    }
+    ctc_fields = (
+        ("amount", "time", "payment_method_field", "recipient_field")
+        if _uses_recipient_protocol(config)
+        else ("amount", "time", "payment_method_field")
+    )
+    if _is_v13(config):
+        ctc_fields = (*ctc_fields, "transfer_status")
+    ctc_counters: dict[str, Counter[str]] = {field: Counter() for field in ctc_fields}
     verifier_counters: dict[str, Counter[str]] = {
         field: Counter() for field in ("amount", "time", "payment_method_field")
     }
@@ -4528,6 +4781,7 @@ def _evaluate_model(
             payment_logits = outputs["payment_logits"]
             status_logits = outputs["status_logits"]
             recipient_logits = outputs.get("recipient_logits")
+            status_text_logits = outputs.get("status_text_logits")
             loss, _ = _batch_loss(
                 amount_logits,
                 time_logits,
@@ -4539,6 +4793,8 @@ def _evaluate_model(
                 payment_to_id=payment_to_id,
                 recipient_logits=recipient_logits,
                 recipient_to_id=recipient_to_id,
+                status_text_logits=status_text_logits,
+                status_text_to_id=status_text_to_id,
                 payment_bank_prefix_classes=payment_bank_prefix_classes,
                 payment_bank_class_weights=payment_bank_class_weights,
                 status_to_id=status_to_id,
@@ -4546,6 +4802,7 @@ def _evaluate_model(
                 status_enabled=status_enabled,
                 payment_loss_weight=payment_loss_weight,
                 recipient_loss_weight=recipient_loss_weight,
+                status_text_loss_weight=status_text_loss_weight,
                 config=config,
                 structured_outputs=outputs if _uses_structured_heads(config) else None,
                 ctc_loss_weight=ctc_loss_weight,
@@ -4553,6 +4810,7 @@ def _evaluate_model(
                 torch=torch,
                 allow_empty=True,
                 collect_metrics=False,
+                status_text_only=status_text_only,
             )
             if loss is not None:
                 total_loss += float(loss.detach().cpu()) * len(records)
@@ -4575,6 +4833,17 @@ def _evaluate_model(
                 )
             else:
                 recipient_ctc_predictions = []
+            if _is_v13(config):
+                if status_text_logits is None or status_text_characters is None:
+                    raise AssertionError("v13 evaluation requires status text logits and charset")
+                status_text_ctc_scored = decode_ctc_logits_with_confidence(
+                    status_text_logits.detach().cpu().numpy(),
+                    characters=status_text_characters,
+                )
+                status_text_ctc_predictions = [text for text, _ in status_text_ctc_scored]
+            else:
+                status_text_ctc_scored = []
+                status_text_ctc_predictions = []
             amount_predictions = list(amount_ctc_predictions)
             time_predictions = list(time_ctc_predictions)
             payment_predictions = list(payment_ctc_predictions)
@@ -4708,6 +4977,11 @@ def _evaluate_model(
                         _slot_text(record, "recipient_field"),
                         recipient_ctc_predictions[index],
                     )
+                if _is_v13(config):
+                    raw_values["transfer_status"] = (
+                        _slot_text(record, "transfer_status"),
+                        status_text_ctc_predictions[index],
+                    )
                 for field, (expected, predicted) in raw_values.items():
                     if expected is None:
                         continue
@@ -4743,7 +5017,14 @@ def _evaluate_model(
                         _recipient_candidate_value(recipient_ctc_predictions[index], config=config),
                         delivery_predictions["recipient_field"][index],
                     )
-                if status_enabled:
+                if _is_v13(config):
+                    status_candidate = normalize_status(status_text_ctc_predictions[index])
+                    values["transfer_status"] = (
+                        _status_name(record),
+                        status_candidate,
+                        None,
+                    )
+                elif status_enabled:
                     values["transfer_status"] = (
                         _status_name(record),
                         STATUS_CLASSES[int(status_predictions[index])],
@@ -4768,6 +5049,12 @@ def _evaluate_model(
                             _ctc_slot_text(record, "recipient_field", config=config) or str(expected)
                         )
                         if any(character not in recipient_to_id for character in recipient_ctc_target):
+                            field_counter["oov_reference"] += 1
+                    if field == "transfer_status" and status_text_to_id is not None:
+                        status_ctc_target = _slot_text(record, "transfer_status")
+                        if status_ctc_target is not None and any(
+                            character not in status_text_to_id for character in status_ctc_target
+                        ):
                             field_counter["oov_reference"] += 1
                     matched = str(expected) == str(predicted)
                     field_counter["exact_matches"] += int(matched)
@@ -4802,6 +5089,8 @@ def _evaluate_model(
     candidate_text_fields = ("amount", "time", "payment_method_field") + (
         ("recipient_field",) if _uses_recipient_protocol(config) else ()
     )
+    if _is_v13(config):
+        candidate_text_fields = (*candidate_text_fields, "transfer_status")
     candidate_text_records = sum(counters[field]["records"] for field in candidate_text_fields)
     candidate_text_exact_matches = sum(counters[field]["exact_matches"] for field in candidate_text_fields)
     candidate_text_field_scores = [
@@ -4865,6 +5154,7 @@ def _evaluate_model(
         },
         "status_non_success_to_success": int(counters["transfer_status"]["non_success_to_success"]),
         "status_training_enabled": status_enabled,
+        "status_text_training_enabled": _is_v13(config),
     }
 
 
@@ -5472,9 +5762,11 @@ def _parameter_only_initialization(
     time_characters: Sequence[str],
     payment_characters: Sequence[str],
     recipient_characters: Sequence[str] | None,
+    status_text_characters: Sequence[str] | None = None,
     payment_bank_prefix_classes: Sequence[str] | None,
     torch: Any,
     target_state_dict: Mapping[str, object] | None = None,
+    allow_v12_status_text_expansion: bool = False,
 ) -> tuple[Mapping[str, object] | None, dict[str, object]]:
     """Load a compatible checkpoint as parameters only, never as a resume.
 
@@ -5502,6 +5794,9 @@ def _parameter_only_initialization(
         raise FileNotFoundError(checkpoint_path)
     payload = _load_checkpoint(checkpoint_path, torch=torch)
     source_config = _checkpoint_config(payload)
+    v12_status_text_expansion = (
+        allow_v12_status_text_expansion and _is_v12(source_config) and _is_v13(config)
+    )
     if init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_INPUT_WIDTH_EXPANSION:
         # Keep this guard at the parameter-load boundary as well as the label
         # override boundary.  Direct callers must not be able to bypass the
@@ -5511,6 +5806,20 @@ def _parameter_only_initialization(
         _validate_recipient_capacity_reinit_config(source_config, config)
     elif init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_OPEN_TEXT_ADAPTER:
         _validate_recipient_open_text_adapter_config(source_config, config)
+    elif v12_status_text_expansion:
+        source_values = asdict(source_config)
+        target_values = asdict(config)
+        source_values["architecture_version"] = 13
+        if source_values != target_values:
+            changed = [
+                key
+                for key in sorted(target_values)
+                if source_values.get(key) != target_values.get(key)
+            ]
+            raise ValueError(
+                "v12 status-text expansion may change only architecture_version; incompatible config fields: "
+                + ", ".join(changed)
+            )
     elif source_config != config:
         raise ValueError(
             "init checkpoint model config does not match the requested training config; "
@@ -5554,12 +5863,68 @@ def _parameter_only_initialization(
         "optimizer_restored": False,
         "epoch_reset": True,
     }
+    if v12_status_text_expansion:
+        if target_state_dict is None:
+            raise ValueError("v12 status-text expansion requires a freshly initialized v13 target state")
+        if status_text_characters is None:
+            raise ValueError("v12 status-text expansion requires a train-only status-text charset")
+        if source_recipient_characters is None or recipient_characters is None:
+            if source_recipient_characters is not recipient_characters:
+                raise ValueError(
+                    "v12 status-text expansion recipient character map does not match the current training data"
+                )
+        elif list(source_recipient_characters) != list(recipient_characters):
+            raise ValueError(
+                "v12 status-text expansion recipient character map does not match the current training data"
+            )
+        source_keys = set(state_dict)
+        target_keys = set(target_state_dict)
+        new_keys = {key for key in target_keys if str(key).startswith("status_text_")}
+        if not new_keys or source_keys != target_keys - new_keys:
+            raise ValueError(
+                "v12 status-text expansion must add only status_text_ parameters; "
+                f"missing_legacy={sorted((target_keys - new_keys) - source_keys)}, "
+                f"unexpected={sorted(source_keys - (target_keys - new_keys))}"
+            )
+        adapted_state = dict(target_state_dict)
+        for key, source_value in state_dict.items():
+            target_value = target_state_dict[key]
+            source_shape = tuple(getattr(source_value, "shape", ()))
+            target_shape = tuple(getattr(target_value, "shape", ()))
+            if source_shape != target_shape:
+                raise ValueError(
+                    "v12 status-text expansion changed a legacy tensor shape: "
+                    f"{key} source={source_shape}, target={target_shape}"
+                )
+            adapted_state[key] = source_value
+        initialization.update(
+            {
+                "mode": "parameter_only_v12_to_v13_status_text_expansion",
+                "copied_legacy_tensor_count": len(source_keys),
+                "new_status_text_tensor_count": len(new_keys),
+                "new_parameter_prefix": "status_text_",
+                "frozen_legacy_output_count": len(V12_ONNX_OUTPUT_NAMES),
+                "target_status_text_character_count": len(status_text_characters),
+                "target_status_text_charset_sha256": hashlib.sha256(
+                    "".join(status_text_characters).encode("utf-8")
+                ).hexdigest(),
+            }
+        )
+        return adapted_state, initialization
     if init_checkpoint_mode == INIT_CHECKPOINT_MODE_STRICT:
         if source_recipient_characters is None or recipient_characters is None:
             if source_recipient_characters is not recipient_characters:
                 raise ValueError("init checkpoint recipient character map does not match the current training data")
         elif list(source_recipient_characters) != list(recipient_characters):
             raise ValueError("init checkpoint recipient character map does not match the current training data")
+        source_status_text_characters = _checkpoint_status_text_characters(
+            payload, config=source_config
+        )
+        if source_status_text_characters is None or status_text_characters is None:
+            if source_status_text_characters is not status_text_characters:
+                raise ValueError("init checkpoint status-text character map does not match the current training data")
+        elif list(source_status_text_characters) != list(status_text_characters):
+            raise ValueError("init checkpoint status-text character map does not match the current training data")
         return state_dict, initialization
 
     if not _is_v12(config):
@@ -5822,6 +6187,34 @@ def _assert_non_recipient_parameter_bytes(model: Any, expected: Mapping[str, byt
         )
 
 
+def _non_status_text_parameter_bytes(model: Any) -> dict[str, bytes]:
+    """Capture the complete frozen v12-compatible side of a v13 model."""
+    snapshots: dict[str, bytes] = {}
+    for name, tensor in model.state_dict().items():
+        if name.startswith("status_text_"):
+            continue
+        if not hasattr(tensor, "detach"):
+            raise AssertionError(f"model state entry {name!r} is not a tensor")
+        value = tensor.detach().cpu().contiguous()
+        snapshots[name] = value.numpy().tobytes()
+    if not snapshots:
+        raise AssertionError("v13 status-text model has no legacy parameters to protect")
+    return snapshots
+
+
+def _assert_non_status_text_parameter_bytes(model: Any, expected: Mapping[str, bytes]) -> None:
+    observed = _non_status_text_parameter_bytes(model)
+    if set(observed) != set(expected):
+        raise AssertionError("v13 frozen legacy parameter set changed during status-text fine-tuning")
+    changed = [name for name, value in observed.items() if value != expected[name]]
+    if changed:
+        preview = ", ".join(sorted(changed)[:5])
+        suffix = "..." if len(changed) > 5 else ""
+        raise AssertionError(
+            "status-text-only fine-tune mutated frozen v12 parameters: " + preview + suffix
+        )
+
+
 def train_unified_reader(
     *,
     records_path: Path,
@@ -5835,6 +6228,7 @@ def train_unified_reader(
     weight_decay: float = 1e-4,
     payment_loss_weight: float = 1.0,
     recipient_loss_weight: float = 1.0,
+    status_text_loss_weight: float = 1.0,
     recipient_sampling_weight: float = 1.0,
     recipient_rare_character_max_support: int = 0,
     recipient_rare_character_sampling_weight: float = 1.0,
@@ -5850,6 +6244,7 @@ def train_unified_reader(
     recipient_train_augmentation: str = "none",
     recipient_train_splits: Sequence[str] = ("train",),
     recipient_only_fine_tune: bool = False,
+    status_text_only_fine_tune: bool = False,
     recipient_open_text_unfreeze_legacy: bool = False,
     validation_every: int = 1,
     checkpoint_selection: str = CHECKPOINT_SELECTION_BALANCED,
@@ -5878,6 +6273,13 @@ def train_unified_reader(
     otherwise its final delivery policy is review-only.
     """
     config.validate()
+    if recipient_only_fine_tune and status_text_only_fine_tune:
+        raise ValueError("recipient_only_fine_tune and status_text_only_fine_tune are mutually exclusive")
+    if status_text_only_fine_tune:
+        if not _is_v13(config):
+            raise ValueError("status_text_only_fine_tune is supported only by architecture v13")
+        if init_checkpoint is None:
+            raise ValueError("status_text_only_fine_tune requires a compatible v12 or v13 --init-checkpoint")
     recipient_train_split_policy = _recipient_train_split_policy(recipient_train_splits)
     if recipient_only_fine_tune:
         if not _is_v12(config):
@@ -5960,11 +6362,11 @@ def train_unified_reader(
         or recipient_tail_loss_static_config["mode"] != "none"
         or recipient_train_augmentation_policy["mode"] != "none"
     )
-    if not (_is_v11(config) or _is_v12(config)) and recipient_training_options_requested:
+    if not (_is_v11(config) or _uses_v12_recipient_topology(config)) and recipient_training_options_requested:
         raise ValueError(
             "recipient sampling/confidence/tail-loss curriculum is supported only by architecture v11 or v12"
         )
-    if not _is_v12(config) and recipient_train_augmentation_policy["mode"] != "none":
+    if not _uses_v12_recipient_topology(config) and recipient_train_augmentation_policy["mode"] != "none":
         raise ValueError("recipient_train_augmentation is supported only by architecture v12")
     checkpoint_selection_policy = _checkpoint_selection_policy(
         config=config,
@@ -5980,12 +6382,13 @@ def train_unified_reader(
         or weight_decay < 0
         or payment_loss_weight <= 0
         or recipient_loss_weight <= 0
+        or status_text_loss_weight <= 0
         or recipient_sampling_weight <= 0
         or ctc_loss_weight <= 0
         or structured_loss_weight <= 0
     ):
         raise ValueError(
-            "learning_rate, payment_loss_weight, recipient_loss_weight, recipient_sampling_weight, ctc_loss_weight, and structured_loss_weight must be positive; "
+            "learning_rate, payment_loss_weight, recipient_loss_weight, status_text_loss_weight, recipient_sampling_weight, ctc_loss_weight, and structured_loss_weight must be positive; "
             "weight_decay cannot be negative"
         )
     if num_workers < 0:
@@ -6015,7 +6418,7 @@ def train_unified_reader(
     required_fields = ["amount", "time", "payment_method_field"]
     if _uses_recipient_protocol(config):
         required_fields.append("recipient_field")
-    if bool(status_policy["training_enabled"]):
+    if bool(status_policy["training_enabled"]) or _is_v13(config):
         required_fields.append("transfer_status")
     _require_train_and_validation_coverage(field_counts, required_fields=required_fields)
     if config.architecture_version == 5:
@@ -6039,6 +6442,12 @@ def train_unified_reader(
         recipient_characters: list[str] | None = _recipient_charset(recipient_charset_records)
     else:
         recipient_characters = None
+    if _is_v13(config):
+        status_text_characters: list[str] | None = _status_text_charset(train_records)
+        if not any(_slot_text(record, "transfer_status") is not None for record in validation_records):
+            raise ValueError("v13 requires visible transfer-status text in both train and val splits")
+    else:
+        status_text_characters = None
     if _uses_modern_protocol(config):
         data_derived_payment_bank_prefix_classes, data_derived_payment_bank_prefix_counts = _payment_bank_prefix_classes(
             train_records,
@@ -6085,13 +6494,28 @@ def train_unified_reader(
         if recipient_characters is not None
         else None
     )
+    status_text_to_id: dict[str, int] | None = (
+        {character: index for index, character in enumerate(status_text_characters, start=1)}
+        if status_text_characters is not None
+        else None
+    )
     payment_to_id = {character: index for index, character in enumerate(payment_characters, start=1)}
-    _validate_ctc_capacity(records, config=config, recipient_characters=recipient_characters)
+    _validate_ctc_capacity(
+        records,
+        config=config,
+        recipient_characters=recipient_characters,
+        status_text_characters=status_text_characters,
+    )
     status_to_id = {name: index for index, name in enumerate(STATUS_CLASSES)}
     payment_oov = _payment_oov_by_split(records, payment_characters=set(payment_characters))
     recipient_oov = (
         _recipient_oov_by_split(records, characters=recipient_characters)
         if recipient_characters is not None
+        else None
+    )
+    status_text_oov = (
+        _status_text_oov_by_split(records, characters=status_text_characters)
+        if status_text_characters is not None
         else None
     )
     payment_bank_prefix_oov = (
@@ -6109,6 +6533,12 @@ def train_unified_reader(
         ]
         if not training_records:
             raise ValueError("recipient_only_fine_tune requires at least one train receipt with recipient_field")
+    elif status_text_only_fine_tune:
+        training_records = [
+            record for record in train_records if _slot_text(record, "transfer_status") is not None
+        ]
+        if not training_records:
+            raise ValueError("status_text_only_fine_tune requires visible status text in the train split")
     recipient_tail_loss_character_counts = _recipient_tail_loss_character_counts(training_records)
     recipient_tail_loss_policy = _recipient_tail_loss_policy(
         rare_character_max_support=recipient_tail_rare_character_max_support,
@@ -6153,6 +6583,7 @@ def train_unified_reader(
         "cuda_tf32_requested": cuda_tf32,
         "cudnn_benchmark_requested": cudnn_benchmark,
         "recipient_only_private_branch_training": recipient_only_fine_tune,
+        "status_text_only_training": status_text_only_fine_tune,
         "recipient_train_split_policy": recipient_train_split_policy,
         "full_validation_schedule": "epoch_1_every_n_and_final_epoch",
         "validation_every": validation_every,
@@ -6183,7 +6614,7 @@ def train_unified_reader(
         config=config,
         torch=torch,
         recipient_train_augmentation_policy=(
-            recipient_train_augmentation_policy if _is_v12(config) else None
+            recipient_train_augmentation_policy if _uses_v12_recipient_topology(config) else None
         ),
         recipient_only=recipient_only_fine_tune,
     )
@@ -6198,7 +6629,7 @@ def train_unified_reader(
     )
     train_sampler: Any | None = None
     if recipient_sampling_policy["mode"] != "uniform":
-        if not (_is_v11(config) or _is_v12(config)):
+        if not (_is_v11(config) or _uses_v12_recipient_topology(config)):
             raise ValueError("recipient sampler is supported only by architecture v11 or v12")
         sample_weights_tensor = torch.tensor(sample_weights, dtype=torch.double)
         generator = torch.Generator()
@@ -6254,6 +6685,9 @@ def train_unified_reader(
         config=config,
         payment_bank_prefix_vocab_size=(len(payment_bank_prefix_classes) if payment_bank_prefix_classes is not None else None),
         recipient_vocab_size=(len(recipient_characters) + 1 if recipient_characters is not None else None),
+        status_text_vocab_size=(
+            len(status_text_characters) + 1 if status_text_characters is not None else None
+        ),
     )
     initialization_state, initialization = _parameter_only_initialization(
         init_checkpoint=init_checkpoint,
@@ -6263,9 +6697,11 @@ def train_unified_reader(
         time_characters=time_characters,
         payment_characters=payment_characters,
         recipient_characters=recipient_characters,
+        status_text_characters=status_text_characters,
         payment_bank_prefix_classes=payment_bank_prefix_classes,
         torch=torch,
         target_state_dict=model.state_dict(),
+        allow_v12_status_text_expansion=status_text_only_fine_tune,
     )
     if initialization_state is not None:
         # This is intentionally strict: equal tensor shapes are insufficient
@@ -6309,6 +6745,27 @@ def train_unified_reader(
             "full_validation_schedule": "epoch_1_every_n_and_final_epoch",
             "validation_every": validation_every,
         }
+    elif status_text_only_fine_tune:
+        for name, parameter in model.named_parameters():
+            parameter.requires_grad_(name.startswith("status_text_"))
+        trainable_parameter_count = sum(
+            parameter.numel() for parameter in model.parameters() if parameter.requires_grad
+        )
+        if trainable_parameter_count == 0:
+            raise AssertionError("v13 status-text-only fine-tune found no status_text parameters")
+        fine_tune_policy = {
+            "mode": "status_text_only_v13",
+            "trainable_parameter_count": trainable_parameter_count,
+            "frozen_parameter_count": sum(
+                parameter.numel() for parameter in model.parameters() if not parameter.requires_grad
+            ),
+            "trainable_parameter_prefix": "status_text_",
+            "frozen_legacy_output_count": len(V12_ONNX_OUTPUT_NAMES),
+            "source_train_records": len(train_records),
+            "status_text_train_records": len(training_records),
+            "full_validation_schedule": "every_epoch",
+            "validation_every": validation_every,
+        }
     if bool(status_policy["training_enabled"]):
         total_status = sum(status_counts["train"].values())
         status_weights = torch.tensor(
@@ -6331,11 +6788,14 @@ def train_unified_reader(
         weight_decay=weight_decay,
     )
     frozen_non_recipient_parameter_snapshot: dict[str, bytes] | None = None
+    frozen_non_status_text_parameter_snapshot: dict[str, bytes] | None = None
     if (
         validation_every > 1
         and init_checkpoint_mode in RECIPIENT_ONLY_INIT_CHECKPOINT_MODES
     ):
         frozen_non_recipient_parameter_snapshot = _non_recipient_parameter_bytes(model)
+    if status_text_only_fine_tune:
+        frozen_non_status_text_parameter_snapshot = _non_status_text_parameter_bytes(model)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     _atomic_write_json(
@@ -6349,6 +6809,21 @@ def train_unified_reader(
             "payment_blank_index": PAYMENT_BLANK_INDEX,
             "payment_characters": payment_characters,
             "status_classes": list(STATUS_CLASSES),
+            **(
+                {
+                    "status_text_blank_index": STATUS_TEXT_BLANK_INDEX,
+                    "status_text_characters": status_text_characters,
+                    "status_text_charset_sha256": hashlib.sha256(
+                        "".join(status_text_characters).encode("utf-8")
+                    ).hexdigest(),
+                    "status_text_charset_source": STATUS_TEXT_CHARSET_SOURCE,
+                    "status_text_target": STATUS_TEXT_TARGET,
+                    "status_text_oov_by_split": status_text_oov,
+                    "status_text_runtime_policy": STATUS_TEXT_RUNTIME_POLICY,
+                }
+                if status_text_characters is not None
+                else {}
+            ),
             "structured_target_counts": structured_counts,
             "checkpoint_selection_policy": checkpoint_selection_policy,
             "initialization": initialization,
@@ -6425,6 +6900,8 @@ def train_unified_reader(
             payment_to_id=payment_to_id,
             recipient_characters=recipient_characters,
             recipient_to_id=recipient_to_id,
+            status_text_characters=status_text_characters,
+            status_text_to_id=status_text_to_id,
             payment_bank_prefix_classes=payment_bank_prefix_classes,
             payment_bank_class_weights=None,
             status_to_id=status_to_id,
@@ -6432,9 +6909,11 @@ def train_unified_reader(
             status_enabled=bool(status_policy["training_enabled"]),
             payment_loss_weight=payment_loss_weight,
             recipient_loss_weight=recipient_loss_weight,
+            status_text_loss_weight=status_text_loss_weight,
             ctc_loss_weight=ctc_loss_weight,
             structured_loss_weight=structured_loss_weight,
             torch=torch,
+            status_text_only=status_text_only_fine_tune,
         )
         if uses_cuda:
             torch.cuda.synchronize(target_device)
@@ -6570,7 +7049,10 @@ def train_unified_reader(
                 payment_logits = outputs["payment_logits"]
                 status_logits = outputs["status_logits"]
                 recipient_logits = outputs.get("recipient_logits")
+                status_text_logits = outputs.get("status_text_logits")
                 structured_outputs = outputs if _uses_structured_heads(config) else None
+            if recipient_only_fine_tune:
+                status_text_logits = None
             optimizer.zero_grad(set_to_none=True)
             recipient_confidence_weights = (
                 _recipient_teacher_confidence_weights(
@@ -6607,6 +7089,8 @@ def train_unified_reader(
                 payment_to_id=payment_to_id,
                 recipient_logits=recipient_logits,
                 recipient_to_id=recipient_to_id,
+                status_text_logits=status_text_logits,
+                status_text_to_id=status_text_to_id,
                 payment_bank_prefix_classes=payment_bank_prefix_classes,
                 payment_bank_class_weights=payment_bank_train_weights,
                 status_to_id=status_to_id,
@@ -6614,6 +7098,7 @@ def train_unified_reader(
                 status_enabled=bool(status_policy["training_enabled"]),
                 payment_loss_weight=payment_loss_weight,
                 recipient_loss_weight=recipient_loss_weight,
+                status_text_loss_weight=status_text_loss_weight,
                 config=config,
                 structured_outputs=structured_outputs,
                 ctc_loss_weight=ctc_loss_weight,
@@ -6622,6 +7107,7 @@ def train_unified_reader(
                 recipient_sample_weights=recipient_sample_weights,
                 collect_metrics=False,
                 recipient_only=recipient_only_fine_tune,
+                status_text_only=status_text_only_fine_tune,
             )
             if loss is None:
                 raise AssertionError("a training batch must produce a loss")
@@ -6674,6 +7160,10 @@ def train_unified_reader(
             validation_started = perf_counter()
             if frozen_non_recipient_parameter_snapshot is not None:
                 _assert_non_recipient_parameter_bytes(model, frozen_non_recipient_parameter_snapshot)
+            if frozen_non_status_text_parameter_snapshot is not None:
+                _assert_non_status_text_parameter_bytes(
+                    model, frozen_non_status_text_parameter_snapshot
+                )
             validation = _evaluate_model(
                 model,
                 validation_loader,
@@ -6687,6 +7177,8 @@ def train_unified_reader(
                 payment_to_id=payment_to_id,
                 recipient_characters=recipient_characters,
                 recipient_to_id=recipient_to_id,
+                status_text_characters=status_text_characters,
+                status_text_to_id=status_text_to_id,
                 payment_bank_prefix_classes=payment_bank_prefix_classes,
                 payment_bank_class_weights=None,
                 status_to_id=status_to_id,
@@ -6694,9 +7186,11 @@ def train_unified_reader(
                 status_enabled=bool(status_policy["training_enabled"]),
                 payment_loss_weight=payment_loss_weight,
                 recipient_loss_weight=recipient_loss_weight,
+                status_text_loss_weight=status_text_loss_weight,
                 ctc_loss_weight=ctc_loss_weight,
                 structured_loss_weight=structured_loss_weight,
                 torch=torch,
+                status_text_only=status_text_only_fine_tune,
             )
             if uses_cuda:
                 torch.cuda.synchronize(target_device)
@@ -6805,6 +7299,21 @@ def train_unified_reader(
                 else {}
             ),
             "status_classes": list(STATUS_CLASSES),
+            **(
+                {
+                    "status_text_blank_index": STATUS_TEXT_BLANK_INDEX,
+                    "status_text_characters": status_text_characters,
+                    "status_text_charset_sha256": hashlib.sha256(
+                        "".join(status_text_characters).encode("utf-8")
+                    ).hexdigest(),
+                    "status_text_charset_source": STATUS_TEXT_CHARSET_SOURCE,
+                    "status_text_target": STATUS_TEXT_TARGET,
+                    "status_text_oov_by_split": status_text_oov,
+                    "status_text_runtime_policy": STATUS_TEXT_RUNTIME_POLICY,
+                }
+                if status_text_characters is not None
+                else {}
+            ),
             "field_counts": field_counts,
             "status_class_counts": status_counts,
             "structured_target_counts": structured_counts,
@@ -6817,6 +7326,7 @@ def train_unified_reader(
             "payment_bank_prefix_oov_by_split": payment_bank_prefix_oov,
             "payment_loss_weight": payment_loss_weight,
             "recipient_loss_weight": recipient_loss_weight,
+            "status_text_loss_weight": status_text_loss_weight,
             "checkpoint_selection_policy": checkpoint_selection_policy,
             "initialization": initialization,
             "training_runtime": training_runtime,
@@ -6845,6 +7355,19 @@ def train_unified_reader(
                 "status_class_counts": status_counts,
                 "structured_target_counts": structured_counts,
                 "status_head_policy": status_policy,
+                "status_text_oov_by_split": status_text_oov,
+                "status_text_charset_sha256": (
+                    hashlib.sha256("".join(status_text_characters).encode("utf-8")).hexdigest()
+                    if status_text_characters is not None
+                    else None
+                ),
+                "status_text_charset_source": (
+                    STATUS_TEXT_CHARSET_SOURCE if status_text_characters is not None else None
+                ),
+                "status_text_target": STATUS_TEXT_TARGET if status_text_characters is not None else None,
+                "status_text_runtime_policy": (
+                    STATUS_TEXT_RUNTIME_POLICY if status_text_characters is not None else None
+                ),
                 "payment_oov_by_split": payment_oov,
                 "payment_bank_prefix_classes": payment_bank_prefix_classes,
                 "payment_bank_prefix_min_support": payment_bank_prefix_min_support
@@ -7022,7 +7545,7 @@ def _checkpoint_labels(
     if _uses_modern_protocol(config):
         expected_amount = V8_AMOUNT_CHARACTERS if _uses_v8_protocol(config) else V6_AMOUNT_CHARACTERS
         if amount != list(expected_amount) or time != list(V6_TIME_CHARACTERS):
-            raise ValueError("Unified v6/v7/v8/v9/v10/v11/v12 OCR checkpoint amount/time label maps are unsupported")
+            raise ValueError("Unified v6-v13 OCR checkpoint amount/time label maps are unsupported")
         bank_classes = payload.get("payment_bank_prefix_classes")
         if (
             not isinstance(bank_classes, list)
@@ -7032,7 +7555,7 @@ def _checkpoint_labels(
             or len(set(bank_classes)) != len(bank_classes)
             or bank_classes[1:] != sorted(bank_classes[1:])
         ):
-            raise ValueError("Unified v6/v7/v8/v9/v10/v11/v12 OCR checkpoint bank-prefix class map is invalid")
+            raise ValueError("Unified v6-v13 OCR checkpoint bank-prefix class map is invalid")
         recipient: list[str] | None = None
         if _uses_recipient_protocol(config):
             raw_recipient = payload.get("recipient_characters")
@@ -7049,7 +7572,7 @@ def _checkpoint_labels(
                 or raw_recipient != sorted(raw_recipient)
                 or payload.get("recipient_blank_index") != RECIPIENT_BLANK_INDEX
             ):
-                raise ValueError("Unified v9/v10/v11/v12 OCR checkpoint recipient charset or blank index is invalid")
+                raise ValueError("Unified v9-v13 OCR checkpoint recipient charset or blank index is invalid")
             recipient_sha256 = hashlib.sha256("".join(raw_recipient).encode("utf-8")).hexdigest()
             if payload.get("recipient_charset_sha256") != recipient_sha256:
                 raise ValueError("Unified v9/v10/v11/v12 OCR checkpoint recipient charset SHA-256 is invalid")
@@ -7058,7 +7581,7 @@ def _checkpoint_labels(
                 raise ValueError("Unified v9/v10/v11/v12 OCR checkpoint recipient charset source is invalid")
             if payload.get("recipient_target") != _recipient_target_mode(config):
                 raise ValueError("Unified v9/v10/v11/v12 OCR checkpoint recipient target contract is invalid")
-            if _is_v11(config) or _is_v12(config):
+            if _is_v11(config) or _uses_v12_recipient_topology(config):
                 _recipient_artifact_metadata(
                     config,
                     recipient_sampling_policy=payload.get("recipient_sampling_policy"),
@@ -7071,6 +7594,94 @@ def _checkpoint_labels(
     if numeric != list(NUMERIC_CHARACTERS):
         raise ValueError("Unified OCR checkpoint numeric label map is not the supported fixed numeric charset")
     return list(numeric), list(numeric), list(payment), None, list(status), None
+
+
+def _validate_status_text_oov_audit(value: object, *, source: str) -> None:
+    """Fail closed on the train-only v13 status alphabet audit."""
+    if not isinstance(value, Mapping) or set(value) != {"train", "val", "test"}:
+        raise ValueError(f"{source} status-text OOV audit is invalid")
+    for split in ("train", "val", "test"):
+        audit = value[split]
+        if not isinstance(audit, Mapping) or set(audit) != {
+            "records",
+            "oov_records",
+            "oov_characters",
+            "examples",
+        }:
+            raise ValueError(f"{source} status-text OOV audit is invalid")
+        records = audit.get("records")
+        oov_records = audit.get("oov_records")
+        oov_characters = audit.get("oov_characters")
+        examples = audit.get("examples")
+        if (
+            isinstance(records, bool)
+            or not isinstance(records, int)
+            or isinstance(oov_records, bool)
+            or not isinstance(oov_records, int)
+            or isinstance(oov_characters, bool)
+            or not isinstance(oov_characters, int)
+            or records < 0
+            or oov_records < 0
+            or oov_records > records
+            or oov_characters < 0
+            or not isinstance(examples, list)
+            or len(examples) > min(20, oov_records)
+        ):
+            raise ValueError(f"{source} status-text OOV audit is invalid")
+        for example in examples:
+            if (
+                not isinstance(example, Mapping)
+                or set(example) != {"id", "characters", "text"}
+                or not isinstance(example.get("id"), str)
+                or not example.get("id")
+                or not isinstance(example.get("characters"), str)
+                or not example.get("characters")
+                or not isinstance(example.get("text"), str)
+                or not example.get("text")
+                or any(character not in str(example["text"]) for character in str(example["characters"]))
+            ):
+                raise ValueError(f"{source} status-text OOV audit is invalid")
+    train_audit = value["train"]
+    if (
+        train_audit["oov_records"] != 0
+        or train_audit["oov_characters"] != 0
+        or train_audit["examples"]
+    ):
+        raise ValueError(f"{source} status-text train split must not contain OOV characters")
+
+
+def _checkpoint_status_text_characters(
+    payload: Mapping[str, object], *, config: UnifiedReaderConfig
+) -> list[str] | None:
+    """Validate the additive v13 visible-status CTC label contract."""
+    if not _is_v13(config):
+        return None
+    raw_characters = payload.get("status_text_characters")
+    if (
+        not isinstance(raw_characters, list)
+        or not raw_characters
+        or not all(
+            isinstance(character, str)
+            and len(character) == 1
+            and character.isprintable()
+            for character in raw_characters
+        )
+        or raw_characters != sorted(raw_characters)
+        or len(set(raw_characters)) != len(raw_characters)
+        or payload.get("status_text_blank_index") != STATUS_TEXT_BLANK_INDEX
+        or payload.get("status_text_charset_source") != STATUS_TEXT_CHARSET_SOURCE
+        or payload.get("status_text_target") != STATUS_TEXT_TARGET
+        or payload.get("status_text_runtime_policy") != STATUS_TEXT_RUNTIME_POLICY
+    ):
+        raise ValueError("Unified v13 OCR checkpoint status-text charset contract is invalid")
+    expected_sha256 = hashlib.sha256("".join(raw_characters).encode("utf-8")).hexdigest()
+    if payload.get("status_text_charset_sha256") != expected_sha256:
+        raise ValueError("Unified v13 OCR checkpoint status-text charset SHA-256 is invalid")
+    _validate_status_text_oov_audit(
+        payload.get("status_text_oov_by_split"),
+        source="Unified v13 OCR checkpoint",
+    )
+    return list(raw_characters)
 
 
 def _validate_exported_onnx(
@@ -7218,6 +7829,7 @@ def export_unified_onnx(
         status_classes,
         payment_bank_prefix_classes,
     ) = _checkpoint_labels(payload, config=config)
+    status_text_characters = _checkpoint_status_text_characters(payload, config=config)
     recipient_artifact_metadata = (
         _recipient_artifact_metadata(
             config,
@@ -7235,6 +7847,16 @@ def export_unified_onnx(
     if not isinstance(state_dict, Mapping) or not isinstance(field_counts, Mapping) or not isinstance(status_counts, Mapping):
         raise ValueError("Unified OCR checkpoint is missing state_dict or audit counts")
     status_policy = _status_policy_from_counts(status_counts, source="Unified OCR checkpoint")
+    if _is_v13(config):
+        status_policy = {
+            **status_policy,
+            "delivery_allowed": False,
+            "runtime_policy": "review_only",
+            "reason": (
+                "v13 supersedes the legacy finite status classifier with visible-text CTC; "
+                "legacy status_logits remain ABI-only and must not be exposed as a candidate"
+            ),
+        }
     model = build_unified_reader(
         payment_vocab_size=len(payment_characters) + 1,
         config=config,
@@ -7242,6 +7864,9 @@ def export_unified_onnx(
             len(payment_bank_prefix_classes) if payment_bank_prefix_classes is not None else None
         ),
         recipient_vocab_size=(len(recipient_characters) + 1 if recipient_characters is not None else None),
+        status_text_vocab_size=(
+            len(status_text_characters) + 1 if status_text_characters is not None else None
+        ),
     )
     model.load_state_dict(state_dict)
     model.eval()
@@ -7287,7 +7912,10 @@ def export_unified_onnx(
                     outputs["payment_parentheses_logits"][0, :],
                 )
                 if _uses_recipient_protocol(config):
-                    return v8_outputs + (outputs["recipient_logits"][:, 0, :],)
+                    recipient_outputs = v8_outputs + (outputs["recipient_logits"][:, 0, :],)
+                    if _is_v13(config):
+                        return recipient_outputs + (outputs["status_text_logits"][:, 0, :],)
+                    return recipient_outputs
                 return v8_outputs
             if _uses_v6_protocol(config):
                 return base + (
@@ -7399,6 +8027,21 @@ def export_unified_onnx(
         "payment_blank_index": PAYMENT_BLANK_INDEX,
         "payment_characters": payment_characters,
         "status_classes": status_classes,
+        **(
+            {
+                "status_text_blank_index": STATUS_TEXT_BLANK_INDEX,
+                "status_text_characters": status_text_characters,
+                "status_text_charset_sha256": hashlib.sha256(
+                    "".join(status_text_characters).encode("utf-8")
+                ).hexdigest(),
+                "status_text_charset_source": STATUS_TEXT_CHARSET_SOURCE,
+                "status_text_target": STATUS_TEXT_TARGET,
+                "status_text_oov_by_split": payload.get("status_text_oov_by_split"),
+                "status_text_runtime_policy": STATUS_TEXT_RUNTIME_POLICY,
+            }
+            if status_text_characters is not None
+            else {}
+        ),
         "checkpoint_selection_policy": payload.get("checkpoint_selection_policy"),
         "initialization": payload.get("initialization"),
         "payment_charset_sha256": hashlib.sha256("".join(payment_characters).encode("utf-8")).hexdigest(),
@@ -7534,7 +8177,7 @@ def export_unified_onnx(
                     "left_trim_fraction": config.recipient_value_left_trim,
                     "horizontal_alignment": "center",
                 }
-                if _is_v11(config) or _is_v12(config)
+                if _is_v11(config) or _uses_v12_recipient_topology(config)
                 else {}
             ),
             **(
@@ -7542,6 +8185,20 @@ def export_unified_onnx(
                 if _uses_high_resolution_recipient_input(config)
                 else {}
             ),
+        }
+    if _is_v13(config):
+        if status_text_characters is None:
+            raise AssertionError("v13 export requires a train-only status-text charset")
+        output_contract["status_text_logits"] = {
+            "shape": list(output_values["status_text_logits"].shape),
+            "layout": "[time,class]",
+            "decoder": "ctc_greedy",
+            "blank_index": STATUS_TEXT_BLANK_INDEX,
+            "characters": "status_text_characters",
+            "target": STATUS_TEXT_TARGET,
+            "runtime_policy": STATUS_TEXT_RUNTIME_POLICY,
+            "review_value": "review",
+            "normalizer": "normalize_status",
         }
     if config.architecture_version == 5:
         output_contract.update(
@@ -7746,7 +8403,7 @@ def export_unified_onnx(
             "RGB crop -> grayscale -> aspect-preserving resize -> white right-aligned letterbox for "
             + (
                 "amount/time/payment (right-aligned), recipient fifth slot (white reserved placeholder), status (centered) -> divide by 255.0"
-                if _is_v12(config)
+                if _uses_v12_recipient_topology(config)
                 else "amount/time/payment (right-aligned), recipient (left-trimmed then centered), status (centered) -> divide by 255.0"
                 if _is_v11(config)
                 else "amount/time/payment (right-aligned), recipient (centered), status (centered) -> divide by 255.0"
@@ -7790,6 +8447,19 @@ def export_unified_onnx(
             "checkpoint_selection_policy": payload.get("checkpoint_selection_policy"),
             "training_initialization": payload.get("initialization"),
             "status_head_policy": status_policy,
+            **(
+                {
+                    "status_text_charset_sha256": hashlib.sha256(
+                        "".join(status_text_characters).encode("utf-8")
+                    ).hexdigest(),
+                    "status_text_charset_source": STATUS_TEXT_CHARSET_SOURCE,
+                    "status_text_target": STATUS_TEXT_TARGET,
+                    "status_text_oov_by_split": payload.get("status_text_oov_by_split"),
+                    "status_text_runtime_policy": STATUS_TEXT_RUNTIME_POLICY,
+                }
+                if status_text_characters is not None
+                else {}
+            ),
             "payment_bank_prefix_classes": payment_bank_prefix_classes,
             "payment_bank_prefix_min_support": payload.get("payment_bank_prefix_min_support"),
             "payment_bank_prefix_class_counts": payload.get("payment_bank_prefix_class_counts"),
@@ -7888,6 +8558,41 @@ def _load_onnx_artifact_details(
         raise ValueError("Unified OCR ONNX payment charset SHA-256 is invalid")
     if status != list(STATUS_CLASSES):
         raise ValueError("Unified OCR ONNX status class order is unsupported")
+    status_text_characters: list[str] | None = None
+    if _is_v13(config):
+        raw_status_text = labels.get("status_text_characters")
+        if (
+            not isinstance(raw_status_text, list)
+            or not raw_status_text
+            or raw_status_text != sorted(raw_status_text)
+            or len(set(raw_status_text)) != len(raw_status_text)
+            or not all(
+                isinstance(character, str)
+                and len(character) == 1
+                and character.isprintable()
+                for character in raw_status_text
+            )
+            or labels.get("status_text_blank_index") != STATUS_TEXT_BLANK_INDEX
+            or labels.get("status_text_charset_source") != STATUS_TEXT_CHARSET_SOURCE
+            or labels.get("status_text_target") != STATUS_TEXT_TARGET
+            or labels.get("status_text_runtime_policy") != STATUS_TEXT_RUNTIME_POLICY
+        ):
+            raise ValueError("Unified v13 OCR status-text label contract is invalid")
+        status_text_sha256 = hashlib.sha256("".join(raw_status_text).encode("utf-8")).hexdigest()
+        if (
+            labels.get("status_text_charset_sha256") != status_text_sha256
+            or contract.get("status_text_charset_sha256") != status_text_sha256
+            or contract.get("status_text_charset_source") != STATUS_TEXT_CHARSET_SOURCE
+            or contract.get("status_text_target") != STATUS_TEXT_TARGET
+            or contract.get("status_text_runtime_policy") != STATUS_TEXT_RUNTIME_POLICY
+            or contract.get("status_text_oov_by_split") != labels.get("status_text_oov_by_split")
+        ):
+            raise ValueError("Unified v13 OCR status-text labels and contract differ")
+        _validate_status_text_oov_audit(
+            labels.get("status_text_oov_by_split"),
+            source="Unified v13 OCR label sidecar",
+        )
+        status_text_characters = list(raw_status_text)
     payment_bank_prefix_classes: list[str] | None = None
     recipient_characters: list[str] | None = None
     if _uses_modern_protocol(config):
@@ -7965,7 +8670,7 @@ def _load_onnx_artifact_details(
                 raise ValueError("Unified v9-v12 OCR recipient target differs between labels and contract")
             if contract.get("recipient_oov_by_split") != labels.get("recipient_oov_by_split"):
                 raise ValueError("Unified v9-v12 OCR recipient OOV audit differs between labels and contract")
-            if _is_v11(config) or _is_v12(config):
+            if _is_v11(config) or _uses_v12_recipient_topology(config):
                 expected_recipient_metadata = _recipient_artifact_metadata(
                     config,
                     recipient_sampling_policy=labels.get("recipient_sampling_policy"),
@@ -8160,6 +8865,13 @@ def _load_onnx_artifact_details(
                 _recipient_time_steps(config),
                 len(recipient_characters) + 1,
             ]
+        if _is_v13(config):
+            if status_text_characters is None:
+                raise AssertionError("v13 status-text characters were validated above")
+            expected_shapes["status_text_logits"] = [
+                time_steps,
+                len(status_text_characters) + 1,
+            ]
     elif _uses_v6_protocol(config):
         assert payment_bank_prefix_classes is not None
         expected_shapes.update(
@@ -8194,7 +8906,7 @@ def _load_onnx_artifact_details(
             or recipient_output.get("runtime_policy") != "review_only"
         ):
             raise ValueError("Unified v9-v12 OCR recipient output contract is unsupported")
-        if _is_v11(config) or _is_v12(config):
+        if _is_v11(config) or _uses_v12_recipient_topology(config):
             try:
                 left_trim_fraction = float(recipient_output.get("left_trim_fraction"))
             except (TypeError, ValueError):
@@ -8227,12 +8939,25 @@ def _load_onnx_artifact_details(
         KIND_V10,
         KIND_V11,
         KIND_V12,
+        KIND_V13,
     }:
         if status_output.get("runtime_policy") != status_policy["runtime_policy"]:
             raise ValueError("Unified OCR ONNX status output policy differs from status_head_policy")
         expected_review = "review" if status_policy["runtime_policy"] == "review_only" else None
         if status_output.get("review_value") != expected_review:
             raise ValueError("Unified OCR ONNX status output review value is invalid")
+    if _is_v13(config):
+        status_text_output = outputs["status_text_logits"]
+        if (
+            status_text_output.get("layout") != "[time,class]"
+            or status_text_output.get("normalizer") != "normalize_status"
+            or status_text_output.get("characters") != "status_text_characters"
+            or status_text_output.get("target") != STATUS_TEXT_TARGET
+            or status_text_output.get("runtime_policy") != STATUS_TEXT_RUNTIME_POLICY
+            or status_text_output.get("review_value") != "review"
+            or status_text_output.get("decoder") != "ctc_greedy"
+        ):
+            raise ValueError("Unified v13 OCR status-text output contract is unsupported")
     return config, list(payment), recipient_characters, contract
 
 
@@ -8373,7 +9098,9 @@ def _delivery_text(
     and proven on group-isolated human truth.  Status follows its separate
     coverage policy upstream.
     """
-    if architecture_version < 5 or field == "transfer_status":
+    if field == "transfer_status":
+        return "review" if architecture_version >= 13 else candidate_text
+    if architecture_version < 5:
         return candidate_text
     # Keep the arguments in the public helper signature: callers still record
     # them in comparisons.jsonl, which is the evidence needed to build the
@@ -8387,6 +9114,8 @@ def _comparison_metrics(rows: Sequence[Mapping[str, object]]) -> dict[str, objec
         return {
             "records": 0,
             "raw_exact_match": None,
+            "ctc_records": 0,
+            "ctc_raw_exact_match": None,
             "semantic_exact_match": None,
             "micro_cer": None,
             "oov_reference_rate": None,
@@ -8398,6 +9127,13 @@ def _comparison_metrics(rows: Sequence[Mapping[str, object]]) -> dict[str, objec
         }
     records = len(rows)
     raw_exact = sum(bool(row["raw_exact"]) for row in rows)
+    ctc_rows = [
+        row
+        for row in rows
+        if row.get("ctc_reference_text") is not None
+        and row.get("ctc_candidate_text") is not None
+    ]
+    ctc_raw_exact = sum(bool(row.get("ctc_raw_exact")) for row in ctc_rows)
     semantic_rows = [row for row in rows if row["reference_semantic"] is not None]
     semantic_exact = sum(bool(row["semantic_exact"]) for row in semantic_rows)
     edits = sum(int(row["cer_edits"]) for row in rows)
@@ -8410,6 +9146,9 @@ def _comparison_metrics(rows: Sequence[Mapping[str, object]]) -> dict[str, objec
         "records": records,
         "raw_exact_matches": raw_exact,
         "raw_exact_match": raw_exact / records,
+        "ctc_records": len(ctc_rows),
+        "ctc_raw_exact_matches": ctc_raw_exact,
+        "ctc_raw_exact_match": ctc_raw_exact / len(ctc_rows) if ctc_rows else None,
         "semantic_exact_matches": semantic_exact,
         "semantic_exact_match": semantic_exact / max(1, len(semantic_rows)),
         "cer_edits": edits,
@@ -8468,6 +9207,7 @@ def _unified_acceptance_failures(
     min_delivery_coverage: float | None,
     min_delivery_exact_match: float | None,
     max_delivery_false_accepts: int | None,
+    status_visible_text_ctc: bool = False,
 ) -> list[str]:
     failures: list[str] = []
     desired = {
@@ -8480,11 +9220,16 @@ def _unified_acceptance_failures(
     for field, threshold in desired.items():
         if threshold is None:
             continue
-        observed = metrics[field]["raw_exact_match"]
+        metric_name = (
+            "ctc_raw_exact_match"
+            if field == "transfer_status" and status_visible_text_ctc
+            else "raw_exact_match"
+        )
+        observed = metrics[field][metric_name]
         if observed is None:
             failures.append(f"{field}: no held-out reference labels remain for the requested acceptance gate")
         elif float(observed) < threshold:
-            failures.append(f"{field}: raw_exact_match={float(observed):.4f} < {threshold:.4f}")
+            failures.append(f"{field}: {metric_name}={float(observed):.4f} < {threshold:.4f}")
     if max_payment_oov_rate is not None and float(metrics["payment_method_field"]["oov_reference_rate"]) > max_payment_oov_rate:
         failures.append(
             "payment_method_field: "
@@ -8600,6 +9345,17 @@ def evaluate_unified_onnx(
     recipient_characters: list[str] | None = None
     if _uses_recipient_protocol(config):
         _, _, recipient_characters, _ = _load_onnx_artifact_details(model_path)
+    status_text_characters: list[str] | None = None
+    if _is_v13(config):
+        # The detailed loader above (or this explicit call) validates hash,
+        # source, target and output contract before the list is consumed.
+        _load_onnx_artifact_details(model_path)
+        raw_status_characters = _load_json_object(
+            Path(model_path).resolve().with_suffix(".labels.json")
+        ).get("status_text_characters")
+        if not isinstance(raw_status_characters, list):
+            raise AssertionError("v13 status-text labels were validated above")
+        status_text_characters = [str(character) for character in raw_status_characters]
     artifact_amount_format_min_confidence = (
         config.amount_format_min_confidence if _uses_v8_protocol(config) else None
     )
@@ -8641,7 +9397,7 @@ def evaluate_unified_onnx(
     required_evaluation_fields = ["amount", "time", "payment_method_field"]
     if _uses_recipient_protocol(config):
         required_evaluation_fields.append("recipient_field")
-    if status_delivery_allowed or min_status_exact_match is not None or max_non_success_to_success is not None:
+    if _is_v13(config) or status_delivery_allowed or min_status_exact_match is not None or max_non_success_to_success is not None:
         required_evaluation_fields.append("transfer_status")
     for field in required_evaluation_fields:
         if not any(
@@ -8724,6 +9480,13 @@ def evaluate_unified_onnx(
                 _recipient_time_steps(config),
                 len(recipient_characters) + 1,
             ]
+        if _is_v13(config):
+            if status_text_characters is None:
+                raise AssertionError("v13 status-text characters were validated with the ONNX sidecar")
+            expected_output_shapes["status_text_logits"] = [
+                config.image_width // 4,
+                len(status_text_characters) + 1,
+            ]
     elif _uses_v6_protocol(config):
         raw_bank_classes = contract.get("payment_bank_prefix_classes")
         if not isinstance(raw_bank_classes, list) or len(raw_bank_classes) < 2:
@@ -8754,6 +9517,7 @@ def evaluate_unified_onnx(
     receipt_latencies: list[float] = []
     payment_character_set = set(payment_characters)
     recipient_character_set = set(recipient_characters or ())
+    status_text_character_set = set(status_text_characters or ())
     status_confusion: Counter[str] = Counter()
     status_reference_counts: Counter[str] = Counter()
     total_records = len(evaluation_records)
@@ -8796,6 +9560,14 @@ def evaluate_unified_onnx(
                 recipient_confidence = 0.0
         status_index, status_confidence = _softmax_confidence(status_logits)
         raw_status_text = STATUS_CLASSES[status_index]
+        if _is_v13(config):
+            if status_text_characters is None:
+                raise AssertionError("v13 status-text characters were validated with the ONNX sidecar")
+            visible_status_text, visible_status_confidence = _ctc_single_output(
+                runtime_outputs["status_text_logits"], characters=status_text_characters
+            )
+        else:
+            visible_status_text, visible_status_confidence = "", 0.0
         ctc_predictions: dict[str, tuple[str, float]] = {
             "amount": (amount_text, amount_confidence),
             "time": (time_text, time_confidence),
@@ -8803,6 +9575,11 @@ def evaluate_unified_onnx(
         }
         if _uses_recipient_protocol(config):
             ctc_predictions["recipient_field"] = (recipient_text, recipient_confidence)
+        if _is_v13(config):
+            ctc_predictions["transfer_status"] = (
+                visible_status_text,
+                visible_status_confidence,
+            )
         structured_predictions: dict[str, tuple[str | None, float]] = {}
         if config.architecture_version == 5:
             structured_predictions = {
@@ -8889,8 +9666,14 @@ def evaluate_unified_onnx(
         # A status head with incomplete classes must never become a business
         # decision, even if its raw argmax says success.
         predictions["transfer_status"] = (
-            raw_status_text if status_delivery_allowed else "review",
-            status_confidence,
+            (
+                normalize_status(visible_status_text)
+                if _is_v13(config)
+                else raw_status_text
+                if status_delivery_allowed
+                else "review"
+            ),
+            visible_status_confidence if _is_v13(config) else status_confidence,
         )
         for field in _slot_order(config):
             slot = dict(record["slots"]).get(field)
@@ -9000,10 +9783,19 @@ def evaluate_unified_onnx(
                     "decoder_agrees": decoder_agrees,
                     "delivery_text": delivery_text,
                     "delivery_raw_exact": delivery_raw_exact,
-                    "raw_model_candidate_text": raw_status_text if field == "transfer_status" else None,
+                    "raw_model_candidate_text": (
+                        visible_status_text if field == "transfer_status" and _is_v13(config)
+                        else raw_status_text if field == "transfer_status"
+                        else None
+                    ),
+                    "legacy_status_classifier_candidate": (
+                        raw_status_text if field == "transfer_status" and _is_v13(config) else None
+                    ),
                     "confidence": round(confidence, 6),
                     "runtime_policy": (
-                        status_policy["runtime_policy"]
+                        STATUS_TEXT_RUNTIME_POLICY
+                        if field == "transfer_status" and _is_v13(config)
+                        else status_policy["runtime_policy"]
                         if field == "transfer_status"
                         else _text_delivery_policy(config)[0]
                         if _uses_structured_heads(config)
@@ -9028,6 +9820,14 @@ def evaluate_unified_onnx(
                                 or reference_text
                             )
                             - recipient_character_set
+                        )
+                    )
+                    or (
+                        field == "transfer_status"
+                        and _is_v13(config)
+                        and bool(
+                            set(_slot_text(record, "transfer_status") or "")
+                            - status_text_character_set
                         )
                     ),
                     "non_success_to_success": non_success_to_success,
@@ -9061,10 +9861,12 @@ def evaluate_unified_onnx(
         min_delivery_coverage=min_delivery_coverage,
         min_delivery_exact_match=min_delivery_exact_match,
         max_delivery_false_accepts=max_delivery_false_accepts,
+        status_visible_text_ctc=_is_v13(config),
     )
     if (
         (min_status_exact_match is not None or max_non_success_to_success is not None)
         and not status_delivery_allowed
+        and not _is_v13(config)
     ):
         failures.append(
             "transfer_status: acceptance was requested, but the artifact is review_only because its status "
@@ -9119,6 +9921,17 @@ def evaluate_unified_onnx(
             class_name: int(status_reference_counts[class_name]) for class_name in STATUS_CLASSES
         },
         "status_head_policy": status_policy,
+        "status_text_policy": (
+            {
+                "target": STATUS_TEXT_TARGET,
+                "runtime_policy": STATUS_TEXT_RUNTIME_POLICY,
+                "review_value": "review",
+                "characters": len(status_text_characters or ()),
+                "charset_source": STATUS_TEXT_CHARSET_SOURCE,
+            }
+            if _is_v13(config)
+            else None
+        ),
         "receipt_latency_ms": _latency_metrics(receipt_latencies),
         "acceptance": {
             "min_amount_exact_match": min_amount_exact_match,
@@ -9188,7 +10001,7 @@ def _recipient_audit_preprocess_gray(
     high-resolution input dimensions.  It is intentionally private so the
     delivery preprocessor remains the sole public runtime contract.
     """
-    if not (_is_v11(config) or _is_v12(config)):
+    if not (_is_v11(config) or _uses_v12_recipient_topology(config)):
         raise ValueError("recipient audit preprocessor supports only architecture v11 or v12")
     source = np.asarray(gray, dtype=np.uint8)
     if source.ndim != 2 or source.shape[0] <= 0 or source.shape[1] <= 0:
@@ -9370,7 +10183,7 @@ def audit_recipient_trims_onnx(
     # particular, do not accept a plain ONNX file with a hand-edited labels
     # file, and never write the diagnostic trim into the artifact.
     config, _payment_characters, contract = _load_onnx_artifacts(model_path)
-    if not (_is_v11(config) or _is_v12(config)):
+    if not (_is_v11(config) or _uses_v12_recipient_topology(config)):
         raise ValueError(
             "audit-recipient supports only v11 or v12 ONNX artifacts with a frozen recipient value trim"
         )
@@ -9650,6 +10463,12 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     train.add_argument(
+        "--status-text-loss-weight",
+        type=float,
+        default=1.0,
+        help="v13 multiplier for visible transfer-status CTC loss",
+    )
+    train.add_argument(
         "--recipient-sampling-weight",
         type=float,
         default=1.0,
@@ -9781,6 +10600,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     train.add_argument(
+        "--status-text-only-fine-tune",
+        action="store_true",
+        help=(
+            "v13 only: warm-start a compatible v12/v13 checkpoint, freeze the shared trunk and all 15 "
+            "legacy outputs, and optimize only the additive status_text_ CTC head"
+        ),
+    )
+    train.add_argument(
         "--recipient-open-text-unfreeze-legacy",
         action="store_true",
         help=(
@@ -9858,12 +10685,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     train.add_argument(
         "--architecture",
-        choices=("v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12"),
+        choices=("v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13"),
         default="v8",
         help=(
             "v9 is the five-field value-only reader. v10 learns the complete visible recipient row. v11 keeps one "
             "five-slot ONNX but learns an anchored recipient value from a left-trimmed value view. v12 remains one "
-            "ONNX/session but adds a second high-resolution recipient value input. v8 remains the compatible "
+            "ONNX/session but adds a second high-resolution recipient value input. v13 appends visible status "
+            "text CTC as output 16 while preserving the v12 inputs and first 15 outputs. v8 remains the compatible "
             "four-field default; v7/v6/v5/v4/v3 remain checkpoint-compatible"
         ),
     )
@@ -10121,6 +10949,7 @@ def main(argv: list[str] | None = None) -> None:
                 weight_decay=args.weight_decay,
                 payment_loss_weight=args.payment_loss_weight,
                 recipient_loss_weight=args.recipient_loss_weight,
+                status_text_loss_weight=args.status_text_loss_weight,
                 recipient_sampling_weight=args.recipient_sampling_weight,
                 recipient_rare_character_max_support=args.recipient_rare_character_max_support,
                 recipient_rare_character_sampling_weight=args.recipient_rare_character_sampling_weight,
@@ -10136,6 +10965,7 @@ def main(argv: list[str] | None = None) -> None:
                 recipient_train_augmentation=args.recipient_train_augmentation,
                 recipient_train_splits=tuple(args.recipient_train_splits),
                 recipient_only_fine_tune=args.recipient_only_fine_tune,
+                status_text_only_fine_tune=args.status_text_only_fine_tune,
                 recipient_open_text_unfreeze_legacy=args.recipient_open_text_unfreeze_legacy,
                 validation_every=args.validation_every,
                 checkpoint_selection=args.checkpoint_selection,
@@ -10200,7 +11030,9 @@ def main(argv: list[str] | None = None) -> None:
             metrics = summary["by_field"]
             status_policy = summary.get("status_head_policy")
             status_display = (
-                "review_only"
+                _format_exact_match(metrics["transfer_status"]["ctc_raw_exact_match"])
+                if summary.get("status_text_policy") is not None
+                else "review_only"
                 if isinstance(status_policy, Mapping) and status_policy.get("runtime_policy") == "review_only"
                 else _format_exact_match(metrics["transfer_status"]["raw_exact_match"])
             )

@@ -423,11 +423,17 @@ function Assert-UnifiedBundle([string]$ModelPath) {
     Assert-NoReparsePointInExistingPath $contractPath "unified OCR contract"
 
     $contract = Get-Content -LiteralPath $contractPath -Raw -Encoding UTF8 | ConvertFrom-Json
-    if ([string]$contract.kind -ne "receipt_unified_field_reader_v12") {
-        throw "Unified OCR contract is not architecture v12: $contractPath"
+    $artifactKind = [string]$contract.kind
+    $architectureVersion = [int]$contract.model.architecture_version
+    $expectedKind = switch ($architectureVersion) {
+        12 { "receipt_unified_field_reader_v12" }
+        13 { "receipt_unified_field_reader_v13" }
+        default {
+            throw "Unified OCR contract has an unsupported architecture_version: $architectureVersion"
+        }
     }
-    if ([int]$contract.model.architecture_version -ne 12) {
-        throw "Unified OCR contract has an unsupported architecture_version: $($contract.model.architecture_version)"
+    if ($artifactKind -ne $expectedKind) {
+        throw "Unified OCR contract kind/version mismatch: kind=$artifactKind architecture_version=$architectureVersion"
     }
     if ([string]$contract.onnx_file -ne [IO.Path]::GetFileName($ModelPath)) {
         throw "Unified OCR contract onnx_file does not match the delivered filename."
@@ -441,7 +447,35 @@ function Assert-UnifiedBundle([string]$ModelPath) {
     if ([string]$contract.labels_sha256 -ne (Get-Sha256 $labelsPath)) {
         throw "Unified OCR labels SHA-256 does not match its contract."
     }
-    return @($labelsPath, $contractPath)
+    $statusTextOutputProperty = if ($null -eq $contract.outputs) {
+        $null
+    }
+    else {
+        $contract.outputs.PSObject.Properties["status_text_logits"]
+    }
+    $statusTextDeliveryPolicy = $null
+    $statusTextReviewValue = $null
+    if ($architectureVersion -eq 13) {
+        if ($null -eq $statusTextOutputProperty `
+            -or $null -eq $statusTextOutputProperty.Value `
+            -or [string]$statusTextOutputProperty.Value.runtime_policy -ne "decode_and_normalize_review_only" `
+            -or [string]$statusTextOutputProperty.Value.review_value -ne "review") {
+            throw "Unified OCR v13 status-text output is not decode-and-normalize review-only."
+        }
+        $statusTextDeliveryPolicy = [string]$statusTextOutputProperty.Value.runtime_policy
+        $statusTextReviewValue = [string]$statusTextOutputProperty.Value.review_value
+    }
+    elseif ($null -ne $statusTextOutputProperty) {
+        throw "Unified OCR v12 contract must not declare the v13 status_text_logits output."
+    }
+    return [pscustomobject]@{
+        LabelsPath = $labelsPath
+        ContractPath = $contractPath
+        Kind = $artifactKind
+        ArchitectureVersion = $architectureVersion
+        StatusTextDeliveryPolicy = $statusTextDeliveryPolicy
+        StatusTextReviewValue = $statusTextReviewValue
+    }
 }
 
 $hasRecords = -not [string]::IsNullOrWhiteSpace($Records)
@@ -527,9 +561,13 @@ if ($includeProductionCpuEntrypoints) {
 }
 
 $unifiedModel = Join-Path $RunDirectory "best.onnx"
-$unifiedSidecars = Assert-UnifiedBundle $unifiedModel
-$unifiedLabels = $unifiedSidecars[0]
-$unifiedContract = $unifiedSidecars[1]
+$unifiedBundle = Assert-UnifiedBundle $unifiedModel
+$unifiedLabels = [string]$unifiedBundle.LabelsPath
+$unifiedContract = [string]$unifiedBundle.ContractPath
+$unifiedKind = [string]$unifiedBundle.Kind
+$unifiedArchitectureVersion = [int]$unifiedBundle.ArchitectureVersion
+$statusTextDeliveryPolicy = $unifiedBundle.StatusTextDeliveryPolicy
+$statusTextReviewValue = $unifiedBundle.StatusTextReviewValue
 $unifiedContractPayload = Get-Content -LiteralPath $unifiedContract -Raw -Encoding UTF8 | ConvertFrom-Json
 $textDeliveryPolicy = [string]$unifiedContractPayload.text_delivery_policy.runtime_policy
 $textReviewValue = [string]$unifiedContractPayload.text_delivery_policy.review_value
@@ -1159,6 +1197,35 @@ try {
                 throw "Result $fieldName candidate escaped the required review-only policy: $resultPath"
             }
         }
+        if ($unifiedArchitectureVersion -eq 13) {
+            $statusProperty = $result.fields.PSObject.Properties["transfer_status"]
+            if ($null -eq $statusProperty -or $null -eq $statusProperty.Value) {
+                throw "Result has no transfer_status field object for unified OCR v13: $resultPath"
+            }
+            $statusField = $statusProperty.Value
+            $statusValueProperty = $statusField.PSObject.Properties["value"]
+            $statusValue = if ($null -eq $statusValueProperty) { $null } else { $statusValueProperty.Value }
+            $statusDeliveryValueProperty = $statusField.PSObject.Properties["delivery_value"]
+            $statusDeliveryValue = if ($null -eq $statusDeliveryValueProperty) {
+                $null
+            }
+            else {
+                $statusDeliveryValueProperty.Value
+            }
+            if ([string]$statusField.delivery_policy -ne [string]$statusTextDeliveryPolicy) {
+                throw "Result transfer_status has the wrong v13 status-text delivery policy: $resultPath"
+            }
+            if ([string]$statusField.state -eq "absent") {
+                if ($null -ne $statusValue -or $null -ne $statusDeliveryValue) {
+                    throw "Absent v13 transfer_status unexpectedly has a delivered value: $resultPath"
+                }
+            }
+            elseif ([string]$statusField.state -ne "review" `
+                -or [string]$statusValue -ne [string]$statusTextReviewValue `
+                -or [string]$statusDeliveryValue -ne [string]$statusTextReviewValue) {
+                throw "Result transfer_status escaped the v13 review-only delivery policy: $resultPath"
+            }
+        }
         $resultEvidenceRows += [ordered]@{
             source = $manifestSource
             result = [IO.Path]::GetFullPath($resultPath)
@@ -1290,6 +1357,22 @@ try {
         }
     }
 
+    $unifiedArtifactEvidence = [ordered]@{
+        kind = $unifiedKind
+        architecture_version = $unifiedArchitectureVersion
+        model_path = "models/unified/$([IO.Path]::GetFileName($unifiedModel))"
+        model_sha256 = $unifiedModelSha256
+        labels_path = "models/unified/$([IO.Path]::GetFileName($unifiedLabels))"
+        labels_sha256 = $unifiedLabelsSha256
+        contract_path = "models/unified/$([IO.Path]::GetFileName($unifiedContract))"
+        contract_sha256 = $unifiedContractSha256
+        text_delivery_policy = $textDeliveryPolicy
+        review_value = $textReviewValue
+    }
+    if ($unifiedArchitectureVersion -eq 13) {
+        $unifiedArtifactEvidence["status_text_delivery_policy"] = [string]$statusTextDeliveryPolicy
+        $unifiedArtifactEvidence["status_text_review_value"] = [string]$statusTextReviewValue
+    }
     $modelArtifactEvidence = [ordered]@{
         detector = [ordered]@{
             kind = "receipt_lrcnn_v1"
@@ -1310,17 +1393,7 @@ try {
         else {
             $null
         }
-        unified_ocr = [ordered]@{
-            kind = "receipt_unified_field_reader_v12"
-            model_path = "models/unified/$([IO.Path]::GetFileName($unifiedModel))"
-            model_sha256 = $unifiedModelSha256
-            labels_path = "models/unified/$([IO.Path]::GetFileName($unifiedLabels))"
-            labels_sha256 = $unifiedLabelsSha256
-            contract_path = "models/unified/$([IO.Path]::GetFileName($unifiedContract))"
-            contract_sha256 = $unifiedContractSha256
-            text_delivery_policy = $textDeliveryPolicy
-            review_value = $textReviewValue
-        }
+        unified_ocr = $unifiedArtifactEvidence
     }
 
     $packageValidation = [ordered]@{
@@ -1335,6 +1408,8 @@ try {
         include_device_model = [bool]$IncludeDeviceModel
         annotate = $Annotate
         model_sha256 = $unifiedModelSha256
+        unified_ocr_kind = $unifiedKind
+        unified_ocr_architecture_version = $unifiedArchitectureVersion
         model_artifacts = $modelArtifactEvidence
         runtime_flavor = $RuntimeFlavor
         runtime_device = $runtimeDevice
@@ -1366,6 +1441,10 @@ try {
             summary_sha256 = Get-Sha256 $onnxValidationSummary
             fields = $validatedMetrics
         }
+    }
+    if ($unifiedArchitectureVersion -eq 13) {
+        $packageValidation["status_text_delivery_policy"] = [string]$statusTextDeliveryPolicy
+        $packageValidation["status_text_review_value"] = [string]$statusTextReviewValue
     }
     $packageValidation | ConvertTo-Json -Depth 12 |
         Set-Content -LiteralPath (Join-Path $evidenceDirectory "package_validation.json") -Encoding UTF8
@@ -1408,9 +1487,15 @@ try {
         detector_model = [IO.Path]::GetFileName($DetectorModel)
         device_model = if ($IncludeDeviceModel) { [IO.Path]::GetFileName($DeviceModel) } else { $null }
         unified_model = "models/unified/$([IO.Path]::GetFileName($unifiedModel))"
+        unified_ocr_kind = $unifiedKind
+        unified_ocr_architecture_version = $unifiedArchitectureVersion
         text_delivery_policy = $textDeliveryPolicy
         text_review_value = $textReviewValue
         model_artifacts = $modelArtifactEvidence
+    }
+    if ($unifiedArchitectureVersion -eq 13) {
+        $packageConfig["status_text_delivery_policy"] = [string]$statusTextDeliveryPolicy
+        $packageConfig["status_text_review_value"] = [string]$statusTextReviewValue
     }
     if ($includeProductionCpuEntrypoints) {
         $packageConfig["production_entrypoints"] = @(

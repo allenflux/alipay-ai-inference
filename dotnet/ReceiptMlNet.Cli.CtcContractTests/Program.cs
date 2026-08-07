@@ -1,3 +1,5 @@
+using System.Text.Json;
+
 internal static class Program
 {
     private static readonly string[] Characters = ["A", "B"];
@@ -10,7 +12,11 @@ internal static class Program
             VerifyFirstMaximumTieParity();
             VerifyAllBlankResult();
             VerifyNonFiniteStillFailsOnDiscardedTimesteps();
-            Console.WriteLine("PASS: optimized CTC decoding is bit-exact and preserves validation/tie contracts.");
+            VerifyVisibleStatusTextNormalization();
+            VerifyResultCacheSemantics();
+            Console.WriteLine(
+                "PASS: optimized CTC decoding is bit-exact, preserves validation/tie contracts, "
+                + "normalizes visible transfer-status text, and rejects stale result-cache semantics.");
             return 0;
         }
         catch (Exception error)
@@ -90,6 +96,77 @@ internal static class Program
             return;
         }
         throw new InvalidOperationException($"{label}: non-finite score was not rejected with the verified error");
+    }
+
+    private static void VerifyVisibleStatusTextNormalization()
+    {
+        var characters = new[] { "转", "账", "成", "功", "处", "理", "中", "失", "败" };
+        VerifyStatusText(characters, [1, 2, 3, 4], "转账成功", "success");
+        VerifyStatusText(characters, [5, 6, 7], "处理中", "pending");
+        VerifyStatusText(characters, [1, 2, 8, 9], "转账失败", "failed");
+        VerifyStatusText(characters, [7], "中", "unknown");
+    }
+
+    private static void VerifyResultCacheSemantics()
+    {
+        AssertCacheCurrent(
+            $"{{\"result_schema_version\":{ReceiptResultCacheContract.SchemaVersion},"
+            + $"\"result_semantics_version\":\"{ReceiptResultCacheContract.SemanticsVersion}\","
+            + "\"source\":\"fixture.jpg\"}",
+            expected: true,
+            "current semantics");
+        AssertCacheCurrent("{\"source\":\"legacy.jpg\"}", expected: false, "legacy result without versions");
+        AssertCacheCurrent(
+            $"{{\"result_schema_version\":{ReceiptResultCacheContract.SchemaVersion}}}",
+            expected: false,
+            "missing semantics version");
+        AssertCacheCurrent(
+            $"{{\"result_semantics_version\":\"{ReceiptResultCacheContract.SemanticsVersion}\"}}",
+            expected: false,
+            "missing schema version");
+        AssertCacheCurrent(
+            $"{{\"result_schema_version\":{ReceiptResultCacheContract.SchemaVersion + 1},"
+            + $"\"result_semantics_version\":\"{ReceiptResultCacheContract.SemanticsVersion}\"}}",
+            expected: false,
+            "future schema version");
+        AssertCacheCurrent(
+            $"{{\"result_schema_version\":{ReceiptResultCacheContract.SchemaVersion},"
+            + "\"result_semantics_version\":\"legacy-status-logit-argmax\"}",
+            expected: false,
+            "legacy status-logit semantics");
+        AssertCacheCurrent(
+            $"{{\"result_schema_version\":\"{ReceiptResultCacheContract.SchemaVersion}\","
+            + $"\"result_semantics_version\":\"{ReceiptResultCacheContract.SemanticsVersion}\"}}",
+            expected: false,
+            "string schema version");
+    }
+
+    private static void AssertCacheCurrent(string json, bool expected, string label)
+    {
+        using var document = JsonDocument.Parse(json);
+        var actual = ReceiptResultCacheContract.IsCurrent(document.RootElement);
+        if (actual != expected)
+        {
+            throw new InvalidOperationException(
+                $"{label}: expected cache-current={expected}, got {actual}");
+        }
+    }
+
+    private static void VerifyStatusText(
+        IReadOnlyList<string> characters,
+        IReadOnlyList<int> winners,
+        string expectedText,
+        string expectedNormalized)
+    {
+        var classCount = characters.Count + 1;
+        var values = Enumerable.Repeat(-3.0f, checked(winners.Count * classCount)).ToArray();
+        for (var time = 0; time < winners.Count; time++)
+        {
+            values[checked(time * classCount + winners[time])] = 3.0f;
+        }
+        var decoded = UnifiedStatusTextDecoder.Decode(values, winners.Count, classCount, characters);
+        AssertEqual(expectedText, decoded.Text, $"{expectedText} status CTC text");
+        AssertEqual(expectedNormalized, decoded.Normalized, $"{expectedText} normalized status");
     }
 
     private static void VerifyLegacyParity(float[] values, int timeSteps, string expectedText, string label)

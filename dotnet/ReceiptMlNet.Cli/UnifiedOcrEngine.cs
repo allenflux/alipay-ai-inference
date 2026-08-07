@@ -4,8 +4,8 @@ using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.PixelFormats;
 
 /// <summary>
-/// Diagnostic result emitted by the v12 unified OCR reader.  The delivery
-/// value is deliberately separate from the candidate: current v12 text
+/// Diagnostic result emitted by a v12/v13 unified OCR reader. The delivery
+/// value is deliberately separate from the candidate: current unified text
 /// contracts are review-only until a human-truth calibration has passed.
 /// </summary>
 internal sealed record UnifiedOcrCandidate(
@@ -20,6 +20,7 @@ internal sealed record UnifiedOcrCandidate(
 internal sealed record UnifiedOcrReadResult(
     IReadOnlyDictionary<string, UnifiedOcrCandidate> Candidates,
     string? StatusCandidate,
+    string? StatusNormalized,
     float? StatusConfidence,
     string StatusDeliveryValue,
     string StatusRuntimePolicy,
@@ -37,7 +38,7 @@ internal sealed record UnifiedOcrStageLatency(
     double PostprocessMs);
 
 /// <summary>
-/// One-session implementation of architecture-v12 unified receipt OCR.
+/// One-session implementation of architecture-v12/v13 unified receipt OCR.
 /// Every receipt produces exactly one ONNX Runtime Run call with the two
 /// fixed contract inputs.  The model, labels and contract are verified by
 /// <see cref="UnifiedOcrBundle"/> before this session is opened.
@@ -88,6 +89,7 @@ internal sealed class UnifiedOcrEngine : IDisposable
     }
 
     public string ExecutionProvider { get; }
+    public int ArchitectureVersion => _bundle.ArchitectureVersion;
 
     /// <summary>
     /// Builds the frozen two-input ABI and invokes the model once.  Missing
@@ -108,7 +110,7 @@ internal sealed class UnifiedOcrEngine : IDisposable
         WriteField(byLabel.GetValueOrDefault("time"), 1, rightAlign: true, source, _fieldValues, readable, "time");
         WriteField(byLabel.GetValueOrDefault("transfer_status"), 2, rightAlign: false, source, _fieldValues, readable, "transfer_status");
         WriteField(byLabel.GetValueOrDefault("payment_method_field"), 3, rightAlign: true, source, _fieldValues, readable, "payment_method_field");
-        // Architecture v12 freezes channel 4 as white. Recipient text is read
+        // Architectures v12/v13 freeze channel 4 as white. Recipient text is read
         // only from the separate high-resolution input below.
         WriteRecipient(byLabel.GetValueOrDefault("recipient_field"), source, _recipientValues, readable);
 
@@ -155,20 +157,54 @@ internal sealed class UnifiedOcrEngine : IDisposable
             }
 
             string? statusCandidate = null;
+            string? statusNormalized = null;
             float? statusConfidence = null;
             if (readable.Contains("transfer_status"))
             {
-                var status = DecodeClass(outputs["status_logits"]);
-                statusCandidate = _bundle.StatusClasses[status.Index];
-                statusConfidence = status.Confidence;
+                if (_bundle.StatusTextCharacters is not null)
+                {
+                    var output = outputs[UnifiedOcrBundle.StatusTextOutputName];
+                    var statusText = UnifiedStatusTextDecoder.Decode(
+                        output.Values.Span,
+                        output.Shape[0],
+                        output.Shape[1],
+                        _bundle.StatusTextCharacters);
+                    if (!string.IsNullOrWhiteSpace(statusText.Text))
+                    {
+                        statusCandidate = statusText.Text;
+                        statusNormalized = statusText.Normalized;
+                        statusConfidence = statusText.Confidence;
+                    }
+                }
+                else if (_bundle.StatusRuntimePolicy == "classify")
+                {
+                    // Legacy v12 classifiers are consumed only when their
+                    // audited contract explicitly permits classification.
+                    // review_only logits are untrained diagnostics and must
+                    // never escape as a status candidate.
+                    var status = DecodeClass(outputs["status_logits"]);
+                    statusCandidate = _bundle.StatusClasses[status.Index];
+                    statusNormalized = statusCandidate;
+                    statusConfidence = status.Confidence;
+                }
             }
+
+            var effectiveStatusPolicy = _bundle.HasStatusTextCtc
+                ? UnifiedOcrBundle.StatusTextRuntimePolicy
+                : _bundle.StatusRuntimePolicy;
+            var statusDeliveryValue = !_bundle.HasStatusTextCtc && _bundle.StatusRuntimePolicy == "classify"
+                ? statusNormalized ?? "review"
+                : _bundle.HasStatusTextCtc
+                    ? "review"
+                    : _bundle.StatusReviewValue ?? "review";
 
             result = new UnifiedOcrReadResult(
                 candidates,
                 statusCandidate,
+                statusNormalized,
                 statusConfidence,
-                _bundle.StatusRuntimePolicy == "classify" ? statusCandidate ?? "review" : _bundle.StatusReviewValue ?? "review",
-                _bundle.StatusRuntimePolicy,
+                statusDeliveryValue,
+                effectiveStatusPolicy,
                 _bundle.TextReviewValue,
                 _bundle.TextRuntimePolicy);
         }
@@ -245,10 +281,10 @@ internal sealed class UnifiedOcrEngine : IDisposable
     private Dictionary<string, OrtOutput> ReadOutputViews(IDisposableReadOnlyCollection<DisposableNamedOnnxValue> runtimeOutputs)
     {
         var names = runtimeOutputs.Select(output => output.Name).ToArray();
-        if (!HasExactNames(names, UnifiedOcrBundle.OutputNames))
+        if (!HasExactNames(names, _bundle.OutputNames))
         {
             throw new InvalidOperationException(
-                $"Unified OCR runtime outputs differ from its v12 contract: [{string.Join(',', names)}]");
+                $"Unified OCR runtime outputs differ from its architecture-v{_bundle.ArchitectureVersion} contract: [{string.Join(',', names)}]");
         }
 
         var output = new Dictionary<string, OrtOutput>(StringComparer.Ordinal);
@@ -540,18 +576,18 @@ internal sealed class UnifiedOcrEngine : IDisposable
         if (!HasExactNames(inputNames, InputNames))
         {
             throw new InvalidOperationException(
-                $"Unified OCR runtime inputs differ from its v12 contract: [{string.Join(',', inputNames)}]");
+                $"Unified OCR runtime inputs differ from its architecture-v{_bundle.ArchitectureVersion} contract: [{string.Join(',', inputNames)}]");
         }
         VerifyRuntimeShape(_session.InputMetadata[FieldImagesInput].Dimensions, [5, 1, _bundle.FieldHeight, _bundle.FieldWidth], FieldImagesInput);
         VerifyRuntimeShape(_session.InputMetadata[RecipientValueInput].Dimensions, [1, 1, _bundle.RecipientHeight, _bundle.RecipientWidth], RecipientValueInput);
 
         var outputNames = _session.OutputMetadata.Keys.ToArray();
-        if (!HasExactNames(outputNames, UnifiedOcrBundle.OutputNames))
+        if (!HasExactNames(outputNames, _bundle.OutputNames))
         {
             throw new InvalidOperationException(
-                $"Unified OCR runtime outputs differ from its v12 contract: [{string.Join(',', outputNames)}]");
+                $"Unified OCR runtime outputs differ from its architecture-v{_bundle.ArchitectureVersion} contract: [{string.Join(',', outputNames)}]");
         }
-        foreach (var outputName in UnifiedOcrBundle.OutputNames)
+        foreach (var outputName in _bundle.OutputNames)
         {
             VerifyRuntimeShape(_session.OutputMetadata[outputName].Dimensions, _bundle.OutputShapes[outputName], outputName);
         }
@@ -568,7 +604,7 @@ internal sealed class UnifiedOcrEngine : IDisposable
 
     /// <summary>
     /// ONNX Runtime exposes metadata/output collections, but does not promise
-    /// their enumeration order. The v12 ABI is a fixed named ABI, so require
+    /// their enumeration order. The versioned ABI is a fixed named ABI, so require
     /// exactly the names from the contract without treating collection order
     /// as part of the runtime contract.
     /// </summary>

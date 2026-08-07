@@ -10,5 +10,8 @@
     <!-- Compile the production decoder itself so the contract tests need no
          test framework or inference-runtime package restore. -->
     <Compile Include="..\ReceiptMlNet.Cli\UnifiedCtcDecoder.cs" Link="UnifiedCtcDecoder.cs" />
+    <Compile Include="..\ReceiptMlNet.Cli\UnifiedStatusTextDecoder.cs" Link="UnifiedStatusTextDecoder.cs" />
+    <Compile Include="..\ReceiptMlNet.Cli\ReceiptFieldNormalizer.cs" Link="ReceiptFieldNormalizer.cs" />
+    <Compile Include="..\ReceiptMlNet.Cli\ReceiptResultCacheContract.cs" Link="ReceiptResultCacheContract.cs" />
   </ItemGroup>
 </Project>

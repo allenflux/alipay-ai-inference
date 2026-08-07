@@ -3,14 +3,20 @@ using System.Text;
 using System.Text.Json;
 
 /// <summary>
-/// Immutable, verified delivery description for the v12 unified receipt
+/// Immutable, verified delivery description for a v12/v13 unified receipt
 /// reader.  The reader is deliberately loaded only from the adjacent ONNX,
 /// labels, and contract sidecars: a hand-edited model or mismatched decoder
 /// vocabulary must fail before a session is created.
 /// </summary>
 internal sealed class UnifiedOcrBundle
 {
-    public const string Kind = "receipt_unified_field_reader_v12";
+    public const string KindV12 = "receipt_unified_field_reader_v12";
+    public const string KindV13 = "receipt_unified_field_reader_v13";
+    public const string StatusTextOutputName = "status_text_logits";
+    public const string StatusTextRuntimePolicy = "decode_and_normalize_review_only";
+    public const string StatusTextTarget = "visible_transfer_status_text";
+    public const string StatusTextCharsetSource = "train_only_visible_transfer_status_text";
+    public const string StatusTextNormalizer = "normalize_status";
 
     public static readonly string[] SlotOrder =
     [
@@ -21,7 +27,7 @@ internal sealed class UnifiedOcrBundle
         "recipient_field",
     ];
 
-    public static readonly string[] OutputNames =
+    private static readonly string[] V12OutputNames =
     [
         "amount_logits",
         "time_logits",
@@ -38,6 +44,12 @@ internal sealed class UnifiedOcrBundle
         "payment_structure_logits",
         "payment_parentheses_logits",
         "recipient_logits",
+    ];
+
+    private static readonly string[] V13OutputNames =
+    [
+        .. V12OutputNames,
+        StatusTextOutputName,
     ];
 
     private static readonly string[] ExpectedAmountCharacters = "0123456789.-".Select(value => value.ToString()).ToArray();
@@ -66,6 +78,7 @@ internal sealed class UnifiedOcrBundle
 
     private UnifiedOcrBundle(
         string modelPath,
+        int architectureVersion,
         string labelsPath,
         string contractPath,
         string modelSha256,
@@ -83,6 +96,7 @@ internal sealed class UnifiedOcrBundle
         IReadOnlyList<string> recipientCharacters,
         IReadOnlyList<string> paymentBankPrefixClasses,
         IReadOnlyList<string> statusClasses,
+        IReadOnlyList<string>? statusTextCharacters,
         IReadOnlyDictionary<string, int[]> outputShapes,
         string statusRuntimePolicy,
         string? statusReviewValue,
@@ -90,6 +104,7 @@ internal sealed class UnifiedOcrBundle
         string textReviewValue)
     {
         ModelPath = modelPath;
+        ArchitectureVersion = architectureVersion;
         LabelsPath = labelsPath;
         ContractPath = contractPath;
         ModelSha256 = modelSha256;
@@ -107,6 +122,8 @@ internal sealed class UnifiedOcrBundle
         RecipientCharacters = recipientCharacters;
         PaymentBankPrefixClasses = paymentBankPrefixClasses;
         StatusClasses = statusClasses;
+        StatusTextCharacters = statusTextCharacters;
+        OutputNames = architectureVersion == 13 ? V13OutputNames : V12OutputNames;
         OutputShapes = outputShapes;
         StatusRuntimePolicy = statusRuntimePolicy;
         StatusReviewValue = statusReviewValue;
@@ -115,6 +132,7 @@ internal sealed class UnifiedOcrBundle
     }
 
     public string ModelPath { get; }
+    public int ArchitectureVersion { get; }
     public string LabelsPath { get; }
     public string ContractPath { get; }
     public string ModelSha256 { get; }
@@ -132,6 +150,9 @@ internal sealed class UnifiedOcrBundle
     public IReadOnlyList<string> RecipientCharacters { get; }
     public IReadOnlyList<string> PaymentBankPrefixClasses { get; }
     public IReadOnlyList<string> StatusClasses { get; }
+    public IReadOnlyList<string>? StatusTextCharacters { get; }
+    public bool HasStatusTextCtc => StatusTextCharacters is not null;
+    public IReadOnlyList<string> OutputNames { get; }
     public IReadOnlyDictionary<string, int[]> OutputShapes { get; }
     public string StatusRuntimePolicy { get; }
     public string? StatusReviewValue { get; }
@@ -160,7 +181,7 @@ internal sealed class UnifiedOcrBundle
         var contract = contractDocument.RootElement;
 
         RequireInteger(contract, "schema_version", contractPath, 1);
-        RequireString(contract, "kind", contractPath, Kind);
+        var artifactKind = RequireStringValue(contract, "kind", contractPath);
         RequireString(contract, "onnx_file", contractPath, Path.GetFileName(fullModelPath));
         RequireString(contract, "labels_file", contractPath, Path.GetFileName(labelsPath));
         var modelSha256 = Sha256(fullModelPath);
@@ -171,7 +192,19 @@ internal sealed class UnifiedOcrBundle
         RequireStringArray(contract, "slot_order", contractPath, SlotOrder);
 
         var model = RequireObject(contract, "model", contractPath);
-        RequireInteger(model, "architecture_version", contractPath, 12);
+        var architectureVersion = RequirePositiveInteger(model, "architecture_version", contractPath, minimum: 1);
+        var expectedKind = architectureVersion switch
+        {
+            12 => KindV12,
+            13 => KindV13,
+            _ => throw ContractError(contractPath, "model.architecture_version must be 12 or 13"),
+        };
+        if (!string.Equals(artifactKind, expectedKind, StringComparison.Ordinal))
+        {
+            throw ContractError(
+                contractPath,
+                $"kind must be '{expectedKind}' for architecture_version={architectureVersion}, found '{artifactKind}'");
+        }
         var fieldHeight = RequirePositiveInteger(model, "image_height", contractPath, minimum: 16);
         var fieldWidth = RequirePositiveInteger(model, "image_width", contractPath, minimum: 64);
         var recipientHeight = RequirePositiveInteger(model, "recipient_input_height", contractPath, minimum: 16);
@@ -201,6 +234,40 @@ internal sealed class UnifiedOcrBundle
         RequireHash(labels, "recipient_charset_sha256", Sha256Utf8(string.Concat(recipientCharacters)), labelsPath);
         var statusClasses = RequireStringList(labels, "status_classes", labelsPath, oneRuneEach: false);
         RequireSequence(statusClasses, ExpectedStatusClasses, labelsPath, "status_classes");
+        IReadOnlyList<string>? statusTextCharacters = null;
+        if (architectureVersion == 13)
+        {
+            RequireInteger(labels, "status_text_blank_index", labelsPath, 0);
+            statusTextCharacters = RequireStringList(
+                labels,
+                "status_text_characters",
+                labelsPath,
+                oneRuneEach: true);
+            RequireUnique(statusTextCharacters, labelsPath, "status_text_characters");
+            RequireSorted(statusTextCharacters, labelsPath, "status_text_characters");
+            RequireString(labels, "status_text_charset_source", labelsPath, StatusTextCharsetSource);
+            RequireString(contract, "status_text_charset_source", contractPath, StatusTextCharsetSource);
+            RequireString(labels, "status_text_target", labelsPath, StatusTextTarget);
+            RequireString(contract, "status_text_target", contractPath, StatusTextTarget);
+            RequireString(labels, "status_text_runtime_policy", labelsPath, StatusTextRuntimePolicy);
+            RequireString(contract, "status_text_runtime_policy", contractPath, StatusTextRuntimePolicy);
+            var statusTextCharsetSha256 = Sha256Utf8(string.Concat(statusTextCharacters));
+            RequireHash(labels, "status_text_charset_sha256", statusTextCharsetSha256, labelsPath);
+            RequireHash(contract, "status_text_charset_sha256", statusTextCharsetSha256, contractPath);
+        }
+        else if (labels.TryGetProperty("status_text_blank_index", out _)
+            || labels.TryGetProperty("status_text_characters", out _)
+            || labels.TryGetProperty("status_text_charset_source", out _)
+            || labels.TryGetProperty("status_text_charset_sha256", out _)
+            || labels.TryGetProperty("status_text_target", out _)
+            || labels.TryGetProperty("status_text_runtime_policy", out _)
+            || contract.TryGetProperty("status_text_charset_source", out _)
+            || contract.TryGetProperty("status_text_charset_sha256", out _)
+            || contract.TryGetProperty("status_text_target", out _)
+            || contract.TryGetProperty("status_text_runtime_policy", out _))
+        {
+            throw ContractError(labelsPath, "v12 artifacts must not declare the v13 status-text CTC vocabulary");
+        }
 
         var paymentBankPrefixClasses = RequireStringList(labels, "payment_bank_prefix_classes", labelsPath, oneRuneEach: false);
         if (paymentBankPrefixClasses.Count < 2 || !string.Equals(paymentBankPrefixClasses[0], "__other__", StringComparison.Ordinal))
@@ -236,18 +303,24 @@ internal sealed class UnifiedOcrBundle
         {
             throw ContractError(contractPath, "status_head_policy.runtime_policy must be review_only or classify");
         }
+        if (architectureVersion == 13 && statusRuntimePolicy != "review_only")
+        {
+            throw ContractError(
+                contractPath,
+                "v13 status_logits must remain review_only because visible status text supersedes the legacy classifier");
+        }
 
         var primaryInput = RequireObject(contract, "input", contractPath);
         ValidateInput(primaryInput, "field_images", [5, 1, fieldHeight, fieldWidth], contractPath);
         var inputs = RequireArray(contract, "inputs", contractPath);
         if (inputs.GetArrayLength() != 2 || !JsonDeepEquals(inputs[0], primaryInput))
         {
-            throw ContractError(contractPath, "v12 contract must declare exactly two ordered ONNX inputs with input as the first entry");
+            throw ContractError(contractPath, $"v{architectureVersion} contract must declare exactly two ordered ONNX inputs with input as the first entry");
         }
         var recipientInput = inputs[1];
         if (recipientInput.ValueKind != JsonValueKind.Object)
         {
-            throw ContractError(contractPath, "v12 recipient input contract must be an object");
+            throw ContractError(contractPath, $"v{architectureVersion} recipient input contract must be an object");
         }
         ValidateInput(recipientInput, "recipient_value_image", [1, 1, recipientHeight, recipientWidth], contractPath);
         RequireString(recipientInput, "absent_slot_policy", contractPath, WhitePlaceholderPolicy);
@@ -257,7 +330,8 @@ internal sealed class UnifiedOcrBundle
 
         var outputs = RequireObject(contract, "outputs", contractPath);
         var outputNames = outputs.EnumerateObject().Select(value => value.Name).OrderBy(value => value, StringComparer.Ordinal).ToArray();
-        var expectedOutputNames = OutputNames.OrderBy(value => value, StringComparer.Ordinal).ToArray();
+        var versionedOutputNames = architectureVersion == 13 ? V13OutputNames : V12OutputNames;
+        var expectedOutputNames = versionedOutputNames.OrderBy(value => value, StringComparer.Ordinal).ToArray();
         RequireSequence(outputNames, expectedOutputNames, contractPath, "outputs");
         var expectedOutputShapes = new Dictionary<string, int[]>(StringComparer.Ordinal)
         {
@@ -277,11 +351,19 @@ internal sealed class UnifiedOcrBundle
             ["payment_parentheses_logits"] = [ExpectedPaymentParenthesisClasses.Length],
             ["recipient_logits"] = [recipientWidth / 4, recipientCharacters.Count + 1],
         };
+        if (architectureVersion == 13)
+        {
+            if (statusTextCharacters is null)
+            {
+                throw new InvalidOperationException("Verified v13 status-text characters are missing");
+            }
+            expectedOutputShapes[StatusTextOutputName] = [fieldWidth / 4, statusTextCharacters.Count + 1];
+        }
         foreach (var (name, shape) in expectedOutputShapes)
         {
             var output = RequireObject(outputs, name, contractPath);
             RequireIntArray(output, "shape", contractPath, shape);
-            if (name is "amount_logits" or "time_logits" or "payment_logits" or "payment_prefix_logits" or "recipient_logits")
+            if (name is "amount_logits" or "time_logits" or "payment_logits" or "payment_prefix_logits" or "recipient_logits" or StatusTextOutputName)
             {
                 RequireInteger(output, "blank_index", contractPath, 0);
             }
@@ -310,8 +392,21 @@ internal sealed class UnifiedOcrBundle
             throw ContractError(contractPath, "review-only status output must use review_value=review");
         }
 
+        if (architectureVersion == 13)
+        {
+            var statusTextOutput = RequireObject(outputs, StatusTextOutputName, contractPath);
+            RequireString(statusTextOutput, "layout", contractPath, "[time,class]");
+            RequireString(statusTextOutput, "decoder", contractPath, "ctc_greedy");
+            RequireString(statusTextOutput, "characters", contractPath, "status_text_characters");
+            RequireString(statusTextOutput, "target", contractPath, StatusTextTarget);
+            RequireString(statusTextOutput, "runtime_policy", contractPath, StatusTextRuntimePolicy);
+            RequireString(statusTextOutput, "review_value", contractPath, ReviewValue);
+            RequireString(statusTextOutput, "normalizer", contractPath, StatusTextNormalizer);
+        }
+
         return new UnifiedOcrBundle(
             fullModelPath,
+            architectureVersion,
             labelsPath,
             contractPath,
             modelSha256,
@@ -329,6 +424,7 @@ internal sealed class UnifiedOcrBundle
             recipientCharacters,
             paymentBankPrefixClasses,
             statusClasses,
+            statusTextCharacters,
             expectedOutputShapes,
             statusRuntimePolicy,
             statusReviewValue,

@@ -52,7 +52,7 @@ from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
-from .ocr import clean_text, extract_field_value, parse_anchored_recipient_row
+from .ocr import clean_text, extract_field_value, normalize_status, parse_anchored_recipient_row
 from .ocr_unified_targets import (
     parse_amount_aux_target,
     parse_amount_display_target,
@@ -73,24 +73,29 @@ KIND_V9 = "receipt_unified_field_dataset_v2"
 KIND_V10 = "receipt_unified_field_dataset_v3"
 KIND_V11 = "receipt_unified_field_dataset_v4"
 KIND_V12 = "receipt_unified_field_dataset_v5"
+KIND_V13 = "receipt_unified_field_dataset_v6"
 KIND = KIND_V8
 SLOT_ORDER = ("amount", "time", "transfer_status", "payment_method_field")
 V9_SLOT_ORDER = (*SLOT_ORDER, "recipient_field")
 V10_SLOT_ORDER = V9_SLOT_ORDER
 V11_SLOT_ORDER = V9_SLOT_ORDER
 V12_SLOT_ORDER = V11_SLOT_ORDER
+V13_SLOT_ORDER = V12_SLOT_ORDER
 ARCHITECTURE_V8 = "v8"
 ARCHITECTURE_V9 = "v9"
 ARCHITECTURE_V10 = "v10"
 ARCHITECTURE_V11 = "v11"
 ARCHITECTURE_V12 = "v12"
+ARCHITECTURE_V13 = "v13"
 STATUS_CLASSES = ("success", "pending", "failed")
 
 # V12 deliberately reuses the fully-audited v11 recipient labels.  Only the
 # reader-side pixels change: it receives a dedicated high-resolution value
 # view, while this manifest continues to store the original crop and the
 # anchored business-value target.
-_ANCHORED_RECIPIENT_ARCHITECTURES = frozenset((ARCHITECTURE_V11, ARCHITECTURE_V12))
+_ANCHORED_RECIPIENT_ARCHITECTURES = frozenset(
+    (ARCHITECTURE_V11, ARCHITECTURE_V12, ARCHITECTURE_V13)
+)
 
 # These are deliberately narrow, high-signal markers of a detector crop that
 # reached into the adjacent payment/balance row.  Merchant names remain open
@@ -116,7 +121,7 @@ def _dataset_spec(architecture: str) -> tuple[str, str, tuple[str, ...]]:
     five-slot artifact be fed to an incompatible runtime.
     """
     if not isinstance(architecture, str):
-        raise ValueError("architecture must be v8, v9, v10, v11, or v12")
+        raise ValueError("architecture must be v8, v9, v10, v11, v12, or v13")
     normalized = architecture.strip().casefold()
     if normalized == ARCHITECTURE_V8:
         return ARCHITECTURE_V8, KIND_V8, SLOT_ORDER
@@ -128,7 +133,9 @@ def _dataset_spec(architecture: str) -> tuple[str, str, tuple[str, ...]]:
         return ARCHITECTURE_V11, KIND_V11, V11_SLOT_ORDER
     if normalized == ARCHITECTURE_V12:
         return ARCHITECTURE_V12, KIND_V12, V12_SLOT_ORDER
-    raise ValueError("architecture must be v8, v9, v10, v11, or v12")
+    if normalized == ARCHITECTURE_V13:
+        return ARCHITECTURE_V13, KIND_V13, V13_SLOT_ORDER
+    raise ValueError("architecture must be v8, v9, v10, v11, v12, or v13")
 
 
 def slot_order_for_architecture(architecture: str) -> tuple[str, ...]:
@@ -489,7 +496,7 @@ def _slot_payload(
     if field == "transfer_status":
         if semantic_value not in STATUS_CLASSES:
             return None
-        return {
+        payload = {
             "image": str(record["image"]),
             "class_name": semantic_value,
             "paddle_text": record.get("paddle_text"),
@@ -497,6 +504,59 @@ def _slot_payload(
             "detector_score": record.get("detector_score"),
             "crop_sha256": record.get("crop_sha256"),
         }
+        if architecture == ARCHITECTURE_V13:
+            audit: dict[str, object] = {
+                "target": "visible_transfer_status_text",
+                "decision": "missing",
+                "source": None,
+                "reason": None,
+                "semantic_value": semantic_value,
+                "record_text": (
+                    clean_text(record["text"]) if isinstance(record.get("text"), str) else ""
+                ),
+                "paddle_text": (
+                    clean_text(record["paddle_text"])
+                    if isinstance(record.get("paddle_text"), str)
+                    else ""
+                ),
+            }
+            candidates = (
+                ("record_text", record.get("text")),
+                ("paddle_text_fallback", record.get("paddle_text")),
+            )
+            rejection_reasons: list[str] = []
+            for source, raw_text in candidates:
+                if not isinstance(raw_text, str):
+                    rejection_reasons.append(f"{source}:not_a_string")
+                    continue
+                visible_text = clean_text(raw_text)
+                if not visible_text:
+                    rejection_reasons.append(f"{source}:empty")
+                    continue
+                if any(not character.isprintable() for character in visible_text):
+                    rejection_reasons.append(f"{source}:non_printable")
+                    continue
+                normalized = normalize_status(visible_text)
+                if normalized != semantic_value:
+                    rejection_reasons.append(
+                        f"{source}:normalizes_to_{normalized}_not_{semantic_value}"
+                    )
+                    continue
+                payload["text"] = visible_text
+                payload["semantic_value"] = semantic_value
+                payload["status_text_source"] = source
+                audit.update(
+                    {
+                        "decision": "accepted",
+                        "source": source,
+                        "reason": "visible_text_normalizes_to_class_name",
+                    }
+                )
+                break
+            if "text" not in payload:
+                audit["reason"] = ";".join(rejection_reasons) or "no_visible_text_candidate"
+            payload["status_text_audit"] = audit
+        return payload
     if field == "payment_method_field":
         # Keep the visible value, not the broad semantic category.  A payment
         # row may contain the label itself; strip it conservatively so the CTC
@@ -585,7 +645,14 @@ def _slot_payload(
 def _target_signature(field: str, slot: Mapping[str, object]) -> str:
     """Return the supervised target used to decide whether a duplicate conflicts."""
     if field == "transfer_status":
-        return str(slot["class_name"])
+        # v13 adds visible-text supervision.  Two duplicate crops that agree
+        # only on the broad semantic class but disagree on their OCR target
+        # are not interchangeable training labels.
+        return json.dumps(
+            [slot["class_name"], slot.get("text")],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
     return str(slot["text"])
 
 
@@ -655,6 +722,79 @@ def _recipient_charset_payload(
     }
 
 
+def _status_text_charset_payload(records: Iterable[Mapping[str, object]]) -> dict[str, object]:
+    """Freeze v13's visible-status alphabet from train labels only.
+
+    Held-out Unicode is recorded as OOV evidence and never appended to the
+    deployable map.  Slots without safe visible text remain useful legacy
+    status-class provenance but are excluded from CTC supervision.
+    """
+    stable_records = list(records)
+    charset = sorted(
+        {
+            glyph
+            for record in stable_records
+            if str(record["split"]) == "train"
+            for slot in [dict(record["slots"]).get("transfer_status")]
+            if isinstance(slot, Mapping)
+            for text in [slot.get("text")]
+            if isinstance(text, str)
+            for glyph in text
+        }
+    )
+    known = set(charset)
+    counters: dict[str, Counter[str]] = {split: Counter() for split in ("train", "val", "test")}
+    source_counts: Counter[str] = Counter()
+    missing_reasons: Counter[str] = Counter()
+    examples: dict[str, list[dict[str, str]]] = {split: [] for split in ("train", "val", "test")}
+    for record in stable_records:
+        split = str(record["split"])
+        slot = dict(record["slots"]).get("transfer_status")
+        if not isinstance(slot, Mapping):
+            continue
+        audit = slot.get("status_text_audit")
+        if isinstance(audit, Mapping):
+            if audit.get("decision") == "accepted":
+                source_counts[str(audit.get("source", "unspecified"))] += 1
+            else:
+                missing_reasons[str(audit.get("reason", "unspecified"))] += 1
+        text = slot.get("text")
+        if not isinstance(text, str):
+            counters[split]["missing_text_records"] += 1
+            continue
+        counters[split]["records"] += 1
+        unknown = sorted(set(text) - known)
+        if unknown:
+            counters[split]["oov_records"] += 1
+            counters[split]["oov_characters"] += len(unknown)
+            if len(examples[split]) < 20:
+                examples[split].append(
+                    {
+                        "id": str(record["id"]),
+                        "characters": "".join(unknown),
+                        "text": text,
+                    }
+                )
+    return {
+        "source": "train_only_visible_transfer_status_text",
+        "characters": charset,
+        "sha256": hashlib.sha256("".join(charset).encode("utf-8")).hexdigest(),
+        "target": "visible_transfer_status_text",
+        "source_counts": dict(sorted(source_counts.items())),
+        "missing_reasons": dict(sorted(missing_reasons.items())),
+        "oov_by_split": {
+            split: {
+                "records": int(counters[split]["records"]),
+                "missing_text_records": int(counters[split]["missing_text_records"]),
+                "oov_records": int(counters[split]["oov_records"]),
+                "oov_characters": int(counters[split]["oov_characters"]),
+                "examples": examples[split],
+            }
+            for split in ("train", "val", "test")
+        },
+    }
+
+
 def build_unified_dataset(
     *,
     records_path: Path,
@@ -691,7 +831,7 @@ def build_unified_dataset(
     if architecture not in _ANCHORED_RECIPIENT_ARCHITECTURES and (
         recipient_min_crop_aspect != 0.0 or recipient_max_visible_chars != 0
     ):
-        raise ValueError("recipient geometry options are supported only by architecture v11 or v12")
+        raise ValueError("recipient geometry options are supported only by architecture v11, v12, or v13")
     dataset_root, records, rejected = _read_flat_records(records_path, slot_order=slot_order)
     output_dir = output_dir.resolve()
     if output_dir.exists() and any(output_dir.iterdir()):
@@ -934,6 +1074,7 @@ def build_unified_dataset(
             ARCHITECTURE_V10: "visible_recipient_line_then_extract_value",
             ARCHITECTURE_V11: "anchored_recipient_value_with_value_view_crop",
             ARCHITECTURE_V12: "anchored_recipient_value_with_dedicated_high_resolution_value_view",
+            ARCHITECTURE_V13: "anchored_recipient_value_with_dedicated_high_resolution_value_view",
         }[architecture]
         recipient_charset_characters = list(recipient_charset["characters"])
         summary["recipient_charset"] = recipient_charset_characters
@@ -976,6 +1117,22 @@ def build_unified_dataset(
             "by_split": quality_by_split,
             "scope": "valid flat recipient_field records read from the source manifest",
         }
+    status_text_charset_characters: list[str] | None = None
+    if architecture == ARCHITECTURE_V13:
+        status_text_charset = _status_text_charset_payload(unified_records)
+        status_text_charset_characters = list(status_text_charset["characters"])
+        if not status_text_charset_characters:
+            raise ValueError(
+                "No safe visible transfer-status text remains in the train split for v13 CTC supervision"
+            )
+        summary["status_text_target"] = status_text_charset["target"]
+        summary["status_text_charset"] = status_text_charset_characters
+        summary["status_text_charset_sha256"] = status_text_charset["sha256"]
+        summary["status_text_charset_source"] = status_text_charset["source"]
+        summary["status_text_source_counts"] = status_text_charset["source_counts"]
+        summary["status_text_missing_reasons"] = status_text_charset["missing_reasons"]
+        summary["status_text_oov_by_split"] = status_text_charset["oov_by_split"]
+
     _atomic_write_jsonl(output_dir / "unified_fields.jsonl", unified_records)
     _atomic_write_jsonl(output_dir / "rejected.jsonl", rejected)
     if architecture in _ANCHORED_RECIPIENT_ARCHITECTURES:
@@ -986,6 +1143,13 @@ def build_unified_dataset(
         _atomic_write_text(
             output_dir / "recipient_charset.txt",
             "".join(recipient_charset_characters) + "\n",
+        )
+    if architecture == ARCHITECTURE_V13:
+        if status_text_charset_characters is None:
+            raise AssertionError("v13 status-text charset was not initialized")
+        _atomic_write_text(
+            output_dir / "status_text_charset.txt",
+            "".join(status_text_charset_characters) + "\n",
         )
     _atomic_write_json(output_dir / "dataset.contract.json", summary)
     return summary
@@ -1005,13 +1169,15 @@ def build_parser() -> argparse.ArgumentParser:
             ARCHITECTURE_V10,
             ARCHITECTURE_V11,
             ARCHITECTURE_V12,
+            ARCHITECTURE_V13,
         ),
         default=ARCHITECTURE_V8,
         help=(
             "v8 keeps four slots; v9 appends recipient_field with a value-only CTC target; "
             "v10 keeps five slots but trains recipient CTC on the visible full line; "
             "v11 filters recipient rows to an anchored clean value-view contract; "
-            "v12 reuses v11's anchored labels for a dedicated high-resolution recipient view"
+            "v12 reuses v11's anchored labels for a dedicated high-resolution recipient view; "
+            "v13 adds visible transfer-status CTC supervision without changing the five input slots"
         ),
     )
     parser.add_argument(

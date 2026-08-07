@@ -124,7 +124,9 @@ internal static class ReceiptMlNetProgram
         }
         if (unifiedOcrEngine is not null)
         {
-            Console.WriteLine($"Unified OCR ONNX execution provider: {unifiedOcrEngine.ExecutionProvider} (one v12 session/run per receipt)");
+            Console.WriteLine(
+                $"Unified OCR ONNX execution provider: {unifiedOcrEngine.ExecutionProvider} "
+                + $"(one v{unifiedOcrEngine.ArchitectureVersion} session/run per receipt)");
         }
 
         foreach (var workItem in workItems)
@@ -322,6 +324,8 @@ internal static class ReceiptMlNetProgram
 
         var rectificationGeometry = rectification.Geometry();
         return new ReceiptResult(
+            ReceiptResultCacheContract.SchemaVersion,
+            ReceiptResultCacheContract.SemanticsVersion,
             Path.GetFullPath(inputFile),
             "mlnet",
             new DetectorGeometry(
@@ -348,8 +352,8 @@ internal static class ReceiptMlNetProgram
                 ocrEngine is not null
                     ? "OCR uses the verified PP-OCR ONNX delivery bundle on the selected rectified image."
                     : unifiedOcrEngine is not null
-                        ? "OCR uses the verified architecture-v12 unified ONNX reader in one session/run per receipt. Its current text/status contract is review-only: candidates are diagnostic and delivered values fail closed to review."
-                        : "OCR field extraction is disabled; use --ocr onnx --ocr-bundle <delivery-directory> or --ocr unified --ocr-model <v12-reader.onnx> to enable it.",
+                        ? $"OCR uses the verified architecture-v{unifiedOcrEngine.ArchitectureVersion} unified ONNX reader in one session/run per receipt. Its current text/status contract is review-only: candidates are diagnostic and delivered values fail closed to review."
+                        : "OCR field extraction is disabled; use --ocr onnx --ocr-bundle <delivery-directory> or --ocr unified --ocr-model <v12-or-v13-reader.onnx> to enable it.",
             });
     }
 
@@ -502,9 +506,9 @@ internal static class ReceiptMlNetProgram
     }
 
     /// <summary>
-    /// Keep v12 candidate diagnostics in the JSON, but do not promote
+    /// Keep v12/v13 candidate diagnostics in the JSON, but do not promote
     /// Paddle-derived pseudo-label text into a business value.  The persisted
-    /// v12 contract decides delivery policy, which is currently review-only.
+    /// review-only contract keeps the delivered value at review.
     /// </summary>
     private static ReceiptFields BuildUnifiedFields(
         IReadOnlyList<DetectionResult> detections,
@@ -588,7 +592,7 @@ internal static class ReceiptMlNetProgram
         if (string.IsNullOrWhiteSpace(unifiedOcr.StatusCandidate))
         {
             return new ReceiptFieldResult(
-                "unreadable",
+                unifiedOcr.StatusDeliveryValue == "review" ? "review" : "unreadable",
                 null,
                 null,
                 null,
@@ -607,10 +611,18 @@ internal static class ReceiptMlNetProgram
             MathF.Round(detection.Score, 6),
             null,
             unifiedOcr.StatusDeliveryValue,
-            unifiedOcr.StatusRuntimePolicy == "classify" ? unifiedOcr.StatusCandidate : null,
+            unifiedOcr.StatusNormalized,
             null,
             null,
             Candidate: unifiedOcr.StatusCandidate,
+            CtcCandidate: unifiedOcr.StatusRuntimePolicy == UnifiedOcrBundle.StatusTextRuntimePolicy
+                ? unifiedOcr.StatusCandidate
+                : null,
+            CtcConfidence: unifiedOcr.StatusRuntimePolicy == UnifiedOcrBundle.StatusTextRuntimePolicy
+                ? unifiedOcr.StatusConfidence is null
+                    ? null
+                    : MathF.Round(unifiedOcr.StatusConfidence.Value, 6)
+                : null,
             DeliveryPolicy: unifiedOcr.StatusRuntimePolicy,
             DeliveryValue: unifiedOcr.StatusDeliveryValue);
     }
@@ -635,7 +647,8 @@ internal static class ReceiptMlNetProgram
         {
             using var document = JsonDocument.Parse(File.ReadAllBytes(outputPath));
             var requiresOcrFields = paddleOcr is not null || unifiedOcr is not null;
-            if ((requiresOcrFields
+            if (!ReceiptResultCacheContract.IsCurrent(document.RootElement)
+                || (requiresOcrFields
                     && (!document.RootElement.TryGetProperty("fields", out var fields)
                         || fields.ValueKind != JsonValueKind.Object))
                 || !document.RootElement.TryGetProperty("geometry", out var geometry)
@@ -1613,7 +1626,7 @@ Usage:
     [--device-model <statusbar_device_v1.onnx>] \
     [--ocr none|onnx|unified] \
     [--ocr-bundle <paddle-ocr-delivery-directory>] \
-    [--ocr-model <receipt_unified_field_reader_v12.onnx>] \
+    [--ocr-model <receipt_unified_field_reader_v12_or_v13.onnx>] \
     (--input <image-or-directory> | --input-list <txt>) --output <directory> \
     [--device auto|cpu|cuda:0] [--score-threshold 0.50] [--annotate all|flagged|none] \
     [--rectification none|max-side-1600] \
@@ -1621,8 +1634,8 @@ Usage:
     [--require-complete] [--continue-on-error] [--skip-existing] [--limit 100]
 
 This .NET CLI runs the receipt/device ONNX models and can optionally run a
-verified PP-OCR delivery bundle (--ocr onnx) or a v12 unified five-field OCR
-reader (--ocr unified). The two OCR modes are mutually exclusive. Unified OCR
+verified PP-OCR delivery bundle (--ocr onnx) or a v12/v13 unified five-field
+OCR reader (--ocr unified). The two OCR modes are mutually exclusive. Unified OCR
 requires its adjacent .labels.json and .contract.json sidecars and emits
 review-only delivery values until independently human-calibrated. It writes
 JSON and, by default, two annotated JPGs. It does not yet include perspective
@@ -1771,6 +1784,8 @@ perspective photos still require an externally rectified input.
 internal sealed class UsageException(string message) : Exception(message);
 
 internal sealed record ReceiptResult(
+    int ResultSchemaVersion,
+    string ResultSemanticsVersion,
     string Source,
     string InferenceEngine,
     DetectorGeometry Geometry,

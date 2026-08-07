@@ -365,9 +365,19 @@ function Read-UnifiedModelEvidence(
     if ($null -eq $labels `
         -or $null -eq $contract `
         -or [int]$labels.schema_version -ne 1 `
-        -or [int]$contract.schema_version -ne 1 `
-        -or [string]$contract.kind -ne "receipt_unified_field_reader_v12" `
-        -or [int]$contract.model.architecture_version -ne 12 `
+        -or [int]$contract.schema_version -ne 1) {
+        throw "Unified OCR labels or contract schema is inconsistent."
+    }
+    $artifactKind = [string]$contract.kind
+    $architectureVersion = [int]$contract.model.architecture_version
+    $expectedKind = switch ($architectureVersion) {
+        12 { "receipt_unified_field_reader_v12" }
+        13 { "receipt_unified_field_reader_v13" }
+        default {
+            throw "Unified OCR contract has an unsupported architecture_version: $architectureVersion"
+        }
+    }
+    if ($artifactKind -ne $expectedKind `
         -or [string]$contract.onnx_file -ne [IO.Path]::GetFileName($ModelPath) `
         -or [string]$contract.labels_file -ne [IO.Path]::GetFileName($labelsPath) `
         -or [string]$contract.onnx_sha256 -ne $modelSha256 `
@@ -375,6 +385,27 @@ function Read-UnifiedModelEvidence(
         -or [string]$contract.text_delivery_policy.runtime_policy -ne $RequiredTextPolicy `
         -or [string]$contract.text_delivery_policy.review_value -ne $RequiredReviewValue) {
         throw "Unified OCR model, labels, contract, or fail-closed text policy is inconsistent."
+    }
+    $statusTextOutputProperty = if ($null -eq $contract.outputs) {
+        $null
+    }
+    else {
+        $contract.outputs.PSObject.Properties["status_text_logits"]
+    }
+    $statusTextDeliveryPolicy = $null
+    $statusTextReviewValue = $null
+    if ($architectureVersion -eq 13) {
+        if ($null -eq $statusTextOutputProperty `
+            -or $null -eq $statusTextOutputProperty.Value `
+            -or [string]$statusTextOutputProperty.Value.runtime_policy -ne "decode_and_normalize_review_only" `
+            -or [string]$statusTextOutputProperty.Value.review_value -ne $RequiredReviewValue) {
+            throw "Unified OCR v13 status-text output is not decode-and-normalize review-only."
+        }
+        $statusTextDeliveryPolicy = [string]$statusTextOutputProperty.Value.runtime_policy
+        $statusTextReviewValue = [string]$statusTextOutputProperty.Value.review_value
+    }
+    elseif ($null -ne $statusTextOutputProperty) {
+        throw "Unified OCR v12 contract must not declare the v13 status_text_logits output."
     }
     return [pscustomobject]@{
         ModelPath = $ModelPath
@@ -386,9 +417,12 @@ function Read-UnifiedModelEvidence(
         ContractPath = $contractPath
         ContractFileName = [IO.Path]::GetFileName($contractPath)
         ContractSha256 = Get-Sha256 $contractPath
-        Kind = "receipt_unified_field_reader_v12"
+        Kind = $artifactKind
+        ArchitectureVersion = $architectureVersion
         TextDeliveryPolicy = $RequiredTextPolicy
         ReviewValue = $RequiredReviewValue
+        StatusTextDeliveryPolicy = $statusTextDeliveryPolicy
+        StatusTextReviewValue = $statusTextReviewValue
     }
 }
 
@@ -400,6 +434,35 @@ function Assert-DeclaredModelArtifacts(
     [object]$UnifiedEvidence,
     [string]$Description
 ) {
+    $versionedUnifiedBindingInvalid = $true
+    $unifiedDeclarationProperty = if ($null -eq $Declaration) {
+        $null
+    }
+    else {
+        $Declaration.PSObject.Properties["unified_ocr"]
+    }
+    if ($null -ne $unifiedDeclarationProperty -and $null -ne $unifiedDeclarationProperty.Value) {
+        $unifiedDeclaration = $unifiedDeclarationProperty.Value
+        $architectureProperty = $unifiedDeclaration.PSObject.Properties["architecture_version"]
+        $statusPolicyProperty = $unifiedDeclaration.PSObject.Properties["status_text_delivery_policy"]
+        $statusReviewProperty = $unifiedDeclaration.PSObject.Properties["status_text_review_value"]
+        if ([int]$UnifiedEvidence.ArchitectureVersion -eq 13) {
+            $versionedUnifiedBindingInvalid = (
+                $null -eq $architectureProperty `
+                -or [int]$architectureProperty.Value -ne 13 `
+                -or $null -eq $statusPolicyProperty `
+                -or [string]$statusPolicyProperty.Value -ne [string]$UnifiedEvidence.StatusTextDeliveryPolicy `
+                -or $null -eq $statusReviewProperty `
+                -or [string]$statusReviewProperty.Value -ne [string]$UnifiedEvidence.StatusTextReviewValue)
+        }
+        else {
+            # Legacy v12 declarations did not record architecture_version.
+            $versionedUnifiedBindingInvalid = (
+                ($null -ne $architectureProperty -and [int]$architectureProperty.Value -ne 12) `
+                -or $null -ne $statusPolicyProperty `
+                -or $null -ne $statusReviewProperty)
+        }
+    }
     if ($null -eq $Declaration `
         -or [string]$Declaration.detector.kind -ne [string]$DetectorEvidence.Kind `
         -or [string]$Declaration.detector.model_path -ne (Get-RelativePackagePath $DetectorEvidence.ModelPath $PackageRoot) `
@@ -419,7 +482,8 @@ function Assert-DeclaredModelArtifacts(
         -or [string]$Declaration.unified_ocr.contract_path -ne (Get-RelativePackagePath $UnifiedEvidence.ContractPath $PackageRoot) `
         -or [string]$Declaration.unified_ocr.contract_sha256 -ne [string]$UnifiedEvidence.ContractSha256 `
         -or [string]$Declaration.unified_ocr.text_delivery_policy -ne [string]$UnifiedEvidence.TextDeliveryPolicy `
-        -or [string]$Declaration.unified_ocr.review_value -ne [string]$UnifiedEvidence.ReviewValue) {
+        -or [string]$Declaration.unified_ocr.review_value -ne [string]$UnifiedEvidence.ReviewValue `
+        -or $versionedUnifiedBindingInvalid) {
         throw "$Description model artifact declaration does not match the delivered models and sidecars."
     }
 }
@@ -640,6 +704,35 @@ function Assert-ResultProvenanceAndPolicy(
             -or [string]$fieldValue -ne [string]$UnifiedEvidence.ReviewValue `
             -or [string]$deliveryValue -ne [string]$UnifiedEvidence.ReviewValue) {
             throw "Result $fieldName candidate escaped the review-only policy: $ResultPath"
+        }
+    }
+
+    if ([int]$UnifiedEvidence.ArchitectureVersion -eq 13) {
+        $statusProperty = $fieldsProperty.Value.PSObject.Properties["transfer_status"]
+        if ($null -eq $statusProperty -or $null -eq $statusProperty.Value) {
+            throw "V13 result has no transfer_status field object: $ResultPath"
+        }
+        $status = $statusProperty.Value
+        $policyProperty = $status.PSObject.Properties["delivery_policy"]
+        $stateProperty = $status.PSObject.Properties["state"]
+        $valueProperty = $status.PSObject.Properties["value"]
+        $deliveryValueProperty = $status.PSObject.Properties["delivery_value"]
+        $statusValue = if ($null -eq $valueProperty) { $null } else { $valueProperty.Value }
+        $statusDeliveryValue = if ($null -eq $deliveryValueProperty) { $null } else { $deliveryValueProperty.Value }
+        if ($null -eq $policyProperty `
+            -or [string]$policyProperty.Value -ne [string]$UnifiedEvidence.StatusTextDeliveryPolicy `
+            -or $null -eq $stateProperty) {
+            throw "V13 result transfer_status has incomplete review-only policy evidence: $ResultPath"
+        }
+        if ([string]$stateProperty.Value -eq "absent") {
+            if ($null -ne $statusValue -or $null -ne $statusDeliveryValue) {
+                throw "V13 result transfer_status delivered a value while absent: $ResultPath"
+            }
+        }
+        elseif ([string]$stateProperty.Value -ne "review" `
+            -or [string]$statusValue -ne [string]$UnifiedEvidence.StatusTextReviewValue `
+            -or [string]$statusDeliveryValue -ne [string]$UnifiedEvidence.StatusTextReviewValue) {
+            throw "V13 result transfer_status escaped the review-only policy: $ResultPath"
         }
     }
 }
