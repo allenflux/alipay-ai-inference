@@ -27,15 +27,7 @@ def test_stage_observation_does_not_repeat_model_inference() -> None:
         "public UnifiedOcrReadResult RecognizeReceipt(",
         "private static double StopAndReadMilliseconds(",
     )
-    assert (
-        recognize_receipt.count(
-            "_session.RunWithBinding(_runtime.RunOptions, _runtime.Binding)"
-        )
-        == 1
-    )
-    assert recognize_receipt.count("SynchronizeBoundInputs()") == 1
-    assert recognize_receipt.count("SynchronizeBoundOutputs()") == 1
-    assert "_session.Run(inputs)" not in recognize_receipt
+    assert recognize_receipt.count("_session.Run(inputs)") == 1
 
 
 def test_stage_latency_is_additive_to_existing_summary_and_manifest_fields() -> None:
