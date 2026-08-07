@@ -72,8 +72,13 @@ def test_hybrid_routes_only_recipient_after_v13_and_keeps_review_policy() -> Non
     assert 'paymentScore < 0.80f' in parser
     assert 'amountCenterY < recipientCenterY' in parser
     assert 'recipientCenterY < paymentCenterY' in parser
-    assert 'recipientBox[1] >= amountBox[3] - verticalTolerance' in parser
-    assert 'recipientBox[3] <= paymentBox[1] + verticalTolerance' in parser
+    assert 'recipientBox[1] >= amountBox[3] - amountVerticalTolerance' in parser
+    assert 'recipientBox[3] <= paymentBox[1] + paymentVerticalTolerance' in parser
+    assert 'paymentOverlapFraction > 0.45f' in parser
+    assert 'recipientDetectorScore >= 0.84f' in parser
+    assert 'AllowsExactCjkPaymentOverlapException' in parser
+    assert 'paymentOverlapFraction: 0.45f' in router
+    assert 'HasVerifiedCalibratedAlternativeRowLayout' in router
     assert 'recipientDetectorScore < 0.90f' in parser
     assert '!float.IsFinite(recipientDetectorScore)' in parser
     assert 'lines[0].Confidence < 0.80f' in parser
@@ -215,9 +220,20 @@ def test_recipient_parser_has_package_free_executable_contract_tests() -> None:
     assert "numeric merchant amount not exact" in harness
     assert "numeric merchant equals amount integer part" in harness
     assert "zero-padded numeric merchant equals amount integer part" in harness
+    assert "exact CJK overlap exception at 0.84" in harness
+    assert "exact CJK overlap exception below 0.84" in harness
+    assert "one-fen route has no overlap exception" in harness
+    assert "one-yuan route has no overlap exception" in harness
+    assert "numeric route has no overlap exception" in harness
+    assert "pinyin route has no overlap exception" in harness
     assert "strict row geometry at calibrated floors" in harness
     assert "amount overlap" in harness
     assert "payment overlap" in harness
+    assert "45 percent payment overlap is rejected by default geometry" in harness
+    assert "45 percent payment overlap at exact-route envelope" in harness
+    assert "payment overlap above 45 percent" in harness
+    assert "exact-route exception does not relax amount overlap" in harness
+    assert "payment overlap fraction above calibrated maximum" in harness
     assert "recipient detector below 0.68 floor" in harness
     assert "non-finite recipient detector score" in harness
 

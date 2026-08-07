@@ -9,6 +9,8 @@ internal sealed record PaddleRecipientAlternativeParseResult(
 
 internal static class PaddleRecipientValueParser
 {
+    internal const string UnlabelledCjkAmountExactRoute = "unlabelled_cjk_amount_exact";
+
     private static readonly string[] RecipientLabels =
         ["\u6536\u6b3e\u65b9", "\u6536\u6b3e\u4eba", "\u6536\u6b3e\u8d26\u6237", "\u6536\u6b3e\u8d26\u53f7"];
     private static readonly char[] RowSeparators = [' ', ':', '\uff1a', '-', '\u2014'];
@@ -145,7 +147,7 @@ internal static class PaddleRecipientValueParser
             }
             var route = amountDeltaFen switch
             {
-                0 => "unlabelled_cjk_amount_exact",
+                0 => UnlabelledCjkAmountExactRoute,
                 <= 1 => "unlabelled_cjk_amount_within_one_fen",
                 _ => "unlabelled_cjk_amount_within_one_yuan",
             };
@@ -171,6 +173,25 @@ internal static class PaddleRecipientValueParser
     }
 
     /// <summary>
+    /// A detector overlap exception is eligible only for the strongest
+    /// alternative route: a CJK merchant plus an explicit CNY amount exactly
+    /// equal to the unified amount.  Ordinary geometry remains authoritative
+    /// for every other route and for lower-scoring recipient detections.
+    /// </summary>
+    public static bool AllowsExactCjkPaymentOverlapException(
+        PaddleRecipientAlternativeParseResult? alternative,
+        float recipientDetectorScore)
+    {
+        return alternative is not null
+            && string.Equals(
+                alternative.Route,
+                UnlabelledCjkAmountExactRoute,
+                StringComparison.Ordinal)
+            && float.IsFinite(recipientDetectorScore)
+            && recipientDetectorScore >= 0.84f;
+    }
+
+    /// <summary>
     /// Primitive-only geometry contract so the package-free executable tests
     /// can prove that the unlabelled recipient row is physically between the
     /// primary amount and payment-method rows, not merely center-sorted.
@@ -183,7 +204,8 @@ internal static class PaddleRecipientValueParser
         float amountScore,
         float[] amountBox,
         float paymentScore,
-        float[] paymentBox)
+        float[] paymentBox,
+        float paymentOverlapFraction = 0.25f)
     {
         if (sourceWidth < 2
             || sourceHeight < 2
@@ -193,6 +215,9 @@ internal static class PaddleRecipientValueParser
             || amountScore < 0.80f
             || !float.IsFinite(paymentScore)
             || paymentScore < 0.80f
+            || !float.IsFinite(paymentOverlapFraction)
+            || paymentOverlapFraction < 0.0f
+            || paymentOverlapFraction > 0.45f
             || !IsFiniteBox(recipientBox)
             || !IsFiniteBox(amountBox)
             || !IsFiniteBox(paymentBox))
@@ -205,15 +230,18 @@ internal static class PaddleRecipientValueParser
         var recipientCenterY = (recipientBox[1] + recipientBox[3]) * 0.5f;
         var amountCenterY = (amountBox[1] + amountBox[3]) * 0.5f;
         var paymentCenterY = (paymentBox[1] + paymentBox[3]) * 0.5f;
-        var verticalTolerance = Math.Max(4.0f, recipientHeight * 0.25f);
+        var amountVerticalTolerance = Math.Max(4.0f, recipientHeight * 0.25f);
+        var paymentVerticalTolerance = Math.Max(
+            4.0f,
+            recipientHeight * paymentOverlapFraction);
         return recipientBox[0] <= sourceWidth * 0.20f
             && recipientBox[2] >= sourceWidth * 0.80f
             && recipientWidth >= sourceWidth * 0.60f
             && recipientHeight <= sourceHeight * 0.15f
             && amountCenterY < recipientCenterY
             && recipientCenterY < paymentCenterY
-            && recipientBox[1] >= amountBox[3] - verticalTolerance
-            && recipientBox[3] <= paymentBox[1] + verticalTolerance;
+            && recipientBox[1] >= amountBox[3] - amountVerticalTolerance
+            && recipientBox[3] <= paymentBox[1] + paymentVerticalTolerance;
     }
 
     private static bool IsCjkMerchantCandidate(string value)

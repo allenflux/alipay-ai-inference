@@ -177,6 +177,41 @@ internal static class Program
             AssertAlternativeNull(ParsePair("123456", "\uffe5100.01", "100.00", 0.99f), "numeric merchant amount not exact");
             AssertAlternativeNull(ParsePair("100", "\uffe5100.00", "100.00", 0.99f), "numeric merchant equals amount integer part");
             AssertAlternativeNull(ParsePair("0100", "\uffe5100.00", "100.00", 0.99f), "zero-padded numeric merchant equals amount integer part");
+            var exactCjkAlternative = ParsePair(
+                "\u6296\u97f3\u7535\u5546\u5546\u5bb6",
+                "\uffe5100.00",
+                "100.00",
+                0.84f);
+            AssertTrue(
+                PaddleRecipientValueParser.AllowsExactCjkPaymentOverlapException(
+                    exactCjkAlternative,
+                    0.84f),
+                "exact CJK overlap exception at 0.84");
+            AssertFalse(
+                PaddleRecipientValueParser.AllowsExactCjkPaymentOverlapException(
+                    exactCjkAlternative,
+                    0.839f),
+                "exact CJK overlap exception below 0.84");
+            AssertFalse(
+                PaddleRecipientValueParser.AllowsExactCjkPaymentOverlapException(
+                    ParsePair("\u6296\u97f3\u7535\u5546\u5546\u5bb6", "\uffe5100.01", "100.00", 0.99f),
+                    0.99f),
+                "one-fen route has no overlap exception");
+            AssertFalse(
+                PaddleRecipientValueParser.AllowsExactCjkPaymentOverlapException(
+                    ParsePair("\u6296\u97f3\u7535\u5546\u5546\u5bb6", "\uffe5101.00", "100.00", 0.99f),
+                    0.99f),
+                "one-yuan route has no overlap exception");
+            AssertFalse(
+                PaddleRecipientValueParser.AllowsExactCjkPaymentOverlapException(
+                    ParsePair("123456", "\uffe5100.00", "100.00", 0.99f),
+                    0.99f),
+                "numeric route has no overlap exception");
+            AssertFalse(
+                PaddleRecipientValueParser.AllowsExactCjkPaymentOverlapException(
+                    ParsePinyin(["shou kuan fang", "\u53f8\u6e90(**\u6e90)", "\u6536\u6b3e\u65b9"], [0.90f, 0.90f, 0.90f], 0.99f),
+                    0.99f),
+                "pinyin route has no overlap exception");
             var amountBox = new[] { 200.0f, 300.0f, 550.0f, 420.0f };
             var recipientBox = new[] { 20.0f, 460.0f, 730.0f, 520.0f };
             var paymentBox = new[] { 180.0f, 550.0f, 720.0f, 610.0f };
@@ -206,6 +241,59 @@ internal static class Program
                     0.90f,
                     paymentBox),
                 "payment overlap");
+            var paymentOverlapAt45Percent = new[] { 180.0f, 493.0f, 720.0f, 610.0f };
+            AssertFalse(
+                PaddleRecipientValueParser.HasVerifiedUnlabelledMerchantRowGeometry(
+                    750, 1000, 0.84f, recipientBox, 0.90f, amountBox, 0.90f, paymentOverlapAt45Percent),
+                "45 percent payment overlap is rejected by default geometry");
+            AssertTrue(
+                PaddleRecipientValueParser.HasVerifiedUnlabelledMerchantRowGeometry(
+                    750,
+                    1000,
+                    0.84f,
+                    recipientBox,
+                    0.90f,
+                    amountBox,
+                    0.90f,
+                    paymentOverlapAt45Percent,
+                    0.45f),
+                "45 percent payment overlap at exact-route envelope");
+            AssertFalse(
+                PaddleRecipientValueParser.HasVerifiedUnlabelledMerchantRowGeometry(
+                    750,
+                    1000,
+                    0.84f,
+                    recipientBox,
+                    0.90f,
+                    amountBox,
+                    0.90f,
+                    [180.0f, 492.9f, 720.0f, 610.0f],
+                    0.45f),
+                "payment overlap above 45 percent");
+            AssertFalse(
+                PaddleRecipientValueParser.HasVerifiedUnlabelledMerchantRowGeometry(
+                    750,
+                    1000,
+                    0.84f,
+                    [20.0f, 390.0f, 730.0f, 450.0f],
+                    0.90f,
+                    amountBox,
+                    0.90f,
+                    paymentBox,
+                    0.45f),
+                "exact-route exception does not relax amount overlap");
+            AssertFalse(
+                PaddleRecipientValueParser.HasVerifiedUnlabelledMerchantRowGeometry(
+                    750,
+                    1000,
+                    0.84f,
+                    recipientBox,
+                    0.90f,
+                    amountBox,
+                    0.90f,
+                    paymentOverlapAt45Percent,
+                    0.451f),
+                "payment overlap fraction above calibrated maximum");
             AssertFalse(
                 PaddleRecipientValueParser.HasVerifiedUnlabelledMerchantRowGeometry(
                     750, 1000, 0.679f, recipientBox, 0.90f, amountBox, 0.90f, paymentBox),

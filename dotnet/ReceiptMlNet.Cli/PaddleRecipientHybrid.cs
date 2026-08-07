@@ -61,16 +61,21 @@ internal static class PaddleRecipientHybrid
         var amountCandidate = unified.Candidates.TryGetValue("amount", out var amount)
             ? amount.Candidate
             : null;
-        var verifiedUnlabelledLayout = HasVerifiedUnlabelledMerchantRowLayout(
-            source, detections, detection);
+        var verifiedAlternativeEnvelope = HasVerifiedUnlabelledMerchantRowLayout(
+            source, detections, detection, paymentOverlapFraction: 0.45f);
         if (value is null
-            && verifiedUnlabelledLayout)
+            && verifiedAlternativeEnvelope)
         {
             var alternative = ParseCalibratedAlternative(
                 firstRead,
                 detection.Score,
                 amountCandidate);
-            if (alternative is not null)
+            if (alternative is not null
+                && HasVerifiedCalibratedAlternativeRowLayout(
+                    source,
+                    detections,
+                    detection,
+                    alternative))
             {
                 value = alternative.Value;
                 route = $"primary_{alternative.Route}";
@@ -94,13 +99,18 @@ internal static class PaddleRecipientHybrid
                 var retryValue = PaddleRecipientValueParser.Parse(retryRead.Text);
                 var retryRoute = "left_context_retry";
                 if (retryValue is null
-                    && verifiedUnlabelledLayout)
+                    && verifiedAlternativeEnvelope)
                 {
                     var retryAlternative = ParseCalibratedAlternative(
                         retryRead,
                         detection.Score,
                         amountCandidate);
-                    if (retryAlternative is not null)
+                    if (retryAlternative is not null
+                        && HasVerifiedCalibratedAlternativeRowLayout(
+                            source,
+                            detections,
+                            detection,
+                            retryAlternative))
                     {
                         retryValue = retryAlternative.Value;
                         retryRoute = $"left_context_retry_{retryAlternative.Route}";
@@ -170,7 +180,8 @@ internal static class PaddleRecipientHybrid
     private static bool HasVerifiedUnlabelledMerchantRowLayout(
         Image<Rgb24> source,
         IReadOnlyList<DetectionResult> detections,
-        DetectionResult recipient)
+        DetectionResult recipient,
+        float paymentOverlapFraction = 0.25f)
     {
         var amount = detections.FirstOrDefault(item =>
             string.Equals(item.Label, "amount", StringComparison.Ordinal));
@@ -188,7 +199,28 @@ internal static class PaddleRecipientHybrid
             amount.Score,
             amount.BboxImage,
             payment.Score,
-            payment.BboxImage);
+            payment.BboxImage,
+            paymentOverlapFraction);
+    }
+
+    private static bool HasVerifiedCalibratedAlternativeRowLayout(
+        Image<Rgb24> source,
+        IReadOnlyList<DetectionResult> detections,
+        DetectionResult recipient,
+        PaddleRecipientAlternativeParseResult alternative)
+    {
+        if (HasVerifiedUnlabelledMerchantRowLayout(source, detections, recipient))
+        {
+            return true;
+        }
+        return PaddleRecipientValueParser.AllowsExactCjkPaymentOverlapException(
+                alternative,
+                recipient.Score)
+            && HasVerifiedUnlabelledMerchantRowLayout(
+                source,
+                detections,
+                recipient,
+                paymentOverlapFraction: 0.45f);
     }
 
 }

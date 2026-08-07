@@ -148,6 +148,8 @@ def _geometry_evidence(
         return None
     recipient_height = recipient[3] - recipient[1]
     tolerance = max(4.0, recipient_height * 0.25)
+    payment_overlap = max(0.0, recipient[3] - payment[1])
+    exact_cjk_tolerance = max(4.0, recipient_height * 0.45)
     return {
         "rectified_width": width,
         "rectified_height": height,
@@ -158,8 +160,12 @@ def _geometry_evidence(
         "vertical_tolerance": round(tolerance, 4),
         "amount_edge_margin": round(recipient[1] - amount[3], 4),
         "payment_edge_margin": round(payment[1] - recipient[3], 4),
+        "payment_overlap_fraction": round(payment_overlap / recipient_height, 6),
         "payment_excess_overlap": round(
             max(0.0, recipient[3] - payment[1] - tolerance), 4
+        ),
+        "payment_exact_cjk_exception_excess": round(
+            max(0.0, payment_overlap - exact_cjk_tolerance), 4
         ),
     }
 
