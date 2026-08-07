@@ -67,7 +67,7 @@ from .ocr_unified_dataset import (
     STATUS_TEXT_TARGET,
     STATUS_VISIBLE_CJK_TEXTS,
     V9_SLOT_ORDER,
-    _visible_status_cjk_text,
+    _is_cjk_ideograph,
 )
 from .ocr_unified_targets import (
     AMOUNT_AUX_FORMAT,
@@ -2239,7 +2239,7 @@ def _validate_v13_status_text_slot(
         raise ValueError(
             f"{records_path}:{line_number}: v13 status_visible_text must equal the CTC target"
         )
-    if _visible_status_cjk_text(text) != text:
+    if not text or any(not _is_cjk_ideograph(character) for character in text):
         raise ValueError(
             f"{records_path}:{line_number}: v13 transfer-status CTC target must contain only visible CJK text"
         )

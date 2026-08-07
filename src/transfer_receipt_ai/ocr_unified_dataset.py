@@ -141,6 +141,12 @@ STATUS_VISIBLE_CJK_TEXTS = frozenset(
         "进行中",
     }
 )
+STATUS_SUCCESS_VISIBLE_CJK_TEXTS = frozenset(
+    {"转账成功", "交易成功", "付款成功", "支付成功", "转帐成功"}
+)
+_STATUS_SUCCESS_NEGATION_TOKENS = frozenset(
+    {"未", "不", "非", "无", "否", "没", "没有", "未能", "不是", "并未", "尚未", "不能", "无法", "没能", "未曾", "从未", "并非"}
+)
 
 
 def _is_cjk_ideograph(character: str) -> bool:
@@ -176,32 +182,42 @@ def _visible_status_cjk_match(value: object) -> tuple[str, int]:
     for character in cleaned:
         if _is_cjk_ideograph(character):
             current.append(character)
-        elif character.isalpha() or character.isdigit():
-            if current:
-                segments.append("".join(current))
-                current = []
-        else:
+        elif character.isspace() or unicodedata.category(character).startswith("P"):
             # Whitespace and punctuation can appear between the visibly
             # separated ideographs of one OCR line.
             continue
+        else:
+            # Letters, every Unicode numeric form, symbols, marks, controls,
+            # and emoji are hard boundaries.  They must never be deleted in a
+            # way that joins two CJK fragments into a manufactured phrase.
+            if current:
+                segments.append("".join(current))
+                current = []
     if current:
         segments.append("".join(current))
 
     matches: list[tuple[int, int, int, str]] = []
+    has_negated_success = False
     for segment_index, segment in enumerate(segments):
         for phrase in STATUS_VISIBLE_CJK_TEXTS:
             start = segment.find(phrase)
             while start >= 0:
                 end = start + len(phrase)
-                # A success phrase directly negated in the same visible CJK
-                # stream is not positive evidence (for example 未转账成功).
-                if not (
-                    normalize_status(phrase) == "success"
-                    and start > 0
-                    and segment[start - 1] in {"未", "不", "非"}
-                ):
+                # A negated success anywhere in the local visible context is
+                # conflicting evidence for the whole OCR string.  Do not let
+                # a second positive copy silently override it.
+                context = segment[max(0, start - 6) : start]
+                negated_success = phrase in STATUS_SUCCESS_VISIBLE_CJK_TEXTS and any(
+                    token in context for token in _STATUS_SUCCESS_NEGATION_TOKENS
+                )
+                if negated_success:
+                    has_negated_success = True
+                else:
                     matches.append((segment_index, start, end, phrase))
                 start = segment.find(phrase, start + 1)
+
+    if has_negated_success:
+        return "", len(matches)
 
     retained: list[tuple[int, int, int, str]] = []
     for match in matches:

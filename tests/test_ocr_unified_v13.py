@@ -47,6 +47,7 @@ from transfer_receipt_ai.ocr_unified import (
 )
 from transfer_receipt_ai.ocr_unified_dataset import (
     KIND_V13 as DATASET_KIND_V13,
+    STATUS_VISIBLE_CJK_TEXTS,
     V13_SLOT_ORDER,
     _visible_status_cjk_match,
     build_unified_dataset,
@@ -76,9 +77,50 @@ def test_v13_status_phrase_extraction_deduplicates_but_rejects_ambiguity() -> No
     assert _visible_status_cjk_match("转账成功 转账成功") == ("转账成功", 2)
     assert _visible_status_cjk_match("转账未成功") == ("转账未成功", 1)
     assert _visible_status_cjk_match("转账成功 支付成功")[0] == ""
+    assert _visible_status_cjk_match("转账成功 转账失败")[0] == ""
     assert _visible_status_cjk_match("转abc账成功")[0] == ""
-    assert _visible_status_cjk_match("未转账成功")[0] == ""
     assert _visible_status_cjk_match("success") == ("", 0)
+
+
+@pytest.mark.parametrize(
+    "paddle_text",
+    (
+        "未转账成功",
+        "没有转账成功",
+        "未能支付成功",
+        "不是交易成功",
+        "否付款成功",
+        "无转帐成功",
+        "没有转账成功，转账成功",
+    ),
+)
+def test_v13_status_phrase_extraction_rejects_negated_success(paddle_text: str) -> None:
+    assert _visible_status_cjk_match(paddle_text)[0] == ""
+
+
+@pytest.mark.parametrize(
+    "paddle_text",
+    ("转￥账成功", "转🙂账成功", "转\u0301账成功", "转Ⅳ账成功", "转½账成功"),
+)
+def test_v13_status_phrase_extraction_does_not_cross_unsafe_characters(
+    paddle_text: str,
+) -> None:
+    assert _visible_status_cjk_match(paddle_text)[0] == ""
+
+
+@pytest.mark.parametrize(
+    "paddle_text",
+    ("转账失败", "转账已撤销", "转账处理中", "转账待处理", "转账进行中"),
+)
+def test_v13_status_phrase_extraction_keeps_the_containing_phrase(
+    paddle_text: str,
+) -> None:
+    assert _visible_status_cjk_match(paddle_text) == (paddle_text, 1)
+
+
+@pytest.mark.parametrize("paddle_text", sorted(STATUS_VISIBLE_CJK_TEXTS))
+def test_v13_status_phrase_whitelist_is_self_consistent(paddle_text: str) -> None:
+    assert _visible_status_cjk_match(paddle_text) == (paddle_text, 1)
 
 
 def _tiny_config(version: int) -> UnifiedReaderConfig:
