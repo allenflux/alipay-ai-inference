@@ -240,9 +240,12 @@ def _fixture_plan(tmp_path: Path) -> Path:
             "includes_device_model": True,
         },
         "performance_gate": {
-            "minimum_throughput_gain_percent": 2.0,
-            "maximum_p50_regression_percent": 0.0,
-            "maximum_p95_regression_percent": 0.0,
+            # Windows PowerShell 5.1 ConvertTo-Json emits whole-valued doubles
+            # as JSON integers. The analyzer must preserve the numeric guard
+            # while accepting that equivalent JSON spelling.
+            "minimum_throughput_gain_percent": 2,
+            "maximum_p50_regression_percent": 0,
+            "maximum_p95_regression_percent": 0,
         },
         "artifacts": artifacts,
         "variants": variants,
@@ -371,6 +374,20 @@ def test_cpu_ab_rejects_a_changed_threshold_or_cpu_contract(tmp_path: Path) -> N
     _write_json(plan_path, plan)
 
     with pytest.raises(compare.ValidationError, match="score_threshold changed"):
+        compare.analyze_plan(plan_path)
+
+
+@pytest.mark.parametrize("changed_value", [1.99, True, "2"])
+def test_cpu_ab_rejects_a_changed_or_non_numeric_performance_gate(
+    tmp_path: Path,
+    changed_value: object,
+) -> None:
+    plan_path = _fixture_plan(tmp_path)
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    plan["performance_gate"]["minimum_throughput_gain_percent"] = changed_value
+    _write_json(plan_path, plan)
+
+    with pytest.raises(compare.ValidationError, match="performance gate"):
         compare.analyze_plan(plan_path)
 
 

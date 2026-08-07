@@ -399,7 +399,12 @@ def _validate_performance_gate(plan: Mapping[str, Any]) -> Mapping[str, Any]:
     }
     for name, expected in exact.items():
         value = gate.get(name)
-        if type(value) is not type(expected) or value != expected:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or float(value) != expected
+        ):
             raise ValidationError(
                 f"CPU performance gate {name} changed: expected {expected!r}, found {value!r}"
             )
