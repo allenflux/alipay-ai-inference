@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Compare Python ONNX detector output with the completed ML.NET miss pilot.
+"""Compare teacher-path and current ML.NET geometry on two detector misses.
 
-This is a two-image, CPU-only diagnostic.  It uses the same detector artifact,
-portrait orientation rule, full-image max-side-1600 rectification and black
-letterbox contract as production.  It writes a new evidence directory and
-never changes the formal inference or evaluation directories.
+This CPU-only diagnostic runs the same detector artifact twice in Python:
+once with the teacher pipeline's portrait-orientation rule and once with the
+current ML.NET pipeline's forced zero-degree orientation.  That separates an
+orientation/rectification mismatch from an ONNX Runtime or resize mismatch.
+It writes a new evidence directory and never changes formal evidence.
 """
 
 from __future__ import annotations
@@ -29,9 +30,11 @@ if str(SOURCE_ROOT) not in sys.path:
 
 from transfer_receipt_ai.geometry import (  # noqa: E402
     RectificationOptions,
+    bbox_to_polygon,
     load_upright_rgb,
     rectify_receipt,
     save_rgb,
+    transform_points,
 )
 from transfer_receipt_ai.onnx_runtime import (  # noqa: E402
     OnnxLRCNNPredictor,
@@ -56,6 +59,19 @@ CASES = (
 
 class ParityError(RuntimeError):
     """Raised when diagnostic evidence is missing or inconsistent."""
+
+
+def _windows_path(value: object) -> str:
+    return str(value).replace("/", "\\").rstrip("\\").casefold()
+
+
+def _finite_number(value: object, description: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ParityError(f"{description} is not numeric")
+    number = float(value)
+    if not math.isfinite(number):
+        raise ParityError(f"{description} is not finite")
+    return number
 
 
 def _sha256(path: Path) -> str:
@@ -114,17 +130,114 @@ def _mlnet_observation(report: Mapping[str, Any], *, field: str, source: Path) -
     observations = zero.get("observations") if isinstance(zero, Mapping) else None
     if not isinstance(observations, list):
         raise ParityError("ML.NET detector pilot has no zero-threshold observations")
-    expected_source = str(source).replace("/", "\\").casefold()
+    expected_source = _windows_path(source)
     matches = [
         item
         for item in observations
         if isinstance(item, Mapping)
         and item.get("field") == field
-        and str(item.get("source", "")).replace("/", "\\").casefold() == expected_source
+        and _windows_path(item.get("source", "")) == expected_source
     ]
     if len(matches) != 1:
         raise ParityError(f"expected one ML.NET zero-threshold observation for {field}, found {len(matches)}")
     return matches[0]
+
+
+def _validate_pilot_run(
+    payload: object,
+    *,
+    name: str,
+    expected_threshold: float,
+) -> Mapping[str, Any]:
+    if not isinstance(payload, Mapping):
+        raise ParityError(f"ML.NET detector pilot has no {name} run")
+    summary = payload.get("summary")
+    if not isinstance(summary, Mapping):
+        raise ParityError(f"ML.NET detector pilot {name} has no summary")
+    expected_summary = {
+        "requested_device": "cpu",
+        "unified_provider": "cpu",
+        "input": 2,
+        "written": 2,
+        "skipped": 0,
+        "errors": 0,
+    }
+    for key, expected in expected_summary.items():
+        if summary.get(key) != expected:
+            raise ParityError(
+                f"ML.NET detector pilot {name} summary {key}={summary.get(key)!r}; "
+                f"expected {expected!r}"
+            )
+    observations = payload.get("observations")
+    if not isinstance(observations, list) or len(observations) != len(CASES):
+        raise ParityError(f"ML.NET detector pilot {name} does not contain two observations")
+    for observation in observations:
+        if not isinstance(observation, Mapping):
+            raise ParityError(f"ML.NET detector pilot {name} has an invalid observation")
+        threshold = _finite_number(observation.get("threshold"), f"{name} observation threshold")
+        if threshold != expected_threshold:
+            raise ParityError(
+                f"ML.NET detector pilot {name} threshold={threshold}; expected {expected_threshold}"
+            )
+    return payload
+
+
+def _validate_mlnet_result(
+    observation: Mapping[str, Any],
+    *,
+    model_hash: str,
+    source: Path,
+) -> tuple[dict[str, Any], Path]:
+    result_path_raw = observation.get("result")
+    if not isinstance(result_path_raw, str) or not result_path_raw:
+        raise ParityError(f"ML.NET observation has no result path for {source}")
+    result_path = Path(result_path_raw)
+    result = _load_json(result_path, "ML.NET detector result")
+    if _windows_path(result.get("source", "")) != _windows_path(source):
+        raise ParityError(f"ML.NET detector result source differs from parity source: {source}")
+
+    contracts = result.get("model_contracts")
+    if not isinstance(contracts, Mapping):
+        raise ParityError(f"ML.NET detector result omitted model contracts: {result_path}")
+    detector_hash = contracts.get("detector_sha256")
+    if not isinstance(detector_hash, str) or detector_hash.casefold() != model_hash:
+        raise ParityError(f"ML.NET detector result used a different detector: {result_path}")
+    for key in ("device_sha256", "unified_ocr_model_sha256"):
+        if not isinstance(contracts.get(key), str) or not contracts[key]:
+            raise ParityError(f"ML.NET detector result omitted {key}: {result_path}")
+
+    geometry = result.get("geometry")
+    if not isinstance(geometry, Mapping):
+        raise ParityError(f"ML.NET detector result omitted geometry: {result_path}")
+    if geometry.get("rectification") != "max-side-1600":
+        raise ParityError(f"ML.NET detector result used different rectification: {result_path}")
+    if geometry.get("rotation_degrees") != 0 or geometry.get("screen_detected") is not False:
+        raise ParityError(f"ML.NET detector result is not current zero-degree full-image geometry: {result_path}")
+    return result, result_path
+
+
+def _source_bbox(detection: object, rectification: object) -> list[float] | None:
+    if detection is None:
+        return None
+    polygon = bbox_to_polygon(detection.bbox_xyxy)
+    projected = transform_points(polygon, rectification.rectified_to_original)
+    source_height, source_width = rectification.source_rgb.shape[:2]
+    return [
+        float(np.clip(projected[:, 0].min(), 0.0, source_width)),
+        float(np.clip(projected[:, 1].min(), 0.0, source_height)),
+        float(np.clip(projected[:, 0].max(), 0.0, source_width)),
+        float(np.clip(projected[:, 1].max(), 0.0, source_height)),
+    ]
+
+
+def _bbox_max_abs_delta(first: object, second: object) -> float | None:
+    if not isinstance(first, list) or not isinstance(second, list) or len(first) != 4 or len(second) != 4:
+        return None
+    first_values = np.asarray(first, dtype=np.float64)
+    second_values = np.asarray(second, dtype=np.float64)
+    if not np.isfinite(first_values).all() or not np.isfinite(second_values).all():
+        return None
+    return float(np.abs(first_values - second_values).max())
 
 
 def run(*, data_root: Path, model: Path, output: Path | None = None) -> tuple[dict[str, Any], Path]:
@@ -133,6 +246,16 @@ def run(*, data_root: Path, model: Path, output: Path | None = None) -> tuple[di
     model = model.resolve()
     contract_path = model.with_suffix(".contract.json")
     contract = _load_json(contract_path, "detector contract")
+    if contract.get("kind") != "receipt_lrcnn_v1":
+        raise ParityError(f"unexpected detector contract kind: {contract.get('kind')}")
+    detector_input = contract.get("input")
+    if not isinstance(detector_input, Mapping):
+        raise ParityError("detector contract omitted input metadata")
+    if detector_input.get("layout") != "CHW" or detector_input.get("shape") != [3, 1536, 864]:
+        raise ParityError(
+            "detector contract must use the production CHW [3,1536,864] input; "
+            f"found layout={detector_input.get('layout')!r} shape={detector_input.get('shape')!r}"
+        )
     expected_model_hash = (
         contract.get("onnx", {}).get("sha256")
         if isinstance(contract.get("onnx"), Mapping)
@@ -148,6 +271,17 @@ def run(*, data_root: Path, model: Path, output: Path | None = None) -> tuple[di
         raise ParityError(f"unexpected ML.NET detector pilot kind: {mlnet_report.get('kind')}")
     if mlnet_report.get("formal_tag") != FORMAL_TAG:
         raise ParityError("ML.NET detector pilot is not bound to the requested formal tag")
+    expected_formal_evaluation = validation_root / f"mlnet-wide1536-cpu-full-e2e-{FORMAL_TAG}"
+    if _windows_path(mlnet_report.get("formal_evaluation", "")) != _windows_path(expected_formal_evaluation):
+        raise ParityError("ML.NET detector pilot is not bound to the fixed formal evaluation")
+    if mlnet_report.get("runtime") != "cpu":
+        raise ParityError("ML.NET detector pilot is not CPU-only")
+    if mlnet_report.get("rectification") != "max-side-1600":
+        raise ParityError("ML.NET detector pilot used different rectification")
+    if mlnet_report.get("includes_device_model") is not True:
+        raise ParityError("ML.NET detector pilot omitted the device model")
+    _validate_pilot_run(mlnet_report.get("baseline"), name="baseline", expected_threshold=0.50)
+    _validate_pilot_run(mlnet_report.get("zero_threshold"), name="zero_threshold", expected_threshold=0.0)
 
     predictor = OnnxLRCNNPredictor(
         model,
@@ -157,6 +291,11 @@ def run(*, data_root: Path, model: Path, output: Path | None = None) -> tuple[di
     )
     if predictor.providers != ["CPUExecutionProvider"]:
         raise ParityError(f"Python ONNX provider is not CPU-only: {predictor.providers}")
+    if predictor.input_width != 864 or predictor.input_height != 1536:
+        raise ParityError(
+            "Python ONNX detector input differs from production 864x1536; "
+            f"found {predictor.input_width}x{predictor.input_height}"
+        )
 
     tag = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     output = output or validation_root / f"mlnet-detector-python-parity-{tag}"
@@ -169,85 +308,146 @@ def run(*, data_root: Path, model: Path, output: Path | None = None) -> tuple[di
         if not source.is_file():
             raise ParityError(f"missing parity source: {source}")
         comparison = _matching_comparison(comparisons_path, token=token, field=field)
-        if str(comparison.get("source", "")).replace("/", "\\").casefold() != str(source).replace("/", "\\").casefold():
+        if _windows_path(comparison.get("source", "")) != _windows_path(source):
             raise ParityError(f"formal comparison source differs from parity source: {source}")
         reference = comparison.get("reference_text")
         if not isinstance(reference, str) or not reference:
             raise ParityError(f"formal comparison has no reference text for {field}")
 
-        source_rgb = load_upright_rgb(source)
-        rectification = rectify_receipt(
-            source_rgb,
-            RectificationOptions(
-                orientation_degrees=None,
-                prefer_portrait=True,
-                auto_screen=False,
-                max_side=1600,
-            ),
-        )
-        rectified_path = output / f"case-{index}-{field}-rectified.png"
-        save_rgb(rectified_path, rectification.rectified_rgb)
-        tensor, mapping = prepare_detector_input(
-            rectification.rectified_rgb,
-            input_width=predictor.input_width,
-            input_height=predictor.input_height,
-            resize_mode="letterbox",
-        )
-        detections = predictor.predict(rectification.rectified_rgb)
-        detection = next((item for item in detections if item.label == field), None)
         mlnet = _mlnet_observation(mlnet_report, field=field, source=source)
-        python_score = None if detection is None else float(detection.score)
+        mlnet_result, mlnet_result_path = _validate_mlnet_result(
+            mlnet,
+            model_hash=model_hash,
+            source=source,
+        )
         mlnet_score_raw = mlnet.get("detection_score")
         mlnet_score = (
             float(mlnet_score_raw)
             if isinstance(mlnet_score_raw, (int, float)) and not isinstance(mlnet_score_raw, bool)
             else None
         )
-        score_delta = (
-            python_score - mlnet_score
-            if python_score is not None and mlnet_score is not None
-            else None
+        if mlnet_score is None or not math.isfinite(mlnet_score):
+            raise ParityError(f"ML.NET zero-threshold observation has no finite detector score for {field}")
+
+        source_rgb = load_upright_rgb(source)
+        python_runs: dict[str, dict[str, Any]] = {}
+        for geometry_name, options in (
+            (
+                "teacher_portrait",
+                RectificationOptions(
+                    orientation_degrees=None,
+                    prefer_portrait=True,
+                    auto_screen=False,
+                    max_side=1600,
+                ),
+            ),
+            (
+                "current_mlnet_forced_zero",
+                RectificationOptions(
+                    orientation_degrees=0,
+                    prefer_portrait=False,
+                    auto_screen=False,
+                    max_side=1600,
+                ),
+            ),
+        ):
+            rectification = rectify_receipt(source_rgb, options)
+            rectified_path = output / f"case-{index}-{field}-{geometry_name}-rectified.png"
+            save_rgb(rectified_path, rectification.rectified_rgb)
+            tensor, mapping = prepare_detector_input(
+                rectification.rectified_rgb,
+                input_width=predictor.input_width,
+                input_height=predictor.input_height,
+                resize_mode="letterbox",
+            )
+            detections = predictor.predict(rectification.rectified_rgb)
+            detection = next((item for item in detections if item.label == field), None)
+            detection_source_bbox = _source_bbox(detection, rectification)
+            python_runs[geometry_name] = {
+                "score": None if detection is None else float(detection.score),
+                "bbox_rectified": None if detection is None else list(detection.bbox_xyxy),
+                "bbox_source": detection_source_bbox,
+                "all_detections": [
+                    {
+                        "label": item.label,
+                        "score": float(item.score),
+                        "bbox_rectified": list(item.bbox_xyxy),
+                        "bbox_source": _source_bbox(item, rectification),
+                    }
+                    for item in detections
+                ],
+                "geometry": {
+                    **rectification.manifest(),
+                    "detector_canvas": {"width": predictor.input_width, "height": predictor.input_height},
+                    "resize_mode": "letterbox",
+                    "scale_x": mapping.scale_x,
+                    "scale_y": mapping.scale_y,
+                    "offset_x": mapping.offset_x,
+                    "offset_y": mapping.offset_y,
+                },
+                "detector_tensor_sha256": hashlib.sha256(
+                    np.ascontiguousarray(tensor).tobytes()
+                ).hexdigest(),
+                "rectified": str(rectified_path),
+            }
+
+        teacher = python_runs["teacher_portrait"]
+        forced_zero = python_runs["current_mlnet_forced_zero"]
+        teacher_score = teacher["score"]
+        forced_zero_score = forced_zero["score"]
+        reference_score_raw = comparison.get("reference_detector_score")
+        reference_score = _finite_number(reference_score_raw, f"formal reference detector score for {field}")
+        teacher_minus_reference = (
+            teacher_score - reference_score if teacher_score is not None else None
         )
-        if score_delta is not None and not math.isfinite(score_delta):
-            raise ParityError(f"non-finite detector score delta for {field}")
+        forced_zero_minus_mlnet = (
+            forced_zero_score - mlnet_score if forced_zero_score is not None else None
+        )
+        for label, value in (
+            ("teacher/reference score delta", teacher_minus_reference),
+            ("forced-zero/ML.NET score delta", forced_zero_minus_mlnet),
+        ):
+            if value is not None and not math.isfinite(value):
+                raise ParityError(f"non-finite {label} for {field}")
+
+        forced_geometry = forced_zero["geometry"]
+        mlnet_geometry = mlnet_result["geometry"]
+        for size_key in ("source_size", "rectified_size"):
+            if forced_geometry.get(size_key) != mlnet_geometry.get(size_key):
+                raise ParityError(f"forced-zero Python {size_key} differs from ML.NET for {field}")
+        if forced_geometry.get("rotation_degrees") != mlnet_geometry.get("rotation_degrees"):
+            raise ParityError(f"forced-zero Python rotation differs from ML.NET for {field}")
+        if forced_geometry.get("screen_detected") != mlnet_geometry.get("screen_detected"):
+            raise ParityError(f"forced-zero Python screen flag differs from ML.NET for {field}")
+
+        bbox_delta = _bbox_max_abs_delta(forced_zero.get("bbox_source"), mlnet.get("detection_bbox"))
         record = {
             "field": field,
             "source": str(source),
             "source_sha256": _sha256(source),
             "reference": reference,
-            "reference_detector_score": comparison.get("reference_detector_score"),
+            "reference_detector_score": reference_score,
             "reference_crop_sha256": comparison.get("reference_crop_sha256"),
-            "python": {
-                "score": python_score,
-                "bbox_rectified": None if detection is None else list(detection.bbox_xyxy),
-                "all_detections": [
-                    {"label": item.label, "score": float(item.score), "bbox_rectified": list(item.bbox_xyxy)}
-                    for item in detections
-                ],
-            },
+            "python": python_runs,
             "mlnet": dict(mlnet),
-            "python_minus_mlnet_score": score_delta,
-            "geometry": {
-                **rectification.manifest(),
-                "detector_canvas": {"width": predictor.input_width, "height": predictor.input_height},
-                "resize_mode": "letterbox",
-                "scale_x": mapping.scale_x,
-                "scale_y": mapping.scale_y,
-                "offset_x": mapping.offset_x,
-                "offset_y": mapping.offset_y,
+            "mlnet_result": str(mlnet_result_path),
+            "comparison": {
+                "teacher_minus_reference_score": teacher_minus_reference,
+                "forced_zero_minus_mlnet_score": forced_zero_minus_mlnet,
+                "forced_zero_source_bbox_minus_mlnet_max_abs": bbox_delta,
+                "bbox_coordinate_system": "EXIF-upright source pixels",
             },
-            "detector_tensor_sha256": hashlib.sha256(np.ascontiguousarray(tensor).tobytes()).hexdigest(),
-            "rectified": str(rectified_path),
         }
         records.append(record)
         print(
-            f"field={field} python_score={python_score} mlnet_score={mlnet_score} "
-            f"delta={score_delta} reference_score={comparison.get('reference_detector_score')}"
+            f"field={field} teacher_score={teacher_score} forced0_score={forced_zero_score} "
+            f"mlnet_score={mlnet_score} reference_score={reference_score} "
+            f"teacher_reference_delta={teacher_minus_reference} forced0_mlnet_delta={forced_zero_minus_mlnet}"
         )
 
     report: dict[str, Any] = {
-        "schema_version": 1,
-        "kind": "receipt_mlnet_detector_python_parity_v1",
+        "schema_version": 2,
+        "kind": "receipt_mlnet_detector_python_parity_v2",
         "formal_tag": FORMAL_TAG,
         "runtime": "cpu",
         "providers": predictor.providers,
