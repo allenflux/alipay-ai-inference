@@ -7,6 +7,7 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using Microsoft.ML;
 using Microsoft.ML.Data;
+using Microsoft.ML.OnnxRuntime;
 using Microsoft.ML.Transforms.Onnx;
 using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.PixelFormats;
@@ -99,14 +100,19 @@ internal static class ReceiptMlNetProgram
         File.WriteAllText(errorsPath, string.Empty, Encoding.UTF8);
 
         var device = DeviceSetting.Parse(options.Device);
-        var detector = new DetectorModel(options.DetectorPath, device, options.DetectorIntraOpThreads);
+        // The inference loop below is intentionally serial. Keep one mutable
+        // detector tensor and its pinned OrtValue per Run invocation rather
+        // than allocating/copying roughly 15.2 MiB for every receipt; never
+        // share this buffer across workers.
+        var detectorInputBuffer = new float[ImagePipeline.DetectorTensorLength];
+        using var detector = new DetectorModel(
+            options.DetectorPath,
+            device,
+            options.DetectorIntraOpThreads,
+            detectorInputBuffer);
         var deviceClassifier = options.DeviceModelPath is null
             ? null
             : new DeviceModel(options.DeviceModelPath, device);
-        // The inference loop below is intentionally serial. Keep one mutable
-        // detector tensor per Run invocation rather than allocating roughly
-        // 15.2 MiB for every receipt; never share this buffer across workers.
-        var detectorInputBuffer = new float[ImagePipeline.DetectorTensorLength];
         Console.WriteLine($"Requested ONNX device: {device.Requested} (receipt detector{(deviceClassifier is null ? string.Empty : "/device model")})");
         Console.WriteLine($"Detector intra-op threads: {(options.DetectorIntraOpThreads?.ToString(CultureInfo.InvariantCulture) ?? "runtime default")}");
         using var ocrEngine = ocrBundle is null ? null : new PaddleOcrEngine(ocrBundle, device);
@@ -944,31 +950,250 @@ internal static class ReceiptMlNetProgram
     };
 }
 
-internal sealed class DetectorModel
+internal sealed class DetectorModel : IDisposable
 {
-    private readonly PredictionEngine<DetectorInput, DetectorOutput> _engine;
+    private static readonly string[] InputNames = ["image"];
+    private static readonly string[] OutputNames = ["boxes", "labels", "scores"];
+    private static readonly long[] InputShape = [3, ImagePipeline.DetectorHeight, ImagePipeline.DetectorWidth];
+    private static readonly int[] InputMetadataShape = [3, ImagePipeline.DetectorHeight, ImagePipeline.DetectorWidth];
 
-    public DetectorModel(string modelPath, DeviceSetting device, int? intraOpThreads)
+    private readonly InferenceSession _session;
+    private readonly RunOptions _runOptions;
+    private readonly OrtValue _inputValue;
+    private readonly OrtValue[] _inputValues;
+    private readonly float[] _inputBuffer;
+    private bool _disposed;
+
+    public DetectorModel(
+        string modelPath,
+        DeviceSetting device,
+        int? intraOpThreads,
+        float[] inputBuffer)
     {
-        var context = new MLContext(seed: 1);
-        var fitData = context.Data.LoadFromEnumerable(new[]
+        ArgumentNullException.ThrowIfNull(inputBuffer);
+        if (inputBuffer.Length != ImagePipeline.DetectorTensorLength)
         {
-            new DetectorInput { Image = new float[ImagePipeline.DetectorTensorLength] },
-        });
-        var pipeline = context.Transforms.ApplyOnnxModel(new OnnxOptions
+            throw new ArgumentException(
+                $"Detector input buffer must contain exactly {ImagePipeline.DetectorTensorLength} floats; found {inputBuffer.Length}",
+                nameof(inputBuffer));
+        }
+        if (intraOpThreads is not null && device.GpuDeviceId is not null)
         {
-            OutputColumns = new[] { "boxes", "labels", "scores" },
-            InputColumns = new[] { "image" },
-            ModelFile = modelPath,
-            GpuDeviceId = device.GpuDeviceId,
-            FallbackToCpu = device.FallbackToCpu,
-            IntraOpNumThreads = intraOpThreads,
-        });
-        var model = pipeline.Fit(fitData);
-        _engine = context.Model.CreatePredictionEngine<DetectorInput, DetectorOutput>(model);
+            throw new ArgumentException("Detector intra-op threads are supported only for an explicit CPU session", nameof(intraOpThreads));
+        }
+
+        var session = CreateSession(modelPath, device, intraOpThreads);
+        try
+        {
+            VerifyModelAbi(session);
+            // The detector loop mutates this same fixed buffer before every
+            // serial Run. OrtValue pins it once and does not copy its contents.
+            var inputValue = OrtValue.CreateTensorValueFromMemory(inputBuffer, InputShape);
+            OrtValue[] inputValues;
+            RunOptions runOptions;
+            try
+            {
+                inputValues = [inputValue];
+                runOptions = new RunOptions();
+            }
+            catch
+            {
+                inputValue.Dispose();
+                throw;
+            }
+            _session = session;
+            _inputValue = inputValue;
+            _inputValues = inputValues;
+            _runOptions = runOptions;
+            _inputBuffer = inputBuffer;
+        }
+        catch
+        {
+            session.Dispose();
+            throw;
+        }
     }
 
-    public DetectorOutput Predict(float[] tensor) => _engine.Predict(new DetectorInput { Image = tensor });
+    public DetectorOutput Predict(float[] tensor)
+    {
+        if (_disposed)
+        {
+            throw new ObjectDisposedException(nameof(DetectorModel));
+        }
+        if (!ReferenceEquals(tensor, _inputBuffer))
+        {
+            throw new ArgumentException(
+                "Detector inference must use the fixed buffer pinned by its reusable OrtValue",
+                nameof(tensor));
+        }
+
+        using var runtimeOutputs = _session.Run(_runOptions, InputNames, _inputValues, OutputNames);
+        if (runtimeOutputs.Count != OutputNames.Length)
+        {
+            throw new InvalidOperationException(
+                $"ONNX receipt detector returned {runtimeOutputs.Count} outputs; expected {OutputNames.Length}");
+        }
+        var outputs = runtimeOutputs.ToArray();
+        var boxes = ReadBoxes(outputs[0]);
+        var labels = ReadVector<long>(outputs[1], "labels", TensorElementType.Int64);
+        var scores = ReadVector<float>(outputs[2], "scores", TensorElementType.Float);
+        var boxCount = boxes.Length / 4;
+        if (labels.Length != boxCount || scores.Length != boxCount)
+        {
+            throw new InvalidOperationException(
+                $"ONNX receipt detector output lengths disagree: boxes={boxCount}, labels={labels.Length}, scores={scores.Length}");
+        }
+        return new DetectorOutput { Boxes = boxes, Labels = labels, Scores = scores };
+    }
+
+    public void Dispose()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+        _disposed = true;
+        _inputValue.Dispose();
+        _runOptions.Dispose();
+        _session.Dispose();
+    }
+
+    private static InferenceSession CreateSession(
+        string modelPath,
+        DeviceSetting device,
+        int? intraOpThreads)
+    {
+        if (device.GpuDeviceId is null)
+        {
+            if (intraOpThreads is null)
+            {
+                return new InferenceSession(modelPath);
+            }
+            using var options = new SessionOptions
+            {
+                IntraOpNumThreads = intraOpThreads.Value,
+            };
+            return new InferenceSession(modelPath, options);
+        }
+
+        try
+        {
+            using var options = new SessionOptions();
+            options.AppendExecutionProvider_CUDA(device.GpuDeviceId.Value);
+            return new InferenceSession(modelPath, options);
+        }
+        catch (OnnxRuntimeException) when (device.FallbackToCpu)
+        {
+            return new InferenceSession(modelPath);
+        }
+    }
+
+    private static void VerifyModelAbi(InferenceSession session)
+    {
+        if (!HasExactNames(session.InputNames, InputNames))
+        {
+            throw new InvalidOperationException(
+                $"ONNX receipt detector inputs must be exactly [{string.Join(',', InputNames)}]; found [{string.Join(',', session.InputNames)}]");
+        }
+        if (!HasExactNames(session.OutputNames, OutputNames))
+        {
+            throw new InvalidOperationException(
+                $"ONNX receipt detector outputs must be exactly [{string.Join(',', OutputNames)}]; found [{string.Join(',', session.OutputNames)}]");
+        }
+
+        var input = RequireTensorMetadata(session.InputMetadata, "image", typeof(float));
+        if (!input.Dimensions.SequenceEqual(InputMetadataShape))
+        {
+            throw new InvalidOperationException(
+                $"ONNX receipt detector input image has shape [{string.Join(',', input.Dimensions)}], expected [{string.Join(',', InputMetadataShape)}]");
+        }
+
+        var boxes = RequireTensorMetadata(session.OutputMetadata, "boxes", typeof(float));
+        VerifyOutputMetadataShape(boxes.Dimensions, "boxes", rank: 2, trailingDimension: 4);
+        var labels = RequireTensorMetadata(session.OutputMetadata, "labels", typeof(long));
+        VerifyOutputMetadataShape(labels.Dimensions, "labels", rank: 1, trailingDimension: null);
+        var scores = RequireTensorMetadata(session.OutputMetadata, "scores", typeof(float));
+        VerifyOutputMetadataShape(scores.Dimensions, "scores", rank: 1, trailingDimension: null);
+    }
+
+    private static NodeMetadata RequireTensorMetadata(
+        IReadOnlyDictionary<string, NodeMetadata> metadata,
+        string name,
+        Type expectedElementType)
+    {
+        if (!metadata.TryGetValue(name, out var value)
+            || !value.IsTensor
+            || value.ElementType != expectedElementType)
+        {
+            throw new InvalidOperationException(
+                $"ONNX receipt detector {name} must be a tensor of {expectedElementType.Name}");
+        }
+        return value;
+    }
+
+    private static void VerifyOutputMetadataShape(
+        IReadOnlyList<int> shape,
+        string name,
+        int rank,
+        int? trailingDimension)
+    {
+        var validLeadingDimension = shape.Count > 0 && (shape[0] == -1 || shape[0] > 0);
+        var validTrailingDimension = trailingDimension is null || shape[^1] == trailingDimension.Value;
+        if (shape.Count != rank || !validLeadingDimension || !validTrailingDimension)
+        {
+            throw new InvalidOperationException(
+                $"ONNX receipt detector output {name} has invalid shape [{string.Join(',', shape)}]");
+        }
+    }
+
+    private static float[] ReadBoxes(OrtValue value)
+    {
+        var typeAndShape = value.GetTensorTypeAndShape();
+        var shape = typeAndShape.Shape;
+        if (typeAndShape.ElementDataType != TensorElementType.Float
+            || shape.Length != 2
+            || shape[0] < 0
+            || shape[1] != 4)
+        {
+            throw new InvalidOperationException(
+                $"ONNX receipt detector output boxes must be a float tensor [N,4]; found {typeAndShape.ElementDataType} [{string.Join(',', shape)}]");
+        }
+        var data = value.GetTensorDataAsSpan<float>();
+        if (typeAndShape.ElementCount != data.Length || shape[0] * 4 != data.Length)
+        {
+            throw new InvalidOperationException("ONNX receipt detector output boxes has inconsistent shape metadata");
+        }
+        return data.ToArray();
+    }
+
+    private static T[] ReadVector<T>(OrtValue value, string name, TensorElementType expectedElementType)
+        where T : unmanaged
+    {
+        var typeAndShape = value.GetTensorTypeAndShape();
+        var shape = typeAndShape.Shape;
+        if (typeAndShape.ElementDataType != expectedElementType
+            || shape.Length != 1
+            || shape[0] < 0)
+        {
+            throw new InvalidOperationException(
+                $"ONNX receipt detector output {name} must be a {expectedElementType} tensor [N]; found {typeAndShape.ElementDataType} [{string.Join(',', shape)}]");
+        }
+        var data = value.GetTensorDataAsSpan<T>();
+        if (typeAndShape.ElementCount != data.Length || shape[0] != data.Length)
+        {
+            throw new InvalidOperationException(
+                $"ONNX receipt detector output {name} has inconsistent shape metadata");
+        }
+        return data.ToArray();
+    }
+
+    private static bool HasExactNames(IEnumerable<string> actual, IReadOnlyCollection<string> expected)
+    {
+        var names = actual.ToArray();
+        return names.Length == expected.Count
+            && names.Distinct(StringComparer.Ordinal).Count() == names.Length
+            && names.ToHashSet(StringComparer.Ordinal).SetEquals(expected);
+    }
 
 }
 
@@ -1268,13 +1493,6 @@ internal sealed record DetectorInputTensor(
             Math.Clamp((y2 - OffsetY) / ScaleY, 0.0f, SourceHeight),
         };
     }
-}
-
-internal sealed class DetectorInput
-{
-    [ColumnName("image")]
-    [VectorType(3, ImagePipeline.DetectorHeight, ImagePipeline.DetectorWidth)]
-    public float[] Image { get; set; } = Array.Empty<float>();
 }
 
 internal sealed class DetectorOutput
