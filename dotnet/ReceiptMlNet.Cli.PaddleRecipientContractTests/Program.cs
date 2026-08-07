@@ -24,6 +24,12 @@ internal static class Program
                 ParsePinyin(["shou kuan fang", "\u53f8\u6e90(**\u6e90)", "\u6536\u6b3e\u65b9"], [0.90f, 0.90f, 0.90f], float.NaN),
                 "pinyin detector is non-finite");
             AssertAlternativeNull(
+                ParsePinyin(["shou kuan fang", "\u53f8\u6e90(**\u6e90)", "\u6536\u6b3e\u65b9"], [0.90f, 0.90f, 0.90f], float.PositiveInfinity),
+                "pinyin detector infinity is rejected");
+            AssertAlternativeNull(
+                ParsePinyin(["shou kuan fang", "\u53f8\u6e90(**\u6e90)", "\u6536\u6b3e\u65b9"], [0.94f, float.NaN, 0.99f], 0.92f),
+                "pinyin line confidence is non-finite");
+            AssertAlternativeNull(
                 ParsePinyin(["shou kuan fang", "\u53f8\u6e90(**\u6e90)", "\u6536\u6b3e\u65b9"], [0.799f, 0.90f, 0.90f], 0.95f),
                 "pinyin annotation line below 0.80");
             AssertAlternative(
@@ -41,6 +47,48 @@ internal static class Program
                     [0.93031883f, 0.700153f, 0.9950261f],
                     0.92100316f),
                 "exact calibrated pilot pinyin evidence");
+            AssertAlternative(
+                "\u5c0f\u8363\uff08**\u9f99\uff09",
+                "pinyin_annotated_three_line_strong_anchors",
+                null,
+                ParsePinyin(
+                    ["shou kuan fang", "\u5c0f\u8363\uff08**\u9f99\uff09", "\u6536\u6b3e\u65b9"],
+                    [0.9424985f, 0.6764692f, 0.9966202f],
+                    0.92100316f),
+                "production rectified pinyin evidence with strong anchors");
+            AssertAlternative(
+                "\u5c0f\u8363\uff08**\u9f99\uff09",
+                "pinyin_annotated_three_line_strong_anchors",
+                null,
+                ParsePinyin(
+                    ["shou kuan fang", "\u5c0f\u8363\uff08**\u9f99\uff09", "\u6536\u6b3e\u65b9"],
+                    [0.94f, 0.67f, 0.99f],
+                    0.92f),
+                "strong-anchor pinyin thresholds are inclusive");
+            AssertAlternativeNull(
+                ParsePinyin(
+                    ["shou kuan fang", "\u5c0f\u8363\uff08**\u9f99\uff09", "\u6536\u6b3e\u65b9"],
+                    [0.9424985f, 0.669f, 0.9966202f],
+                    0.92100316f),
+                "strong-anchor pinyin merchant line below 0.67");
+            AssertAlternativeNull(
+                ParsePinyin(
+                    ["shou kuan fang", "\u5c0f\u8363\uff08**\u9f99\uff09", "\u6536\u6b3e\u65b9"],
+                    [0.9424985f, 0.6764692f, 0.9966202f],
+                    0.919f),
+                "lower pinyin merchant confidence without strong detector anchor");
+            AssertAlternativeNull(
+                ParsePinyin(
+                    ["shou kuan fang", "\u5c0f\u8363\uff08**\u9f99\uff09", "\u6536\u6b3e\u65b9"],
+                    [0.939f, 0.6764692f, 0.9966202f],
+                    0.92100316f),
+                "lower pinyin merchant confidence without strong first-line anchor");
+            AssertAlternativeNull(
+                ParsePinyin(
+                    ["shou kuan fang", "\u5c0f\u8363\uff08**\u9f99\uff09", "\u6536\u6b3e\u65b9"],
+                    [0.9424985f, 0.6764692f, 0.989f],
+                    0.92100316f),
+                "lower pinyin merchant confidence without strong label anchor");
             AssertAlternativeNull(
                 ParsePinyin(["shou kuan fang", "\u53f8\u6e90(**\u6e90)", "\u6536\u6b3e\u65b9"], [0.90f, 0.699f, 0.90f], 0.95f),
                 "pinyin merchant line below 0.70");
@@ -65,6 +113,51 @@ internal static class Program
             AssertAlternativeNull(
                 ParsePinyin(["shou kuan fang", "\u53f8\u6e90(**\u6e90)"], [0.90f, 0.90f], 0.95f),
                 "pinyin missing label line");
+
+            var strongPinyin = ParsePinyin(
+                ["shou kuan fang", "\u5c0f\u8363\uff08**\u9f99\uff09", "\u6536\u6b3e\u65b9"],
+                [0.9424985f, 0.6764692f, 0.9966202f],
+                0.92100316f);
+            var ordinaryPinyin = ParsePinyin(
+                ["shou kuan fang", "\u5c0f\u8363\uff08**\u9f99\uff09", "\u6536\u6b3e\u65b9"],
+                [0.95f, 0.70f, 0.995f],
+                0.95f);
+            var differentStrongPinyin = ParsePinyin(
+                ["shou kuan fang", "\u5c0f\u738b\uff08**\u6d77\uff09", "\u6536\u6b3e\u65b9"],
+                [0.95f, 0.68f, 0.995f],
+                0.95f);
+            AssertTrue(
+                PaddleRecipientValueParser.HasRequiredDualCropAgreement(
+                    strongPinyin, true, strongPinyin, true),
+                "matching strong pinyin crops pass dual-crop gate");
+            AssertTrue(
+                PaddleRecipientValueParser.HasRequiredDualCropAgreement(
+                    strongPinyin, true, ordinaryPinyin, true),
+                "matching strong and ordinary pinyin crops pass dual-crop gate");
+            AssertFalse(
+                PaddleRecipientValueParser.HasRequiredDualCropAgreement(
+                    strongPinyin, true, null, true),
+                "single strong primary crop cannot pass dual-crop gate");
+            AssertFalse(
+                PaddleRecipientValueParser.HasRequiredDualCropAgreement(
+                    null, true, strongPinyin, true),
+                "single strong retry crop cannot pass dual-crop gate");
+            AssertFalse(
+                PaddleRecipientValueParser.HasRequiredDualCropAgreement(
+                    strongPinyin, true, differentStrongPinyin, true),
+                "different pinyin merchants cannot pass dual-crop gate");
+            AssertFalse(
+                PaddleRecipientValueParser.HasRequiredDualCropAgreement(
+                    strongPinyin, false, strongPinyin, true),
+                "strong primary crop with failed geometry cannot pass dual-crop gate");
+            AssertFalse(
+                PaddleRecipientValueParser.HasRequiredDualCropAgreement(
+                    strongPinyin, true, strongPinyin, false),
+                "strong retry crop with failed geometry cannot pass dual-crop gate");
+            AssertFalse(
+                PaddleRecipientValueParser.HasRequiredDualCropAgreement(
+                    ordinaryPinyin, true, ordinaryPinyin, true),
+                "ordinary pinyin crops do not use the low-confidence dual-crop gate");
 
             AssertAlternative(
                 "\u6296\u97f3\u7535\u5546\u5546\u5bb6",

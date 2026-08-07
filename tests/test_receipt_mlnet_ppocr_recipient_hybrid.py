@@ -59,7 +59,7 @@ def test_hybrid_routes_only_recipient_after_v13_and_keeps_review_policy() -> Non
     assert "ParsePinyinAnnotatedRecipient" in router
     assert "ParseUnlabelledMerchantAmountPair" in router
     assert 'route = $"primary_{firstAlternative.Route}"' in router
-    assert 'retryRoute = $"left_context_retry_{retryAlternative.Route}"' in router
+    assert '$"left_context_retry_{retryAlternative.Route}"' in router
     assert "HasVerifiedUnlabelledMerchantRowLayout" in router
     assert "HasVerifiedUnlabelledMerchantRowGeometry" in router
     assert "ParseCalibratedAlternative" in router
@@ -82,10 +82,16 @@ def test_hybrid_routes_only_recipient_after_v13_and_keeps_review_policy() -> Non
     assert 'recipientDetectorScore < 0.90f' in parser
     assert '!float.IsFinite(recipientDetectorScore)' in parser
     assert 'lines[0].Confidence < 0.80f' in parser
-    assert 'lines[1].Confidence < 0.70f' in parser
+    assert 'merchantConfidenceFloor = hasStrongPinyinAnchors ? 0.67f : 0.70f' in parser
+    assert 'lines[1].Confidence < merchantConfidenceFloor' in parser
     assert 'lines[2].Confidence < 0.80f' in parser
     assert '"shoukuanfang"' in parser
     assert '"pinyin_annotated_three_line"' in parser
+    assert '"pinyin_annotated_three_line_strong_anchors"' in parser
+    assert "PaddleRecipientValueParser.RequiresDualCropAgreement" in router
+    assert "PaddleRecipientValueParser.HasRequiredDualCropAgreement" in router
+    assert "first!.Value, retry!.Value, StringComparison.Ordinal" in parser
+    assert 'dual_crop_{PaddleRecipientValueParser.PinyinAnnotatedThreeLineStrongAnchorsRoute}' in router
     assert '0 => 0.75f' in parser
     assert '<= 1 => 0.68f' in parser
     assert '<= 100 => 0.90f' in parser
@@ -184,6 +190,16 @@ def test_recipient_parser_has_package_free_executable_contract_tests() -> None:
     assert "pinyin annotation line below 0.80" in harness
     assert "pinyin merchant line at 0.70" in harness
     assert "pinyin merchant line below 0.70" in harness
+    assert "production rectified pinyin evidence with strong anchors" in harness
+    assert "strong-anchor pinyin thresholds are inclusive" in harness
+    assert "strong-anchor pinyin merchant line below 0.67" in harness
+    assert "lower pinyin merchant confidence without strong detector anchor" in harness
+    assert "lower pinyin merchant confidence without strong first-line anchor" in harness
+    assert "lower pinyin merchant confidence without strong label anchor" in harness
+    assert "matching strong pinyin crops pass dual-crop gate" in harness
+    assert "single strong retry crop cannot pass dual-crop gate" in harness
+    assert "different pinyin merchants cannot pass dual-crop gate" in harness
+    assert "ordinary pinyin crops do not use the low-confidence dual-crop gate" in harness
     assert "pinyin wrong line order" in harness
     assert "pinyin annotation typo" in harness
     assert "pinyin annotation contains non-letter noise" in harness

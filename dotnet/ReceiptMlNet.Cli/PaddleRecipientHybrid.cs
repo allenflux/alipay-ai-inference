@@ -81,7 +81,8 @@ internal static class PaddleRecipientHybrid
                     firstAlternative);
             }
             if (firstAlternative is not null
-                && firstAlternativeGeometryAccepted is true)
+                && firstAlternativeGeometryAccepted is true
+                && !PaddleRecipientValueParser.RequiresDualCropAgreement(firstAlternative))
             {
                 value = firstAlternative.Value;
                 route = $"primary_{firstAlternative.Route}";
@@ -126,8 +127,20 @@ internal static class PaddleRecipientHybrid
                     if (retryAlternative is not null
                         && retryAlternativeGeometryAccepted is true)
                     {
-                        retryValue = retryAlternative.Value;
-                        retryRoute = $"left_context_retry_{retryAlternative.Route}";
+                        var dualCropAgreement = PaddleRecipientValueParser.HasRequiredDualCropAgreement(
+                            firstAlternative,
+                            firstAlternativeGeometryAccepted,
+                            retryAlternative,
+                            retryAlternativeGeometryAccepted);
+                        if ((!PaddleRecipientValueParser.RequiresDualCropAgreement(firstAlternative)
+                                && !PaddleRecipientValueParser.RequiresDualCropAgreement(retryAlternative))
+                            || dualCropAgreement)
+                        {
+                            retryValue = retryAlternative.Value;
+                            retryRoute = dualCropAgreement
+                                ? $"dual_crop_{PaddleRecipientValueParser.PinyinAnnotatedThreeLineStrongAnchorsRoute}"
+                                : $"left_context_retry_{retryAlternative.Route}";
+                        }
                     }
                 }
                 if (retryValue is not null)

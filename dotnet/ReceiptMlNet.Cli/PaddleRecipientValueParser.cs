@@ -9,6 +9,9 @@ internal sealed record PaddleRecipientAlternativeParseResult(
 
 internal static class PaddleRecipientValueParser
 {
+    internal const string PinyinAnnotatedThreeLineRoute = "pinyin_annotated_three_line";
+    internal const string PinyinAnnotatedThreeLineStrongAnchorsRoute =
+        "pinyin_annotated_three_line_strong_anchors";
     internal const string UnlabelledCjkAmountExactRoute = "unlabelled_cjk_amount_exact";
 
     private static readonly string[] RecipientLabels =
@@ -72,8 +75,10 @@ internal static class PaddleRecipientValueParser
     /// Accept the observed three-line pinyin annotation layout only when its
     /// detector and every OCR line pass their independent floors.  The
     /// normalised order is exactly "shou kuan fang", a CJK merchant value,
-    /// then the Chinese recipient label.  This does not relax the ordinary
-    /// left-label parser above.
+    /// then the Chinese recipient label.  The ordinary merchant floor stays
+    /// at 0.70; a separate 0.67 tier requires independently strong detector,
+    /// pinyin and exact Chinese-label anchors.  This does not relax the
+    /// ordinary left-label parser above.
     /// </summary>
     public static PaddleRecipientAlternativeParseResult? ParsePinyinAnnotatedRecipient(
         IReadOnlyList<string>? rawLines,
@@ -89,8 +94,12 @@ internal static class PaddleRecipientValueParser
             return null;
         }
 
+        var hasStrongPinyinAnchors = recipientDetectorScore >= 0.92f
+            && lines[0].Confidence >= 0.94f
+            && lines[2].Confidence >= 0.99f;
+        var merchantConfidenceFloor = hasStrongPinyinAnchors ? 0.67f : 0.70f;
         if (lines[0].Confidence < 0.80f
-            || lines[1].Confidence < 0.70f
+            || lines[1].Confidence < merchantConfidenceFloor
             || lines[2].Confidence < 0.80f
             || !string.Equals(NormalizePinyin(lines[0].Text), "shoukuanfang", StringComparison.Ordinal)
             || !IsCjkMerchantCandidate(lines[1].Text)
@@ -100,7 +109,9 @@ internal static class PaddleRecipientValueParser
         }
         return new PaddleRecipientAlternativeParseResult(
             lines[1].Text,
-            "pinyin_annotated_three_line");
+            hasStrongPinyinAnchors && lines[1].Confidence < 0.70f
+                ? PinyinAnnotatedThreeLineStrongAnchorsRoute
+                : PinyinAnnotatedThreeLineRoute);
     }
 
     /// <summary>
@@ -192,6 +203,36 @@ internal static class PaddleRecipientValueParser
     }
 
     /// <summary>
+    /// The lower-confidence pinyin merchant tier is diagnostic until two
+    /// independently cropped PP-OCR reads agree on the cleaned merchant and
+    /// both pass the ordinary row geometry.  Keeping this primitive-only
+    /// makes the gate executable in the package-free contract tests.
+    /// </summary>
+    public static bool RequiresDualCropAgreement(
+        PaddleRecipientAlternativeParseResult? alternative)
+    {
+        return alternative is not null
+            && string.Equals(
+                alternative.Route,
+                PinyinAnnotatedThreeLineStrongAnchorsRoute,
+                StringComparison.Ordinal);
+    }
+
+    public static bool HasRequiredDualCropAgreement(
+        PaddleRecipientAlternativeParseResult? first,
+        bool? firstGeometryAccepted,
+        PaddleRecipientAlternativeParseResult? retry,
+        bool? retryGeometryAccepted)
+    {
+        return firstGeometryAccepted is true
+            && retryGeometryAccepted is true
+            && IsPinyinAlternative(first)
+            && IsPinyinAlternative(retry)
+            && (RequiresDualCropAgreement(first) || RequiresDualCropAgreement(retry))
+            && string.Equals(first!.Value, retry!.Value, StringComparison.Ordinal);
+    }
+
+    /// <summary>
     /// Primitive-only geometry contract so the package-free executable tests
     /// can prove that the unlabelled recipient row is physically between the
     /// primary amount and payment-method rows, not merely center-sorted.
@@ -255,6 +296,17 @@ internal static class PaddleRecipientValueParser
             return false;
         }
         return value.Any(character => character is >= '\u3400' and <= '\u9fff');
+    }
+
+    private static bool IsPinyinAlternative(
+        PaddleRecipientAlternativeParseResult? alternative)
+    {
+        return alternative is not null
+            && (string.Equals(
+                    alternative.Route,
+                    PinyinAnnotatedThreeLineRoute,
+                    StringComparison.Ordinal)
+                || RequiresDualCropAgreement(alternative));
     }
 
     private static bool TryPrepareLines(
