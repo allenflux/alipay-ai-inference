@@ -82,9 +82,11 @@ function Get-Sha256([string]$Path) {
 
 function Get-NormalizedTransferStatus([string]$Text) {
     $compact = $Text -replace '\s+', ''
-    if ($compact -match '失败|未成功|已撤销') { return "failed" }
-    if ($compact -match '处理中|待处理|进行中') { return "pending" }
-    if ($compact -match '转账成功|交易成功|付款成功|支付成功|转帐成功') { return "success" }
+    # Keep this file ASCII so Windows PowerShell 5.1 does not misparse a
+    # UTF-8-without-BOM script. .NET Regex expands the Unicode escapes.
+    if ($compact -match '\u5931\u8d25|\u672a\u6210\u529f|\u5df2\u64a4\u9500') { return "failed" }
+    if ($compact -match '\u5904\u7406\u4e2d|\u5f85\u5904\u7406|\u8fdb\u884c\u4e2d') { return "pending" }
+    if ($compact -match '\u8f6c\u8d26\u6210\u529f|\u4ea4\u6613\u6210\u529f|\u4ed8\u6b3e\u6210\u529f|\u652f\u4ed8\u6210\u529f|\u8f6c\u5e10\u6210\u529f') { return "success" }
     return "unknown"
 }
 
@@ -114,7 +116,7 @@ function Assert-SafePathSyntax([string]$Path, [string]$Description) {
         throw "${Description} must not use a drive-relative path: $Path"
     }
 
-    $segments = @($Path.Split([char[]]@('\', '/')))
+    $segments = @($Path.Split([char[]] @('\', '/')))
     for ($index = 0; $index -lt $segments.Count; $index++) {
         $segment = [string]$segments[$index]
         if ([string]::IsNullOrEmpty($segment)) {
@@ -129,7 +131,7 @@ function Assert-SafePathSyntax([string]$Path, [string]$Description) {
         if ($segment.Contains(':')) {
             throw "${Description} must not use an alternate data stream or path alias: $Path"
         }
-        $canonicalSegment = $segment.TrimEnd([char[]]@('.', ' '))
+        $canonicalSegment = $segment.TrimEnd([char[]] @('.', ' '))
         if ($canonicalSegment.Length -ne $segment.Length) {
             throw "${Description} must not contain a trailing dot or space: $Path"
         }
