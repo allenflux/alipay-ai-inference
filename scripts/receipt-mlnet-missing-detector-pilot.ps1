@@ -25,6 +25,9 @@ foreach ($required in @($projectFile, $detector, $deviceModel, $unifiedModel, $f
         throw "Missing detector pilot dependency: $required"
     }
 }
+$detectorSha256 = (Get-FileHash -LiteralPath $detector -Algorithm SHA256).Hash.ToLowerInvariant()
+$deviceSha256 = (Get-FileHash -LiteralPath $deviceModel -Algorithm SHA256).Hash.ToLowerInvariant()
+$unifiedSha256 = (Get-FileHash -LiteralPath $unifiedModel -Algorithm SHA256).Hash.ToLowerInvariant()
 
 $cases = @(
     [pscustomobject]@{
@@ -52,7 +55,16 @@ foreach ($case in $cases) {
     if ($comparison.Count -ne 1) {
         throw "Expected one formal comparison for $($case.Field), found $($comparison.Count)."
     }
-    Add-Member -InputObject $case -NotePropertyName Reference -NotePropertyValue ([string]$comparison[0].reference_text)
+    if (-not [IO.Path]::GetFullPath([string]$comparison[0].source).Equals(
+            [IO.Path]::GetFullPath([string]$case.Source),
+            [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Formal comparison source differs from fixed detector pilot source: $($case.Source)"
+    }
+    $reference = [string]$comparison[0].reference_text
+    if ([string]::IsNullOrWhiteSpace($reference)) {
+        throw "Formal comparison has no reference text for $($case.Field)."
+    }
+    Add-Member -InputObject $case -NotePropertyName Reference -NotePropertyValue $reference
 }
 
 $tag = (Get-Date).ToUniversalTime().ToString("yyyyMMdd-HHmmss")
@@ -137,7 +149,11 @@ function Invoke-ThresholdPilot([string]$Name, [double]$Threshold) {
         -or [int]$summary.errors -ne 0) {
         throw "Detector pilot $Name runtime summary is not a complete CPU run."
     }
-    $manifest = @(Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json)
+    $manifestPayload = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    $manifest = @()
+    foreach ($manifestItem in $manifestPayload) {
+        $manifest += $manifestItem
+    }
     if ($manifest.Count -ne $cases.Count) {
         throw "Detector pilot $Name manifest count differs from input count."
     }
@@ -155,6 +171,12 @@ function Invoke-ThresholdPilot([string]$Name, [double]$Threshold) {
         $result = Get-Content -LiteralPath $resultPath -Raw -Encoding UTF8 | ConvertFrom-Json
         if ($null -eq $result.device) {
             throw "Detector pilot $Name omitted the device model result for $($case.Source)."
+        }
+        if ([string]$result.geometry.rectification -ne "max-side-1600" `
+            -or [string]$result.model_contracts.detector_sha256 -ne $detectorSha256 `
+            -or [string]$result.model_contracts.device_sha256 -ne $deviceSha256 `
+            -or [string]$result.model_contracts.unified_ocr_model_sha256 -ne $unifiedSha256) {
+            throw "Detector pilot $Name result does not prove the requested geometry/model contracts."
         }
         $field = $result.fields.PSObject.Properties[[string]$case.ResultField].Value
         $detection = @($result.detections | Where-Object { [string]$_.label -eq [string]$case.Field })
