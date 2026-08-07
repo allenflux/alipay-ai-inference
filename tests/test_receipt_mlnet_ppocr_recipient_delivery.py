@@ -65,7 +65,9 @@ def test_dotnet_parity_emits_single_line_jsonl_records() -> None:
 def test_cpu_ab_runs_same_val_inputs_through_v13_and_hybrid_on_cpu() -> None:
     source = CPU_AB.read_text(encoding="utf-8")
 
-    assert "prepare --records $Records --output $inputList --split val" in source
+    assert "prepare --records $Records --output $preparedInputList --split val" in source
+    assert '@($preparedInputs | Select-Object -First $Limit)' in source
+    assert '[IO.File]::WriteAllLines(' in source
     assert '"--device", "cpu"' in source
     assert '"--device-model", $DeviceModel' in source
     assert '"--ocr", "unified"' in source
@@ -311,7 +313,11 @@ def _write_ab_run(
         "written": 1,
         "skipped": 0,
         "errors": 0,
-        "inference_latency_ms": {"p50": 100.0 if not hybrid else 120.0, "p95": 110.0 if not hybrid else 135.0},
+        "inference_latency_ms": {
+            "count": 1,
+            "p50": 100.0 if not hybrid else 120.0,
+            "p95": 110.0 if not hybrid else 135.0,
+        },
         "stage_latency_ms": {"paddle_ocr": {"p50": None if not hybrid else 20.0, "p95": None if not hybrid else 25.0}},
     }
     (directory / "inference_summary.json").write_text(json.dumps(summary), encoding="utf-8")
@@ -491,6 +497,7 @@ def test_cpu_ab_comparator_rejects_summary_manifest_count_mismatch(tmp_path: Pat
         summary_path = run / "inference_summary.json"
         summary = json.loads(summary_path.read_text(encoding="utf-8"))
         summary["input"] = summary["written"] = 2
+        summary["inference_latency_ms"]["count"] = 2
         summary_path.write_text(json.dumps(summary), encoding="utf-8")
 
     with pytest.raises(module.ComparisonError, match="manifest/result count 1 differs"):

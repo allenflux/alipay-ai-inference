@@ -14,7 +14,7 @@ LAUNCHER = ROOT / "scripts" / "v13-cpu.ps1"
 def _source() -> str:
     payload = LAUNCHER.read_bytes()
     assert all(byte < 128 for byte in payload), "hybrid CPU orchestrator must remain Windows PowerShell ASCII"
-    return payload.decode("ascii")
+    return payload.decode("ascii").replace("\r\n", "\n")
 
 
 def test_orchestrator_requires_and_passes_verified_ppocr_bundle_to_both_runs() -> None:
