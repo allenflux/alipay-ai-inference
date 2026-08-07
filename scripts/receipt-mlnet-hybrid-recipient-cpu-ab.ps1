@@ -146,8 +146,7 @@ $common = @(
     "--input-list", $inputList,
     "--device", "cpu",
     "--rectification", "max-side-1600",
-    "--annotate", "none",
-    "--require-complete"
+    "--annotate", "none"
 )
 if ($Limit -gt 0) {
     $common += "--limit"

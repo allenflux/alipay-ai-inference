@@ -986,7 +986,12 @@ internal static class ReceiptMlNetProgram
 
     private static readonly string[] RequiredLabels =
     {
-        "time", "amount", "transfer_status", "recipient_field", "payment_method_field",
+        // The status-bar clock is evaluated by the OCR accuracy/coverage gate,
+        // but it is not a core transaction field.  Keep this aligned with
+        // transfer_receipt_ai.labels.REQUIRED_DETECTION_CLASSES so
+        // --require-complete and --annotate flagged have the same semantics
+        // in Python and .NET.
+        "amount", "transfer_status", "recipient_field", "payment_method_field",
     };
 
     private static readonly HashSet<string> ImageExtensions = new(StringComparer.OrdinalIgnoreCase)

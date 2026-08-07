@@ -16,6 +16,7 @@ CPU_AB = ROOT / "scripts" / "receipt-mlnet-hybrid-recipient-cpu-ab.ps1"
 SAMPLE = ROOT / "scripts" / "receipt-ppocr-val-parity-sample.py"
 COMPARATOR = ROOT / "scripts" / "receipt-mlnet-hybrid-recipient-ab.py"
 DOTNET_PARITY_PROGRAM = ROOT / "dotnet" / "ReceiptMlNet.Cli.PaddleParity" / "Program.cs"
+DOTNET_PROGRAM = ROOT / "dotnet" / "ReceiptMlNet.Cli" / "Program.cs"
 
 
 def _load_module(path: Path, name: str):
@@ -84,7 +85,20 @@ def test_cpu_ab_runs_same_val_inputs_through_v13_and_hybrid_on_cpu() -> None:
     assert 'formal_delivery_gate=true' in source
     assert '$passLabel = "PILOT PASS"' in source
     assert '$passLabel = "FORMAL PASS"' in source
+    assert '"--require-complete"' not in source
+    assert '"--continue-on-error"' not in source
     assert "--split test" not in source
+
+
+def test_dotnet_complete_detection_contract_excludes_status_bar_clock() -> None:
+    source = DOTNET_PROGRAM.read_text(encoding="utf-8")
+    block = source.split("private static readonly string[] RequiredLabels =", 1)[1].split("};", 1)[0]
+
+    assert '"amount"' in block
+    assert '"transfer_status"' in block
+    assert '"recipient_field"' in block
+    assert '"payment_method_field"' in block
+    assert '"time"' not in block
 
 
 def test_val_parity_sample_rejects_non_val_or_non_full_pipeline(tmp_path: Path) -> None:
