@@ -1,4 +1,4 @@
-using Clipper2Lib;
+using ClipperLib;
 using OpenCvSharp;
 
 /// <summary>Frozen DB post-processing settings from PaddleOCR v2.</summary>
@@ -159,17 +159,17 @@ internal static class PaddleDbPostProcessor
             return null;
         }
         var distance = area * unclipRatio / perimeter;
-        var path = new Path64();
+        var path = new List<IntPoint>();
         foreach (var point in box)
         {
             // pyclipper's integer coordinate conversion truncates positive
             // mini-box coordinates, so keep that behaviour here.
-            path.Add(new Point64((long)point.X, (long)point.Y));
+            path.Add(new IntPoint((long)point.X, (long)point.Y));
         }
         var offset = new ClipperOffset();
-        offset.AddPath(path, JoinType.Round, EndType.Polygon);
-        var expanded = new Paths64();
-        offset.Execute(distance, expanded);
+        offset.AddPath(path, JoinType.jtRound, EndType.etClosedPolygon);
+        var expanded = new List<List<IntPoint>>();
+        offset.Execute(ref expanded, distance);
         if (expanded.Count != 1 || expanded[0].Count < 3)
         {
             return null;

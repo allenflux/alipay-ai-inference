@@ -17,8 +17,8 @@
     <PackageReference Include="OpenCvSharp4" Version="4.11.0.20250507" />
     <!-- The supported delivery target is Windows x64. This package supplies OpenCV native binaries. -->
     <PackageReference Include="OpenCvSharp4.runtime.win" Version="4.11.0.20250507" />
-    <!-- Managed polygon offsetting used by Paddle DB's unclip step. -->
-    <PackageReference Include="Clipper2" Version="1.5.4" />
+    <!-- Match PaddleOCR/pyclipper's Clipper 6.4.2 unclip geometry exactly. -->
+    <PackageReference Include="clipper.NetStandard2" Version="6.4.2" />
   </ItemGroup>
 
   <!-- Build with -p:OnnxRuntimeFlavor=gpu for CUDA deployment. -->
