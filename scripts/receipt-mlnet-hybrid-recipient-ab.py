@@ -294,6 +294,18 @@ def _detections_by_label(result: Mapping[str, Any]) -> dict[str, dict[str, Any]]
     return by_label
 
 
+def _canonical_detector_score(field: Mapping[str, Any], description: str) -> float | None:
+    """Read the detector score across the compatible read/unreadable shapes."""
+    detector_score = field.get("detector_score")
+    unreadable_score = field.get("score")
+    if detector_score is not None and unreadable_score is not None:
+        raise ComparisonError(
+            f"{description} contains both detector_score and unreadable compatibility score"
+        )
+    value = detector_score if detector_score is not None else unreadable_score
+    return None if value is None else _finite_number(value, f"{description} detector score")
+
+
 def compare(
     *,
     baseline_dir: Path,
@@ -384,7 +396,11 @@ def compare(
                 recipient_candidate = None
             else:
                 recipient_candidate = hybrid_recipient.get("candidate")
-                for key in ("detector_score", "delivery_policy", "delivery_value", "value"):
+                if _canonical_detector_score(
+                    baseline_recipient, "baseline recipient"
+                ) != _canonical_detector_score(hybrid_recipient, "hybrid recipient"):
+                    source_failures.append("recipient detector_score changed")
+                for key in ("delivery_policy", "delivery_value", "value"):
                     if baseline_recipient.get(key) != hybrid_recipient.get(key):
                         source_failures.append(f"recipient {key} changed")
                 if not isinstance(recipient_candidate, str) or not recipient_candidate:

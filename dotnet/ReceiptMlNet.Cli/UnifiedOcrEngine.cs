@@ -25,7 +25,20 @@ internal sealed record UnifiedOcrReadResult(
     string StatusDeliveryValue,
     string StatusRuntimePolicy,
     string TextDeliveryValue,
-    string TextRuntimePolicy);
+    string TextRuntimePolicy,
+    PaddleRecipientDiagnostic? RecipientDiagnostic = null);
+
+internal sealed record PaddleRecipientDiagnostic(
+    string Route,
+    string? FailureReason,
+    string FirstRaw,
+    int FirstLineCount,
+    int FirstCropWidth,
+    int FirstCropHeight,
+    string? RetryRaw = null,
+    int? RetryLineCount = null,
+    int? RetryCropWidth = null,
+    int? RetryCropHeight = null);
 
 /// <summary>
 /// Observability-only timing for the unified reader.  The three measurements

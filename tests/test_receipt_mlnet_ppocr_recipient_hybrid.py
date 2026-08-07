@@ -53,6 +53,23 @@ def test_hybrid_routes_only_recipient_after_v13_and_keeps_review_policy() -> Non
         assert forbidden not in router
     assert "unified.TextDeliveryValue" in router
     assert "never falls back to the lower-accuracy v13 recipient branch" in router
+    assert "CropRecipientRowLeftContext" in router
+    assert 'route = "left_context_retry"' in router
+    assert "PaddleRecipientValueParser.Parse(retryRead.Text)" in router
+    assert "RecipientDiagnostic = diagnostic" in router
+
+
+def test_hybrid_retry_is_left_context_only_and_remains_fail_closed() -> None:
+    image_ops = _source("UnifiedOcrImageOps.cs")
+    router = _source("PaddleRecipientHybrid.cs")
+
+    retry = image_ops.split("CropRecipientRowLeftContext", 1)[1]
+    assert "new Rectangle(0, top, right, bottom - top)" in retry
+    assert router.count("paddleOcr.Recognize(") == 2
+    assert router.count("PaddleRecipientValueParser.Parse(") == 2
+    assert '"anchor_parse_failed"' in router
+    assert '"ocr_empty"' in router
+    assert "candidates.Remove(\"recipient_field\")" in router
 
 
 def test_hybrid_is_pure_onnx_cpu_and_binds_all_artifact_hashes() -> None:

@@ -404,6 +404,22 @@ def test_cpu_ab_comparator_allows_only_recipient_candidate_change(tmp_path: Path
     assert summary["cli_summary_counts_verified"] is True
 
 
+def test_cpu_ab_comparator_normalizes_read_and_unreadable_detector_score_shapes() -> None:
+    module = _load_module(COMPARATOR, "receipt_hybrid_ab_detector_score_shape")
+
+    assert module._canonical_detector_score({"detector_score": 0.99}, "read") == pytest.approx(0.99)
+    assert module._canonical_detector_score({"score": 0.99}, "unreadable") == pytest.approx(0.99)
+    assert module._canonical_detector_score({}, "absent") is None
+
+    with pytest.raises(module.ComparisonError, match="contains both"):
+        module._canonical_detector_score(
+            {"detector_score": 0.99, "score": 0.99},
+            "conflicting schema",
+        )
+    with pytest.raises(module.ComparisonError, match="finite number"):
+        module._canonical_detector_score({"score": "0.99"}, "wrong type")
+
+
 def test_cpu_ab_comparator_rejects_protected_field_change(tmp_path: Path) -> None:
     module = _load_module(COMPARATOR, "receipt_hybrid_ab_changed")
     delivery, delivery_sha256 = _write_delivery(tmp_path / "delivery")

@@ -562,7 +562,8 @@ internal static class ReceiptMlNetProgram
                 byLabel.GetValueOrDefault("recipient_field"),
                 unifiedOcr.Candidates.GetValueOrDefault("recipient_field"),
                 unifiedOcr.TextRuntimePolicy,
-                unifiedOcr.TextDeliveryValue),
+                unifiedOcr.TextDeliveryValue,
+                unifiedOcr.RecipientDiagnostic),
             UnifiedTextField(
                 byLabel.GetValueOrDefault("payment_method_field"),
                 unifiedOcr.Candidates.GetValueOrDefault("payment_method_field"),
@@ -574,7 +575,8 @@ internal static class ReceiptMlNetProgram
         DetectionResult? detection,
         UnifiedOcrCandidate? candidate,
         string policy,
-        string deliveryValue)
+        string deliveryValue,
+        PaddleRecipientDiagnostic? recipientDiagnostic = null)
     {
         if (detection is null)
         {
@@ -593,7 +595,17 @@ internal static class ReceiptMlNetProgram
                 null,
                 null,
                 DeliveryPolicy: policy,
-                DeliveryValue: deliveryValue);
+                DeliveryValue: deliveryValue,
+                HybridOcrRoute: recipientDiagnostic?.Route,
+                HybridOcrFailureReason: recipientDiagnostic?.FailureReason,
+                HybridOcrFirstRaw: recipientDiagnostic?.FirstRaw,
+                HybridOcrFirstLineCount: recipientDiagnostic?.FirstLineCount,
+                HybridOcrFirstCropWidth: recipientDiagnostic?.FirstCropWidth,
+                HybridOcrFirstCropHeight: recipientDiagnostic?.FirstCropHeight,
+                HybridOcrRetryRaw: recipientDiagnostic?.RetryRaw,
+                HybridOcrRetryLineCount: recipientDiagnostic?.RetryLineCount,
+                HybridOcrRetryCropWidth: recipientDiagnostic?.RetryCropWidth,
+                HybridOcrRetryCropHeight: recipientDiagnostic?.RetryCropHeight);
         }
         return new ReceiptFieldResult(
             deliveryValue == "review" ? "review" : "read",
@@ -611,7 +623,17 @@ internal static class ReceiptMlNetProgram
             StructuredCandidate: candidate.StructuredCandidate,
             StructuredConfidence: candidate.StructuredConfidence is null ? null : MathF.Round(candidate.StructuredConfidence.Value, 6),
             DeliveryPolicy: policy,
-            DeliveryValue: candidate.DeliveryValue);
+            DeliveryValue: candidate.DeliveryValue,
+            HybridOcrRoute: recipientDiagnostic?.Route,
+            HybridOcrFailureReason: recipientDiagnostic?.FailureReason,
+            HybridOcrFirstRaw: recipientDiagnostic?.FirstRaw,
+            HybridOcrFirstLineCount: recipientDiagnostic?.FirstLineCount,
+            HybridOcrFirstCropWidth: recipientDiagnostic?.FirstCropWidth,
+            HybridOcrFirstCropHeight: recipientDiagnostic?.FirstCropHeight,
+            HybridOcrRetryRaw: recipientDiagnostic?.RetryRaw,
+            HybridOcrRetryLineCount: recipientDiagnostic?.RetryLineCount,
+            HybridOcrRetryCropWidth: recipientDiagnostic?.RetryCropWidth,
+            HybridOcrRetryCropHeight: recipientDiagnostic?.RetryCropHeight);
     }
 
     private static ReceiptFieldResult UnifiedStatusField(DetectionResult? detection, UnifiedOcrReadResult unifiedOcr)
@@ -1875,7 +1897,17 @@ internal sealed record ReceiptFieldResult(
     string? StructuredCandidate = null,
     float? StructuredConfidence = null,
     string? DeliveryPolicy = null,
-    string? DeliveryValue = null);
+    string? DeliveryValue = null,
+    string? HybridOcrRoute = null,
+    string? HybridOcrFailureReason = null,
+    string? HybridOcrFirstRaw = null,
+    int? HybridOcrFirstLineCount = null,
+    int? HybridOcrFirstCropWidth = null,
+    int? HybridOcrFirstCropHeight = null,
+    string? HybridOcrRetryRaw = null,
+    int? HybridOcrRetryLineCount = null,
+    int? HybridOcrRetryCropWidth = null,
+    int? HybridOcrRetryCropHeight = null);
 internal sealed record DeviceResult(
     string Platform,
     string PlatformCn,
