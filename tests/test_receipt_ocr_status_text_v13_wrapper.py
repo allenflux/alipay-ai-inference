@@ -85,7 +85,11 @@ def test_wrapper_fails_closed_on_visible_status_text_and_review_only_delivery() 
     assert "candidateContract.status_head_policy.runtime_policy -ne \"review_only\"" in source
     assert 'Get-StatusOovAudit $datasetContract "val"' in source
     assert 'Get-StatusOovAudit $datasetContract "test"' in source
+    assert 'Properties["missing_text_records"]' in source
+    assert "visible transfer status text in train, val, and test" in source
     assert "train status text must have zero OOV" in source
+    assert "missing_status_text_records -ne 0" in source
+    assert "refusing to shrink the status OCR denominator" in source
     assert "held-out train-charset OOV is retained as an error" in source
     assert "max_possible_exact_match -lt $StatusTextFloor" in source
     assert "train-charset OOV makes the requested status exact floor impossible" in source
@@ -103,6 +107,7 @@ def test_wrapper_fails_closed_on_visible_status_text_and_review_only_delivery() 
 def test_wrapper_exports_and_evaluates_but_delegates_cpu_packaging() -> None:
     source = _source()
 
+    assert "$OutputRoot = [IO.Path]::GetFullPath($OutputRoot)" in source
     assert source.count('"transfer_receipt_ai.ocr_unified", "export"') == 2
     assert '"transfer_receipt_ai.ocr_unified", "evaluate"' in source
     assert "CUDAExecutionProvider" in source
@@ -110,6 +115,24 @@ def test_wrapper_exports_and_evaluates_but_delegates_cpu_packaging() -> None:
     assert "cpu_packaging" in source
     assert "performed = $false" in source
     assert "receipt-mlnet-unified-package-validate-4090.ps1" in source
+    assert 'Join-Path $OutputRoot "onnx-val-gpu\\summary.json"' in source
+    assert "unified_model_path = $candidateModel" in source
+    assert "onnx_validation_summary_path = $packagingValidationSummary" in source
+    assert "unified_model_sha256 = Get-Sha256 $candidateModel" in source
+    assert "onnx_validation_summary_sha256 = Get-Sha256 $packagingValidationSummary" in source
+    assert "records_sha256 = Get-Sha256 $records" in source
+    assert "evaluationSummary.records_sha256 -ne (Get-Sha256 $records)" in source
+    assert "candidateLabelsPath" in source
+    assert "labels_sha256 = Get-Sha256 $candidateLabelsPath" in source
+    assert "$statusCtcRecords -ne [int]$statusAudit.visible_status_records" in source
+    assert "$statusCtcExactMatches / [double]$statusCtcRecords" in source
+    assert 'Properties["max_non_success_to_success"]' in source
+    assert "$statusMetrics.non_success_to_success -ne 0" in source
+    assert "include_device_model = $true" in source
+    assert 'required_runtime_flavor = "cpu"' in source
+    assert 'required_rectification = "max-side-1600"' in source
+    assert 'Write-Host "    -UnifiedModelPath $candidateModel"' in source
+    assert 'Write-Host "    -OnnxValidationSummaryPath $packagingValidationSummary"' in source
     assert "& $pythonExe @CommandArguments" in source
     assert "$LASTEXITCODE -ne 0" in source
 

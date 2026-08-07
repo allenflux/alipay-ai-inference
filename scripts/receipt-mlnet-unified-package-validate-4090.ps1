@@ -2,6 +2,13 @@
 param(
     [Parameter(Mandatory = $true)]
     [string]$RunDirectory,
+    # Optional direct artifact bindings let additive runs (for example v13's
+    # artifacts/status-text-v13.onnx) enter the existing packager without
+    # renaming files or rewriting their hash-bound sidecars.  Supply both or
+    # neither; the legacy best.onnx + onnx-val/summary.json layout remains the
+    # default.
+    [string]$UnifiedModelPath,
+    [string]$OnnxValidationSummaryPath,
     [Alias("Input")]
     [string]$InputPath,
     [string]$InputList,
@@ -71,6 +78,14 @@ if ([string]::IsNullOrWhiteSpace($DeviceModel)) {
 
 function Get-Sha256([string]$Path) {
     return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+
+function Get-NormalizedTransferStatus([string]$Text) {
+    $compact = $Text -replace '\s+', ''
+    if ($compact -match '失败|未成功|已撤销') { return "failed" }
+    if ($compact -match '处理中|待处理|进行中') { return "pending" }
+    if ($compact -match '转账成功|交易成功|付款成功|支付成功|转帐成功') { return "success" }
+    return "unknown"
 }
 
 function Require-File([string]$Path, [string]$Description) {
@@ -481,6 +496,25 @@ function Assert-UnifiedBundle([string]$ModelPath) {
 $hasRecords = -not [string]::IsNullOrWhiteSpace($Records)
 $hasEndToEndEvaluationDir = -not [string]::IsNullOrWhiteSpace($EndToEndEvaluationDir)
 $includeProductionCpuEntrypoints = $hasRecords -and $RuntimeFlavor -eq "cpu"
+$requestedRecordsSha256 = $null
+$hasExplicitUnifiedModel = -not [string]::IsNullOrWhiteSpace($UnifiedModelPath)
+$hasExplicitOnnxValidationSummary = -not [string]::IsNullOrWhiteSpace($OnnxValidationSummaryPath)
+$usesExplicitUnifiedArtifactBinding = $hasExplicitUnifiedModel -and $hasExplicitOnnxValidationSummary
+$minimumAmountFloor = 0.7885
+$minimumTimeFloor = 0.9840
+$minimumPaymentFloor = 0.9325
+$minimumRecipientFloor = 0.90
+$requiredStatusTextFloor = 0.90
+
+if ($hasExplicitUnifiedModel -ne $hasExplicitOnnxValidationSummary) {
+    throw "Supply -UnifiedModelPath and -OnnxValidationSummaryPath together, or omit both for the legacy run layout."
+}
+if ($AmountFloor -lt $minimumAmountFloor `
+    -or $TimeFloor -lt $minimumTimeFloor `
+    -or $PaymentFloor -lt $minimumPaymentFloor `
+    -or $RecipientFloor -lt $minimumRecipientFloor) {
+    throw "Delivery floors may be raised but must not be lower than amount=78.85%, time=98.40%, payment=93.25%, recipient=90%."
+}
 
 if ([string]::IsNullOrWhiteSpace($InputPath) -eq [string]::IsNullOrWhiteSpace($InputList)) {
     throw "Specify exactly one of -Input or -InputList."
@@ -514,6 +548,10 @@ Assert-SafePathSyntax $Output "Output"
 Assert-SafePathSyntax $DeliveryDir "DeliveryDir"
 Assert-SafePathSyntax $DetectorModel "DetectorModel"
 Assert-SafePathSyntax $DeviceModel "DeviceModel"
+if ($usesExplicitUnifiedArtifactBinding) {
+    Assert-SafePathSyntax $UnifiedModelPath "UnifiedModelPath"
+    Assert-SafePathSyntax $OnnxValidationSummaryPath "OnnxValidationSummaryPath"
+}
 $RunDirectory = [IO.Path]::GetFullPath($RunDirectory)
 $Output = [IO.Path]::GetFullPath($Output)
 $DeliveryDir = [IO.Path]::GetFullPath($DeliveryDir)
@@ -524,6 +562,16 @@ Assert-NoReparsePointInExistingPath $Output "Output"
 Assert-NoReparsePointInExistingPath $DeliveryDir "DeliveryDir"
 Assert-NoReparsePointInExistingPath $DetectorModel "DetectorModel"
 Assert-NoReparsePointInExistingPath $DeviceModel "DeviceModel"
+if ($usesExplicitUnifiedArtifactBinding) {
+    $UnifiedModelPath = [IO.Path]::GetFullPath($UnifiedModelPath)
+    $OnnxValidationSummaryPath = [IO.Path]::GetFullPath($OnnxValidationSummaryPath)
+    Assert-NoReparsePointInExistingPath $UnifiedModelPath "UnifiedModelPath"
+    Assert-NoReparsePointInExistingPath $OnnxValidationSummaryPath "OnnxValidationSummaryPath"
+    if (-not (Test-PathWithin $UnifiedModelPath $RunDirectory) `
+        -or -not (Test-PathWithin $OnnxValidationSummaryPath $RunDirectory)) {
+        throw "Explicit unified model and ONNX validation summary must both be contained by RunDirectory."
+    }
+}
 
 if ($hasRecords) {
     Assert-SafePathSyntax $Records "Records"
@@ -535,6 +583,7 @@ if ($hasRecords) {
     if (-not (Test-Path -LiteralPath $Records -PathType Leaf)) {
         throw "Missing end-to-end evaluation records: $Records"
     }
+    $requestedRecordsSha256 = Get-Sha256 $Records
     if (-not (Test-Path -LiteralPath $endToEndScorer -PathType Leaf)) {
         throw "Missing ML.NET end-to-end scorer: $endToEndScorer"
     }
@@ -560,7 +609,12 @@ if ($includeProductionCpuEntrypoints) {
     Require-File $cpuDeliveryReadme "production CPU delivery README"
 }
 
-$unifiedModel = Join-Path $RunDirectory "best.onnx"
+$unifiedModel = if ($usesExplicitUnifiedArtifactBinding) {
+    $UnifiedModelPath
+}
+else {
+    Join-Path $RunDirectory "best.onnx"
+}
 $unifiedBundle = Assert-UnifiedBundle $unifiedModel
 $unifiedLabels = [string]$unifiedBundle.LabelsPath
 $unifiedContract = [string]$unifiedBundle.ContractPath
@@ -574,7 +628,12 @@ $textReviewValue = [string]$unifiedContractPayload.text_delivery_policy.review_v
 if ($textDeliveryPolicy -ne "review_only_pending_independent_human_truth_calibration" -or $textReviewValue -ne "review") {
     throw "Unified OCR text delivery policy is not the required fail-closed review-only policy."
 }
-$onnxValidationSummary = Join-Path $RunDirectory "onnx-val\summary.json"
+$onnxValidationSummary = if ($usesExplicitUnifiedArtifactBinding) {
+    $OnnxValidationSummaryPath
+}
+else {
+    Join-Path $RunDirectory "onnx-val\summary.json"
+}
 Require-File $onnxValidationSummary "final ONNX validation summary"
 
 $detectorContract = Assert-StandardModelContract $DetectorModel "receipt_lrcnn_v1"
@@ -594,7 +653,7 @@ $unifiedModelSha256 = Get-Sha256 $unifiedModel
 $unifiedLabelsSha256 = Get-Sha256 $unifiedLabels
 $unifiedContractSha256 = Get-Sha256 $unifiedContract
 if ([string]$summary.model_sha256 -ne $unifiedModelSha256) {
-    throw "onnx-val summary model_sha256 does not belong to best.onnx."
+    throw "onnx-val summary model_sha256 does not belong to the selected unified ONNX artifact."
 }
 $providers = @($summary.providers | ForEach-Object { [string]$_ })
 if ($providers.Count -eq 0) {
@@ -656,6 +715,261 @@ foreach ($gate in $fieldGates) {
         required_floor = $floor
         requested_floor = $requestedFloor
     }
+}
+
+$guardedValidationEvidencePath = $null
+$guardedValidationEvidenceSha256 = $null
+$guardedTestSummaryPath = $null
+$guardedTestSummarySha256 = $null
+
+# v13 adds visible transfer-status CTC.  Its independent held-out exact-match
+# evidence is part of the delivery gate, not merely diagnostic output.  Keep
+# the 90% floor fixed here so a direct-artifact packaging command cannot omit
+# or weaken the status OCR validation performed by the v13 training wrapper.
+if ($unifiedArchitectureVersion -eq 13) {
+    $v13SummaryRecordsPath = [string]$summary.records
+    Assert-SafePathSyntax $v13SummaryRecordsPath "v13 onnx-val records"
+    $v13SummaryRecordsPath = [IO.Path]::GetFullPath($v13SummaryRecordsPath)
+    Require-File $v13SummaryRecordsPath "v13 onnx-val records"
+    if (-not (Test-PathWithin $v13SummaryRecordsPath $RunDirectory) `
+        -or [string]$summary.records_sha256 -ne (Get-Sha256 $v13SummaryRecordsPath)) {
+        throw "v13 onnx-val records path or SHA-256 does not match the current run manifest."
+    }
+    $statusMetricProperty = $summary.by_field.PSObject.Properties["transfer_status"]
+    $statusAcceptanceProperty = $summary.acceptance.PSObject.Properties["min_status_exact_match"]
+    if ($null -eq $statusMetricProperty `
+        -or $null -eq $statusMetricProperty.Value `
+        -or $null -eq $statusAcceptanceProperty `
+        -or $null -eq $statusAcceptanceProperty.Value) {
+        throw "v13 onnx-val summary is missing visible transfer-status CTC metrics or its acceptance gate."
+    }
+    $statusMetric = $statusMetricProperty.Value
+    $statusCtcRecords = [int]$statusMetric.ctc_records
+    $statusCtcExactMatches = [int]$statusMetric.ctc_raw_exact_matches
+    $statusCtcExactMatch = [double]$statusMetric.ctc_raw_exact_match
+    $requestedStatusFloor = [double]$statusAcceptanceProperty.Value
+    if ($statusCtcRecords -le 0 `
+        -or $statusCtcRecords -ne [int]$statusMetric.records `
+        -or $statusCtcExactMatches -lt 0 `
+        -or $statusCtcExactMatches -gt $statusCtcRecords `
+        -or [Math]::Abs(
+            $statusCtcExactMatch - ([double]$statusCtcExactMatches / [double]$statusCtcRecords)
+        ) -gt 0.000000000001 `
+        -or [double]::IsNaN($statusCtcExactMatch) `
+        -or [double]::IsInfinity($statusCtcExactMatch) `
+        -or $requestedStatusFloor -lt $requiredStatusTextFloor `
+        -or $statusCtcExactMatch -lt $requiredStatusTextFloor) {
+        throw "v13 onnx-val visible transfer-status CTC did not meet the fixed 90% exact-match floor."
+    }
+    if ($null -eq $summary.status_text_policy `
+        -or [string]$summary.status_text_policy.runtime_policy -ne "decode_and_normalize_review_only" `
+        -or [string]$summary.status_text_policy.review_value -ne "review") {
+        throw "v13 onnx-val status-text policy is not decode-and-normalize review-only."
+    }
+    $validatedMetrics["transfer_status"] = [ordered]@{
+        exact_matches = $statusCtcExactMatches
+        records = $statusCtcRecords
+        exact_match = $statusCtcExactMatch
+        metric = "ctc_raw_exact_match"
+        required_floor = $requiredStatusTextFloor
+        requested_floor = $requestedStatusFloor
+    }
+
+    # The v13 wrapper writes this only after both independent val and test
+    # evaluations pass.  Bind that wrapper evidence to the exact model and val
+    # summary selected above, so packaging cannot substitute a different or
+    # edited summary merely because it contains the same model hash string.
+    $guardedValidationEvidencePath = Join-Path $RunDirectory "v13_status_ocr_validation.json"
+    Require-File $guardedValidationEvidencePath "v13 guarded validation evidence"
+    $guardedValidationEvidence = Read-NormalizedJson $guardedValidationEvidencePath
+    if ([string]$guardedValidationEvidence.kind -ne "receipt_unified_status_text_v13_guarded_validation_v1" `
+        -or [string]$guardedValidationEvidence.candidate.kind -ne "receipt_unified_field_reader_v13" `
+        -or [int]$guardedValidationEvidence.candidate.architecture_version -ne 13 `
+        -or [string]$guardedValidationEvidence.candidate.model_sha256 -ne $unifiedModelSha256) {
+        throw "v13 guarded validation evidence does not belong to the selected unified model."
+    }
+
+    $evidenceModelPath = [string]$guardedValidationEvidence.candidate.model
+    $evidenceContractPath = [string]$guardedValidationEvidence.candidate.contract
+    $evidenceLabelsPath = [string]$guardedValidationEvidence.candidate.labels
+    $evidenceManifestPath = [string]$guardedValidationEvidence.manifest.records
+    Assert-SafePathSyntax $evidenceModelPath "v13 evidence candidate model"
+    Assert-SafePathSyntax $evidenceContractPath "v13 evidence candidate contract"
+    Assert-SafePathSyntax $evidenceLabelsPath "v13 evidence candidate labels"
+    Assert-SafePathSyntax $evidenceManifestPath "v13 evidence manifest"
+    $evidenceModelPath = [IO.Path]::GetFullPath($evidenceModelPath)
+    $evidenceContractPath = [IO.Path]::GetFullPath($evidenceContractPath)
+    $evidenceLabelsPath = [IO.Path]::GetFullPath($evidenceLabelsPath)
+    $evidenceManifestPath = [IO.Path]::GetFullPath($evidenceManifestPath)
+    if (-not $evidenceModelPath.Equals($unifiedModel, [StringComparison]::OrdinalIgnoreCase) `
+        -or -not $evidenceContractPath.Equals($unifiedContract, [StringComparison]::OrdinalIgnoreCase) `
+        -or -not $evidenceLabelsPath.Equals($unifiedLabels, [StringComparison]::OrdinalIgnoreCase) `
+        -or [string]$guardedValidationEvidence.candidate.contract_sha256 -ne $unifiedContractSha256 `
+        -or [string]$guardedValidationEvidence.candidate.labels_sha256 -ne $unifiedLabelsSha256 `
+        -or -not $evidenceManifestPath.Equals(
+            [IO.Path]::GetFullPath([string]$summary.records),
+            [StringComparison]::OrdinalIgnoreCase) `
+        -or [string]$guardedValidationEvidence.manifest.records_sha256 -ne `
+            (Get-Sha256 $v13SummaryRecordsPath)) {
+        throw "v13 guarded validation model, sidecars, or manifest do not match the selected ONNX validation evidence."
+    }
+
+    $guardedFloors = $guardedValidationEvidence.acceptance_floors
+    if ([double]$guardedFloors.amount -lt $minimumAmountFloor `
+        -or [double]$guardedFloors.time -lt $minimumTimeFloor `
+        -or [double]$guardedFloors.payment_method_field -lt $minimumPaymentFloor `
+        -or [double]$guardedFloors.recipient_field -lt $minimumRecipientFloor `
+        -or [double]$guardedFloors.visible_transfer_status_cjk_text -lt $requiredStatusTextFloor) {
+        throw "v13 guarded validation evidence weakened a required delivery floor."
+    }
+
+    $packagingBinding = $guardedValidationEvidence.cpu_packaging
+    $boundModelPath = [string]$packagingBinding.unified_model_path
+    $boundSummaryPath = [string]$packagingBinding.onnx_validation_summary_path
+    Assert-SafePathSyntax $boundModelPath "v13 packaging evidence model"
+    Assert-SafePathSyntax $boundSummaryPath "v13 packaging evidence summary"
+    $boundModelPath = [IO.Path]::GetFullPath($boundModelPath)
+    $boundSummaryPath = [IO.Path]::GetFullPath($boundSummaryPath)
+    if (-not $boundModelPath.Equals($unifiedModel, [StringComparison]::OrdinalIgnoreCase) `
+        -or -not $boundSummaryPath.Equals($onnxValidationSummary, [StringComparison]::OrdinalIgnoreCase) `
+        -or [string]$packagingBinding.unified_model_sha256 -ne $unifiedModelSha256 `
+        -or [string]$packagingBinding.onnx_validation_summary_sha256 -ne (Get-Sha256 $onnxValidationSummary) `
+        -or [string]$packagingBinding.required_runtime_flavor -ne "cpu" `
+        -or [string]$packagingBinding.required_rectification -ne "max-side-1600" `
+        -or $packagingBinding.include_device_model -ne $true) {
+        throw "v13 guarded validation packaging binding does not match the requested full CPU pipeline."
+    }
+
+    $valEvidence = @(
+        $guardedValidationEvidence.evaluations |
+            Where-Object { [string]$_.split -eq "val" }
+    )
+    $testEvidence = @(
+        $guardedValidationEvidence.evaluations |
+            Where-Object { [string]$_.split -eq "test" }
+    )
+    if ($valEvidence.Count -ne 1 `
+        -or $valEvidence[0].evaluated -ne $true `
+        -or $valEvidence[0].accepted -ne $true `
+        -or [int]$valEvidence[0].visible_status_records -ne $statusCtcRecords `
+        -or [double]$valEvidence[0].status_text_exact_match -ne $statusCtcExactMatch `
+        -or [string]$valEvidence[0].summary_sha256 -ne (Get-Sha256 $onnxValidationSummary) `
+        -or $testEvidence.Count -ne 1 `
+        -or $testEvidence[0].evaluated -ne $true `
+        -or $testEvidence[0].accepted -ne $true) {
+        throw "v13 guarded validation must contain one accepted val and one accepted test evaluation."
+    }
+    $valNonSuccessTruthRecords = [int]$valEvidence[0].non_success_truth_records
+    $valSafetyCalibrated = $valEvidence[0].non_success_safety_calibrated -eq $true
+    $valMaxSafetyProperty = $summary.acceptance.PSObject.Properties["max_non_success_to_success"]
+    if ($valSafetyCalibrated -ne ($valNonSuccessTruthRecords -gt 0) `
+        -or [int]$valEvidence[0].status_non_success_to_success -ne `
+            [int]$statusMetric.non_success_to_success `
+        -or ($valNonSuccessTruthRecords -gt 0 `
+            -and ($null -eq $valMaxSafetyProperty `
+                -or $null -eq $valMaxSafetyProperty.Value `
+                -or [int]$valMaxSafetyProperty.Value -ne 0 `
+                -or [int]$statusMetric.non_success_to_success -ne 0))) {
+        throw "v13 guarded val summary did not preserve the zero non-success-to-success safety line."
+    }
+    $valEvidenceSummaryPath = [string]$valEvidence[0].summary_path
+    $testEvidenceSummaryPath = [string]$testEvidence[0].summary_path
+    Assert-SafePathSyntax $valEvidenceSummaryPath "v13 guarded val summary"
+    Assert-SafePathSyntax $testEvidenceSummaryPath "v13 guarded test summary"
+    $valEvidenceSummaryPath = [IO.Path]::GetFullPath($valEvidenceSummaryPath)
+    $testEvidenceSummaryPath = [IO.Path]::GetFullPath($testEvidenceSummaryPath)
+    Require-File $testEvidenceSummaryPath "v13 guarded test ONNX summary"
+    if (-not (Test-PathWithin $valEvidenceSummaryPath $RunDirectory) `
+        -or -not (Test-PathWithin $testEvidenceSummaryPath $RunDirectory) `
+        -or -not $valEvidenceSummaryPath.Equals($onnxValidationSummary, [StringComparison]::OrdinalIgnoreCase) `
+        -or [string]$testEvidence[0].summary_sha256 -ne (Get-Sha256 $testEvidenceSummaryPath)) {
+        throw "v13 guarded val/test summary paths or hashes do not match their evidence."
+    }
+    $testSummary = Read-NormalizedJson $testEvidenceSummaryPath
+    $testFailures = @(
+        $testSummary.acceptance.failures |
+            ForEach-Object { [string]$_ } |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+    $testRecordsPath = [string]$testSummary.records
+    Assert-SafePathSyntax $testRecordsPath "v13 test summary records"
+    $testRecordsPath = [IO.Path]::GetFullPath($testRecordsPath)
+    if ([string]$testSummary.model_sha256 -ne $unifiedModelSha256 `
+        -or [string]$testSummary.evaluation_split -ne "test" `
+        -or [string]$testSummary.records_sha256 -ne (Get-Sha256 $v13SummaryRecordsPath) `
+        -or -not $testRecordsPath.Equals($v13SummaryRecordsPath, [StringComparison]::OrdinalIgnoreCase) `
+        -or $testSummary.providers -notcontains "CUDAExecutionProvider" `
+        -or $testSummary.acceptance.requested -ne $true `
+        -or $testSummary.acceptance.passed -ne $true `
+        -or $testFailures.Count -ne 0 `
+        -or [string]$testSummary.status_text_policy.runtime_policy -ne "decode_and_normalize_review_only" `
+        -or [string]$testSummary.status_text_policy.review_value -ne "review") {
+        throw "v13 guarded test summary is not a passing, model/records-bound CUDA status-text evaluation."
+    }
+    $testNonSuccessTruthRecords = [int]$testEvidence[0].non_success_truth_records
+    $testSafetyCalibrated = $testEvidence[0].non_success_safety_calibrated -eq $true
+    $testMaxSafetyProperty = $testSummary.acceptance.PSObject.Properties["max_non_success_to_success"]
+    if ($testSafetyCalibrated -ne ($testNonSuccessTruthRecords -gt 0) `
+        -or [int]$testEvidence[0].status_non_success_to_success -ne `
+            [int]$testSummary.by_field.transfer_status.non_success_to_success `
+        -or ($testNonSuccessTruthRecords -gt 0 `
+            -and ($null -eq $testMaxSafetyProperty `
+                -or $null -eq $testMaxSafetyProperty.Value `
+                -or [int]$testMaxSafetyProperty.Value -ne 0 `
+                -or [int]$testSummary.by_field.transfer_status.non_success_to_success -ne 0))) {
+        throw "v13 guarded test summary did not preserve the zero non-success-to-success safety line."
+    }
+    foreach ($testGate in @(
+            @{ Field = "amount"; Floor = $minimumAmountFloor; Acceptance = "min_amount_exact_match"; Metric = "raw_exact_match" },
+            @{ Field = "time"; Floor = $minimumTimeFloor; Acceptance = "min_time_exact_match"; Metric = "raw_exact_match" },
+            @{ Field = "payment_method_field"; Floor = $minimumPaymentFloor; Acceptance = "min_payment_exact_match"; Metric = "raw_exact_match" },
+            @{ Field = "recipient_field"; Floor = $minimumRecipientFloor; Acceptance = "min_recipient_exact_match"; Metric = "raw_exact_match" },
+            @{ Field = "transfer_status"; Floor = $requiredStatusTextFloor; Acceptance = "min_status_exact_match"; Metric = "ctc_raw_exact_match" }
+        )) {
+        $testFieldProperty = $testSummary.by_field.PSObject.Properties[[string]$testGate.Field]
+        $testFloorProperty = $testSummary.acceptance.PSObject.Properties[[string]$testGate.Acceptance]
+        $testMetricProperty = if ($null -eq $testFieldProperty -or $null -eq $testFieldProperty.Value) {
+            $null
+        }
+        else {
+            $testFieldProperty.Value.PSObject.Properties[[string]$testGate.Metric]
+        }
+        if ($null -eq $testFieldProperty `
+            -or $null -eq $testFieldProperty.Value `
+            -or $null -eq $testFloorProperty `
+            -or $null -eq $testFloorProperty.Value `
+            -or $null -eq $testMetricProperty `
+            -or $null -eq $testMetricProperty.Value) {
+            throw "v13 guarded test summary is missing $($testGate.Field) metrics or floor."
+        }
+        $testExactMatch = [double]$testMetricProperty.Value
+        if ([int]$testFieldProperty.Value.records -le 0 `
+            -or [double]::IsNaN($testExactMatch) `
+            -or [double]::IsInfinity($testExactMatch) `
+            -or [double]$testFloorProperty.Value -lt [double]$testGate.Floor `
+            -or $testExactMatch -lt [double]$testGate.Floor) {
+            throw "v13 guarded test summary did not meet the $($testGate.Field) exact-match floor."
+        }
+    }
+    $testStatusMetric = $testSummary.by_field.transfer_status
+    $testStatusCtcRecords = [int]$testStatusMetric.ctc_records
+    $testStatusCtcExactMatches = [int]$testStatusMetric.ctc_raw_exact_matches
+    $testStatusCtcExactMatch = [double]$testStatusMetric.ctc_raw_exact_match
+    if ($testStatusCtcRecords -le 0 `
+        -or $testStatusCtcRecords -ne [int]$testStatusMetric.records `
+        -or $testStatusCtcRecords -ne [int]$testEvidence[0].visible_status_records `
+        -or $testStatusCtcExactMatches -lt 0 `
+        -or $testStatusCtcExactMatches -gt $testStatusCtcRecords `
+        -or [Math]::Abs(
+            $testStatusCtcExactMatch - `
+                ([double]$testStatusCtcExactMatches / [double]$testStatusCtcRecords)
+        ) -gt 0.000000000001 `
+        -or [double]$testEvidence[0].status_text_exact_match -ne $testStatusCtcExactMatch) {
+        throw "v13 guarded test status CTC counts or exact-match evidence are inconsistent."
+    }
+    $guardedTestSummaryPath = $testEvidenceSummaryPath
+    $guardedTestSummarySha256 = Get-Sha256 $testEvidenceSummaryPath
+    $guardedValidationEvidenceSha256 = Get-Sha256 $guardedValidationEvidencePath
 }
 
 $runtimeDevice = if ($RuntimeFlavor -eq "cpu") { "cpu" } else { "cuda:0" }
@@ -769,13 +1083,26 @@ $published = $false
 try {
     New-Item -ItemType Directory -Path $appDirectory, $modelDirectory, $unifiedDirectory, $evidenceDirectory | Out-Null
     [IO.File]::WriteAllText($consoleLog, "")
+    $scoringRecords = $Records
+    $recordsSnapshot = $null
+    if ($hasRecords) {
+        New-Item -ItemType Directory -Path $EndToEndEvaluationDir | Out-Null
+        Assert-NoReparsePointInExistingPath $EndToEndEvaluationDir "end-to-end evaluation directory"
+        $recordsSnapshot = Join-Path $EndToEndEvaluationDir "bound-unified-fields.jsonl"
+        Copy-Item -LiteralPath $Records -Destination $recordsSnapshot
+        Require-File $recordsSnapshot "bound end-to-end records snapshot"
+        if ((Get-Sha256 $recordsSnapshot) -ne $requestedRecordsSha256) {
+            throw "End-to-end records changed while the immutable scoring snapshot was created."
+        }
+        $scoringRecords = $recordsSnapshot
+    }
 
     $formalExpectedInputList = $null
     if ($hasRecords) {
         $formalExpectedInputList = Join-Path $evidenceDirectory "expected-val-input-list.txt"
         Write-Host "mlnet_unified_prepare_full_val"
         & $pythonExe $endToEndScorer prepare `
-            --records $Records `
+            --records $scoringRecords `
             --output $formalExpectedInputList `
             --split val 2>&1 | Tee-Object -FilePath $consoleLog -Append
         $prepareExitCode = $LASTEXITCODE
@@ -867,6 +1194,12 @@ try {
     Copy-Item -LiteralPath $unifiedLabels -Destination $unifiedDirectory
     Copy-Item -LiteralPath $unifiedContract -Destination $unifiedDirectory
     Copy-Item -LiteralPath $onnxValidationSummary -Destination (Join-Path $evidenceDirectory "onnx-validation-summary.json")
+    if ($null -ne $guardedValidationEvidencePath) {
+        Copy-Item -LiteralPath $guardedValidationEvidencePath -Destination `
+            (Join-Path $evidenceDirectory "v13-guarded-validation.json")
+        Copy-Item -LiteralPath $guardedTestSummaryPath -Destination `
+            (Join-Path $evidenceDirectory "v13-onnx-test-summary.json")
+    }
     if ($includeProductionCpuEntrypoints) {
         Copy-Item -LiteralPath $singleCpuEntrypoint -Destination $stagingRoot
         Copy-Item -LiteralPath $batchCpuEntrypoint -Destination $stagingRoot
@@ -1206,6 +1539,10 @@ try {
             $statusValueProperty = $statusField.PSObject.Properties["value"]
             $statusValue = if ($null -eq $statusValueProperty) { $null } else { $statusValueProperty.Value }
             $statusDeliveryValueProperty = $statusField.PSObject.Properties["delivery_value"]
+            $statusRawProperty = $statusField.PSObject.Properties["raw"]
+            $statusCandidateProperty = $statusField.PSObject.Properties["candidate"]
+            $statusCtcCandidateProperty = $statusField.PSObject.Properties["ctc_candidate"]
+            $statusNormalizedProperty = $statusField.PSObject.Properties["normalized"]
             $statusDeliveryValue = if ($null -eq $statusDeliveryValueProperty) {
                 $null
             }
@@ -1216,14 +1553,25 @@ try {
                 throw "Result transfer_status has the wrong v13 status-text delivery policy: $resultPath"
             }
             if ([string]$statusField.state -eq "absent") {
-                if ($null -ne $statusValue -or $null -ne $statusDeliveryValue) {
-                    throw "Absent v13 transfer_status unexpectedly has a delivered value: $resultPath"
-                }
+                throw "Result transfer_status is absent; formal v13 delivery requires visible OCR text: $resultPath"
             }
-            elseif ([string]$statusField.state -ne "review" `
-                -or [string]$statusValue -ne [string]$statusTextReviewValue `
-                -or [string]$statusDeliveryValue -ne [string]$statusTextReviewValue) {
-                throw "Result transfer_status escaped the v13 review-only delivery policy: $resultPath"
+            else {
+                $statusRaw = if ($null -eq $statusRawProperty) { "" } else { [string]$statusRawProperty.Value }
+                $statusCandidate = if ($null -eq $statusCandidateProperty) { "" } else { [string]$statusCandidateProperty.Value }
+                $statusCtcCandidate = if ($null -eq $statusCtcCandidateProperty) { "" } else { [string]$statusCtcCandidateProperty.Value }
+                $statusNormalized = if ($null -eq $statusNormalizedProperty) { "" } else { [string]$statusNormalizedProperty.Value }
+                if ([string]::IsNullOrWhiteSpace($statusRaw) `
+                    -or $statusRaw -ne $statusCandidate `
+                    -or $statusRaw -ne $statusCtcCandidate `
+                    -or [string]::IsNullOrWhiteSpace($statusNormalized) `
+                    -or $statusNormalized -ne (Get-NormalizedTransferStatus $statusRaw)) {
+                    throw "Result transfer_status has incomplete or inconsistent v13 OCR text evidence: $resultPath"
+                }
+                if ([string]$statusField.state -ne "review" `
+                    -or [string]$statusValue -ne [string]$statusTextReviewValue `
+                    -or [string]$statusDeliveryValue -ne [string]$statusTextReviewValue) {
+                    throw "Result transfer_status escaped the v13 review-only delivery policy: $resultPath"
+                }
             }
         }
         $resultEvidenceRows += [ordered]@{
@@ -1255,7 +1603,7 @@ try {
         Write-Host "mlnet_unified_end_to_end_score"
         $scoreArguments = @(
             "score",
-            "--records", $Records,
+            "--records", $scoringRecords,
             "--results", $Output,
             "--model", $unifiedModel,
             "--output", $EndToEndEvaluationDir,
@@ -1265,6 +1613,12 @@ try {
             "--payment-floor", [Convert]::ToString($PaymentFloor, [Globalization.CultureInfo]::InvariantCulture),
             "--recipient-floor", [Convert]::ToString($RecipientFloor, [Globalization.CultureInfo]::InvariantCulture)
         )
+        if ($unifiedArchitectureVersion -eq 13) {
+            $scoreArguments += @(
+                "--status-floor",
+                [Convert]::ToString($requiredStatusTextFloor, [Globalization.CultureInfo]::InvariantCulture)
+            )
+        }
         & $pythonExe $endToEndScorer @scoreArguments 2>&1 | Tee-Object -FilePath $consoleLog -Append
         $scoreExitCode = $LASTEXITCODE
         $endToEndSummaryPath = Join-Path $EndToEndEvaluationDir "summary.json"
@@ -1285,9 +1639,9 @@ try {
             throw "ML.NET end-to-end scorer wrote an unexpected summary kind or split."
         }
         if ([string]$endToEndSummary.model_sha256 -ne $unifiedModelSha256) {
-            throw "ML.NET end-to-end score is not bound to the delivered best.onnx."
+            throw "ML.NET end-to-end score is not bound to the delivered unified ONNX artifact."
         }
-        if ([string]$endToEndSummary.records_sha256 -ne (Get-Sha256 $Records) `
+        if ([string]$endToEndSummary.records_sha256 -ne $requestedRecordsSha256 `
             -or [string]$endToEndSummary.manifest_sha256 -ne (Get-Sha256 $manifestPath)) {
             throw "ML.NET end-to-end score is not bound to the requested records and inference manifest."
         }
@@ -1332,12 +1686,54 @@ try {
                 required_floor = $floor
             }
         }
+        if ($unifiedArchitectureVersion -eq 13) {
+            $statusScoreMetricProperty = $endToEndSummary.by_field.PSObject.Properties["transfer_status"]
+            $statusScoreFloorProperty = $endToEndSummary.floors.PSObject.Properties["transfer_status"]
+            if ($null -eq $statusScoreMetricProperty `
+                -or $null -eq $statusScoreMetricProperty.Value `
+                -or $null -eq $statusScoreFloorProperty `
+                -or $null -eq $statusScoreFloorProperty.Value) {
+                throw "ML.NET end-to-end score is missing v13 visible transfer-status metrics or floor."
+            }
+            $statusScoreMetric = $statusScoreMetricProperty.Value
+            $statusScoreExactMatch = [double]$statusScoreMetric.raw_exact_match
+            $statusScoreCandidateCoverage = [double]$statusScoreMetric.candidate_coverage
+            $statusScoreMaxSafetyProperty = `
+                $endToEndSummary.acceptance.PSObject.Properties["max_non_success_to_success"]
+            if ([int]$statusScoreMetric.records -ne [int]$validatedMetrics["transfer_status"].records `
+                -or [int]$statusScoreMetric.non_success_truth_records -ne $valNonSuccessTruthRecords `
+                -or ($statusScoreMetric.non_success_safety_calibrated -eq $true) -ne $valSafetyCalibrated `
+                -or [int]$statusScoreMetric.non_success_to_success -ne 0 `
+                -or ($valNonSuccessTruthRecords -gt 0 `
+                    -and ($null -eq $statusScoreMaxSafetyProperty `
+                        -or $null -eq $statusScoreMaxSafetyProperty.Value `
+                        -or [int]$statusScoreMaxSafetyProperty.Value -ne 0)) `
+                -or [double]$statusScoreFloorProperty.Value -lt $requiredStatusTextFloor `
+                -or [double]::IsNaN($statusScoreExactMatch) `
+                -or [double]::IsInfinity($statusScoreExactMatch) `
+                -or $statusScoreExactMatch -lt $requiredStatusTextFloor `
+                -or $statusScoreCandidateCoverage -ne 1.0) {
+                throw "ML.NET end-to-end visible transfer-status OCR did not meet exact-match or candidate-coverage gates."
+            }
+            $validatedEndToEndMetrics["transfer_status"] = [ordered]@{
+                exact_matches = [int]$statusScoreMetric.raw_exact_matches
+                records = [int]$statusScoreMetric.records
+                exact_match = $statusScoreExactMatch
+                candidate_coverage = $statusScoreCandidateCoverage
+                non_success_truth_records = [int]$statusScoreMetric.non_success_truth_records
+                non_success_to_success = [int]$statusScoreMetric.non_success_to_success
+                non_success_safety_calibrated = $statusScoreMetric.non_success_safety_calibrated -eq $true
+                required_floor = $requiredStatusTextFloor
+            }
+        }
         $validationScope = "full_val_end_to_end_scored_cpu"
         $endToEndEvidence = [ordered]@{
             performed = $true
             status = "accepted"
             records = $Records
-            records_sha256 = Get-Sha256 $Records
+            records_sha256 = $requestedRecordsSha256
+            records_snapshot = "evidence/bound-unified-fields.jsonl"
+            records_snapshot_sha256 = Get-Sha256 $recordsSnapshot
             evaluation = $EndToEndEvaluationDir
             summary_sha256 = Get-Sha256 $endToEndSummaryPath
             comparisons_sha256 = Get-Sha256 $endToEndComparisonsPath
@@ -1408,6 +1804,22 @@ try {
         include_device_model = [bool]$IncludeDeviceModel
         annotate = $Annotate
         model_sha256 = $unifiedModelSha256
+        unified_artifact_source = [ordered]@{
+            binding = if ($usesExplicitUnifiedArtifactBinding) { "explicit_run_contained" } else { "legacy_run_layout" }
+            run_directory = $RunDirectory
+            model = $unifiedModel
+            model_sha256 = $unifiedModelSha256
+            labels = $unifiedLabels
+            labels_sha256 = $unifiedLabelsSha256
+            contract = $unifiedContract
+            contract_sha256 = $unifiedContractSha256
+            onnx_validation_summary = $onnxValidationSummary
+            onnx_validation_summary_sha256 = Get-Sha256 $onnxValidationSummary
+            guarded_validation_evidence = $guardedValidationEvidencePath
+            guarded_validation_evidence_sha256 = $guardedValidationEvidenceSha256
+            guarded_test_summary = $guardedTestSummaryPath
+            guarded_test_summary_sha256 = $guardedTestSummarySha256
+        }
         unified_ocr_kind = $unifiedKind
         unified_ocr_architecture_version = $unifiedArchitectureVersion
         model_artifacts = $modelArtifactEvidence
@@ -1460,6 +1872,7 @@ try {
     if ($null -ne $endToEndSummaryPath) {
         Copy-Item -LiteralPath $endToEndSummaryPath -Destination (Join-Path $evidenceDirectory "end-to-end-evaluation-summary.json")
         Copy-Item -LiteralPath $endToEndComparisonsPath -Destination (Join-Path $evidenceDirectory "end-to-end-comparisons.jsonl")
+        Copy-Item -LiteralPath $recordsSnapshot -Destination (Join-Path $evidenceDirectory "bound-unified-fields.jsonl")
     }
     $packageConfig = [ordered]@{
         schema_version = 1
@@ -1479,9 +1892,23 @@ try {
         }
         validation_scope = $validationScope
         run_directory = $RunDirectory
+        unified_artifact_source_binding = if ($usesExplicitUnifiedArtifactBinding) {
+            "explicit_run_contained"
+        }
+        else {
+            "legacy_run_layout"
+        }
+        unified_artifact_source_model = $unifiedModel
+        onnx_validation_summary_source = $onnxValidationSummary
+        guarded_validation_evidence_source = $guardedValidationEvidencePath
+        guarded_validation_evidence_sha256 = $guardedValidationEvidenceSha256
+        guarded_test_summary_source = $guardedTestSummaryPath
+        guarded_test_summary_sha256 = $guardedTestSummarySha256
         input = $resolvedInput
         input_list = $resolvedInputList
         records = if ($hasRecords) { $Records } else { $null }
+        records_sha256 = if ($hasRecords) { $requestedRecordsSha256 } else { $null }
+        records_snapshot = if ($hasRecords) { "evidence/bound-unified-fields.jsonl" } else { $null }
         end_to_end_evaluation = if ($hasRecords) { $EndToEndEvaluationDir } else { $null }
         limit = $Limit
         detector_model = [IO.Path]::GetFileName($DetectorModel)
@@ -1506,6 +1933,10 @@ try {
     }
     $packageConfig | ConvertTo-Json -Depth 8 |
         Set-Content -LiteralPath (Join-Path $evidenceDirectory "package_config.json") -Encoding UTF8
+
+    if ($hasRecords -and (Get-Sha256 $Records) -ne $requestedRecordsSha256) {
+        throw "End-to-end records changed during CPU validation; refusing atomic publication."
+    }
 
     $hashRows = @(
         Get-PackagePayloadFiles $stagingRoot |

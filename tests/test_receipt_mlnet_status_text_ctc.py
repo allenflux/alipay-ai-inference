@@ -18,8 +18,8 @@ def test_unified_bundle_has_strict_versioned_status_text_abi() -> None:
     assert 'KindV13 = "receipt_unified_field_reader_v13"' in bundle
     assert 'StatusTextOutputName = "status_text_logits"' in bundle
     assert 'StatusTextRuntimePolicy = "decode_and_normalize_review_only"' in bundle
-    assert 'StatusTextTarget = "visible_transfer_status_text"' in bundle
-    assert 'StatusTextCharsetSource = "train_only_visible_transfer_status_text"' in bundle
+    assert 'StatusTextTarget = "visible_transfer_status_cjk_text"' in bundle
+    assert 'StatusTextCharsetSource = "train_only_visible_transfer_status_cjk_text"' in bundle
     assert 'StatusTextNormalizer = "normalize_status"' in bundle
     assert "12 => KindV12" in bundle
     assert "13 => KindV13" in bundle

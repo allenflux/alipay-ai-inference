@@ -38,6 +38,14 @@ function Get-Sha256([string]$Path) {
     return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 
+function Get-NormalizedTransferStatus([string]$Text) {
+    $compact = $Text -replace '\s+', ''
+    if ($compact -match '失败|未成功|已撤销') { return "failed" }
+    if ($compact -match '处理中|待处理|进行中') { return "pending" }
+    if ($compact -match '转账成功|交易成功|付款成功|支付成功|转帐成功') { return "success" }
+    return "unknown"
+}
+
 function Assert-SafePathSyntax([string]$Path, [string]$Description) {
     if ([string]::IsNullOrWhiteSpace($Path)) {
         throw "Missing ${Description} path."
@@ -687,6 +695,10 @@ function Assert-ResultProvenanceAndPolicy(
         $stateProperty = $status.PSObject.Properties["state"]
         $valueProperty = $status.PSObject.Properties["value"]
         $deliveryValueProperty = $status.PSObject.Properties["delivery_value"]
+        $rawProperty = $status.PSObject.Properties["raw"]
+        $candidateProperty = $status.PSObject.Properties["candidate"]
+        $ctcCandidateProperty = $status.PSObject.Properties["ctc_candidate"]
+        $normalizedProperty = $status.PSObject.Properties["normalized"]
         $statusValue = if ($null -eq $valueProperty) { $null } else { $valueProperty.Value }
         $statusDeliveryValue = if ($null -eq $deliveryValueProperty) { $null } else { $deliveryValueProperty.Value }
         if ($null -eq $policyProperty `
@@ -695,14 +707,25 @@ function Assert-ResultProvenanceAndPolicy(
             throw "V13 result transfer_status has incomplete review-only policy evidence: $ResultPath"
         }
         if ([string]$stateProperty.Value -eq "absent") {
-            if ($null -ne $statusValue -or $null -ne $statusDeliveryValue) {
-                throw "V13 result transfer_status delivered a value while absent: $ResultPath"
-            }
+            throw "V13 result transfer_status is absent; the complete delivery path requires visible OCR text: $ResultPath"
         }
-        elseif ([string]$stateProperty.Value -ne "review" `
-            -or [string]$statusValue -ne [string]$UnifiedEvidence.StatusTextReviewValue `
-            -or [string]$statusDeliveryValue -ne [string]$UnifiedEvidence.StatusTextReviewValue) {
-            throw "V13 result transfer_status escaped the review-only policy: $ResultPath"
+        else {
+            $rawStatus = if ($null -eq $rawProperty) { "" } else { [string]$rawProperty.Value }
+            $candidateStatus = if ($null -eq $candidateProperty) { "" } else { [string]$candidateProperty.Value }
+            $ctcCandidateStatus = if ($null -eq $ctcCandidateProperty) { "" } else { [string]$ctcCandidateProperty.Value }
+            $normalizedStatus = if ($null -eq $normalizedProperty) { "" } else { [string]$normalizedProperty.Value }
+            if ([string]::IsNullOrWhiteSpace($rawStatus) `
+                -or $rawStatus -ne $candidateStatus `
+                -or $rawStatus -ne $ctcCandidateStatus `
+                -or [string]::IsNullOrWhiteSpace($normalizedStatus) `
+                -or $normalizedStatus -ne (Get-NormalizedTransferStatus $rawStatus)) {
+                throw "V13 result transfer_status has incomplete or inconsistent OCR text evidence: $ResultPath"
+            }
+            if ([string]$stateProperty.Value -ne "review" `
+                -or [string]$statusValue -ne [string]$UnifiedEvidence.StatusTextReviewValue `
+                -or [string]$statusDeliveryValue -ne [string]$UnifiedEvidence.StatusTextReviewValue) {
+                throw "V13 result transfer_status escaped the review-only policy: $ResultPath"
+            }
         }
     }
 }
@@ -894,14 +917,20 @@ $fieldRows = @(
     [pscustomobject]@{ Field = "Amount"; Candidate = [string]$result.fields.amount.candidate; State = [string]$result.fields.amount.state },
     [pscustomobject]@{ Field = "Time"; Candidate = [string]$result.fields.time.candidate; State = [string]$result.fields.time.state },
     [pscustomobject]@{ Field = "Recipient"; Candidate = [string]$result.fields.recipient.candidate; State = [string]$result.fields.recipient.state },
-    [pscustomobject]@{ Field = "Payment method"; Candidate = [string]$result.fields.payment_method.candidate; State = [string]$result.fields.payment_method.state },
-    [pscustomobject]@{ Field = "Transfer status"; Candidate = [string]$result.fields.transfer_status.candidate; State = [string]$result.fields.transfer_status.state }
+    [pscustomobject]@{ Field = "Payment method"; Candidate = [string]$result.fields.payment_method.candidate; State = [string]$result.fields.payment_method.state }
 )
 
 Write-Host ""
 Write-Host "RESULT" -ForegroundColor Green
 Write-Host ("Device : {0} ({1}, confidence {2})" -f $result.device.platform_cn, $result.device.platform, $result.device.confidence)
 $fieldRows | Format-Table -AutoSize
+Write-Host ""
+Write-Host "TRANSFER STATUS OCR" -ForegroundColor Cyan
+[pscustomobject]@{
+    "Raw OCR" = [string]$result.fields.transfer_status.raw
+    "Normalized" = [string]$result.fields.transfer_status.normalized
+    "Decision" = [string]$result.fields.transfer_status.state
+} | Format-List
 Write-Host ("CPU latency: {0:N2} ms" -f $meanLatencyMs)
 Write-Host "Result JSON : $resultPath"
 Write-Host "Annotated   : $annotatedOriginalPath"

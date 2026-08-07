@@ -39,6 +39,7 @@ from transfer_receipt_ai.ocr_unified import (
     _status_text_only_legacy_label_override,
     _unified_acceptance_failures,
     _validate_ctc_capacity,
+    _validate_v13_status_text_slot,
     _validate_validation_every,
     _validate_status_text_oov_audit,
     build_unified_reader,
@@ -104,21 +105,21 @@ def _flat_status_record(
     }
 
 
-def test_v13_dataset_uses_checked_visible_text_and_audits_fallback(tmp_path: Path) -> None:
+def test_v13_dataset_uses_paddle_grounded_visible_chinese_text(tmp_path: Path) -> None:
     source = tmp_path / "flat"
     rows = [
         _flat_status_record(
             index=1,
             split="train",
-            text="  转账成功  ",
-            paddle_text="交易成功",
+            text="legacy转账成功",
+            paddle_text="zhuǎn zhàng chéng gōng 转 账 成 功",
             semantic_value="success",
         ),
         _flat_status_record(
             index=2,
             split="val",
             text="success",
-            paddle_text="转账成功",
+            paddle_text="zhī fù chéng gōng 支 付 成 功",
             semantic_value="success",
         ),
         _flat_status_record(
@@ -152,18 +153,19 @@ def test_v13_dataset_uses_checked_visible_text_and_audits_fallback(tmp_path: Pat
     assert summary["kind"] == DATASET_KIND_V13
     assert summary["slot_order"] == list(V13_SLOT_ORDER)
     assert by_split["train"]["text"] == "转账成功"
-    assert by_split["train"]["status_text_source"] == "record_text"
-    assert by_split["val"]["text"] == "转账成功"
-    assert by_split["val"]["status_text_source"] == "paddle_text_fallback"
+    assert by_split["train"]["status_visible_text"] == "转账成功"
+    assert by_split["train"]["status_text_source"] == "paddle_text_cjk"
+    assert by_split["val"]["text"] == "支付成功"
+    assert by_split["val"]["status_visible_text"] == "支付成功"
+    assert by_split["val"]["status_text_source"] == "paddle_text_cjk"
     assert "text" not in by_split["test"]
     assert by_split["test"]["class_name"] == "success"
-    assert "normalizes_to_unknown" in by_split["test"]["status_text_audit"]["reason"]
+    assert by_split["test"]["status_text_audit"]["reason"] == (
+        "paddle_text:no_visible_cjk_status_text"
+    )
     assert summary["status_text_charset_source"] == STATUS_TEXT_CHARSET_SOURCE
     assert summary["status_text_target"] == STATUS_TEXT_TARGET
-    assert summary["status_text_source_counts"] == {
-        "paddle_text_fallback": 1,
-        "record_text": 1,
-    }
+    assert summary["status_text_source_counts"] == {"paddle_text_cjk": 2}
     expected_characters = sorted(set("转账成功"))
     assert summary["status_text_charset"] == expected_characters
     assert summary["status_text_charset_sha256"] == hashlib.sha256(
@@ -172,6 +174,83 @@ def test_v13_dataset_uses_checked_visible_text_and_audits_fallback(tmp_path: Pat
     assert (output / "status_text_charset.txt").read_text(encoding="utf-8") == (
         "".join(expected_characters) + "\n"
     )
+
+
+def test_v13_status_text_never_falls_back_when_paddle_truth_conflicts(tmp_path: Path) -> None:
+    source = tmp_path / "flat"
+    rows = [
+        _flat_status_record(
+            index=1,
+            split="train",
+            text="转账成功",
+            paddle_text="转账成功",
+            semantic_value="success",
+        ),
+        _flat_status_record(
+            index=2,
+            split="val",
+            text="转账成功",
+            paddle_text="转账失败",
+            semantic_value="success",
+        ),
+    ]
+    for index, row in enumerate(rows):
+        _write_crop(source / str(row["image"]), 60 + index)
+    manifest = source / "pseudo_labels.jsonl"
+    manifest.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+    output = tmp_path / "v13"
+    summary = build_unified_dataset(
+        records_path=manifest,
+        output_dir=output,
+        architecture="v13",
+    )
+    unified = [
+        json.loads(line)
+        for line in (output / "unified_fields.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    by_split = {row["split"]: row["slots"]["transfer_status"] for row in unified}
+
+    assert by_split["train"]["text"] == "转账成功"
+    assert "text" not in by_split["val"]
+    assert by_split["val"]["status_text_audit"]["reason"] == (
+        "paddle_text_cjk:normalizes_to_failed_not_success"
+    )
+    assert summary["status_text_missing_reasons"] == {
+        "paddle_text_cjk:normalizes_to_failed_not_success": 1
+    }
+
+
+def test_v13_loader_rejects_non_cjk_or_mismatched_visible_status_target() -> None:
+    _validate_v13_status_text_slot(
+        {"text": "转账成功", "status_visible_text": "转账成功"},
+        records_path=Path("records.jsonl"),
+        line_number=1,
+    )
+    with pytest.raises(ValueError, match="must equal the CTC target"):
+        _validate_v13_status_text_slot(
+            {"text": "转账成功", "status_visible_text": "交易成功"},
+            records_path=Path("records.jsonl"),
+            line_number=2,
+        )
+    with pytest.raises(ValueError, match="audited visible status phrase"):
+        _validate_v13_status_text_slot(
+            {"text": "首页转账成功", "status_visible_text": "首页转账成功"},
+            records_path=Path("records.jsonl"),
+            line_number=4,
+        )
+    with pytest.raises(ValueError, match="only visible CJK text"):
+        _validate_v13_status_text_slot(
+            {
+                "text": "zhuanzhang转账成功",
+                "status_visible_text": "zhuanzhang转账成功",
+            },
+            records_path=Path("records.jsonl"),
+            line_number=3,
+        )
 
 
 def test_v13_appends_status_ctc_without_changing_v12_outputs() -> None:
@@ -392,7 +471,7 @@ def test_v13_contract_constants_are_additive_and_review_only() -> None:
     assert V13_ONNX_OUTPUT_NAMES[:15] == V12_ONNX_OUTPUT_NAMES
     assert V13_ONNX_OUTPUT_NAMES[-1] == "status_text_logits"
     assert STATUS_TEXT_BLANK_INDEX == 0
-    assert STATUS_TEXT_TARGET == "visible_transfer_status_text"
+    assert STATUS_TEXT_TARGET == "visible_transfer_status_cjk_text"
     assert STATUS_TEXT_RUNTIME_POLICY == "decode_and_normalize_review_only"
     assert KIND_V13 == "receipt_unified_field_reader_v13"
 

@@ -133,9 +133,23 @@ function Get-StatusOovAudit([object]$Contract, [string]$Split) {
         throw "v13 dataset contract has no status-text OOV audit for split '$Split'."
     }
     $audit = $splitProperty.Value
+    $recordsProperty = $audit.PSObject.Properties["records"]
+    $missingTextProperty = $audit.PSObject.Properties["missing_text_records"]
+    $oovRecordsProperty = $audit.PSObject.Properties["oov_records"]
+    $oovCharactersProperty = $audit.PSObject.Properties["oov_characters"]
+    if ($null -eq $recordsProperty `
+        -or $null -eq $missingTextProperty `
+        -or $null -eq $oovRecordsProperty `
+        -or $null -eq $oovCharactersProperty) {
+        throw "v13 dataset contract has an incomplete status-text audit for split '$Split'."
+    }
     $records = [int]$audit.records
+    $missingTextRecords = [int]$audit.missing_text_records
     $oovRecords = [int]$audit.oov_records
     $oovCharacters = [int]$audit.oov_characters
+    if ($records -lt 0 -or $missingTextRecords -lt 0 -or $oovRecords -lt 0 -or $oovCharacters -lt 0) {
+        throw "v13 dataset contract has negative status-text counts for split '$Split'."
+    }
     $maxPossibleExactMatch = if ($records -gt 0) {
         [double]($records - $oovRecords) / [double]$records
     }
@@ -145,6 +159,8 @@ function Get-StatusOovAudit([object]$Contract, [string]$Split) {
     return [ordered]@{
         split = $Split
         visible_status_records = $records
+        missing_status_text_records = $missingTextRecords
+        total_status_records = $records + $missingTextRecords
         oov_records = $oovRecords
         oov_characters = $oovCharacters
         checked = ($records -gt 0)
@@ -164,9 +180,13 @@ function Get-StatusOovAudit([object]$Contract, [string]$Split) {
 }
 
 function Assert-ArtifactHash([object]$Contract, [string]$ModelPath, [string]$Description) {
+    $labelsPath = [IO.Path]::ChangeExtension($ModelPath, ".labels.json")
+    Require-File $labelsPath "$Description labels"
     if ([string]$Contract.onnx_file -ne [IO.Path]::GetFileName($ModelPath) `
-        -or [string]$Contract.onnx_sha256 -ne (Get-Sha256 $ModelPath)) {
-        throw "$Description ONNX does not match its adjacent contract."
+        -or [string]$Contract.onnx_sha256 -ne (Get-Sha256 $ModelPath) `
+        -or [string]$Contract.labels_file -ne [IO.Path]::GetFileName($labelsPath) `
+        -or [string]$Contract.labels_sha256 -ne (Get-Sha256 $labelsPath)) {
+        throw "$Description ONNX/labels do not match their adjacent contract."
     }
 }
 
@@ -178,6 +198,7 @@ Require-File $SeedCheckpoint "wide1536 v12 best.pt"
 if ([IO.Path]::GetExtension($SeedCheckpoint) -ne ".pt") {
     throw "SeedCheckpoint must be a PyTorch .pt checkpoint: $SeedCheckpoint"
 }
+$OutputRoot = [IO.Path]::GetFullPath($OutputRoot)
 if (Test-Path -LiteralPath $OutputRoot) {
     throw "Refusing to reuse v13 output root: $OutputRoot"
 }
@@ -238,15 +259,24 @@ Require-File $records "v13 unified manifest"
 $datasetContract = Read-GuardedJson $datasetContractPath
 if ([string]$datasetContract.kind -ne "receipt_unified_field_dataset_v6" `
     -or [string]$datasetContract.architecture -ne "v13" `
-    -or [string]$datasetContract.status_text_target -ne "visible_transfer_status_text" `
-    -or [string]$datasetContract.status_text_charset_source -ne "train_only_visible_transfer_status_text") {
+    -or [string]$datasetContract.status_text_target -ne "visible_transfer_status_cjk_text" `
+    -or [string]$datasetContract.status_text_charset_source -ne "train_only_visible_transfer_status_cjk_text") {
     throw "Built manifest does not carry the strict v13 visible-status contract."
 }
 $trainStatusAudit = Get-StatusOovAudit $datasetContract "train"
 $valStatusAudit = Get-StatusOovAudit $datasetContract "val"
 $testStatusAudit = Get-StatusOovAudit $datasetContract "test"
-if ([int]$trainStatusAudit.visible_status_records -le 0 -or [int]$valStatusAudit.visible_status_records -le 0) {
-    throw "v13 status-text training requires visible transfer status text in both train and val."
+if ([int]$trainStatusAudit.visible_status_records -le 0 `
+    -or [int]$valStatusAudit.visible_status_records -le 0 `
+    -or [int]$testStatusAudit.visible_status_records -le 0) {
+    throw "v13 status-text delivery requires visible transfer status text in train, val, and test."
+}
+foreach ($statusAudit in @($trainStatusAudit, $valStatusAudit, $testStatusAudit)) {
+    if ([int]$statusAudit.missing_status_text_records -ne 0) {
+        throw ("v13 {0} contains {1} transfer-status records without teacher-grounded visible Chinese text; " +
+            "refusing to shrink the status OCR denominator.") -f `
+            $statusAudit.split, [int]$statusAudit.missing_status_text_records
+    }
 }
 if ([int]$trainStatusAudit.oov_records -ne 0 -or [int]$trainStatusAudit.oov_characters -ne 0) {
     throw "v13 train status text must have zero OOV against its own frozen charset."
@@ -383,6 +413,7 @@ Invoke-Python @(
 
 $seedContractPath = [IO.Path]::ChangeExtension($seedModel, ".contract.json")
 $candidateContractPath = [IO.Path]::ChangeExtension($candidateModel, ".contract.json")
+$candidateLabelsPath = [IO.Path]::ChangeExtension($candidateModel, ".labels.json")
 $seedContract = Read-GuardedJson $seedContractPath
 $candidateContract = Read-GuardedJson $candidateContractPath
 Assert-ArtifactHash $seedContract $seedModel "v12 seed"
@@ -463,7 +494,24 @@ foreach ($statusAudit in @($valStatusAudit, $testStatusAudit)) {
     Invoke-Python $evaluateArgs "v13 $split CUDA ONNX evaluation"
     $evaluationSummaryPath = Join-Path $evaluationOutput "summary.json"
     $evaluationSummary = Read-GuardedJson $evaluationSummaryPath
-    if ($evaluationSummary.providers -notcontains "CUDAExecutionProvider" `
+    $evaluationRecords = [IO.Path]::GetFullPath([string]$evaluationSummary.records)
+    $statusMetrics = $evaluationSummary.by_field.transfer_status
+    $statusCtcRecords = [int]$statusMetrics.ctc_records
+    $statusCtcExactMatches = [int]$statusMetrics.ctc_raw_exact_matches
+    $statusCtcExactMatch = [double]$statusMetrics.ctc_raw_exact_match
+    if (-not $evaluationRecords.Equals(
+            [IO.Path]::GetFullPath($records),
+            [StringComparison]::OrdinalIgnoreCase) `
+        -or [string]$evaluationSummary.records_sha256 -ne (Get-Sha256 $records) `
+        -or $statusCtcRecords -le 0 `
+        -or $statusCtcRecords -ne [int]$statusMetrics.records `
+        -or $statusCtcRecords -ne [int]$statusAudit.visible_status_records `
+        -or $statusCtcExactMatches -lt 0 `
+        -or $statusCtcExactMatches -gt $statusCtcRecords `
+        -or [Math]::Abs(
+            $statusCtcExactMatch - ([double]$statusCtcExactMatches / [double]$statusCtcRecords)
+        ) -gt 0.000000000001 `
+        -or $evaluationSummary.providers -notcontains "CUDAExecutionProvider" `
         -or $evaluationSummary.acceptance.requested -ne $true `
         -or $evaluationSummary.acceptance.passed -ne $true `
         -or [string]$evaluationSummary.status_text_policy.runtime_policy -ne $requiredStatusTextPolicy `
@@ -475,8 +523,14 @@ foreach ($statusAudit in @($valStatusAudit, $testStatusAudit)) {
         -or (Get-ExactMetric $evaluationSummary "transfer_status" "$split evaluation" "ctc_raw_exact_match") -lt $StatusTextFloor) {
         throw "v13 $split evaluation did not satisfy its GPU, policy, or exact-match contract."
     }
-    if ($nonSuccessSafetyCalibrated -and [int]$evaluationSummary.status_non_success_to_success -ne 0) {
-        throw "v13 $split evaluation promoted a non-success truth to success."
+    if ($nonSuccessSafetyCalibrated) {
+        $maxSafetyProperty = $evaluationSummary.acceptance.PSObject.Properties["max_non_success_to_success"]
+        if ($null -eq $maxSafetyProperty `
+            -or $null -eq $maxSafetyProperty.Value `
+            -or [int]$maxSafetyProperty.Value -ne 0 `
+            -or [int]$statusMetrics.non_success_to_success -ne 0) {
+            throw "v13 $split evaluation did not preserve the zero non-success-to-success safety line."
+        }
     }
     $evaluationEvidence += [ordered]@{
         split = $split
@@ -492,11 +546,14 @@ foreach ($statusAudit in @($valStatusAudit, $testStatusAudit)) {
         else {
             "no pending/failed truth in this split; no non-success safety claim is made"
         }
-        status_text_exact_match = Get-ExactMetric `
-            $evaluationSummary "transfer_status" "$split evaluation" "ctc_raw_exact_match"
+        status_text_exact_match = $statusCtcExactMatch
+        status_non_success_to_success = [int]$statusMetrics.non_success_to_success
         accepted = $true
     }
 }
+
+$packagingValidationSummary = Join-Path $OutputRoot "onnx-val-gpu\summary.json"
+Require-File $packagingValidationSummary "accepted v13 val ONNX summary for CPU packaging"
 
 $validationEvidence = [ordered]@{
     schema_version = 1
@@ -507,6 +564,7 @@ $validationEvidence = [ordered]@{
     dataset_root = [IO.Path]::GetFullPath($DatasetRoot)
     manifest = [ordered]@{
         records = $records
+        records_sha256 = Get-Sha256 $records
         contract = $datasetContractPath
         contract_sha256 = Get-Sha256 $datasetContractPath
         status_text_oov = @($trainStatusAudit, $valStatusAudit, $testStatusAudit)
@@ -527,6 +585,8 @@ $validationEvidence = [ordered]@{
         model_sha256 = Get-Sha256 $candidateModel
         contract = $candidateContractPath
         contract_sha256 = Get-Sha256 $candidateContractPath
+        labels = $candidateLabelsPath
+        labels_sha256 = Get-Sha256 $candidateLabelsPath
         kind = [string]$candidateContract.kind
         architecture_version = [int]$candidateContract.model.architecture_version
         status_text_runtime_policy = $requiredStatusTextPolicy
@@ -551,12 +611,20 @@ $validationEvidence = [ordered]@{
         time = $timeFloor
         payment_method_field = $paymentFloor
         recipient_field = $recipientFloor
-        visible_transfer_status_text = $StatusTextFloor
+        visible_transfer_status_cjk_text = $StatusTextFloor
     }
     evaluations = $evaluationEvidence
     cpu_packaging = [ordered]@{
         performed = $false
         next_script = "scripts/receipt-mlnet-unified-package-validate-4090.ps1"
+        run_directory = [IO.Path]::GetFullPath($OutputRoot)
+        unified_model_path = $candidateModel
+        unified_model_sha256 = Get-Sha256 $candidateModel
+        onnx_validation_summary_path = $packagingValidationSummary
+        onnx_validation_summary_sha256 = Get-Sha256 $packagingValidationSummary
+        required_runtime_flavor = "cpu"
+        required_rectification = "max-side-1600"
+        include_device_model = $true
     }
 }
 $validationEvidence | ConvertTo-Json -Depth 12 |
@@ -567,4 +635,7 @@ Write-Host "PASS: additive v13 visible-status OCR candidate is ready for existin
 Write-Host "  model=$candidateModel"
 Write-Host "  manifest=$records"
 Write-Host "  evidence=$validationEvidencePath"
-Write-Host "  CPU packaging intentionally not run; use scripts\receipt-mlnet-unified-package-validate-4090.ps1 next."
+Write-Host "  CPU packaging intentionally not run; use scripts\receipt-mlnet-unified-package-validate-4090.ps1 next with:"
+Write-Host "    -RunDirectory $OutputRoot"
+Write-Host "    -UnifiedModelPath $candidateModel"
+Write-Host "    -OnnxValidationSummaryPath $packagingValidationSummary"

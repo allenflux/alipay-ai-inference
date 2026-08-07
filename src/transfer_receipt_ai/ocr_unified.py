@@ -9,7 +9,8 @@ while retaining specialised heads where the output spaces differ:
   canonical amount digits in CTC while learning a tiny visible-format grammar;
 * payment method: a raw CTC fallback plus a visible prefix, a finite known-bank
   classifier, and exact four-digit card-tail readers; and
-* transfer status: a finite three-class head; and
+* transfer status: a legacy finite three-class head plus v13's additive
+  visible-Chinese CTC reader; and
 * v9/v10/v11 recipient: a dedicated free-text Chinese CTC reader.  v10 learns
   the complete visible detector row; v11 learns an anchored right-side value
   after a frozen left title crop, so each target matches its input pixels.
@@ -59,7 +60,15 @@ from .ocr_unified_dataset import KIND_V10 as DATASET_KIND_V10
 from .ocr_unified_dataset import KIND_V11 as DATASET_KIND_V11
 from .ocr_unified_dataset import KIND_V12 as DATASET_KIND_V12
 from .ocr_unified_dataset import KIND_V13 as DATASET_KIND_V13
-from .ocr_unified_dataset import SLOT_ORDER, STATUS_CLASSES, V9_SLOT_ORDER
+from .ocr_unified_dataset import (
+    SLOT_ORDER,
+    STATUS_CLASSES,
+    STATUS_TEXT_CHARSET_SOURCE,
+    STATUS_TEXT_TARGET,
+    STATUS_VISIBLE_CJK_TEXTS,
+    V9_SLOT_ORDER,
+    _visible_status_cjk_text,
+)
 from .ocr_unified_targets import (
     AMOUNT_AUX_FORMAT,
     AMOUNT_CURRENCY_STYLE_CLASSES,
@@ -337,8 +346,6 @@ V13_TEXT_DELIVERY_REASON = (
     "an independent group-isolated human-truth calibration accepts status delivery."
 )
 STATUS_TEXT_RUNTIME_POLICY = "decode_and_normalize_review_only"
-STATUS_TEXT_TARGET = "visible_transfer_status_text"
-STATUS_TEXT_CHARSET_SOURCE = "train_only_visible_transfer_status_text"
 
 
 def _uses_structured_heads(config: "UnifiedReaderConfig") -> bool:
@@ -2217,6 +2224,31 @@ def _validate_anchored_recipient_slot(
         raise ValueError(f"{records_path}:{line_number}: anchored recipient quality policy is unsupported")
 
 
+def _validate_v13_status_text_slot(
+    slot: Mapping[str, object] | None,
+    *,
+    records_path: Path,
+    line_number: int,
+) -> None:
+    """Lock v13's CTC target to Paddle-grounded visible Chinese text."""
+    if slot is None or slot.get("text") is None:
+        return
+    text = slot.get("text")
+    visible_text = slot.get("status_visible_text")
+    if not isinstance(text, str) or visible_text != text:
+        raise ValueError(
+            f"{records_path}:{line_number}: v13 status_visible_text must equal the CTC target"
+        )
+    if _visible_status_cjk_text(text) != text:
+        raise ValueError(
+            f"{records_path}:{line_number}: v13 transfer-status CTC target must contain only visible CJK text"
+        )
+    if text not in STATUS_VISIBLE_CJK_TEXTS:
+        raise ValueError(
+            f"{records_path}:{line_number}: v13 transfer-status CTC target is not an audited visible status phrase"
+        )
+
+
 def load_records(
     records_path: Path,
     *,
@@ -2341,6 +2373,12 @@ def load_records(
             if config is not None and (_is_v11(config) or _uses_v12_recipient_topology(config)):
                 _validate_anchored_recipient_slot(
                     parsed_slots.get("recipient_field"),
+                    records_path=records_path,
+                    line_number=line_number,
+                )
+            if config is not None and _is_v13(config):
+                _validate_v13_status_text_slot(
+                    parsed_slots.get("transfer_status"),
                     records_path=records_path,
                     line_number=line_number,
                 )
@@ -10141,6 +10179,7 @@ def evaluate_unified_onnx(
         "model": model_path.as_posix(),
         "model_sha256": _sha256(model_path),
         "records": records_path.resolve().as_posix(),
+        "records_sha256": _sha256(records_path),
         "evaluation_split": split,
         "label_sources": label_sources,
         "providers": active_providers,

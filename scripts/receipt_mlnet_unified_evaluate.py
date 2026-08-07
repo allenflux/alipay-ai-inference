@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Prepare and score ML.NET v12 unified-reader delivery runs.
+"""Prepare and score ML.NET v12/v13 unified-reader delivery runs.
 
 ``prepare`` writes the unique source images for one manifest split. ``score``
 joins the C# inference manifest to its result JSON files, verifies that every
 result came from the requested unified ONNX artifact, and applies the same
-strict candidate/reference comparison used by the Python v12 evaluator.
+strict candidate/reference comparison used by the Python unified evaluator.
 
 This evaluates the diagnostic ``candidate`` channel.  It does not promote the
 artifact's review-only business ``value`` or turn Paddle-derived labels into
@@ -33,6 +33,7 @@ if str(SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, str(SOURCE_ROOT))
 
 from transfer_receipt_ai.ocr_unified_targets import parse_amount_visible_format_target
+from transfer_receipt_ai.ocr import normalize_status
 
 
 SCHEMA_VERSION = 1
@@ -40,6 +41,7 @@ DEFAULT_AMOUNT_FLOOR = 0.7885
 DEFAULT_TIME_FLOOR = 0.9840
 DEFAULT_PAYMENT_FLOOR = 0.9325
 DEFAULT_RECIPIENT_FLOOR = 0.90
+DEFAULT_STATUS_TEXT_FLOOR = 0.90
 WINDOWS_ABSOLUTE_PATH = re.compile(r"^[A-Za-z]:[\\/]")
 
 # Python evaluator field name -> C# ``fields`` property name.
@@ -49,6 +51,7 @@ FIELD_RESULT_KEYS = {
     "payment_method_field": "payment_method",
     "recipient_field": "recipient",
 }
+STATUS_RESULT_KEY = "transfer_status"
 
 
 class EvaluationInputError(ValueError):
@@ -144,7 +147,7 @@ def prepare_input_list(*, records_path: Path, output_path: Path, split: str = "v
 
 
 def _reference_text(field: str, slot: Mapping[str, Any]) -> str | None:
-    """Mirror the architecture-v12 reference selection in ``ocr_unified``."""
+    """Mirror the architecture-v12/v13 reference selection in ``ocr_unified``."""
     text = slot.get("text")
     if not isinstance(text, str):
         return None
@@ -156,7 +159,7 @@ def _reference_text(field: str, slot: Mapping[str, Any]) -> str | None:
     if field == "time":
         visible = slot.get("visible_text")
         return visible if isinstance(visible, str) and visible else text
-    if field in {"payment_method_field", "recipient_field"}:
+    if field in {"payment_method_field", "recipient_field", "transfer_status"}:
         return text
     raise AssertionError(field)
 
@@ -189,7 +192,15 @@ def _amount_semantic_text(value: Decimal | None) -> str | None:
     return format(value, "f") if value is not None else None
 
 
-def _expected_receipts(records_path: Path, *, split: str) -> dict[str, dict[str, Any]]:
+def _expected_receipts(
+    records_path: Path,
+    *,
+    split: str,
+    include_status_text: bool = False,
+) -> dict[str, dict[str, Any]]:
+    field_result_keys = dict(FIELD_RESULT_KEYS)
+    if include_status_text:
+        field_result_keys["transfer_status"] = STATUS_RESULT_KEY
     expected: dict[str, dict[str, Any]] = {}
     for record in _load_jsonl(records_path):
         if record.get("split") != split:
@@ -201,7 +212,7 @@ def _expected_receipts(records_path: Path, *, split: str) -> dict[str, dict[str,
             raise EvaluationInputError(f"{records_path}: record {record.get('id')!r} has no slots object")
         references: dict[str, str] = {}
         reference_diagnostics: dict[str, dict[str, Any]] = {}
-        for field in FIELD_RESULT_KEYS:
+        for field in field_result_keys:
             slot = raw_slots.get(field)
             if isinstance(slot, Mapping):
                 reference = _reference_text(field, slot)
@@ -212,6 +223,8 @@ def _expected_receipts(records_path: Path, *, split: str) -> dict[str, dict[str,
                         "reference_detector_score": slot.get("detector_score"),
                         "reference_bbox_rectified": slot.get("bbox_rectified"),
                     }
+                    if field == "transfer_status":
+                        reference_diagnostics[field]["reference_status_class"] = slot.get("class_name")
         if key not in expected:
             expected[key] = {
                 "source": source,
@@ -484,6 +497,22 @@ def _field_metrics(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _status_metrics(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    metrics = _field_metrics(rows)
+    non_success_rows = [
+        row for row in rows if row.get("reference_status_class") in {"pending", "failed"}
+    ]
+    non_success_to_success = sum(bool(row.get("non_success_to_success")) for row in non_success_rows)
+    metrics.update(
+        {
+            "non_success_truth_records": len(non_success_rows),
+            "non_success_safety_calibrated": bool(non_success_rows),
+            "non_success_to_success": non_success_to_success,
+        }
+    )
+    return metrics
+
+
 def _amount_semantic_metrics(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     records = len(rows)
     reference_parseable = sum(row.get("reference_amount_decimal") is not None for row in rows)
@@ -521,6 +550,7 @@ def score_results(
     time_floor: float = DEFAULT_TIME_FLOOR,
     payment_floor: float = DEFAULT_PAYMENT_FLOOR,
     recipient_floor: float = DEFAULT_RECIPIENT_FLOOR,
+    status_floor: float | None = None,
     limit: int = 0,
 ) -> dict[str, Any]:
     records_path = records_path.resolve()
@@ -533,7 +563,10 @@ def score_results(
         "time_floor": time_floor,
         "payment_floor": payment_floor,
         "recipient_floor": recipient_floor,
+        "status_floor": status_floor,
     }.items():
+        if floor is None:
+            continue
         if isinstance(floor, bool) or not math.isfinite(float(floor)) or not 0.0 <= float(floor) <= 1.0:
             raise EvaluationInputError(f"{name} must be between 0 and 1")
     if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
@@ -544,7 +577,14 @@ def score_results(
         raise EvaluationInputError(f"ML.NET inference manifest not found: {manifest_path}")
 
     model_sha256 = _sha256(model_path)
-    full_expected = _expected_receipts(records_path, split=split)
+    field_result_keys = dict(FIELD_RESULT_KEYS)
+    if status_floor is not None:
+        field_result_keys["transfer_status"] = STATUS_RESULT_KEY
+    full_expected = _expected_receipts(
+        records_path,
+        split=split,
+        include_status_text=status_floor is not None,
+    )
     full_expected_count = len(full_expected)
     # ``prepare`` emits sources in the first-seen order of the records
     # manifest.  Preserve that same order here so ``--limit N`` evaluates the
@@ -559,7 +599,7 @@ def score_results(
 
     comparisons: list[dict[str, Any]] = []
     missing_result_sources: list[str] = []
-    missing_field_sources: dict[str, list[str]] = {field: [] for field in FIELD_RESULT_KEYS}
+    missing_field_sources: dict[str, list[str]] = {field: [] for field in field_result_keys}
     fully_scored_receipts = 0
     matched_receipts = 0
     for source_key, truth in expected.items():
@@ -572,7 +612,7 @@ def score_results(
         receipt_complete = result is not None
         references = truth["references"]
         for field, reference in references.items():
-            result_key = FIELD_RESULT_KEYS[field]
+            result_key = field_result_keys[field]
             if result is None:
                 candidate, missing_reason = None, "result_missing"
             else:
@@ -603,6 +643,18 @@ def score_results(
             comparison.update(
                 _result_field_diagnostics(result, result_key=result_key, detector_label=field)
             )
+            if field == "transfer_status":
+                reference_status_class = comparison.get("reference_status_class")
+                candidate_status_class = normalize_status(candidate) if candidate_present else None
+                comparison.update(
+                    {
+                        "candidate_status_class": candidate_status_class,
+                        "non_success_to_success": (
+                            reference_status_class in {"pending", "failed"}
+                            and candidate_status_class == "success"
+                        ),
+                    }
+                )
             if field == "amount":
                 reference_decimal = _amount_semantic_decimal(reference)
                 candidate_decimal = _amount_semantic_decimal(candidate)
@@ -622,10 +674,12 @@ def score_results(
             fully_scored_receipts += 1
 
     comparisons.sort(key=lambda row: (str(row["field"]), str(row["id"]), str(row["source"])))
-    by_field = {
-        field: _field_metrics([row for row in comparisons if row["field"] == field])
-        for field in FIELD_RESULT_KEYS
-    }
+    by_field = {}
+    for field in field_result_keys:
+        field_rows = [row for row in comparisons if row["field"] == field]
+        by_field[field] = (
+            _status_metrics(field_rows) if field == "transfer_status" else _field_metrics(field_rows)
+        )
     amount_semantic = _amount_semantic_metrics(
         [row for row in comparisons if row["field"] == "amount"]
     )
@@ -667,6 +721,8 @@ def score_results(
         "payment_method_field": float(payment_floor),
         "recipient_field": float(recipient_floor),
     }
+    if status_floor is not None:
+        floors["transfer_status"] = float(status_floor)
     failures = list(integrity_failures)
     if extra_manifest_sources:
         failures.append(
@@ -689,6 +745,16 @@ def score_results(
             failures.append(f"{field}: candidate_coverage={rendered} < 1.0000")
         if float(observed) < floor:
             failures.append(f"{field}: raw_exact_match={float(observed):.4f} < {floor:.4f}")
+    status_metrics = by_field.get("transfer_status")
+    if (
+        isinstance(status_metrics, Mapping)
+        and int(status_metrics["non_success_truth_records"]) > 0
+        and int(status_metrics["non_success_to_success"]) > 0
+    ):
+        failures.append(
+            "transfer_status: "
+            f"non_success_to_success={int(status_metrics['non_success_to_success'])} > 0"
+        )
 
     sample_thresholds_passed = not failures
     summary: dict[str, Any] = {
@@ -717,9 +783,16 @@ def score_results(
             "min_time_exact_match": float(time_floor),
             "min_payment_exact_match": float(payment_floor),
             "min_recipient_exact_match": float(recipient_floor),
+            "min_status_exact_match": float(status_floor) if status_floor is not None else None,
+            "max_non_success_to_success": (
+                0
+                if isinstance(status_metrics, Mapping)
+                and int(status_metrics["non_success_truth_records"]) > 0
+                else None
+            ),
         },
         "warning": (
-            "This compares ML.NET candidate text with v12 manifest labels. Paddle-derived labels are not "
+            "This compares ML.NET candidate text with unified manifest labels. Paddle-derived labels are not "
             "independently verified business truth, and the artifact's business values remain review-only."
         ),
     }
@@ -747,7 +820,7 @@ def score_results(
             "partial_pilot: only the first "
             f"{len(expected)} of {full_expected_count} expected {split} receipt source(s) were evaluated; "
             "formal_delivery_gate=false and this report cannot be accepted as delivery evidence. "
-            "It compares ML.NET candidate text with v12 manifest labels; Paddle-derived labels are not "
+            "It compares ML.NET candidate text with unified manifest labels; Paddle-derived labels are not "
             "independently verified business truth, and business values remain review-only."
         )
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -765,17 +838,22 @@ def _parser() -> argparse.ArgumentParser:
     prepare.add_argument("--output", type=Path, required=True, help="UTF-8 newline-delimited input list")
     prepare.add_argument("--split", default="val")
 
-    score = subparsers.add_parser("score", help="score ML.NET result JSON against v12 manifest references")
+    score = subparsers.add_parser("score", help="score ML.NET result JSON against v12/v13 manifest references")
     score.add_argument("--records", type=Path, required=True, help="unified_fields.jsonl")
     score.add_argument("--results", type=Path, required=True, help="ML.NET output root")
     score.add_argument("--manifest", type=Path, help="defaults to RESULTS/inference_manifest.json")
-    score.add_argument("--model", type=Path, required=True, help="the delivered v12 unified ONNX")
+    score.add_argument("--model", type=Path, required=True, help="the delivered v12/v13 unified ONNX")
     score.add_argument("--output", type=Path, required=True, help="evaluation output directory")
     score.add_argument("--split", default="val")
     score.add_argument("--amount-floor", type=_floor, default=DEFAULT_AMOUNT_FLOOR)
     score.add_argument("--time-floor", type=_floor, default=DEFAULT_TIME_FLOOR)
     score.add_argument("--payment-floor", type=_floor, default=DEFAULT_PAYMENT_FLOOR)
     score.add_argument("--recipient-floor", type=_floor, default=DEFAULT_RECIPIENT_FLOOR)
+    score.add_argument(
+        "--status-floor",
+        type=_floor,
+        help="enable v13 visible transfer-status raw exact scoring at this fixed floor",
+    )
     score.add_argument(
         "--limit",
         type=_limit,
@@ -807,6 +885,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             time_floor=args.time_floor,
             payment_floor=args.payment_floor,
             recipient_floor=args.recipient_floor,
+            status_floor=args.status_floor,
             limit=args.limit,
         )
         metrics = summary["by_field"]

@@ -29,7 +29,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("summary", type=Path)
     args = parser.parse_args()
-    with args.summary.open("r", encoding="utf-8") as stream:
+    # Windows PowerShell 5.1's ``Set-Content -Encoding UTF8`` emits a BOM,
+    # while Python-generated evidence is plain UTF-8.  ``utf-8-sig`` accepts
+    # both without weakening JSON parsing.
+    with args.summary.open("r", encoding="utf-8-sig") as stream:
         payload = json.load(stream, parse_constant=lambda _value: None)
     print(json.dumps(_normalize(payload), ensure_ascii=True, allow_nan=False, separators=(",", ":")))
 

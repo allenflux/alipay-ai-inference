@@ -14,8 +14,8 @@ internal sealed class UnifiedOcrBundle
     public const string KindV13 = "receipt_unified_field_reader_v13";
     public const string StatusTextOutputName = "status_text_logits";
     public const string StatusTextRuntimePolicy = "decode_and_normalize_review_only";
-    public const string StatusTextTarget = "visible_transfer_status_text";
-    public const string StatusTextCharsetSource = "train_only_visible_transfer_status_text";
+    public const string StatusTextTarget = "visible_transfer_status_cjk_text";
+    public const string StatusTextCharsetSource = "train_only_visible_transfer_status_cjk_text";
     public const string StatusTextNormalizer = "normalize_status";
 
     public static readonly string[] SlotOrder =

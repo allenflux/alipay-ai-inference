@@ -1145,6 +1145,7 @@ def test_v12_train_export_ort_load_and_evaluate_two_static_inputs_when_onnx_is_a
     )
     assert failures == []
     assert summary["providers"] == ["CPUExecutionProvider"]
+    assert summary["records_sha256"] == hashlib.sha256(records_path.read_bytes()).hexdigest()
     assert summary["by_field"]["recipient_field"]["records"] == 1
 
     # The v12 trim audit reads the same ONNX/manifest but sends trial pixels

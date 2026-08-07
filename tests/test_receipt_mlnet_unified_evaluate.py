@@ -32,24 +32,29 @@ def _record(
     time_visible: str = "2026-08-06 07:08:09",
     payment: str = "余额",
     recipient: str = "商户甲",
+    status: str | None = None,
+    status_class: str = "success",
 ) -> dict[str, object]:
+    slots: dict[str, object] = {
+        "amount": {"text": amount_text, "visible_text": amount_visible},
+        "time": {"text": time_text, "visible_text": time_visible},
+        "payment_method_field": {"text": payment},
+        "recipient_field": {"text": recipient},
+    }
+    if status is not None:
+        slots["transfer_status"] = {"text": status, "class_name": status_class}
     return {
         "id": receipt_id,
         "group_id": f"group:{receipt_id}",
         "split": split,
         "source": str(source),
-        "slots": {
-            "amount": {"text": amount_text, "visible_text": amount_visible},
-            "time": {"text": time_text, "visible_text": time_visible},
-            "payment_method_field": {"text": payment},
-            "recipient_field": {"text": recipient},
-        },
+        "slots": slots,
     }
 
 
 def _result(source: Path, model_sha256: str, **candidates: str | None) -> dict[str, object]:
     fields: dict[str, object] = {}
-    for name in ("amount", "time", "payment_method", "recipient"):
+    for name in ("amount", "time", "payment_method", "recipient", "transfer_status"):
         if name in candidates:
             fields[name] = {"candidate": candidates[name]}
     return {
@@ -167,6 +172,179 @@ def test_score_matches_v12_references_and_accepts_uniform_model(tmp_path: Path) 
     assert amounts["one"]["reference_text"] == "¥ 1,234.56"
     assert amounts["two"]["reference_text"] == "2.00"
     assert json.loads((output / "summary.json").read_text(encoding="utf-8"))["accepted"] is True
+
+
+def test_score_v13_status_uses_visible_raw_text_without_requiring_unlabeled_receipts(
+    tmp_path: Path,
+) -> None:
+    model = tmp_path / "status-text-v13.onnx"
+    model.write_bytes(b"unified-v13-model")
+    model_sha256 = hashlib.sha256(model.read_bytes()).hexdigest()
+    status_source = tmp_path / "status.png"
+    no_status_source = tmp_path / "no-status.png"
+    records = tmp_path / "unified_fields.jsonl"
+    _write_jsonl(
+        records,
+        [
+            _record("status", status_source, status="转账成功"),
+            _record("no-status", no_status_source),
+        ],
+    )
+    results = tmp_path / "results"
+    manifest: list[dict[str, object]] = []
+    for receipt_id, source, status in (
+        ("status", status_source, "转账成功"),
+        ("no-status", no_status_source, None),
+    ):
+        result_path = results / f"{receipt_id}.json"
+        candidates: dict[str, str | None] = {
+            "amount": "¥ 1,234.56",
+            "time": "2026-08-06 07:08:09",
+            "payment_method": "余额",
+            "recipient": "商户甲",
+        }
+        if status is not None:
+            candidates["transfer_status"] = status
+        _write_json(result_path, _result(source, model_sha256, **candidates))
+        manifest.append({"source": str(source), "result": str(result_path), "status": "written"})
+    _write_json(results / "inference_manifest.json", manifest)
+
+    summary = score_results(
+        records_path=records,
+        results_root=results,
+        model_path=model,
+        output_dir=tmp_path / "evaluation",
+        status_floor=0.90,
+    )
+
+    assert summary["accepted"] is True
+    assert summary["floors"]["transfer_status"] == 0.90
+    assert summary["acceptance"]["min_status_exact_match"] == 0.90
+    assert summary["by_field"]["transfer_status"] == {
+        "records": 1,
+        "raw_exact_matches": 1,
+        "raw_exact_match": 1.0,
+        "candidate_records": 1,
+        "missing_candidate_records": 0,
+        "candidate_coverage": 1.0,
+        "non_success_truth_records": 0,
+        "non_success_safety_calibrated": False,
+        "non_success_to_success": 0,
+    }
+    status_rows = [
+        json.loads(line)
+        for line in (tmp_path / "evaluation" / "comparisons.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if json.loads(line)["field"] == "transfer_status"
+    ]
+    assert len(status_rows) == 1
+    assert status_rows[0]["reference_text"] == "转账成功"
+    assert status_rows[0]["candidate_text"] == "转账成功"
+    assert status_rows[0]["raw_exact"] is True
+
+
+def test_score_v13_status_missing_or_semantic_only_candidate_fails_raw_gate(
+    tmp_path: Path,
+) -> None:
+    model = tmp_path / "status-text-v13.onnx"
+    model.write_bytes(b"unified-v13-model")
+    model_sha256 = hashlib.sha256(model.read_bytes()).hexdigest()
+    sources = [tmp_path / "one.png", tmp_path / "two.png"]
+    records = tmp_path / "unified_fields.jsonl"
+    _write_jsonl(
+        records,
+        [
+            _record("one", sources[0], status="转账成功"),
+            _record("two", sources[1], status="转账成功"),
+        ],
+    )
+    results = tmp_path / "results"
+    manifest: list[dict[str, object]] = []
+    for index, source in enumerate(sources):
+        result_path = results / f"{index}.json"
+        _write_json(
+            result_path,
+            _result(
+                source,
+                model_sha256,
+                amount="¥ 1,234.56",
+                time="2026-08-06 07:08:09",
+                payment_method="余额",
+                recipient="商户甲",
+                **({"transfer_status": "成功"} if index == 0 else {}),
+            ),
+        )
+        manifest.append({"source": str(source), "result": str(result_path), "status": "written"})
+    _write_json(results / "inference_manifest.json", manifest)
+
+    summary = score_results(
+        records_path=records,
+        results_root=results,
+        model_path=model,
+        output_dir=tmp_path / "evaluation",
+        status_floor=0.90,
+    )
+
+    assert summary["accepted"] is False
+    assert summary["by_field"]["transfer_status"]["raw_exact_match"] == 0.0
+    assert summary["by_field"]["transfer_status"]["candidate_coverage"] == 0.5
+    assert any(
+        "transfer_status: candidate_coverage=0.5000 < 1.0000" in failure
+        for failure in summary["failures"]
+    )
+    assert any(
+        "transfer_status: raw_exact_match=0.0000 < 0.9000" in failure
+        for failure in summary["failures"]
+    )
+
+
+def test_score_v13_rejects_non_success_promoted_to_success_even_with_zero_floor(
+    tmp_path: Path,
+) -> None:
+    model = tmp_path / "status-text-v13.onnx"
+    model.write_bytes(b"unified-v13-model")
+    model_sha256 = hashlib.sha256(model.read_bytes()).hexdigest()
+    source = tmp_path / "failed.png"
+    records = tmp_path / "unified_fields.jsonl"
+    _write_jsonl(
+        records,
+        [_record("failed", source, status="转账失败", status_class="failed")],
+    )
+    results = tmp_path / "results"
+    result_path = results / "failed.json"
+    _write_json(
+        result_path,
+        _result(
+            source,
+            model_sha256,
+            amount="¥ 1,234.56",
+            time="2026-08-06 07:08:09",
+            payment_method="余额",
+            recipient="商户甲",
+            transfer_status="转账成功",
+        ),
+    )
+    _write_json(
+        results / "inference_manifest.json",
+        [{"source": str(source), "result": str(result_path), "status": "written"}],
+    )
+
+    summary = score_results(
+        records_path=records,
+        results_root=results,
+        model_path=model,
+        output_dir=tmp_path / "evaluation",
+        status_floor=0.0,
+    )
+
+    status_metrics = summary["by_field"]["transfer_status"]
+    assert summary["accepted"] is False
+    assert status_metrics["non_success_truth_records"] == 1
+    assert status_metrics["non_success_safety_calibrated"] is True
+    assert status_metrics["non_success_to_success"] == 1
+    assert summary["acceptance"]["max_non_success_to_success"] == 0
+    assert "transfer_status: non_success_to_success=1 > 0" in summary["failures"]
 
 
 def test_score_counts_missing_result_and_candidate_as_errors(tmp_path: Path) -> None:

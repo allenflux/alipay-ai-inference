@@ -35,6 +35,11 @@ reader consumes that same value view through a dedicated high-resolution input
 branch.  Keeping the manifest kind separate prevents a v11 artifact from
 silently consuming a v12 training manifest.
 
+The v13 contract adds a transfer-status text reader.  Its target is the visible
+Chinese status line reported by Paddle OCR, not the adjacent pinyin guide and
+not a semantic class name.  This keeps ``转账成功`` as pixel-grounded CTC text
+while ``success`` remains a separately derived diagnostic value.
+
 The payment slot deliberately retains the visible payment-method value (for
 example ``建设银行储蓄卡(3667)``) as a CTC target.  Its normalised business
 category remains provenance only; reducing it to ``bank_card`` would make a
@@ -88,6 +93,89 @@ ARCHITECTURE_V11 = "v11"
 ARCHITECTURE_V12 = "v12"
 ARCHITECTURE_V13 = "v13"
 STATUS_CLASSES = ("success", "pending", "failed")
+STATUS_TEXT_TARGET = "visible_transfer_status_cjk_text"
+STATUS_TEXT_CHARSET_SOURCE = "train_only_visible_transfer_status_cjk_text"
+STATUS_VISIBLE_CJK_TEXTS = frozenset(
+    {
+        "转账成功",
+        "交易成功",
+        "付款成功",
+        "支付成功",
+        "转帐成功",
+        "转账失败",
+        "交易失败",
+        "付款失败",
+        "支付失败",
+        "转帐失败",
+        "转账未成功",
+        "交易未成功",
+        "付款未成功",
+        "支付未成功",
+        "转帐未成功",
+        "转账已撤销",
+        "交易已撤销",
+        "付款已撤销",
+        "支付已撤销",
+        "转帐已撤销",
+        "转账处理中",
+        "交易处理中",
+        "付款处理中",
+        "支付处理中",
+        "转帐处理中",
+        "转账待处理",
+        "交易待处理",
+        "付款待处理",
+        "支付待处理",
+        "转帐待处理",
+        "转账进行中",
+        "交易进行中",
+        "付款进行中",
+        "支付进行中",
+        "转帐进行中",
+        "失败",
+        "未成功",
+        "已撤销",
+        "处理中",
+        "待处理",
+        "进行中",
+    }
+)
+
+
+def _is_cjk_ideograph(character: str) -> bool:
+    return (
+        "\u3400" <= character <= "\u4dbf"
+        or "\u4e00" <= character <= "\u9fff"
+        or "\uf900" <= character <= "\ufaff"
+    )
+
+
+def _visible_status_cjk_text(value: object) -> str:
+    """Return the visible Chinese status line from a Paddle OCR result.
+
+    Some Alipay status crops contain a small pinyin guide above the Chinese
+    business text.  Paddle legitimately returns both lines, but teaching that
+    combined string makes the deployable reader sensitive to tone marks,
+    spacing and capitalization that are irrelevant to transfer status.  Keep
+    only CJK ideographs that are actually present in the OCR result; never
+    manufacture text from the semantic class.
+    """
+    if not isinstance(value, str):
+        return ""
+    cleaned = clean_text(value)
+    first_cjk = next(
+        (index for index, character in enumerate(cleaned) if _is_cjk_ideograph(character)),
+        None,
+    )
+    if first_cjk is None:
+        return ""
+    visible_suffix = cleaned[first_cjk:]
+    # Pinyin is valid only as a leading guide line.  Once the Chinese line has
+    # begun, another alphabetic fragment would mean that filtering characters
+    # could manufacture a continuous status phrase that was never visible.
+    if any(character.isalpha() and not _is_cjk_ideograph(character) for character in visible_suffix):
+        return ""
+    return "".join(character for character in visible_suffix if _is_cjk_ideograph(character))
 
 # V12 deliberately reuses the fully-audited v11 recipient labels.  Only the
 # reader-side pixels change: it receives a dedicated high-resolution value
@@ -506,7 +594,7 @@ def _slot_payload(
         }
         if architecture == ARCHITECTURE_V13:
             audit: dict[str, object] = {
-                "target": "visible_transfer_status_text",
+                "target": STATUS_TEXT_TARGET,
                 "decision": "missing",
                 "source": None,
                 "reason": None,
@@ -520,41 +608,36 @@ def _slot_payload(
                     else ""
                 ),
             }
-            candidates = (
-                ("record_text", record.get("text")),
-                ("paddle_text_fallback", record.get("paddle_text")),
-            )
-            rejection_reasons: list[str] = []
-            for source, raw_text in candidates:
-                if not isinstance(raw_text, str):
-                    rejection_reasons.append(f"{source}:not_a_string")
-                    continue
-                visible_text = clean_text(raw_text)
-                if not visible_text:
-                    rejection_reasons.append(f"{source}:empty")
-                    continue
-                if any(not character.isprintable() for character in visible_text):
-                    rejection_reasons.append(f"{source}:non_printable")
-                    continue
+            # Paddle's OCR value is the only permitted v13 text truth.  The
+            # record text may be a semantic label or a legacy transcription,
+            # so it remains audit evidence and can never override Paddle.
+            raw_text = record.get("paddle_text")
+            visible_text = _visible_status_cjk_text(raw_text)
+            if not isinstance(raw_text, str):
+                audit["reason"] = "paddle_text:not_a_string"
+            elif not visible_text:
+                audit["reason"] = "paddle_text:no_visible_cjk_status_text"
+            elif visible_text not in STATUS_VISIBLE_CJK_TEXTS:
+                audit["reason"] = "paddle_text:unsupported_visible_cjk_status_text"
+            else:
                 normalized = normalize_status(visible_text)
                 if normalized != semantic_value:
-                    rejection_reasons.append(
-                        f"{source}:normalizes_to_{normalized}_not_{semantic_value}"
+                    audit["reason"] = (
+                        f"paddle_text_cjk:normalizes_to_{normalized}_not_{semantic_value}"
                     )
-                    continue
-                payload["text"] = visible_text
-                payload["semantic_value"] = semantic_value
-                payload["status_text_source"] = source
-                audit.update(
-                    {
-                        "decision": "accepted",
-                        "source": source,
-                        "reason": "visible_text_normalizes_to_class_name",
-                    }
-                )
-                break
-            if "text" not in payload:
-                audit["reason"] = ";".join(rejection_reasons) or "no_visible_text_candidate"
+                else:
+                    source = "paddle_text_cjk"
+                    payload["text"] = visible_text
+                    payload["status_visible_text"] = visible_text
+                    payload["semantic_value"] = semantic_value
+                    payload["status_text_source"] = source
+                    audit.update(
+                        {
+                            "decision": "accepted",
+                            "source": source,
+                            "reason": "paddle_visible_cjk_text_normalizes_to_class_name",
+                        }
+                    )
             payload["status_text_audit"] = audit
         return payload
     if field == "payment_method_field":
@@ -776,10 +859,10 @@ def _status_text_charset_payload(records: Iterable[Mapping[str, object]]) -> dic
                     }
                 )
     return {
-        "source": "train_only_visible_transfer_status_text",
+        "source": STATUS_TEXT_CHARSET_SOURCE,
         "characters": charset,
         "sha256": hashlib.sha256("".join(charset).encode("utf-8")).hexdigest(),
-        "target": "visible_transfer_status_text",
+        "target": STATUS_TEXT_TARGET,
         "source_counts": dict(sorted(source_counts.items())),
         "missing_reasons": dict(sorted(missing_reasons.items())),
         "oov_by_split": {
