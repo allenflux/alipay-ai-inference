@@ -364,7 +364,7 @@ def test_recipient_priority_rejects_epochs_below_any_protected_floor(
 def test_recipient_priority_requires_a_recipient_protocol_and_complete_valid_floors(
     invalid_floor: float,
 ) -> None:
-    with pytest.raises(ValueError, match="requires architecture v9, v10, v11, or v12"):
+    with pytest.raises(ValueError, match="requires architecture v9, v10, v11, v12, or v13"):
         _checkpoint_selection_policy(
             config=_tiny_config(architecture_version=8),
             checkpoint_selection=CHECKPOINT_SELECTION_RECIPIENT_PRIORITY,
