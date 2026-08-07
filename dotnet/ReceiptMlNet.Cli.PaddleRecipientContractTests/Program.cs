@@ -24,8 +24,17 @@ internal static class Program
                 ParsePinyin(["shou kuan fang", "\u53f8\u6e90(**\u6e90)", "\u6536\u6b3e\u65b9"], [0.90f, 0.90f, 0.90f], float.NaN),
                 "pinyin detector is non-finite");
             AssertAlternativeNull(
-                ParsePinyin(["shou kuan fang", "\u53f8\u6e90(**\u6e90)", "\u6536\u6b3e\u65b9"], [0.90f, 0.799f, 0.90f], 0.95f),
-                "pinyin line below 0.80");
+                ParsePinyin(["shou kuan fang", "\u53f8\u6e90(**\u6e90)", "\u6536\u6b3e\u65b9"], [0.799f, 0.90f, 0.90f], 0.95f),
+                "pinyin annotation line below 0.80");
+            AssertAlternative(
+                "\u53f8\u6e90(**\u6e90)",
+                "pinyin_annotated_three_line",
+                null,
+                ParsePinyin(["shou kuan fang", "\u53f8\u6e90(**\u6e90)", "\u6536\u6b3e\u65b9"], [0.90f, 0.70f, 0.90f], 0.95f),
+                "pinyin merchant line at 0.70");
+            AssertAlternativeNull(
+                ParsePinyin(["shou kuan fang", "\u53f8\u6e90(**\u6e90)", "\u6536\u6b3e\u65b9"], [0.90f, 0.699f, 0.90f], 0.95f),
+                "pinyin merchant line below 0.70");
             AssertAlternativeNull(
                 ParsePinyin(["shou kuan fang", "\u6536\u6b3e\u65b9", "\u53f8\u6e90(**\u6e90)"], [0.90f, 0.90f, 0.90f], 0.95f),
                 "pinyin wrong line order");

@@ -76,7 +76,9 @@ def test_hybrid_routes_only_recipient_after_v13_and_keeps_review_policy() -> Non
     assert 'recipientBox[3] <= paymentBox[1] + verticalTolerance' in parser
     assert 'recipientDetectorScore < 0.90f' in parser
     assert '!float.IsFinite(recipientDetectorScore)' in parser
-    assert 'line.Confidence < 0.80f' in parser
+    assert 'lines[0].Confidence < 0.80f' in parser
+    assert 'lines[1].Confidence < 0.70f' in parser
+    assert 'lines[2].Confidence < 0.80f' in parser
     assert '"shoukuanfang"' in parser
     assert '"pinyin_annotated_three_line"' in parser
     assert '0 => 0.75f' in parser
@@ -173,7 +175,9 @@ def test_recipient_parser_has_package_free_executable_contract_tests() -> None:
     assert "strict pinyin annotation route" in harness
     assert "pinyin detector below 0.90" in harness
     assert "pinyin detector is non-finite" in harness
-    assert "pinyin line below 0.80" in harness
+    assert "pinyin annotation line below 0.80" in harness
+    assert "pinyin merchant line at 0.70" in harness
+    assert "pinyin merchant line below 0.70" in harness
     assert "pinyin wrong line order" in harness
     assert "pinyin annotation typo" in harness
     assert "pinyin annotation contains non-letter noise" in harness

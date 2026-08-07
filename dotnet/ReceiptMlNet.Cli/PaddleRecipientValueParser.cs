@@ -87,7 +87,9 @@ internal static class PaddleRecipientValueParser
             return null;
         }
 
-        if (lines.Any(line => line.Confidence < 0.80f)
+        if (lines[0].Confidence < 0.80f
+            || lines[1].Confidence < 0.70f
+            || lines[2].Confidence < 0.80f
             || !string.Equals(NormalizePinyin(lines[0].Text), "shoukuanfang", StringComparison.Ordinal)
             || !IsCjkMerchantCandidate(lines[1].Text)
             || !string.Equals(lines[2].Text, RecipientLabels[0], StringComparison.Ordinal))

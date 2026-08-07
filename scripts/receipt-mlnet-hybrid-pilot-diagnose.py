@@ -131,6 +131,39 @@ def _geometry_reasons(
     return reasons
 
 
+def _geometry_evidence(
+    result: Mapping[str, Any], detections: Mapping[str, Mapping[str, Any]]
+) -> dict[str, Any] | None:
+    geometry = result.get("geometry")
+    size = geometry.get("rectified_size") if isinstance(geometry, Mapping) else None
+    recipient = _box(detections.get("recipient_field"))
+    amount = _box(detections.get("amount"))
+    payment = _box(detections.get("payment_method_field"))
+    try:
+        width = int(size.get("width"))
+        height = int(size.get("height"))
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if recipient is None or amount is None or payment is None:
+        return None
+    recipient_height = recipient[3] - recipient[1]
+    tolerance = max(4.0, recipient_height * 0.25)
+    return {
+        "rectified_width": width,
+        "rectified_height": height,
+        "amount_box": amount,
+        "recipient_box": recipient,
+        "payment_box": payment,
+        "recipient_height": round(recipient_height, 4),
+        "vertical_tolerance": round(tolerance, 4),
+        "amount_edge_margin": round(recipient[1] - amount[3], 4),
+        "payment_edge_margin": round(payment[1] - recipient[3], 4),
+        "payment_excess_overlap": round(
+            max(0.0, recipient[3] - payment[1] - tolerance), 4
+        ),
+    }
+
+
 def _amount_fen(value: object) -> int | None:
     match = EXPECTED_AMOUNT_PATTERN.fullmatch(str(value or "").strip())
     if match is None:
@@ -305,6 +338,7 @@ def diagnose(
                 "amount_score": _score(detections.get("amount")),
                 "payment_score": _score(detections.get("payment_method_field")),
                 "geometry_reasons": geometry_reasons,
+                "geometry_evidence": _geometry_evidence(result, detections),
                 "first_raw": recipient.get("hybrid_ocr_first_raw"),
                 "first_line_count": recipient.get("hybrid_ocr_first_line_count"),
                 "first_pair_reasons": first_reasons,
