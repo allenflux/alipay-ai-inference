@@ -49,3 +49,14 @@ def test_csharp_contract_harness_compares_legacy_and_optimized_float_bits() -> N
     assert "VerifyCase(13, 5, reusableDetectorBuffer, reusableStatusbarBuffer)" in harness
     assert "VerifyCase(9, 16, reusableDetectorBuffer, reusableStatusbarBuffer)" in harness
     assert "VerifyCase(1179, 2556, reusableDetectorBuffer, reusableStatusbarBuffer)" in harness
+
+
+def test_unified_runtime_decodes_native_output_views_without_array_copies() -> None:
+    engine = (
+        ROOT / "dotnet" / "ReceiptMlNet.Cli" / "UnifiedOcrEngine.cs"
+    ).read_text(encoding="utf-8")
+
+    assert "ReadOutputViews(runtimeOutputs)" in engine
+    assert "denseTensor.Buffer" in engine
+    assert "output.Values.Span" in engine
+    assert "tensor.ToArray()" not in engine

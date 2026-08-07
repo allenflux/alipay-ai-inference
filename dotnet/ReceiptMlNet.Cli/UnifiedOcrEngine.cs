@@ -121,54 +121,59 @@ internal sealed class UnifiedOcrEngine : IDisposable
         };
         var preprocessMs = StopAndReadMilliseconds(stageStopwatch);
 
-        Dictionary<string, OrtOutput> outputs;
+        UnifiedOcrReadResult result;
         double inferenceMs;
+        double postprocessMs;
         stageStopwatch.Restart();
         using (IDisposableReadOnlyCollection<DisposableNamedOnnxValue> runtimeOutputs = _session.Run(inputs))
         {
             inferenceMs = StopAndReadMilliseconds(stageStopwatch);
             stageStopwatch.Restart();
-            outputs = ReadOutputs(runtimeOutputs);
+            // DisposableNamedOnnxValue already exposes ORT's native CPU output
+            // memory through DenseTensor.Buffer. Decode while that collection
+            // is alive instead of copying every output tensor to a new array.
+            var outputs = ReadOutputViews(runtimeOutputs);
+
+            var candidates = new Dictionary<string, UnifiedOcrCandidate>(StringComparer.Ordinal);
+            if (readable.Contains("amount"))
+            {
+                candidates["amount"] = DecodeAmount(outputs);
+            }
+            if (readable.Contains("time"))
+            {
+                candidates["time"] = DecodeTime(outputs);
+            }
+            if (readable.Contains("payment_method_field"))
+            {
+                candidates["payment_method_field"] = DecodeCtcCandidate(
+                    outputs["payment_logits"], _bundle.PaymentCharacters);
+            }
+            if (readable.Contains("recipient_field"))
+            {
+                candidates["recipient_field"] = DecodeCtcCandidate(
+                    outputs["recipient_logits"], _bundle.RecipientCharacters);
+            }
+
+            string? statusCandidate = null;
+            float? statusConfidence = null;
+            if (readable.Contains("transfer_status"))
+            {
+                var status = DecodeClass(outputs["status_logits"]);
+                statusCandidate = _bundle.StatusClasses[status.Index];
+                statusConfidence = status.Confidence;
+            }
+
+            result = new UnifiedOcrReadResult(
+                candidates,
+                statusCandidate,
+                statusConfidence,
+                _bundle.StatusRuntimePolicy == "classify" ? statusCandidate ?? "review" : _bundle.StatusReviewValue ?? "review",
+                _bundle.StatusRuntimePolicy,
+                _bundle.TextReviewValue,
+                _bundle.TextRuntimePolicy);
+            postprocessMs = StopAndReadMilliseconds(stageStopwatch);
         }
 
-        var candidates = new Dictionary<string, UnifiedOcrCandidate>(StringComparer.Ordinal);
-        if (readable.Contains("amount"))
-        {
-            candidates["amount"] = DecodeAmount(outputs);
-        }
-        if (readable.Contains("time"))
-        {
-            candidates["time"] = DecodeTime(outputs);
-        }
-        if (readable.Contains("payment_method_field"))
-        {
-            candidates["payment_method_field"] = DecodeCtcCandidate(
-                outputs["payment_logits"], _bundle.PaymentCharacters);
-        }
-        if (readable.Contains("recipient_field"))
-        {
-            candidates["recipient_field"] = DecodeCtcCandidate(
-                outputs["recipient_logits"], _bundle.RecipientCharacters);
-        }
-
-        string? statusCandidate = null;
-        float? statusConfidence = null;
-        if (readable.Contains("transfer_status"))
-        {
-            var status = DecodeClass(outputs["status_logits"]);
-            statusCandidate = _bundle.StatusClasses[status.Index];
-            statusConfidence = status.Confidence;
-        }
-
-        var result = new UnifiedOcrReadResult(
-            candidates,
-            statusCandidate,
-            statusConfidence,
-            _bundle.StatusRuntimePolicy == "classify" ? statusCandidate ?? "review" : _bundle.StatusReviewValue ?? "review",
-            _bundle.StatusRuntimePolicy,
-            _bundle.TextReviewValue,
-            _bundle.TextRuntimePolicy);
-        var postprocessMs = StopAndReadMilliseconds(stageStopwatch);
         stageLatency = new UnifiedOcrStageLatency(preprocessMs, inferenceMs, postprocessMs);
         return result;
     }
@@ -235,7 +240,7 @@ internal sealed class UnifiedOcrEngine : IDisposable
         readable.Add("recipient_field");
     }
 
-    private Dictionary<string, OrtOutput> ReadOutputs(IDisposableReadOnlyCollection<DisposableNamedOnnxValue> runtimeOutputs)
+    private Dictionary<string, OrtOutput> ReadOutputViews(IDisposableReadOnlyCollection<DisposableNamedOnnxValue> runtimeOutputs)
     {
         var names = runtimeOutputs.Select(output => output.Name).ToArray();
         if (!HasExactNames(names, UnifiedOcrBundle.OutputNames))
@@ -248,6 +253,11 @@ internal sealed class UnifiedOcrEngine : IDisposable
         foreach (var namedValue in runtimeOutputs)
         {
             var tensor = namedValue.AsTensor<float>();
+            if (tensor is not DenseTensor<float> denseTensor)
+            {
+                throw new InvalidOperationException(
+                    $"Unified OCR runtime output {namedValue.Name} is not a dense CPU tensor");
+            }
             var shape = tensor.Dimensions.ToArray();
             if (!_bundle.OutputShapes.TryGetValue(namedValue.Name, out var expected)
                 || !shape.SequenceEqual(expected))
@@ -255,7 +265,7 @@ internal sealed class UnifiedOcrEngine : IDisposable
                 throw new InvalidOperationException(
                     $"Unified OCR runtime output {namedValue.Name} has invalid static shape [{string.Join(',', shape)}]");
             }
-            output.Add(namedValue.Name, new OrtOutput(tensor.ToArray(), shape));
+            output.Add(namedValue.Name, new OrtOutput(denseTensor.Buffer, shape));
         }
         return output;
     }
@@ -315,7 +325,7 @@ internal sealed class UnifiedOcrEngine : IDisposable
         {
             throw new InvalidOperationException("Unified OCR CTC tensor differs from the verified character dictionary");
         }
-        var decoded = UnifiedCtcDecoder.Decode(output.Values, output.Shape[0], output.Shape[1], characters);
+        var decoded = UnifiedCtcDecoder.Decode(output.Values.Span, output.Shape[0], output.Shape[1], characters);
         return new CtcRead(decoded.Text, decoded.Confidence);
     }
 
@@ -366,7 +376,7 @@ internal sealed class UnifiedOcrEngine : IDisposable
         var confidence = new float[14];
         for (var index = 0; index < digits.Length; index++)
         {
-            var decoded = ArgMax(digitsOutput.Values, index * 10, 10);
+            var decoded = ArgMax(digitsOutput.Values.Span, index * 10, 10);
             digits[index] = decoded.Index;
             confidence[index] = decoded.Confidence;
         }
@@ -512,7 +522,7 @@ internal sealed class UnifiedOcrEngine : IDisposable
         {
             throw new InvalidOperationException("Unified OCR finite classifier tensor must be one-dimensional");
         }
-        return ArgMax(output.Values, 0, output.Shape[0]);
+        return ArgMax(output.Values.Span, 0, output.Shape[0]);
     }
 
     private static ClassRead ArgMax(ReadOnlySpan<float> values, int offset, int count)
@@ -590,7 +600,7 @@ internal sealed class UnifiedOcrEngine : IDisposable
         }
     }
 
-    private sealed record OrtOutput(float[] Values, int[] Shape);
+    private sealed record OrtOutput(Memory<float> Values, int[] Shape);
     private sealed record CtcRead(string Text, float Confidence);
     private sealed record StructuredRead(string Text, float Confidence);
     private sealed record ClassRead(int Index, float Confidence);
