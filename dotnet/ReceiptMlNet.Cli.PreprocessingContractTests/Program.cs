@@ -11,12 +11,17 @@ internal static class Program
             // Tiny portrait/landscape inputs exercise both letterbox axes and
             // rounding. The production-size input catches row/plane-offset
             // mistakes at the actual detector tensor dimensions.
-            VerifyCase(7, 11);
-            VerifyCase(13, 5);
-            VerifyCase(9, 16);
-            VerifyCase(1179, 2556);
+            var reusableDetectorBuffer = new float[ImagePipeline.DetectorTensorLength];
+            var reusableStatusbarBuffer = new float[ImagePipeline.StatusbarTensorLength];
+            VerifyCase(7, 11, reusableDetectorBuffer, reusableStatusbarBuffer);
+            VerifyCase(13, 5, reusableDetectorBuffer, reusableStatusbarBuffer);
+            VerifyCase(9, 16, reusableDetectorBuffer, reusableStatusbarBuffer);
+            VerifyCase(1179, 2556, reusableDetectorBuffer, reusableStatusbarBuffer);
+            VerifyDetectorDestinationLengthContract();
+            VerifyStatusbarDestinationLengthContract();
             VerifyRecipientTrimUsesPythonDoubleToEven();
-            Console.WriteLine("PASS: detector/statusbar preprocessing is bit-exact against the legacy implementation.");
+            VerifyUnifiedFieldTensorReuse();
+            Console.WriteLine("PASS: detector/statusbar/unified OCR preprocessing and reusable buffers are bit-exact against the legacy implementation.");
             return 0;
         }
         catch (Exception error)
@@ -35,23 +40,243 @@ internal static class Program
         AssertEqual(20, UnifiedOcrImageOps.LeftTrimPixels(65, 0.30), "recipient trim 19.5 to even");
     }
 
-    private static void VerifyCase(int width, int height)
+    private static void VerifyCase(
+        int width,
+        int height,
+        float[] reusableDetectorBuffer,
+        float[] reusableStatusbarBuffer)
     {
         using var source = CreatePattern(width, height);
 
         var expectedDetector = LegacyPrepareDetectorInput(source);
         var actualDetector = ImagePipeline.PrepareDetectorInput(source);
-        AssertEqual(expectedDetector.SourceWidth, actualDetector.SourceWidth, "detector source width");
-        AssertEqual(expectedDetector.SourceHeight, actualDetector.SourceHeight, "detector source height");
-        AssertFloatBitsEqual(expectedDetector.ScaleX, actualDetector.ScaleX, "detector scale X");
-        AssertFloatBitsEqual(expectedDetector.ScaleY, actualDetector.ScaleY, "detector scale Y");
-        AssertEqual(expectedDetector.OffsetX, actualDetector.OffsetX, "detector offset X");
-        AssertEqual(expectedDetector.OffsetY, actualDetector.OffsetY, "detector offset Y");
-        AssertArrayBitsEqual(expectedDetector.Tensor, actualDetector.Tensor, $"detector {width}x{height}");
+        AssertDetectorInputEqual(expectedDetector, actualDetector, $"allocated detector {width}x{height}");
+
+        // Poison every element so bit equality proves both padding clearing and
+        // complete RGB-plane writes when this buffer is reused across shapes.
+        Array.Fill(
+            reusableDetectorBuffer,
+            BitConverter.Int32BitsToSingle(unchecked((int)0x7FC12345)));
+        var reusedDetector = ImagePipeline.PrepareDetectorInput(source, reusableDetectorBuffer);
+        Assert(
+            ReferenceEquals(reusableDetectorBuffer, reusedDetector.Tensor),
+            "destination overload must return the caller-owned detector buffer");
+        AssertDetectorInputEqual(expectedDetector, reusedDetector, $"reused detector {width}x{height}");
 
         var expectedStatusbar = LegacyPrepareStatusbarInput(source);
         var actualStatusbar = ImagePipeline.PrepareStatusbarInput(source);
-        AssertArrayBitsEqual(expectedStatusbar, actualStatusbar, $"statusbar {width}x{height}");
+        AssertArrayBitsEqual(expectedStatusbar, actualStatusbar, $"allocated statusbar {width}x{height}");
+
+        Array.Fill(
+            reusableStatusbarBuffer,
+            BitConverter.Int32BitsToSingle(unchecked((int)0x7FC12345)));
+        var reusedStatusbar = ImagePipeline.PrepareStatusbarInput(source, reusableStatusbarBuffer);
+        Assert(
+            ReferenceEquals(reusableStatusbarBuffer, reusedStatusbar),
+            "destination overload must return the caller-owned status-bar buffer");
+        AssertArrayBitsEqual(expectedStatusbar, reusedStatusbar, $"reused statusbar {width}x{height}");
+    }
+
+    private static void VerifyDetectorDestinationLengthContract()
+    {
+        using var source = CreatePattern(3, 5);
+        AssertDetectorDestinationRejected(source, Array.Empty<float>(), "short detector destination");
+        AssertDetectorDestinationRejected(
+            source,
+            new float[ImagePipeline.DetectorTensorLength + 1],
+            "long detector destination");
+        try
+        {
+            ImagePipeline.PrepareDetectorInput(source, null!);
+        }
+        catch (ArgumentNullException error) when (error.ParamName == "destination")
+        {
+            return;
+        }
+        catch (Exception error)
+        {
+            throw new InvalidOperationException(
+                $"null detector destination raised {error.GetType().Name} instead of ArgumentNullException",
+                error);
+        }
+        throw new InvalidOperationException("null detector destination was accepted");
+    }
+
+    private static void AssertDetectorDestinationRejected(
+        Image<Rgb24> source,
+        float[] destination,
+        string label)
+    {
+        try
+        {
+            ImagePipeline.PrepareDetectorInput(source, destination);
+        }
+        catch (ArgumentException error) when (error.ParamName == "destination")
+        {
+            return;
+        }
+        catch (Exception error)
+        {
+            throw new InvalidOperationException(
+                $"{label} raised {error.GetType().Name} instead of ArgumentException",
+                error);
+        }
+        throw new InvalidOperationException($"{label} was accepted");
+    }
+
+    private static void VerifyStatusbarDestinationLengthContract()
+    {
+        using var source = CreatePattern(3, 5);
+        AssertStatusbarDestinationRejected(source, Array.Empty<float>(), "short status-bar destination");
+        AssertStatusbarDestinationRejected(
+            source,
+            new float[ImagePipeline.StatusbarTensorLength + 1],
+            "long status-bar destination");
+        try
+        {
+            ImagePipeline.PrepareStatusbarInput(source, null!);
+        }
+        catch (ArgumentNullException error) when (error.ParamName == "destination")
+        {
+            return;
+        }
+        catch (Exception error)
+        {
+            throw new InvalidOperationException(
+                $"null status-bar destination raised {error.GetType().Name} instead of ArgumentNullException",
+                error);
+        }
+        throw new InvalidOperationException("null status-bar destination was accepted");
+    }
+
+    private static void AssertStatusbarDestinationRejected(
+        Image<Rgb24> source,
+        float[] destination,
+        string label)
+    {
+        try
+        {
+            ImagePipeline.PrepareStatusbarInput(source, destination);
+        }
+        catch (ArgumentException error) when (error.ParamName == "destination")
+        {
+            return;
+        }
+        catch (Exception error)
+        {
+            throw new InvalidOperationException(
+                $"{label} raised {error.GetType().Name} instead of ArgumentException",
+                error);
+        }
+        throw new InvalidOperationException($"{label} was accepted");
+    }
+
+    private static void AssertDetectorInputEqual(
+        DetectorInputTensor expected,
+        DetectorInputTensor actual,
+        string label)
+    {
+        AssertEqual(expected.SourceWidth, actual.SourceWidth, label + " source width");
+        AssertEqual(expected.SourceHeight, actual.SourceHeight, label + " source height");
+        AssertFloatBitsEqual(expected.ScaleX, actual.ScaleX, label + " scale X");
+        AssertFloatBitsEqual(expected.ScaleY, actual.ScaleY, label + " scale Y");
+        AssertEqual(expected.OffsetX, actual.OffsetX, label + " offset X");
+        AssertEqual(expected.OffsetY, actual.OffsetY, label + " offset Y");
+        AssertArrayBitsEqual(expected.Tensor, actual.Tensor, label + " tensor");
+    }
+
+    private static void VerifyUnifiedFieldTensorReuse()
+    {
+        VerifyUnifiedFieldCase(13, 5, 11, 19, rightAlign: true, leftCropFraction: 0.0);
+        VerifyUnifiedFieldCase(7, 17, 13, 23, rightAlign: false, leftCropFraction: 0.0);
+        VerifyUnifiedFieldCase(55, 9, 16, 31, rightAlign: false, leftCropFraction: 0.30);
+
+        using var source = CreatePattern(7, 11);
+        var required = 5 * 9;
+        AssertUnifiedDestinationRejected(source, 5, 9, new float[required - 1], 0, "short unified destination");
+        AssertUnifiedDestinationRejected(source, 5, 9, new float[required], 1, "offset unified destination");
+        try
+        {
+            UnifiedOcrImageOps.WriteFieldTensor(source, 5, 9, true, null!, 0);
+        }
+        catch (ArgumentNullException error) when (error.ParamName == "destination")
+        {
+            return;
+        }
+        catch (Exception error)
+        {
+            throw new InvalidOperationException(
+                $"null unified destination raised {error.GetType().Name} instead of ArgumentNullException",
+                error);
+        }
+        throw new InvalidOperationException("null unified destination was accepted");
+    }
+
+    private static void VerifyUnifiedFieldCase(
+        int width,
+        int height,
+        int targetHeight,
+        int targetWidth,
+        bool rightAlign,
+        double leftCropFraction)
+    {
+        using var source = CreatePattern(width, height);
+        var expected = LegacyPrepareFieldTensor(source, targetHeight, targetWidth, rightAlign, leftCropFraction);
+        var allocated = UnifiedOcrImageOps.PrepareFieldTensor(
+            source,
+            targetHeight,
+            targetWidth,
+            rightAlign,
+            leftCropFraction);
+        AssertArrayBitsEqual(expected, allocated, $"allocated unified {width}x{height}");
+
+        var sentinel = BitConverter.Int32BitsToSingle(unchecked((int)0x7FC12345));
+        var destination = Enumerable.Repeat(sentinel, expected.Length + 6).ToArray();
+        UnifiedOcrImageOps.WriteFieldTensor(
+            source,
+            targetHeight,
+            targetWidth,
+            rightAlign,
+            destination,
+            destinationOffset: 3,
+            leftCropFraction: leftCropFraction);
+        AssertArrayBitsEqual(expected, destination.AsSpan(3, expected.Length).ToArray(), $"reused unified {width}x{height}");
+        for (var index = 0; index < 3; index++)
+        {
+            AssertFloatBitsEqual(sentinel, destination[index], "unified destination prefix");
+            AssertFloatBitsEqual(sentinel, destination[destination.Length - 1 - index], "unified destination suffix");
+        }
+    }
+
+    private static void AssertUnifiedDestinationRejected(
+        Image<Rgb24> source,
+        int targetHeight,
+        int targetWidth,
+        float[] destination,
+        int destinationOffset,
+        string label)
+    {
+        try
+        {
+            UnifiedOcrImageOps.WriteFieldTensor(
+                source,
+                targetHeight,
+                targetWidth,
+                true,
+                destination,
+                destinationOffset);
+        }
+        catch (ArgumentOutOfRangeException error) when (error.ParamName == "destinationOffset")
+        {
+            return;
+        }
+        catch (Exception error)
+        {
+            throw new InvalidOperationException(
+                $"{label} raised {error.GetType().Name} instead of ArgumentOutOfRangeException",
+                error);
+        }
+        throw new InvalidOperationException($"{label} was accepted");
     }
 
     private static Image<Rgb24> CreatePattern(int width, int height)
@@ -146,6 +371,62 @@ internal static class Program
         return values;
     }
 
+    private static float[] LegacyPrepareFieldTensor(
+        Image<Rgb24> image,
+        int targetHeight,
+        int targetWidth,
+        bool rightAlign,
+        double leftCropFraction)
+    {
+        using var grayscale = new Image<L8>(image.Width, image.Height);
+        for (var y = 0; y < image.Height; y++)
+        {
+            for (var x = 0; x < image.Width; x++)
+            {
+                var pixel = image[x, y];
+                grayscale[x, y] = new L8((byte)Math.Clamp(
+                    (int)Math.Round(
+                        pixel.R * 0.299 + pixel.G * 0.587 + pixel.B * 0.114,
+                        MidpointRounding.ToEven),
+                    byte.MinValue,
+                    byte.MaxValue));
+            }
+        }
+        if (leftCropFraction > 0.0)
+        {
+            var left = Math.Min(
+                grayscale.Width - 1,
+                Math.Max(0, (int)Math.Round(grayscale.Width * leftCropFraction, MidpointRounding.ToEven)));
+            grayscale.Mutate(context => context.Crop(new Rectangle(left, 0, grayscale.Width - left, grayscale.Height)));
+        }
+
+        var scale = Math.Min((float)targetWidth / grayscale.Width, (float)targetHeight / grayscale.Height);
+        var resizedWidth = Math.Clamp(
+            (int)Math.Round(grayscale.Width * scale, MidpointRounding.ToEven),
+            1,
+            targetWidth);
+        var resizedHeight = Math.Clamp(
+            (int)Math.Round(grayscale.Height * scale, MidpointRounding.ToEven),
+            1,
+            targetHeight);
+        using var resized = grayscale.Clone(context =>
+            context.Resize(resizedWidth, resizedHeight, KnownResamplers.Triangle));
+        using var canvas = new Image<L8>(targetWidth, targetHeight, new L8(255));
+        var leftOffset = rightAlign ? targetWidth - resizedWidth : (targetWidth - resizedWidth) / 2;
+        var topOffset = (targetHeight - resizedHeight) / 2;
+        canvas.Mutate(context => context.DrawImage(resized, new Point(leftOffset, topOffset), 1.0f));
+
+        var values = new float[targetHeight * targetWidth];
+        for (var y = 0; y < targetHeight; y++)
+        {
+            for (var x = 0; x < targetWidth; x++)
+            {
+                values[y * targetWidth + x] = canvas[x, y].PackedValue / 255.0f;
+            }
+        }
+        return values;
+    }
+
     private static void AssertArrayBitsEqual(float[] expected, float[] actual, string label)
     {
         AssertEqual(expected.Length, actual.Length, $"{label} length");
@@ -179,6 +460,14 @@ internal static class Program
         if (expected != actual)
         {
             throw new InvalidOperationException($"{label}: expected {expected}, actual {actual}");
+        }
+    }
+
+    private static void Assert(bool condition, string message)
+    {
+        if (!condition)
+        {
+            throw new InvalidOperationException(message);
         }
     }
 }

@@ -51,6 +51,41 @@ internal static class UnifiedOcrImageOps
         {
             throw new ArgumentOutOfRangeException(nameof(leftCropFraction), "Unified OCR left crop fraction must be in [0, 1)");
         }
+        var values = new float[checked(targetHeight * targetWidth)];
+        WriteFieldTensor(image, targetHeight, targetWidth, rightAlign, values, 0, leftCropFraction);
+        return values;
+    }
+
+    /// <summary>
+    /// Write one field tensor directly into a caller-owned fixed-shape ABI
+    /// buffer. The requested destination range is overwritten in full.
+    /// </summary>
+    public static void WriteFieldTensor(
+        Image<Rgb24> image,
+        int targetHeight,
+        int targetWidth,
+        bool rightAlign,
+        float[] destination,
+        int destinationOffset,
+        double leftCropFraction = 0.0)
+    {
+        ArgumentNullException.ThrowIfNull(image);
+        ArgumentNullException.ThrowIfNull(destination);
+        if (targetHeight <= 0 || targetWidth <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(targetHeight), "Unified OCR target dimensions must be positive");
+        }
+        if (!double.IsFinite(leftCropFraction) || leftCropFraction < 0.0 || leftCropFraction >= 1.0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(leftCropFraction), "Unified OCR left crop fraction must be in [0, 1)");
+        }
+        var valueCount = checked(targetHeight * targetWidth);
+        if (destinationOffset < 0 || destinationOffset > destination.Length - valueCount)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(destinationOffset),
+                "Unified OCR tensor destination does not contain the requested output range");
+        }
 
         using var grayscale = ToGrayscale(image);
         if (leftCropFraction > 0.0)
@@ -63,20 +98,24 @@ internal static class UnifiedOcrImageOps
         var resizedWidth = Math.Clamp((int)Math.Round(grayscale.Width * scale, MidpointRounding.ToEven), 1, targetWidth);
         var resizedHeight = Math.Clamp((int)Math.Round(grayscale.Height * scale, MidpointRounding.ToEven), 1, targetHeight);
         using var resized = grayscale.Clone(context => context.Resize(resizedWidth, resizedHeight, KnownResamplers.Triangle));
-        using var canvas = new Image<L8>(targetWidth, targetHeight, new L8(255));
         var leftOffset = rightAlign ? targetWidth - resizedWidth : (targetWidth - resizedWidth) / 2;
         var topOffset = (targetHeight - resizedHeight) / 2;
-        canvas.Mutate(context => context.DrawImage(resized, new Point(leftOffset, topOffset), 1.0f));
-
-        var values = new float[targetHeight * targetWidth];
-        for (var y = 0; y < targetHeight; y++)
+        // L8 has no alpha channel. An opaque DrawImage onto a white canvas is
+        // therefore exactly a copy at this offset; write it directly and
+        // avoid allocating/traversing the intermediate canvas.
+        Array.Fill(destination, 1.0f, destinationOffset, valueCount);
+        resized.ProcessPixelRows(accessor =>
         {
-            for (var x = 0; x < targetWidth; x++)
+            for (var y = 0; y < resizedHeight; y++)
             {
-                values[y * targetWidth + x] = canvas[x, y].PackedValue / 255.0f;
+                var row = accessor.GetRowSpan(y);
+                var destinationRow = destinationOffset + (y + topOffset) * targetWidth + leftOffset;
+                for (var x = 0; x < row.Length; x++)
+                {
+                    destination[destinationRow + x] = row[x].PackedValue / 255.0f;
+                }
             }
-        }
-        return values;
+        });
     }
 
     internal static int LeftTrimPixels(int width, double leftCropFraction)

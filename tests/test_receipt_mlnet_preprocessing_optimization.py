@@ -44,7 +44,8 @@ def test_csharp_contract_harness_compares_legacy_and_optimized_float_bits() -> N
     assert "LegacyPrepareDetectorInput" in harness
     assert "LegacyPrepareStatusbarInput" in harness
     assert "BitConverter.SingleToInt32Bits" in harness
-    assert "VerifyCase(7, 11)" in harness
-    assert "VerifyCase(13, 5)" in harness
-    assert "VerifyCase(9, 16)" in harness
-    assert "VerifyCase(1179, 2556)" in harness
+    assert "VerifyCase(7, 11, reusableDetectorBuffer, reusableStatusbarBuffer)" in harness
+    assert "VerifyUnifiedFieldTensorReuse()" in harness
+    assert "VerifyCase(13, 5, reusableDetectorBuffer, reusableStatusbarBuffer)" in harness
+    assert "VerifyCase(9, 16, reusableDetectorBuffer, reusableStatusbarBuffer)" in harness
+    assert "VerifyCase(1179, 2556, reusableDetectorBuffer, reusableStatusbarBuffer)" in harness

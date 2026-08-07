@@ -63,10 +63,17 @@ internal sealed class UnifiedOcrEngine : IDisposable
 
     private readonly UnifiedOcrBundle _bundle;
     private readonly InferenceSession _session;
+    private readonly float[] _fieldValues;
+    private readonly float[] _recipientValues;
 
     public UnifiedOcrEngine(UnifiedOcrBundle bundle, DeviceSetting requestedDevice)
     {
         _bundle = bundle;
+        // ReceiptMlNetProgram owns one engine and invokes it from its serial
+        // image loop. Reuse the fixed-shape ABI buffers instead of allocating
+        // them for every receipt; this engine must not be shared concurrently.
+        _fieldValues = new float[checked(5 * bundle.FieldHeight * bundle.FieldWidth)];
+        _recipientValues = new float[checked(bundle.RecipientHeight * bundle.RecipientWidth)];
         _session = CreateSession(bundle.ModelPath, requestedDevice, out var provider);
         ExecutionProvider = provider;
         try
@@ -93,20 +100,20 @@ internal sealed class UnifiedOcrEngine : IDisposable
     {
         var stageStopwatch = System.Diagnostics.Stopwatch.StartNew();
         var byLabel = detections.ToDictionary(item => item.Label, StringComparer.Ordinal);
-        var fieldValues = Enumerable.Repeat(1.0f, checked(5 * _bundle.FieldHeight * _bundle.FieldWidth)).ToArray();
-        var recipientValues = Enumerable.Repeat(1.0f, checked(_bundle.RecipientHeight * _bundle.RecipientWidth)).ToArray();
+        Array.Fill(_fieldValues, 1.0f);
+        Array.Fill(_recipientValues, 1.0f);
 
         var readable = new HashSet<string>(StringComparer.Ordinal);
-        WriteField(byLabel.GetValueOrDefault("amount"), 0, rightAlign: true, source, fieldValues, readable, "amount");
-        WriteField(byLabel.GetValueOrDefault("time"), 1, rightAlign: true, source, fieldValues, readable, "time");
-        WriteField(byLabel.GetValueOrDefault("transfer_status"), 2, rightAlign: false, source, fieldValues, readable, "transfer_status");
-        WriteField(byLabel.GetValueOrDefault("payment_method_field"), 3, rightAlign: true, source, fieldValues, readable, "payment_method_field");
+        WriteField(byLabel.GetValueOrDefault("amount"), 0, rightAlign: true, source, _fieldValues, readable, "amount");
+        WriteField(byLabel.GetValueOrDefault("time"), 1, rightAlign: true, source, _fieldValues, readable, "time");
+        WriteField(byLabel.GetValueOrDefault("transfer_status"), 2, rightAlign: false, source, _fieldValues, readable, "transfer_status");
+        WriteField(byLabel.GetValueOrDefault("payment_method_field"), 3, rightAlign: true, source, _fieldValues, readable, "payment_method_field");
         // Architecture v12 freezes channel 4 as white. Recipient text is read
         // only from the separate high-resolution input below.
-        WriteRecipient(byLabel.GetValueOrDefault("recipient_field"), source, recipientValues, readable);
+        WriteRecipient(byLabel.GetValueOrDefault("recipient_field"), source, _recipientValues, readable);
 
-        var fieldTensor = new DenseTensor<float>(fieldValues, [5, 1, _bundle.FieldHeight, _bundle.FieldWidth]);
-        var recipientTensor = new DenseTensor<float>(recipientValues, [1, 1, _bundle.RecipientHeight, _bundle.RecipientWidth]);
+        var fieldTensor = new DenseTensor<float>(_fieldValues, [5, 1, _bundle.FieldHeight, _bundle.FieldWidth]);
+        var recipientTensor = new DenseTensor<float>(_recipientValues, [1, 1, _bundle.RecipientHeight, _bundle.RecipientWidth]);
         var inputs = new[]
         {
             NamedOnnxValue.CreateFromTensor(FieldImagesInput, fieldTensor),
@@ -192,8 +199,13 @@ internal sealed class UnifiedOcrEngine : IDisposable
         {
             return;
         }
-        var values = UnifiedOcrImageOps.PrepareFieldTensor(crop, _bundle.FieldHeight, _bundle.FieldWidth, rightAlign);
-        values.CopyTo(destination, checked(slot * _bundle.FieldHeight * _bundle.FieldWidth));
+        UnifiedOcrImageOps.WriteFieldTensor(
+            crop,
+            _bundle.FieldHeight,
+            _bundle.FieldWidth,
+            rightAlign,
+            destination,
+            checked(slot * _bundle.FieldHeight * _bundle.FieldWidth));
         readable.Add(label);
     }
 
@@ -212,13 +224,14 @@ internal sealed class UnifiedOcrEngine : IDisposable
         {
             return;
         }
-        var values = UnifiedOcrImageOps.PrepareFieldTensor(
+        UnifiedOcrImageOps.WriteFieldTensor(
             crop,
             _bundle.RecipientHeight,
             _bundle.RecipientWidth,
             rightAlign: false,
-            _bundle.RecipientLeftTrim);
-        values.CopyTo(destination, 0);
+            destination: destination,
+            destinationOffset: 0,
+            leftCropFraction: _bundle.RecipientLeftTrim);
         readable.Add("recipient_field");
     }
 

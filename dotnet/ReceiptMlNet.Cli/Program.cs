@@ -102,6 +102,10 @@ internal static class ReceiptMlNetProgram
         var deviceClassifier = options.DeviceModelPath is null
             ? null
             : new DeviceModel(options.DeviceModelPath, device);
+        // The inference loop below is intentionally serial. Keep one mutable
+        // detector tensor per Run invocation rather than allocating roughly
+        // 15.2 MiB for every receipt; never share this buffer across workers.
+        var detectorInputBuffer = new float[ImagePipeline.DetectorTensorLength];
         Console.WriteLine($"Requested ONNX device: {device.Requested} (receipt detector{(deviceClassifier is null ? string.Empty : "/device model")})");
         using var ocrEngine = ocrBundle is null ? null : new PaddleOcrEngine(ocrBundle, device);
         using var unifiedOcrEngine = unifiedOcrBundle is null ? null : new UnifiedOcrEngine(unifiedOcrBundle, device);
@@ -142,6 +146,7 @@ internal static class ReceiptMlNetProgram
                 var result = InferImage(
                     inputFile,
                     detector,
+                    detectorInputBuffer,
                     deviceClassifier,
                     ocrEngine,
                     unifiedOcrEngine,
@@ -225,6 +230,7 @@ internal static class ReceiptMlNetProgram
     private static ReceiptResult InferImage(
         string inputFile,
         DetectorModel detector,
+        float[] detectorInputBuffer,
         DeviceModel? deviceClassifier,
         PaddleOcrEngine? ocrEngine,
         UnifiedOcrEngine? unifiedOcrEngine,
@@ -247,7 +253,7 @@ internal static class ReceiptMlNetProgram
         stageStopwatch.Restart();
         using var rectification = ReceiptRectifier.Rectify(source, rectificationMode);
         var rectified = rectification.Image;
-        var prepared = ImagePipeline.PrepareDetectorInput(rectified);
+        var prepared = ImagePipeline.PrepareDetectorInput(rectified, detectorInputBuffer);
         var detectorPreprocessMs = StopAndReadMilliseconds(stageStopwatch);
 
         stageStopwatch.Restart();
@@ -944,7 +950,7 @@ internal sealed class DetectorModel
         var context = new MLContext(seed: 1);
         var fitData = context.Data.LoadFromEnumerable(new[]
         {
-            new DetectorInput { Image = new float[3 * ImagePipeline.DetectorHeight * ImagePipeline.DetectorWidth] },
+            new DetectorInput { Image = new float[ImagePipeline.DetectorTensorLength] },
         });
         var pipeline = context.Transforms.ApplyOnnxModel(
             outputColumnNames: new[] { "boxes", "labels", "scores" },
@@ -963,13 +969,16 @@ internal sealed class DetectorModel
 internal sealed class DeviceModel
 {
     private readonly PredictionEngine<DeviceInput, DeviceOutput> _engine;
+    // PredictionEngine is already restricted to the serial receipt loop. Keep
+    // its status-bar tensor private to the same non-thread-safe model instance.
+    private readonly float[] _statusbarInputBuffer = new float[ImagePipeline.StatusbarTensorLength];
 
     public DeviceModel(string modelPath, DeviceSetting device)
     {
         var context = new MLContext(seed: 1);
         var fitData = context.Data.LoadFromEnumerable(new[]
         {
-            new DeviceInput { Statusbar = new float[1 * 3 * ImagePipeline.StatusbarHeight * ImagePipeline.StatusbarWidth] },
+            new DeviceInput { Statusbar = new float[ImagePipeline.StatusbarTensorLength] },
         });
         var pipeline = context.Transforms.ApplyOnnxModel(
             outputColumnNames: new[] { "probabilities" },
@@ -1019,7 +1028,10 @@ internal sealed class DeviceModel
 
     private float PredictPIos(Image<Rgb24> source)
     {
-        var probabilities = _engine.Predict(new DeviceInput { Statusbar = ImagePipeline.PrepareStatusbarInput(source) }).Probabilities;
+        var probabilities = _engine.Predict(new DeviceInput
+        {
+            Statusbar = ImagePipeline.PrepareStatusbarInput(source, _statusbarInputBuffer),
+        }).Probabilities;
         if (probabilities.Length != 2)
         {
             throw new InvalidOperationException($"ONNX status-bar model must return two probabilities; found length {probabilities.Length}");
@@ -1059,8 +1071,10 @@ internal static class ImagePipeline
 {
     public const int DetectorWidth = 864;
     public const int DetectorHeight = 1536;
+    public const int DetectorTensorLength = 3 * DetectorHeight * DetectorWidth;
     public const int StatusbarWidth = 512;
     public const int StatusbarHeight = 64;
+    public const int StatusbarTensorLength = 3 * StatusbarHeight * StatusbarWidth;
 
     public static Image<Rgb24> LoadUprightRgb(string path)
     {
@@ -1071,6 +1085,35 @@ internal static class ImagePipeline
 
     public static DetectorInputTensor PrepareDetectorInput(Image<Rgb24> source)
     {
+        ArgumentNullException.ThrowIfNull(source);
+        return PrepareDetectorInputCore(source, new float[DetectorTensorLength], clearLetterboxPadding: false);
+    }
+
+    /// <summary>
+    /// Prepare detector input in a caller-owned tensor buffer.
+    ///
+    /// Every destination element is overwritten on each call: letterbox
+    /// padding is cleared and the resized rectangle fills all three RGB planes.
+    /// A destination must not be shared by concurrent inference operations.
+    /// </summary>
+    public static DetectorInputTensor PrepareDetectorInput(Image<Rgb24> source, float[] destination)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        ArgumentNullException.ThrowIfNull(destination);
+        if (destination.Length != DetectorTensorLength)
+        {
+            throw new ArgumentException(
+                $"Detector tensor destination must contain exactly {DetectorTensorLength} floats; found {destination.Length}",
+                nameof(destination));
+        }
+        return PrepareDetectorInputCore(source, destination, clearLetterboxPadding: true);
+    }
+
+    private static DetectorInputTensor PrepareDetectorInputCore(
+        Image<Rgb24> source,
+        float[] values,
+        bool clearLetterboxPadding)
+    {
         var scale = Math.Min((float)DetectorWidth / source.Width, (float)DetectorHeight / source.Height);
         var resizedWidth = Math.Clamp((int)Math.Round(source.Width * scale, MidpointRounding.ToEven), 1, DetectorWidth);
         var resizedHeight = Math.Clamp((int)Math.Round(source.Height * scale, MidpointRounding.ToEven), 1, DetectorHeight);
@@ -1078,11 +1121,14 @@ internal static class ImagePipeline
         var top = (DetectorHeight - resizedHeight) / 2;
         // ImageSharp calls the bilinear kernel "Triangle".
         using var resized = source.Clone(context => context.Resize(resizedWidth, resizedHeight, KnownResamplers.Triangle));
+        if (clearLetterboxPadding)
+        {
+            ClearDetectorLetterboxPadding(values, resizedWidth, resizedHeight, left, top);
+        }
 
-        // float arrays are zero-initialised, so writing the resized pixels at
-        // their letterbox offset is exactly the former black-canvas + opaque
-        // DrawImage operation without allocating and traversing that canvas.
-        var values = new float[3 * DetectorHeight * DetectorWidth];
+        // The padding is zero and the resized pixels overwrite the full content
+        // rectangle, exactly matching the former black canvas + opaque
+        // DrawImage operation.
         var plane = DetectorHeight * DetectorWidth;
         resized.ProcessPixelRows(accessor =>
         {
@@ -1103,14 +1149,79 @@ internal static class ImagePipeline
         return new DetectorInputTensor(values, source.Width, source.Height, (float)resizedWidth / source.Width, (float)resizedHeight / source.Height, left, top);
     }
 
+    private static void ClearDetectorLetterboxPadding(
+        float[] values,
+        int resizedWidth,
+        int resizedHeight,
+        int left,
+        int top)
+    {
+        var plane = DetectorHeight * DetectorWidth;
+        var firstContentRow = top;
+        var firstBottomPaddingRow = top + resizedHeight;
+        var firstRightPaddingColumn = left + resizedWidth;
+        for (var channel = 0; channel < 3; channel++)
+        {
+            var planeOffset = channel * plane;
+            if (firstContentRow > 0)
+            {
+                Array.Clear(values, planeOffset, firstContentRow * DetectorWidth);
+            }
+            if (firstBottomPaddingRow < DetectorHeight)
+            {
+                Array.Clear(
+                    values,
+                    planeOffset + firstBottomPaddingRow * DetectorWidth,
+                    (DetectorHeight - firstBottomPaddingRow) * DetectorWidth);
+            }
+            for (var y = firstContentRow; y < firstBottomPaddingRow; y++)
+            {
+                var rowOffset = planeOffset + y * DetectorWidth;
+                if (left > 0)
+                {
+                    Array.Clear(values, rowOffset, left);
+                }
+                if (firstRightPaddingColumn < DetectorWidth)
+                {
+                    Array.Clear(
+                        values,
+                        rowOffset + firstRightPaddingColumn,
+                        DetectorWidth - firstRightPaddingColumn);
+                }
+            }
+        }
+    }
+
     public static float[] PrepareStatusbarInput(Image<Rgb24> source)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        return PrepareStatusbarInputCore(source, new float[StatusbarTensorLength]);
+    }
+
+    /// <summary>
+    /// Prepare status-bar input in a caller-owned tensor buffer. Every element
+    /// is overwritten on each call; do not share a destination concurrently.
+    /// </summary>
+    public static float[] PrepareStatusbarInput(Image<Rgb24> source, float[] destination)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        ArgumentNullException.ThrowIfNull(destination);
+        if (destination.Length != StatusbarTensorLength)
+        {
+            throw new ArgumentException(
+                $"Status-bar tensor destination must contain exactly {StatusbarTensorLength} floats; found {destination.Length}",
+                nameof(destination));
+        }
+        return PrepareStatusbarInputCore(source, destination);
+    }
+
+    private static float[] PrepareStatusbarInputCore(Image<Rgb24> source, float[] values)
     {
         var stripHeight = Math.Max(1, (int)Math.Round(source.Height * 0.08, MidpointRounding.ToEven));
         using var strip = source.Clone(context => context.Crop(new Rectangle(0, 0, source.Width, stripHeight)));
         // The Python training/inference path calls Pillow resize without an
         // explicit filter for RGB, whose default is bicubic.
         using var canvas = strip.Clone(context => context.Resize(StatusbarWidth, StatusbarHeight, KnownResamplers.Bicubic));
-        var values = new float[3 * StatusbarHeight * StatusbarWidth];
         var plane = StatusbarHeight * StatusbarWidth;
         canvas.ProcessPixelRows(accessor =>
         {
