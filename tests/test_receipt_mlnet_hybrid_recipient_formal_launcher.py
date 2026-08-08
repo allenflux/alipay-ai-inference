@@ -15,7 +15,7 @@ V13_GENERATOR = ROOT / "scripts" / "receipt-ocr-status-text-v13-4090.ps1"
 def _source() -> str:
     payload = LAUNCHER.read_bytes()
     assert all(byte < 128 for byte in payload), "formal launcher must remain ASCII-only"
-    return payload.decode("ascii")
+    return payload.decode("ascii").replace("\r\n", "\n")
 
 
 def test_launcher_requires_only_explicit_evidence_bundle_output_and_optional_dotnet() -> None:
