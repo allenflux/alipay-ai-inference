@@ -21,6 +21,7 @@ internal static class Program
             VerifyStatusbarDestinationLengthContract();
             VerifyRecipientTrimUsesPythonDoubleToEven();
             VerifyRecipientRightValueDiagnosticCrop();
+            VerifyUnifiedGrayscaleRowSpanBitExactness();
             VerifyUnifiedFieldTensorReuse();
             Console.WriteLine("PASS: detector/statusbar/unified OCR preprocessing and reusable buffers are bit-exact against the legacy implementation.");
             return 0;
@@ -256,6 +257,86 @@ internal static class Program
                 error);
         }
         throw new InvalidOperationException("null unified destination was accepted");
+    }
+
+    private static void VerifyUnifiedGrayscaleRowSpanBitExactness()
+    {
+        var random = new Random(0x5EED);
+        var dimensions = new List<(int Width, int Height)>
+        {
+            (1, 1),
+        };
+        foreach (var width in new[] { 1, 2, 3, 15, 16, 17, 31, 32, 33, 63, 64, 65, 257 })
+        {
+            dimensions.Add((width, width % 7 + 2));
+        }
+        var dimensionRandom = new Random(0xD1A5);
+        for (var caseIndex = 0; caseIndex < 32; caseIndex++)
+        {
+            dimensions.Add((dimensionRandom.Next(1, 513), dimensionRandom.Next(1, 33)));
+        }
+
+        foreach (var (width, height) in dimensions)
+        {
+            using var source = new Image<Rgb24>(width, height);
+            source.ProcessPixelRows(accessor =>
+            {
+                for (var y = 0; y < accessor.Height; y++)
+                {
+                    var row = accessor.GetRowSpan(y);
+                    for (var x = 0; x < row.Length; x++)
+                    {
+                        row[x] = new Rgb24(
+                            (byte)random.Next(256),
+                            (byte)random.Next(256),
+                            (byte)random.Next(256));
+                    }
+                }
+            });
+            var expected = LegacyPrepareFieldTensor(
+                source, height, width, rightAlign: false, leftCropFraction: 0.0);
+            var actual = UnifiedOcrImageOps.PrepareFieldTensor(
+                source, height, width, rightAlign: false, leftCropFraction: 0.0);
+            AssertArrayBitsEqual(expected, actual, $"row-span grayscale {width}x{height}");
+        }
+
+        using var boundary = new Image<Rgb24>(4, 2);
+        var boundaryPixels = new[]
+        {
+            new Rgb24(0, 0, 0),
+            new Rgb24(255, 255, 255),
+            new Rgb24(255, 0, 0),
+            new Rgb24(0, 255, 0),
+            new Rgb24(0, 0, 255),
+            new Rgb24(0, 0, 250),
+            new Rgb24(0, 32, 94),
+            new Rgb24(1, 205, 69),
+        };
+        boundary.ProcessPixelRows(accessor =>
+        {
+            var index = 0;
+            for (var y = 0; y < accessor.Height; y++)
+            {
+                var row = accessor.GetRowSpan(y);
+                for (var x = 0; x < row.Length; x++)
+                {
+                    row[x] = boundaryPixels[index++];
+                }
+            }
+        });
+        var boundaryExpected = LegacyPrepareFieldTensor(
+            boundary, 2, 4, rightAlign: false, leftCropFraction: 0.0);
+        var boundaryActual = UnifiedOcrImageOps.PrepareFieldTensor(
+            boundary, 2, 4, rightAlign: false, leftCropFraction: 0.0);
+        var boundaryExpectedBytes = new byte[] { 0, 255, 76, 150, 29, 28, 30, 128 };
+        for (var index = 0; index < boundaryExpectedBytes.Length; index++)
+        {
+            AssertFloatBitsEqual(
+                boundaryExpectedBytes[index] / 255.0f,
+                boundaryExpected[index],
+                $"legacy grayscale rounding boundary {index}");
+        }
+        AssertArrayBitsEqual(boundaryExpected, boundaryActual, "row-span grayscale rounding boundaries");
     }
 
     private static void VerifyUnifiedFieldCase(

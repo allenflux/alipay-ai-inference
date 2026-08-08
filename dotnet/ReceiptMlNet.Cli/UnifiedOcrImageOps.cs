@@ -200,20 +200,25 @@ internal static class UnifiedOcrImageOps
     private static Image<L8> ToGrayscale(Image<Rgb24> source)
     {
         var grayscale = new Image<L8>(source.Width, source.Height);
-        for (var y = 0; y < source.Height; y++)
+        source.ProcessPixelRows(grayscale, static (sourceAccessor, grayscaleAccessor) =>
         {
-            for (var x = 0; x < source.Width; x++)
+            for (var y = 0; y < sourceAccessor.Height; y++)
             {
-                var pixel = source[x, y];
-                // Pillow Image.convert("L")'s standard RGB luma weights.
-                grayscale[x, y] = new L8((byte)Math.Clamp(
-                    (int)Math.Round(
-                        pixel.R * 0.299 + pixel.G * 0.587 + pixel.B * 0.114,
-                        MidpointRounding.ToEven),
-                    byte.MinValue,
-                    byte.MaxValue));
+                var sourceRow = sourceAccessor.GetRowSpan(y);
+                var grayscaleRow = grayscaleAccessor.GetRowSpan(y);
+                for (var x = 0; x < sourceRow.Length; x++)
+                {
+                    var pixel = sourceRow[x];
+                    // Pillow Image.convert("L")'s standard RGB luma weights.
+                    grayscaleRow[x] = new L8((byte)Math.Clamp(
+                        (int)Math.Round(
+                            pixel.R * 0.299 + pixel.G * 0.587 + pixel.B * 0.114,
+                            MidpointRounding.ToEven),
+                        byte.MinValue,
+                        byte.MaxValue));
+                }
             }
-        }
+        });
         return grayscale;
     }
 }
