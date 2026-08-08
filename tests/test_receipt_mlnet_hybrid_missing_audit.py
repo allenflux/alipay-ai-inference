@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -445,10 +446,20 @@ def test_main_emits_exactly_one_json_line(tmp_path: Path, capsys: pytest.Capture
     root = tmp_path / "ab"
     _write_fixture(root)
 
+    expected = (
+        json.dumps(
+            MODULE.audit(root),
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
+
     assert MODULE.main(["--root", str(root)]) == 0
 
     output = capsys.readouterr().out
-    assert output.count("\n") == 1
+    assert output == expected
     assert json.loads(output)["kind"] == "receipt_mlnet_hybrid_missing_audit_v1"
 
 
@@ -461,6 +472,7 @@ def test_main_text_format_is_complete_and_terminal_width_bounded(
     assert MODULE.main(["--root", str(root), "--format", "text"]) == 0
 
     output = capsys.readouterr().out
+    assert output == MODULE.format_text(MODULE.audit(root)) + "\n"
     lines = output.splitlines()
     assert lines[0] == "Receipt ML.NET hybrid missing audit"
     assert "Counts:" in lines
@@ -503,3 +515,122 @@ def test_main_text_format_is_complete_and_terminal_width_bounded(
     assert '      crop_wxh: "600x90"' in lines
     assert '      crop_wxh: "720x90"' in lines
     assert max(map(len, lines)) <= 96
+
+
+@pytest.mark.parametrize("output_format", ["json", "text"])
+def test_main_atomically_writes_fresh_output_and_emits_short_summary(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    output_format: str,
+) -> None:
+    root = tmp_path / "ab"
+    _write_fixture(root)
+    output = tmp_path / "nested" / f"audit.{output_format}"
+    payload = MODULE.audit(root)
+    expected = MODULE._render_payload(payload, output_format=output_format) + "\n"
+
+    assert MODULE.main(
+        [
+            "--root",
+            str(root),
+            "--format",
+            output_format,
+            "--output",
+            str(output),
+        ]
+    ) == 0
+
+    assert output.read_bytes() == expected.encode("utf-8")
+    assert not output.read_bytes().startswith(b"\xef\xbb\xbf")
+    summary = json.loads(capsys.readouterr().out)
+    assert summary == {
+        "kind": "receipt_mlnet_hybrid_missing_audit_output_v1",
+        "output": output.absolute().as_posix(),
+        "records": 3,
+        "recipient_missing_records": 2,
+    }
+    assert list(output.parent.glob(f".{output.name}.*.tmp")) == []
+    assert not (output.parent / f".{output.name}.publish.lock").exists()
+
+
+@pytest.mark.parametrize("destination_kind", ["file", "broken_symlink"])
+def test_main_refuses_existing_or_broken_symlink_output(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    destination_kind: str,
+) -> None:
+    root = tmp_path / "ab"
+    _write_fixture(root)
+    output = tmp_path / "audit.json"
+    if destination_kind == "file":
+        output.write_bytes(b"do-not-overwrite")
+    else:
+        try:
+            output.symlink_to(tmp_path / "absent-target")
+        except OSError as exception:
+            pytest.skip(f"symlink creation is unavailable: {exception}")
+
+    assert MODULE.main(
+        ["--root", str(root), "--output", str(output)]
+    ) == 2
+
+    error = json.loads(capsys.readouterr().out)
+    assert error["kind"] == "receipt_mlnet_hybrid_missing_audit_error_v1"
+    assert "refusing to overwrite audit output" in error["error"]
+    assert os.path.lexists(output)
+    if destination_kind == "file":
+        assert output.read_bytes() == b"do-not-overwrite"
+    else:
+        assert output.is_symlink()
+
+
+def test_main_removes_stage_and_lock_when_atomic_publish_fails(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "ab"
+    _write_fixture(root)
+    output = tmp_path / "audit.json"
+
+    def fail_link(_stage: Path, _output: Path) -> None:
+        raise OSError("forced atomic link failure")
+
+    monkeypatch.setattr(MODULE.os, "link", fail_link)
+
+    assert MODULE.main(
+        ["--root", str(root), "--output", str(output)]
+    ) == 2
+
+    error = json.loads(capsys.readouterr().out)
+    assert "forced atomic link failure" in error["error"]
+    assert not os.path.lexists(output)
+    assert list(tmp_path.glob(f".{output.name}.*.tmp")) == []
+    assert not (tmp_path / f".{output.name}.publish.lock").exists()
+
+
+def test_main_does_not_overwrite_output_created_at_publish_boundary(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "ab"
+    _write_fixture(root)
+    output = tmp_path / "audit.json"
+    original_link = MODULE.os.link
+
+    def create_destination_then_link(stage: Path, destination: Path) -> None:
+        Path(destination).write_bytes(b"non-cooperating-writer")
+        original_link(stage, destination)
+
+    monkeypatch.setattr(MODULE.os, "link", create_destination_then_link)
+
+    assert MODULE.main(
+        ["--root", str(root), "--output", str(output)]
+    ) == 2
+
+    error = json.loads(capsys.readouterr().out)
+    assert "refusing to overwrite audit output" in error["error"]
+    assert output.read_bytes() == b"non-cooperating-writer"
+    assert list(tmp_path.glob(f".{output.name}.*.tmp")) == []
+    assert not (tmp_path / f".{output.name}.publish.lock").exists()

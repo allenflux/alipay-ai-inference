@@ -11,6 +11,7 @@ import re
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 
 WINDOWS_ABSOLUTE_PATH = re.compile(r"^[A-Za-z]:[\\/]")
@@ -825,6 +826,87 @@ def format_text(payload: Mapping[str, Any], *, width: int = _TEXT_WIDTH) -> str:
     return "\n".join(lines)
 
 
+def _render_payload(payload: Mapping[str, Any], *, output_format: str) -> str:
+    if output_format == "text":
+        return format_text(payload)
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    )
+
+
+def _require_fresh_output(path: Path) -> Path:
+    output = path.absolute()
+    if not output.name:
+        raise AuditError(f"output must name a file: {output}")
+    if os.path.lexists(os.fspath(output)):
+        raise AuditError(f"refusing to overwrite audit output: {output}")
+    return output
+
+
+def _write_fresh_atomic(output: Path, contents: str) -> None:
+    """Publish a complete UTF-8 file through a hidden, no-clobber stage."""
+
+    output = _require_fresh_output(output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    if not output.parent.is_dir():
+        raise AuditError(f"audit output parent is not a directory: {output.parent}")
+
+    stage = output.parent / f".{output.name}.{uuid4().hex}.tmp"
+    lock = output.parent / f".{output.name}.publish.lock"
+    stage_created = False
+    lock_fd: int | None = None
+    try:
+        try:
+            lock_fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError as exception:
+            raise AuditError(
+                f"another audit output publication is active or left a lock: {lock}"
+            ) from exception
+
+        # Recheck after acquiring the exclusive publisher lock.  lexists also
+        # rejects a broken destination symlink, unlike Path.exists().
+        if os.path.lexists(os.fspath(output)):
+            raise AuditError(f"refusing to overwrite audit output: {output}")
+
+        try:
+            stage_fd = os.open(
+                stage,
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                0o600,
+            )
+        except FileExistsError as exception:
+            raise AuditError(f"audit output stage already exists: {stage}") from exception
+        stage_created = True
+        with os.fdopen(stage_fd, "w", encoding="utf-8", newline="\n") as stream:
+            stream.write(contents)
+            stream.flush()
+            os.fsync(stream.fileno())
+
+        # Keep the final check for a clear diagnostic, then rely on the hard
+        # link itself for atomic no-clobber publication.  The stage lives in
+        # the destination directory, so a successful link exposes the already
+        # fsynced inode without a partially written destination.  If any
+        # cooperating or non-cooperating writer wins the race, os.link fails
+        # instead of replacing that writer's destination on POSIX or Windows.
+        if os.path.lexists(os.fspath(output)):
+            raise AuditError(f"refusing to overwrite audit output: {output}")
+        try:
+            os.link(stage, output)
+        except FileExistsError as exception:
+            raise AuditError(f"refusing to overwrite audit output: {output}") from exception
+        stage.unlink()
+        stage_created = False
+    finally:
+        if stage_created:
+            stage.unlink(missing_ok=True)
+        if lock_fd is not None:
+            os.close(lock_fd)
+            lock.unlink(missing_ok=True)
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", required=True, type=Path, help="hybrid CPU A/B output root")
@@ -840,17 +922,39 @@ def _parser() -> argparse.ArgumentParser:
         default="json",
         help="output format (default: json)",
     )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        help="fresh output file for the complete rendered audit",
+    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
+        output = _require_fresh_output(args.output) if args.output is not None else None
         payload = audit(args.root, records_path=args.records)
-        if args.output_format == "text":
-            print(format_text(payload))
+        rendered = _render_payload(payload, output_format=args.output_format)
+        if output is None:
+            print(rendered)
         else:
-            print(json.dumps(payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")))
+            _write_fresh_atomic(output, rendered + "\n")
+            print(
+                json.dumps(
+                    {
+                        "kind": "receipt_mlnet_hybrid_missing_audit_output_v1",
+                        "output": output.as_posix(),
+                        "records": payload["records"],
+                        "recipient_missing_records": payload[
+                            "recipient_missing_records"
+                        ],
+                    },
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                )
+            )
         return 0
     except (AuditError, OSError, UnicodeError) as exception:
         error_payload = {
