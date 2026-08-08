@@ -240,6 +240,23 @@ def test_audit_binds_dominant_replay_and_publishes_atomically(
         _run(fixture, output)
 
 
+def test_audit_uses_the_frozen_replay_input_order_not_diagnostic_sort_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _fixture(tmp_path, monkeypatch)
+    reordered_manifest = list(reversed(fixture["manifest"]))
+    _write_json(fixture["replay"] / "inference_manifest.json", reordered_manifest)
+    Path(str(fixture["replay"].resolve()) + ".inputs.txt").write_text(
+        "".join(f"{row['source']}\n" for row in reordered_manifest),
+        encoding="utf-8",
+    )
+
+    summary = _run(fixture, tmp_path / "reordered-audit")
+
+    assert summary["accepted"] is True
+    assert summary["counts"]["replay_records"] == 2
+
+
 def test_audit_rejects_nonrecipient_or_ctc_regression(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

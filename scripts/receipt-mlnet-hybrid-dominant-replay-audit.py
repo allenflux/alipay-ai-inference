@@ -356,15 +356,19 @@ def _load_probe(
     }
 
 
-def _load_replay_input(path: Path, *, expected_sources: Sequence[str]) -> dict[str, Any]:
+def _load_replay_input(
+    path: Path, *, expected_sources: Sequence[str]
+) -> tuple[dict[str, Any], list[str]]:
     identity = _identity(path, description="fresh replay input list")
     sources = path.read_text(encoding="utf-8-sig").splitlines()
     if len(sources) != FAILURE_RECORDS or any(not source.strip() for source in sources):
         _fail(f"fresh replay input list must contain exactly {FAILURE_RECORDS} nonblank rows")
-    observed_keys = [_source_key(source.strip()) for source in sources]
+    if any(source != source.strip() for source in sources):
+        _fail("fresh replay input list contains surrounding whitespace")
+    observed_keys = [_source_key(source) for source in sources]
     expected_keys = [_source_key(source) for source in expected_sources]
-    if observed_keys != expected_keys:
-        _fail("fresh replay input list differs from canonical formal omission order")
+    if set(observed_keys) != set(expected_keys):
+        _fail("fresh replay input list source set differs from the formal omission set")
     if len(set(observed_keys)) != FAILURE_RECORDS:
         _fail("fresh replay input list contains duplicate sources")
     identity.update(
@@ -375,7 +379,7 @@ def _load_replay_input(path: Path, *, expected_sources: Sequence[str]) -> dict[s
             ),
         }
     )
-    return identity
+    return identity, sources
 
 
 def _load_cli_closure(directory: Path) -> dict[str, Any]:
@@ -617,10 +621,18 @@ def audit(
         diagnostic_directory=diagnostic_root,
         missing_keys=set(formal["missing_keys"]),
     )
+    replay_root = _resolve_regular_directory(
+        replay_directory, description="fresh replay"
+    )
+    replay_input_path = Path(str(replay_root) + ".inputs.txt")
+    cli_directory = Path(str(replay_root) + ".cli-app")
+    replay_input, replay_sources = _load_replay_input(
+        replay_input_path, expected_sources=missing_sources
+    )
     try:
         replay = REPLAY._load_run(
-            replay_directory,
-            expected_sources=missing_sources,
+            replay_root,
+            expected_sources=replay_sources,
             hybrid=True,
         )
     except REPLAY.ReplayError as error:
@@ -628,9 +640,6 @@ def audit(
     if replay["root"] == formal["hybrid"]["root"]:
         _fail("fresh replay directory aliases the old formal hybrid run")
 
-    replay_input_path = Path(str(replay["root"]) + ".inputs.txt")
-    cli_directory = Path(str(replay["root"]) + ".cli-app")
-    replay_input = _load_replay_input(replay_input_path, expected_sources=missing_sources)
     cli = _load_cli_closure(cli_directory)
     _assert_paths_do_not_overlap(
         output,
