@@ -209,3 +209,43 @@ def test_main_emits_exactly_one_json_line(tmp_path: Path, capsys: pytest.Capture
     output = capsys.readouterr().out
     assert output.count("\n") == 1
     assert json.loads(output)["kind"] == "receipt_mlnet_hybrid_missing_audit_v1"
+
+
+def test_main_text_format_is_complete_and_terminal_width_bounded(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "ab"
+    sources, _, _ = _write_fixture(root)
+
+    assert MODULE.main(["--root", str(root), "--format", "text"]) == 0
+
+    output = capsys.readouterr().out
+    lines = output.splitlines()
+    assert lines[0] == "Receipt ML.NET hybrid missing audit"
+    assert "Counts:" in lines
+    assert "  records: 3" in lines
+    assert "  invariant failures: 1" in lines
+    assert "  recipient missing: 2" in lines
+    assert "  flagged: 2" in lines
+    assert "Finding 1/2" in lines
+    assert '  basename: "bad.jpg"' in lines
+    collapsed = "".join(line.strip() for line in lines)
+    assert str(sources[1]) in collapsed
+    assert "hybrid recipient candidate missing" in output
+    assert "  baseline recipient:" in lines
+    assert "  hybrid recipient:" in lines
+    assert "    candidate: null" in lines
+    assert "    raw: <missing>" in lines
+    assert "    value: <missing>" in lines
+    assert '    state: "unreadable"' in lines
+    assert "  baseline recipient detection:" in lines
+    assert "    bbox: [1,2,3,4]" in lines
+    assert "    score: 0.93" in lines
+    assert "  hybrid PP-OCR evidence:" in lines
+    assert '    route: "none"' in lines
+    assert "anchored_or_alternative_parse_failed" in output
+    assert '      raw: "商户"' in lines
+    assert "      line_count: 1" in lines
+    assert '      crop_wxh: "600x90"' in lines
+    assert '      crop_wxh: "720x90"' in lines
+    assert max(map(len, lines)) <= 96

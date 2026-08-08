@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Emit a strict, read-only one-line audit of missing hybrid recipients."""
+"""Emit a strict, read-only audit of missing hybrid recipients."""
 
 from __future__ import annotations
 
@@ -278,9 +278,213 @@ def audit(root: Path) -> dict[str, Any]:
     }
 
 
+_MISSING = object()
+_TEXT_WIDTH = 96
+
+
+def _text_value(value: object) -> str:
+    if value is _MISSING:
+        return "<missing>"
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    )
+
+
+def _append_text_value(
+    lines: list[str],
+    label: str,
+    value: object,
+    *,
+    indent: int = 0,
+    width: int = _TEXT_WIDTH,
+) -> None:
+    """Append a lossless, fixed-width rendering without truncating long evidence."""
+
+    prefix = " " * indent + label + ": "
+    continuation = " " * (indent + 2)
+    rendered = _text_value(value)
+    first_width = max(1, width - len(prefix))
+    lines.append(prefix + rendered[:first_width])
+    rendered = rendered[first_width:]
+    continuation_width = max(1, width - len(continuation))
+    while rendered:
+        lines.append(continuation + rendered[:continuation_width])
+        rendered = rendered[continuation_width:]
+
+
+def _source_basename(source: object) -> object:
+    if not isinstance(source, str):
+        return source
+    return source.replace("\\", "/").rsplit("/", maxsplit=1)[-1]
+
+
+def _append_recipient_summary(
+    lines: list[str], label: str, recipient: object, *, width: int
+) -> None:
+    lines.append(f"  {label} recipient:")
+    mapping = recipient if isinstance(recipient, Mapping) else {}
+    for key in ("candidate", "raw", "value", "state"):
+        _append_text_value(
+            lines,
+            key,
+            mapping.get(key, _MISSING),
+            indent=4,
+            width=width,
+        )
+
+
+def _append_detection_summary(
+    lines: list[str], label: str, detection: object, *, width: int
+) -> None:
+    lines.append(f"  {label} recipient detection:")
+    mapping = detection if isinstance(detection, Mapping) else {}
+    bbox = mapping.get("bbox_image", mapping.get("bbox", _MISSING))
+    _append_text_value(lines, "bbox", bbox, indent=4, width=width)
+    _append_text_value(
+        lines,
+        "score",
+        mapping.get("score", _MISSING),
+        indent=4,
+        width=width,
+    )
+
+
+def _append_ppocr_summary(lines: list[str], evidence: object, *, width: int) -> None:
+    lines.append("  hybrid PP-OCR evidence:")
+    mapping = evidence if isinstance(evidence, Mapping) else {}
+    _append_text_value(
+        lines, "route", mapping.get("route", _MISSING), indent=4, width=width
+    )
+    _append_text_value(
+        lines,
+        "failure_reason",
+        mapping.get("failure_reason", _MISSING),
+        indent=4,
+        width=width,
+    )
+    for attempt in ("first", "retry"):
+        lines.append(f"    {attempt}:")
+        _append_text_value(
+            lines,
+            "raw",
+            mapping.get(f"{attempt}_raw", _MISSING),
+            indent=6,
+            width=width,
+        )
+        _append_text_value(
+            lines,
+            "line_count",
+            mapping.get(f"{attempt}_line_count", _MISSING),
+            indent=6,
+            width=width,
+        )
+        crop_width = mapping.get(f"{attempt}_crop_width", _MISSING)
+        crop_height = mapping.get(f"{attempt}_crop_height", _MISSING)
+        crop = f"{_text_value(crop_width)}x{_text_value(crop_height)}"
+        _append_text_value(lines, "crop_wxh", crop, indent=6, width=width)
+
+    displayed = {
+        "route",
+        "failure_reason",
+        "first_raw",
+        "first_line_count",
+        "first_crop_width",
+        "first_crop_height",
+        "retry_raw",
+        "retry_line_count",
+        "retry_crop_width",
+        "retry_crop_height",
+    }
+    extra = {key: value for key, value in mapping.items() if key not in displayed}
+    if extra:
+        _append_text_value(lines, "extra", extra, indent=4, width=width)
+
+
+def format_text(payload: Mapping[str, Any], *, width: int = _TEXT_WIDTH) -> str:
+    """Render audit evidence as a compact multi-line terminal report."""
+
+    if width < 40:
+        raise ValueError("text width must be at least 40")
+    lines = ["Receipt ML.NET hybrid missing audit"]
+    _append_text_value(lines, "A/B root", payload.get("ab_root", _MISSING), width=width)
+    lines.append("Counts:")
+    for label, key in (
+        ("records", "records"),
+        ("invariant failures", "invariant_failure_records"),
+        ("recipient missing", "recipient_missing_records"),
+        ("flagged", "flagged_records"),
+    ):
+        _append_text_value(lines, label, payload.get(key, _MISSING), indent=2, width=width)
+
+    findings = payload.get("findings")
+    finding_rows = findings if isinstance(findings, list) else []
+    for index, finding in enumerate(finding_rows, start=1):
+        mapping = finding if isinstance(finding, Mapping) else {}
+        lines.extend(("", f"Finding {index}/{len(finding_rows)}"))
+        _append_text_value(
+            lines,
+            "basename",
+            _source_basename(mapping.get("source", _MISSING)),
+            indent=2,
+            width=width,
+        )
+        _append_text_value(
+            lines, "source", mapping.get("source", _MISSING), indent=2, width=width
+        )
+        _append_text_value(
+            lines,
+            "invariant",
+            mapping.get("invariant", _MISSING),
+            indent=2,
+            width=width,
+        )
+        _append_text_value(
+            lines,
+            "recipient_candidate",
+            mapping.get("recipient_candidate", _MISSING),
+            indent=2,
+            width=width,
+        )
+        _append_text_value(
+            lines, "failures", mapping.get("failures", _MISSING), indent=2, width=width
+        )
+        _append_recipient_summary(
+            lines, "baseline", mapping.get("baseline_recipient_field"), width=width
+        )
+        _append_recipient_summary(
+            lines, "hybrid", mapping.get("hybrid_recipient_field"), width=width
+        )
+        _append_detection_summary(
+            lines,
+            "baseline",
+            mapping.get("baseline_recipient_detection"),
+            width=width,
+        )
+        _append_detection_summary(
+            lines,
+            "hybrid",
+            mapping.get("hybrid_recipient_detection"),
+            width=width,
+        )
+        _append_ppocr_summary(
+            lines, mapping.get("hybrid_ppocr_evidence"), width=width
+        )
+    return "\n".join(lines)
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", required=True, type=Path, help="hybrid CPU A/B output root")
+    parser.add_argument(
+        "--format",
+        dest="output_format",
+        choices=("json", "text"),
+        default="json",
+        help="output format (default: json)",
+    )
     return parser
 
 
@@ -288,17 +492,29 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         payload = audit(args.root)
-        print(json.dumps(payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")))
+        if args.output_format == "text":
+            print(format_text(payload))
+        else:
+            print(json.dumps(payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")))
         return 0
     except (AuditError, OSError, UnicodeError) as exception:
-        print(
-            json.dumps(
-                {"kind": "receipt_mlnet_hybrid_missing_audit_error_v1", "error": str(exception)},
-                ensure_ascii=False,
-                allow_nan=False,
-                separators=(",", ":"),
+        error_payload = {
+            "kind": "receipt_mlnet_hybrid_missing_audit_error_v1",
+            "error": str(exception),
+        }
+        if args.output_format == "text":
+            lines = ["Receipt ML.NET hybrid missing audit: ERROR"]
+            _append_text_value(lines, "error", str(exception))
+            print("\n".join(lines))
+        else:
+            print(
+                json.dumps(
+                    error_payload,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                )
             )
-        )
         return 2
 
 
