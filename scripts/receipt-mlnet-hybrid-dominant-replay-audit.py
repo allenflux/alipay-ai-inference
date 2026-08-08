@@ -22,6 +22,7 @@ import json
 import math
 from pathlib import Path
 import shutil
+import struct
 from typing import Any
 from uuid import uuid4
 
@@ -453,6 +454,13 @@ def _effective_detector_score(field: Mapping[str, Any], *, description: str) -> 
     return _finite_confidence(present[0], description=f"{description} detector score")
 
 
+def _round_runtime_confidence(value: float) -> float:
+    """Mirror the CLI's MathF.Round(value, 6) JSON field projection."""
+
+    value32 = struct.unpack("<f", struct.pack("<f", value))[0]
+    return round(value32, 6)
+
+
 def _assert_nonrecipient_identical(
     old: Mapping[str, Any],
     new: Mapping[str, Any],
@@ -523,9 +531,16 @@ def _assert_recipient_contract(
     detector_score = _finite_confidence(
         new_detection.get("score"), description=f"fresh result {source!r} detection score"
     )
-    if _effective_detector_score(old_field, description=f"old recipient {source!r}") != detector_score:
+    rounded_detector_score = _round_runtime_confidence(detector_score)
+    if (
+        _effective_detector_score(old_field, description=f"old recipient {source!r}")
+        != rounded_detector_score
+    ):
         _fail(f"old result {source!r} recipient detector score disagrees with detection")
-    if _effective_detector_score(new_field, description=f"fresh recipient {source!r}") != detector_score:
+    if (
+        _effective_detector_score(new_field, description=f"fresh recipient {source!r}")
+        != rounded_detector_score
+    ):
         _fail(f"fresh result {source!r} recipient detector score disagrees with detection")
 
     candidate = new_field.get("candidate")
@@ -557,9 +572,11 @@ def _assert_recipient_contract(
     ocr = new_detection.get("ocr")
     if not isinstance(ocr, Mapping) or ocr.get("text") != candidate:
         _fail(f"fresh replay {source!r} recipient detection OCR differs from candidate")
-    if _finite_confidence(
-        ocr.get("confidence"), description=f"fresh recipient {source!r} detection OCR confidence"
-    ) != ocr_confidence:
+    detection_ocr_confidence = _finite_confidence(
+        ocr.get("confidence"),
+        description=f"fresh recipient {source!r} detection OCR confidence",
+    )
+    if _round_runtime_confidence(detection_ocr_confidence) != ocr_confidence:
         _fail(f"fresh replay {source!r} detection/field OCR confidence mismatch")
     return {"candidate": candidate, "route": route, "ctc_matches": True}
 

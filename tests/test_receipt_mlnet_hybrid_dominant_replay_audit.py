@@ -257,6 +257,43 @@ def test_audit_uses_the_frozen_replay_input_order_not_diagnostic_sort_order(
     assert summary["counts"]["replay_records"] == 2
 
 
+def test_audit_mirrors_runtime_six_decimal_confidence_projection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _fixture(tmp_path, monkeypatch)
+    source = fixture["manifest"][0]["source"]
+    new_path = Path(fixture["manifest"][0]["result"])
+    old_manifest = json.loads(
+        (
+            fixture["formal"]
+            / "hybrid-recipient"
+            / "inference_manifest.json"
+        ).read_text()
+    )
+    old_path = Path(next(row["result"] for row in old_manifest if row["source"] == source))
+
+    for result_path in (old_path, new_path):
+        result = json.loads(result_path.read_text())
+        field = result["fields"]["recipient"]
+        score_key = "detector_score" if field.get("detector_score") is not None else "score"
+        field[score_key] = 0.925238
+        detection = next(
+            item
+            for item in result["detections"]
+            if item["label"] == "recipient_field"
+        )
+        detection["score"] = 0.9252378
+        if result_path == new_path:
+            field["ocr_confidence"] = 0.876543
+            field["ctc_confidence"] = 0.876543
+            detection["ocr"]["confidence"] = 0.8765432
+        _write_json(result_path, result)
+
+    summary = _run(fixture, tmp_path / "rounded-confidence-audit")
+
+    assert summary["accepted"] is True
+
+
 def test_audit_rejects_nonrecipient_or_ctc_regression(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
