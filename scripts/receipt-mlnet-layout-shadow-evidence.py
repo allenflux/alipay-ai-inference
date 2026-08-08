@@ -627,6 +627,49 @@ def _convex_hull_area(points: Sequence[tuple[float, float]]) -> float:
     ) / 2.0
 
 
+def _quad_has_proper_self_intersection(
+    points: Sequence[tuple[float, float]],
+) -> bool:
+    """Return true only when a pair of non-adjacent edges crosses properly."""
+
+    if len(points) != 4:
+        return False
+
+    def cross(
+        start: tuple[float, float],
+        end: tuple[float, float],
+        point: tuple[float, float],
+    ) -> float:
+        return (end[0] - start[0]) * (point[1] - start[1]) - (
+            end[1] - start[1]
+        ) * (point[0] - start[0])
+
+    def crosses(
+        first_start: tuple[float, float],
+        first_end: tuple[float, float],
+        second_start: tuple[float, float],
+        second_end: tuple[float, float],
+    ) -> bool:
+        first_left = cross(first_start, first_end, second_start)
+        first_right = cross(first_start, first_end, second_end)
+        second_left = cross(second_start, second_end, first_start)
+        second_right = cross(second_start, second_end, first_end)
+
+        def strictly_opposite_sign(first: float, second: float) -> bool:
+            # Exact zero is an endpoint/collinear contact rather than a proper
+            # crossing.  Do not use an epsilon here: a near-endpoint crossing
+            # remains a real bow-tie and must stay fatal at any nonzero scale.
+            return (first < 0 < second) or (second < 0 < first)
+
+        return strictly_opposite_sign(first_left, first_right) and (
+            strictly_opposite_sign(second_left, second_right)
+        )
+
+    return crosses(points[0], points[1], points[2], points[3]) or crosses(
+        points[1], points[2], points[3], points[0]
+    )
+
+
 def _quad_geometry(
     line: Mapping[str, Any],
     *,
@@ -638,6 +681,7 @@ def _quad_geometry(
     source_height: int,
     rectified_to_source: Sequence[Sequence[float]],
     allow_intrinsically_degenerate: bool = False,
+    allow_order_cancellation_contract_violation: bool = False,
 ) -> dict[str, Any]:
     raw = line.get("quad_rectified")
     normalized = line.get("quad_rectified_normalized")
@@ -677,18 +721,30 @@ def _quad_geometry(
         for item in range(4)
     )) / 2.0
     hull_area = _convex_hull_area(raw_points)
+    self_intersects = _quad_has_proper_self_intersection(raw_points)
     degenerate_quad: dict[str, Any] | None = None
     if polygon_area <= 1e-3:
         # A zero shoelace area may also be caused by a bow-tie ordering over a
-        # perfectly non-degenerate point set.  That is evidence corruption,
-        # not a low-area DB box, and must remain fatal even in the narrow
-        # diagnostic exclusion mode.
-        if hull_area > 1e-3:
+        # perfectly non-degenerate point set.  That is a producer-contract
+        # violation, not a low-area DB box.  It stays fatal by default; the
+        # separate explicit mode below may only report it for whole-record
+        # quarantine and never turns the point order into usable geometry.
+        if hull_area > 1e-3 and not allow_order_cancellation_contract_violation:
+            diagnostic = json.dumps(
+                {
+                    "quad_rectified": [list(point) for point in raw_points],
+                    "polygon_area_pixels2": polygon_area,
+                    "convex_hull_area_pixels2": hull_area,
+                },
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+            )
             raise EvidenceError(
                 f"layout record[{record_index}] line[{line_index}] quad order "
-                "cancels a non-degenerate hull"
+                f"cancels a non-degenerate hull: {diagnostic}"
             )
-        if not allow_intrinsically_degenerate:
+        if hull_area <= 1e-3 and not allow_intrinsically_degenerate:
             raise EvidenceError(
                 f"layout record[{record_index}] line[{line_index}] quad is degenerate"
             )
@@ -699,7 +755,9 @@ def _quad_geometry(
         bounding_height = max(point[1] for point in raw_points) - min(
             point[1] for point in raw_points
         )
-        if unique_points < 4:
+        if hull_area > 1e-3:
+            classification = "order_cancels_nondegenerate_hull"
+        elif unique_points < 4:
             classification = "repeated_points"
         elif bounding_width <= 1e-9 or bounding_height <= 1e-9:
             classification = "axis_collapsed"
@@ -716,6 +774,33 @@ def _quad_geometry(
             "bounding_height_pixels": bounding_height,
             "candidate_eligible": False,
         }
+        if classification == "order_cancels_nondegenerate_hull":
+            # The producer declares TL/TR/BR/BL.  Preserve the raw evidence,
+            # but never reinterpret or canonicalize this non-cyclic order.
+            # A caller opting into this diagnostic must quarantine the whole
+            # record rather than merely removing this line.
+            degenerate_quad.update(
+                {
+                    "producer_contract_violation": True,
+                    "record_candidate_eligible": False,
+                    "canonicalized": False,
+                }
+            )
+    elif self_intersects:
+        diagnostic = json.dumps(
+            {
+                "quad_rectified": [list(point) for point in raw_points],
+                "polygon_area_pixels2": polygon_area,
+                "convex_hull_area_pixels2": hull_area,
+            },
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        )
+        raise EvidenceError(
+            f"layout record[{record_index}] line[{line_index}] quad is "
+            f"self-intersecting with nonzero ordered area: {diagnostic}"
+        )
     source_normalized = [
         (
             min(1.0, max(0.0, x / (source_width - 1))),
@@ -1108,6 +1193,7 @@ def _validate_layout(
     missing_sets: Mapping[str, set[str]],
     *,
     allow_intrinsically_degenerate_lines: bool = False,
+    allow_order_cancellation_contract_violation_lines: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     summary_path = layout_directory / "summary.json"
     records_path = layout_directory / "records.jsonl"
@@ -1260,6 +1346,9 @@ def _validate_layout(
                 source_height=source_height,
                 rectified_to_source=rectified_to_source,
                 allow_intrinsically_degenerate=allow_intrinsically_degenerate_lines,
+                allow_order_cancellation_contract_violation=(
+                    allow_order_cancellation_contract_violation_lines
+                ),
             )
             prepared = dict(line)
             prepared["_geometry"] = line_geometry
@@ -1306,7 +1395,13 @@ def _validate_layout(
             _require_number(timing.get(stage), description=f"layout timing {stage}", minimum=0)
 
         source_key = _path_key(source)
-        analysis_lines = [
+        record_has_order_contract_violation = any(
+            line["_geometry"].get("degenerate_quad", {}).get("classification")
+            == "order_cancels_nondegenerate_hull"
+            for line in prepared_lines
+            if isinstance(line["_geometry"].get("degenerate_quad"), Mapping)
+        )
+        analysis_lines = [] if record_has_order_contract_violation else [
             line
             for line in prepared_lines
             if line["_geometry"].get("degenerate_quad") is None
@@ -1335,7 +1430,16 @@ def _validate_layout(
         "layout_latency_ms": summary.get("latency_ms"),
     }
     if allow_intrinsically_degenerate_lines:
-        bindings["excluded_intrinsically_degenerate_lines"] = degenerate_lines
+        bindings["excluded_intrinsically_degenerate_lines"] = [
+            item
+            for item in degenerate_lines
+            if item.get("classification") != "order_cancels_nondegenerate_hull"
+        ]
+    if (
+        allow_intrinsically_degenerate_lines
+        or allow_order_cancellation_contract_violation_lines
+    ):
+        bindings["excluded_quad_contract_lines"] = degenerate_lines
     return evidence_rows, bindings
 
 

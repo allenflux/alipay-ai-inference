@@ -564,13 +564,67 @@ def test_layout_closure_can_report_one_degenerate_raw_line_without_using_it_as_f
     )
 
 
-def test_degenerate_exclusion_mode_still_rejects_bow_tie_and_normalization_damage() -> None:
+def test_layout_closure_quarantines_entire_record_for_order_cancellation_contract_violation(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+    records = fixture["records"]
+    source = fixture["sources"][0]
+    raw = [[10.0, 10.0], [30.0, 30.0], [10.0, 30.0], [30.0, 10.0]]
+    cancelled = {
+        "index": len(records[0]["lines"]),
+        "text": "收款方：不得使用",
+        "confidence": 0.95,
+        "passes_drop_score": True,
+        "quad_rectified": raw,
+        "quad_rectified_normalized": [[x / 999.0, y / 1599.0] for x, y in raw],
+    }
+    records[0] = _record(0, source, [*records[0]["lines"], cancelled])
+    records_path = Path(fixture["layout"]) / "records.jsonl"
+    records_bytes = _write_jsonl(records_path, records)
+    layout_summary = fixture["layout_summary"]
+    layout_summary["artifacts"]["records_jsonl"]["sha256"] = _sha(records_bytes)
+    layout_summary["artifacts"]["records_jsonl"]["size_bytes"] = len(records_bytes)
+    _write_json(Path(fixture["layout"]) / "summary.json", layout_summary)
+
+    selection, sources, source_ids, _ = MODULE._validate_selection(
+        fixture["selection"], fixture["audit"]
+    )
+    missing_sets, _ = MODULE._validate_audit(
+        fixture["audit"], selection, sources
+    )
+    evidence, bindings = MODULE._validate_layout(
+        fixture["layout"],
+        fixture["selection"],
+        selection,
+        sources,
+        source_ids,
+        missing_sets,
+        allow_intrinsically_degenerate_lines=True,
+        allow_order_cancellation_contract_violation_lines=True,
+    )
+    excluded = bindings["excluded_quad_contract_lines"]
+    assert len(excluded) == 1
+    assert excluded[0]["record_index"] == 0
+    assert excluded[0]["line_index"] == 3
+    assert excluded[0]["classification"] == "order_cancels_nondegenerate_hull"
+    assert excluded[0]["record_candidate_eligible"] is False
+    # The valid clock/payment/status lines in the same record are also kept
+    # out of diagnostic field evidence; no ambiguity can be removed by
+    # deleting only the malformed line.
+    assert all(
+        field["anchors"] == []
+        for field in evidence[0]["evidence_by_field"].values()
+    )
+
+
+def test_order_cancellation_requires_explicit_contract_violation_mode_and_preserves_raw_evidence() -> None:
     bow_tie = [[10.0, 10.0], [30.0, 30.0], [10.0, 30.0], [30.0, 10.0]]
     line = {
         "quad_rectified": bow_tie,
         "quad_rectified_normalized": [[x / 99.0, y / 99.0] for x, y in bow_tie],
     }
-    with pytest.raises(MODULE.EvidenceError, match="cancels a non-degenerate hull"):
+    with pytest.raises(MODULE.EvidenceError, match="cancels a non-degenerate hull") as raised:
         MODULE._quad_geometry(
             line,
             record_index=0,
@@ -582,6 +636,98 @@ def test_degenerate_exclusion_mode_still_rejects_bow_tie_and_normalization_damag
             rectified_to_source=[[1, 0, 0], [0, 1, 0], [0, 0, 1]],
             allow_intrinsically_degenerate=True,
         )
+    assert '"quad_rectified":[[10.0,10.0],[30.0,30.0],[10.0,30.0],[30.0,10.0]]' in str(
+        raised.value
+    )
+    assert '"polygon_area_pixels2":0.0' in str(raised.value)
+    assert '"convex_hull_area_pixels2":400.0' in str(raised.value)
+
+    geometry = MODULE._quad_geometry(
+        line,
+        record_index=146,
+        line_index=20,
+        rectified_width=100,
+        rectified_height=100,
+        source_width=100,
+        source_height=100,
+        rectified_to_source=[[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+        allow_intrinsically_degenerate=True,
+        allow_order_cancellation_contract_violation=True,
+    )
+    assert geometry["degenerate_quad"] == {
+        "classification": "order_cancels_nondegenerate_hull",
+        "polygon_area_pixels2": 0.0,
+        "convex_hull_area_pixels2": 400.0,
+        "unique_points": 4,
+        "bounding_width_pixels": 20.0,
+        "bounding_height_pixels": 20.0,
+        "candidate_eligible": False,
+        "producer_contract_violation": True,
+        "record_candidate_eligible": False,
+        "canonicalized": False,
+    }
+
+
+def test_explicit_order_cancellation_mode_does_not_accept_arbitrary_bow_ties() -> None:
+    # This is a producer-reachable boundary-clipped ordering: Paddle's
+    # sum/difference ordering yields a crossing with non-zero ordered area,
+    # while its width/height checks still exceed three pixels.  The one-record
+    # quarantine is deliberately limited to exact cancellation; it is not a
+    # generic point-set or bow-tie canonicalizer.
+    bow_tie = [[3.0, 0.0], [0.0, 3.0], [7.0, 0.0], [0.0, 7.0]]
+    line = {
+        "quad_rectified": bow_tie,
+        "quad_rectified_normalized": [[x / 99.0, y / 99.0] for x, y in bow_tie],
+    }
+    with pytest.raises(MODULE.EvidenceError, match="self-intersecting with nonzero ordered area"):
+        MODULE._quad_geometry(
+            line,
+            record_index=0,
+            line_index=0,
+            rectified_width=100,
+            rectified_height=100,
+            source_width=100,
+            source_height=100,
+            rectified_to_source=[[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+            allow_intrinsically_degenerate=True,
+            allow_order_cancellation_contract_violation=True,
+        )
+
+    # A crossing arbitrarily close to an endpoint is still proper.  This
+    # locks strict sign semantics rather than an epsilon that could turn a
+    # small-but-real crossing into accepted geometry.
+    near_endpoint = [
+        [0.0, 1.0],
+        [1000.0, 1.0],
+        [500.0, 100.0],
+        [0.000001, 0.9999999999],
+    ]
+    with pytest.raises(MODULE.EvidenceError, match="self-intersecting with nonzero ordered area"):
+        MODULE._quad_geometry(
+            {
+                "quad_rectified": near_endpoint,
+                "quad_rectified_normalized": [
+                    [x / 1000.0, y / 100.0] for x, y in near_endpoint
+                ],
+            },
+            record_index=0,
+            line_index=0,
+            rectified_width=1001,
+            rectified_height=101,
+            source_width=1001,
+            source_height=101,
+            rectified_to_source=[[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+            allow_intrinsically_degenerate=True,
+            allow_order_cancellation_contract_violation=True,
+        )
+
+
+def test_quad_exclusion_mode_still_rejects_normalization_damage() -> None:
+    bow_tie = [[10.0, 10.0], [30.0, 30.0], [10.0, 30.0], [30.0, 10.0]]
+    line = {
+        "quad_rectified": bow_tie,
+        "quad_rectified_normalized": [[x / 99.0, y / 99.0] for x, y in bow_tie],
+    }
 
     damaged = dict(line)
     damaged["quad_rectified"] = [[10.0, 20.0]] * 4

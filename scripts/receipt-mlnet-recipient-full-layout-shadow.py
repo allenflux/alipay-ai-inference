@@ -51,6 +51,7 @@ EVALUATION_RECORD_KIND = "receipt_mlnet_recipient_full_layout_shadow_record_v1"
 
 MINIMUM_LINE_CONFIDENCE = 0.80
 MAX_EXCLUDED_DEGENERATE_QUAD_LINES = 1
+ORDER_CANCELLATION_CLASSIFICATION = "order_cancels_nondegenerate_hull"
 LABELS = ("收款账户", "收款方", "收款人")
 LABEL_ALTERNATION = "|".join(map(re.escape, LABELS))
 LABEL_ONLY = re.compile(rf"^(?P<label>{LABEL_ALTERNATION})\s*[:：]?\s*$")
@@ -1105,6 +1106,44 @@ def _recipient_shadow(lines: Sequence[Mapping[str, Any]], *, drop_score: float, 
     }
 
 
+def _recipient_shadow_with_geometry_policy(
+    raw_lines: Sequence[Mapping[str, Any]],
+    excluded_lines: Sequence[Mapping[str, Any]],
+    *,
+    drop_score: float,
+    filter_module,
+) -> tuple[dict[str, Any], bool]:
+    """Apply exclusions without salvaging a contract-invalid record."""
+
+    if any(
+        item.get("classification") == ORDER_CANCELLATION_CLASSIFICATION
+        for item in excluded_lines
+    ):
+        return ({
+            "state": "unresolved",
+            "shadow_candidate": None,
+            "shadow_route": None,
+            "minimum_confidence": None,
+            "label_anchor_indices": [],
+            "ambiguous_anchor_indices": [],
+            "distinct_eligible_values": [],
+            "evidence": [],
+            "rejected_value_reasons": {"layout_quad_contract_violation": 1},
+        }, False)
+    excluded_indices = {int(item["line_index"]) for item in excluded_lines}
+    eligible_lines = [
+        line
+        for line in raw_lines
+        if isinstance(line, Mapping) and line.get("index") not in excluded_indices
+    ]
+    return (
+        _recipient_shadow(
+            eligible_lines, drop_score=drop_score, filter_module=filter_module
+        ),
+        True,
+    )
+
+
 def _validate_degenerate_exclusions(
     excluded: object, records: Sequence[Mapping[str, Any]]
 ) -> list[dict[str, Any]]:
@@ -1112,7 +1151,7 @@ def _validate_degenerate_exclusions(
         raise FullLayoutShadowError("layout validator did not report degenerate-line diagnostics")
     if len(excluded) > MAX_EXCLUDED_DEGENERATE_QUAD_LINES:
         raise FullLayoutShadowError(
-            "LayoutShadow contains more than one intrinsically degenerate line; "
+            "LayoutShadow contains more than one excluded quad line; "
             "treating this as evidence damage instead of widening the exclusion"
         )
     allowed_classifications = {
@@ -1120,6 +1159,7 @@ def _validate_degenerate_exclusions(
         "axis_collapsed",
         "collinear_points",
         "sub_millipixel_area",
+        ORDER_CANCELLATION_CLASSIFICATION,
     }
     seen_excluded: set[tuple[int, int]] = set()
     for item in excluded:
@@ -1145,6 +1185,27 @@ def _validate_degenerate_exclusions(
             != item.get("quad_rectified_normalized")
         ):
             raise FullLayoutShadowError("degenerate-line diagnostic differs from raw OCR record")
+        if item.get("classification") == ORDER_CANCELLATION_CLASSIFICATION:
+            polygon_area = _require_number(
+                item.get("polygon_area_pixels2"),
+                description="order-cancellation polygon area",
+                minimum=0,
+            )
+            hull_area = _require_number(
+                item.get("convex_hull_area_pixels2"),
+                description="order-cancellation convex-hull area",
+                minimum=0,
+            )
+            if (
+                item.get("producer_contract_violation") is not True
+                or item.get("record_candidate_eligible") is not False
+                or item.get("canonicalized") is not False
+                or polygon_area > 1e-3
+                or hull_area <= 1e-3
+            ):
+                raise FullLayoutShadowError(
+                    "order-cancellation diagnostic does not prove fail-closed record quarantine"
+                )
     return [dict(item) for item in excluded]
 
 
@@ -1162,6 +1223,7 @@ def _validate_layout(
             selection["source_identities"],
             missing_sets,
             allow_intrinsically_degenerate_lines=True,
+            allow_order_cancellation_contract_violation_lines=True,
         )
     except (OSError, ValueError) as error:
         raise FullLayoutShadowError(f"LayoutShadow 339 closure is invalid: {error}") from error
@@ -1177,7 +1239,7 @@ def _validate_layout(
     ):
         raise FullLayoutShadowError("LayoutShadow output is not the fresh CPU339 contract")
     excluded = _validate_degenerate_exclusions(
-        generic_bindings.get("excluded_intrinsically_degenerate_lines"), records
+        generic_bindings.get("excluded_quad_contract_lines"), records
     )
     return records, {
         "layout_summary": _identity(
@@ -1218,19 +1280,29 @@ def evaluate(
     excluded_by_record: dict[int, list[dict[str, Any]]] = defaultdict(list)
     for item in layout_bindings["excluded_degenerate_quad_lines"]:
         excluded_by_record[int(item["record_index"])].append(dict(item))
+    order_contract_violations = [
+        item
+        for item in layout_bindings["excluded_degenerate_quad_lines"]
+        if item.get("classification") == ORDER_CANCELLATION_CLASSIFICATION
+    ]
+    intrinsically_degenerate_lines = [
+        item
+        for item in layout_bindings["excluded_degenerate_quad_lines"]
+        if item.get("classification") != ORDER_CANCELLATION_CLASSIFICATION
+    ]
+    contract_invalid_records = {
+        int(item["record_index"]) for item in order_contract_violations
+    }
 
     findings: list[dict[str, Any]] = []
     for index, (selected, layout) in enumerate(zip(selection["rows"], records, strict=True)):
         raw_lines = layout.get("lines", [])
         excluded_lines = excluded_by_record.get(index, [])
-        excluded_indices = {int(item["line_index"]) for item in excluded_lines}
-        eligible_lines = [
-            line
-            for line in raw_lines
-            if isinstance(line, Mapping) and line.get("index") not in excluded_indices
-        ]
-        shadow = _recipient_shadow(
-            eligible_lines, drop_score=drop_score, filter_module=filter_module
+        shadow, record_candidate_eligible = _recipient_shadow_with_geometry_policy(
+            raw_lines,
+            excluded_lines,
+            drop_score=drop_score,
+            filter_module=filter_module,
         )
         base = {
             "schema_version": 1,
@@ -1242,6 +1314,7 @@ def evaluate(
             "index": index,
             "source": selected["source"],
             "cohort": selected["cohort"],
+            "record_candidate_eligible": record_candidate_eligible,
             "excluded_degenerate_quad_lines": excluded_lines,
             **shadow,
         }
@@ -1310,16 +1383,23 @@ def evaluate(
         "target_truth_used_for_candidate_selection": False,
         "records": EXPECTED_RECORDS,
         "layout_geometry_safety": {
-            "intrinsically_degenerate_quad_lines": len(
-                layout_bindings["excluded_degenerate_quad_lines"]
-            ),
+            "intrinsically_degenerate_quad_lines": len(intrinsically_degenerate_lines),
             "records_with_intrinsically_degenerate_quad_lines": len(
-                excluded_by_record
+                {
+                    int(item["record_index"])
+                    for item in intrinsically_degenerate_lines
+                }
             ),
+            "order_cancellation_contract_violation_lines": len(
+                order_contract_violations
+            ),
+            "records_forced_candidate_ineligible": len(contract_invalid_records),
             "maximum_allowed_exclusions": MAX_EXCLUDED_DEGENERATE_QUAD_LINES,
             "non_degenerate_hull_order_cancellation_allowed": False,
+            "non_degenerate_hull_order_cancellation_canonicalized": 0,
             "excluded_lines_candidate_eligible": False,
-            "policy": "fail_closed_exclude_from_labels_and_values",
+            "contract_violation_policy": "fail_closed_whole_record_unresolved",
+            "intrinsic_degenerate_policy": "fail_closed_exclude_line_from_labels_and_values",
         },
         "targets": {
             "records": TARGET_RECORDS,

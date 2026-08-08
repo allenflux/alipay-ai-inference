@@ -65,6 +65,8 @@ def test_fixed_scope_and_source_contract_do_not_touch_production() -> None:
     assert "receipt-mlnet-formal-missing-fields-audit.py" in source
     assert "receipt-mlnet-layout-shadow-evidence.py" in source
     assert "dotnet/" not in source
+    assert "allow_order_cancellation_contract_violation_lines=True" in source
+    assert '"contract_violation_policy": "fail_closed_whole_record_unresolved"' in source
 
 
 def test_stratified_allocation_is_proportional_deterministic_and_spread() -> None:
@@ -101,6 +103,63 @@ def test_exact_label_rhs_and_unique_same_row_right_neighbor() -> None:
     assert row["shadow_candidate"] == "张三"
     assert row["shadow_route"] == "full_layout_label_right_neighbor_shadow"
     assert row["evidence"][0]["candidate_line_index"] == 1
+
+
+def test_order_cancellation_contract_violation_forces_whole_record_unresolved() -> None:
+    lines = [
+        _line(0, "收款方：恶意值"),
+        _line(1, "收款方：张三"),
+    ]
+    shadow, record_candidate_eligible = MODULE._recipient_shadow_with_geometry_policy(
+        lines,
+        [
+            {
+                "line_index": 0,
+                "classification": MODULE.ORDER_CANCELLATION_CLASSIFICATION,
+            }
+        ],
+        drop_score=0.5,
+        filter_module=FILTER,
+    )
+    assert record_candidate_eligible is False
+    assert shadow == {
+        "state": "unresolved",
+        "shadow_candidate": None,
+        "shadow_route": None,
+        "minimum_confidence": None,
+        "label_anchor_indices": [],
+        "ambiguous_anchor_indices": [],
+        "distinct_eligible_values": [],
+        "evidence": [],
+        "rejected_value_reasons": {"layout_quad_contract_violation": 1},
+    }
+
+
+def test_order_cancellation_exclusion_requires_noncanonicalized_whole_record_contract() -> None:
+    raw = [[10.0, 10.0], [30.0, 30.0], [10.0, 30.0], [30.0, 10.0]]
+    normalized = [[x / 99.0, y / 99.0] for x, y in raw]
+    records = [{"lines": [{"index": 0, "text": "收款方：张三", "quad_rectified": raw,
+                              "quad_rectified_normalized": normalized}]}]
+    diagnostic = {
+        "record_index": 0,
+        "line_index": 0,
+        "text": "收款方：张三",
+        "quad_rectified": raw,
+        "quad_rectified_normalized": normalized,
+        "classification": MODULE.ORDER_CANCELLATION_CLASSIFICATION,
+        "polygon_area_pixels2": 0.0,
+        "convex_hull_area_pixels2": 400.0,
+        "candidate_eligible": False,
+        "producer_contract_violation": True,
+        "record_candidate_eligible": False,
+        "canonicalized": False,
+    }
+    assert MODULE._validate_degenerate_exclusions([diagnostic], records) == [diagnostic]
+    damaged = dict(diagnostic, canonicalized=True)
+    with pytest.raises(MODULE.FullLayoutShadowError, match="fail-closed record quarantine"):
+        MODULE._validate_degenerate_exclusions([damaged], records)
+    with pytest.raises(MODULE.FullLayoutShadowError, match="more than one excluded quad line"):
+        MODULE._validate_degenerate_exclusions([diagnostic, diagnostic], records)
 
 
 @pytest.mark.parametrize(
@@ -380,10 +439,14 @@ def test_evaluate_reports_target_shadow_only_and_control_regression_metrics(
     assert summary["layout_geometry_safety"] == {
         "intrinsically_degenerate_quad_lines": 1,
         "records_with_intrinsically_degenerate_quad_lines": 1,
+        "order_cancellation_contract_violation_lines": 0,
+        "records_forced_candidate_ineligible": 0,
         "maximum_allowed_exclusions": 1,
         "non_degenerate_hull_order_cancellation_allowed": False,
+        "non_degenerate_hull_order_cancellation_canonicalized": 0,
         "excluded_lines_candidate_eligible": False,
-        "policy": "fail_closed_exclude_from_labels_and_values",
+        "contract_violation_policy": "fail_closed_whole_record_unresolved",
+        "intrinsic_degenerate_policy": "fail_closed_exclude_line_from_labels_and_values",
     }
     findings = [json.loads(line) for line in (output / "findings.jsonl").read_text().splitlines()]
     assert findings[0]["shadow_candidate"] == "张三"
@@ -391,3 +454,46 @@ def test_evaluate_reports_target_shadow_only_and_control_regression_metrics(
     assert findings[0]["excluded_degenerate_quad_lines"][0]["candidate_eligible"] is False
     assert all("control_evaluation" not in row for row in findings[:2])
     assert all("external_reference" not in json.dumps(row) for row in findings[:2])
+
+    order_violation = {
+        **excluded,
+        "classification": MODULE.ORDER_CANCELLATION_CLASSIFICATION,
+        "polygon_area_pixels2": 0.0,
+        "convex_hull_area_pixels2": 100.0,
+        "producer_contract_violation": True,
+        "record_candidate_eligible": False,
+        "canonicalized": False,
+    }
+    layout_bindings["excluded_degenerate_quad_lines"] = [order_violation]
+    quarantined_output = tmp_path / "evaluation-order-quarantine"
+    MODULE.evaluate(
+        selection_directory=tmp_path,
+        layout_directory=tmp_path,
+        output_directory=quarantined_output,
+    )
+    quarantined_summary = json.loads(
+        (quarantined_output / "summary.json").read_text()
+    )
+    assert quarantined_summary["targets"]["shadow_candidate_records"] == 0
+    assert quarantined_summary["targets"]["unresolved_records"] == 2
+    assert quarantined_summary["layout_geometry_safety"] == {
+        "intrinsically_degenerate_quad_lines": 0,
+        "records_with_intrinsically_degenerate_quad_lines": 0,
+        "order_cancellation_contract_violation_lines": 1,
+        "records_forced_candidate_ineligible": 1,
+        "maximum_allowed_exclusions": 1,
+        "non_degenerate_hull_order_cancellation_allowed": False,
+        "non_degenerate_hull_order_cancellation_canonicalized": 0,
+        "excluded_lines_candidate_eligible": False,
+        "contract_violation_policy": "fail_closed_whole_record_unresolved",
+        "intrinsic_degenerate_policy": "fail_closed_exclude_line_from_labels_and_values",
+    }
+    quarantined = [
+        json.loads(line)
+        for line in (quarantined_output / "findings.jsonl").read_text().splitlines()
+    ]
+    assert quarantined[0]["record_candidate_eligible"] is False
+    assert quarantined[0]["state"] == "unresolved"
+    assert quarantined[0]["shadow_candidate"] is None
+    assert quarantined[0]["evidence"] == []
+    assert quarantined[1]["record_candidate_eligible"] is True
