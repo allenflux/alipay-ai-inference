@@ -65,8 +65,9 @@ def test_fixed_scope_and_source_contract_do_not_touch_production() -> None:
     assert "receipt-mlnet-formal-missing-fields-audit.py" in source
     assert "receipt-mlnet-layout-shadow-evidence.py" in source
     assert "dotnet/" not in source
-    assert "allow_order_cancellation_contract_violation_lines=True" in source
+    assert "allow_invalid_quad_contract_violation_lines=True" in source
     assert '"contract_violation_policy": "fail_closed_whole_record_unresolved"' in source
+    assert "MAX_EXCLUDED" not in source
 
 
 def test_stratified_allocation_is_proportional_deterministic_and_spread() -> None:
@@ -135,7 +136,7 @@ def test_order_cancellation_contract_violation_forces_whole_record_unresolved() 
     }
 
 
-def test_order_cancellation_exclusion_requires_noncanonicalized_whole_record_contract() -> None:
+def test_multiple_invalid_quad_diagnostics_are_allowed_but_each_remains_noncanonicalized() -> None:
     raw = [[10.0, 10.0], [30.0, 30.0], [10.0, 30.0], [30.0, 10.0]]
     normalized = [[x / 99.0, y / 99.0] for x, y in raw]
     records = [{"lines": [{"index": 0, "text": "收款方：张三", "quad_rectified": raw,
@@ -158,7 +159,26 @@ def test_order_cancellation_exclusion_requires_noncanonicalized_whole_record_con
     damaged = dict(diagnostic, canonicalized=True)
     with pytest.raises(MODULE.FullLayoutShadowError, match="fail-closed record quarantine"):
         MODULE._validate_degenerate_exclusions([damaged], records)
-    with pytest.raises(MODULE.FullLayoutShadowError, match="more than one excluded quad line"):
+
+    second_raw = [[3.0, 0.0], [0.0, 3.0], [7.0, 0.0], [0.0, 7.0]]
+    second_normalized = [[x / 99.0, y / 99.0] for x, y in second_raw]
+    records.append({"lines": [{"index": 0, "text": "收款方：李四",
+                                "quad_rectified": second_raw,
+                                "quad_rectified_normalized": second_normalized}]})
+    second = {
+        **diagnostic,
+        "record_index": 1,
+        "text": "收款方：李四",
+        "quad_rectified": second_raw,
+        "quad_rectified_normalized": second_normalized,
+        "classification": MODULE.SELF_INTERSECTION_CLASSIFICATION,
+        "polygon_area_pixels2": 8.0,
+        "convex_hull_area_pixels2": 24.5,
+    }
+    assert MODULE._validate_degenerate_exclusions(
+        [diagnostic, second], records
+    ) == [diagnostic, second]
+    with pytest.raises(MODULE.FullLayoutShadowError, match="exclusion evidence is invalid"):
         MODULE._validate_degenerate_exclusions([diagnostic, diagnostic], records)
 
 
@@ -202,7 +222,7 @@ def test_low_confidence_and_multiple_right_values_do_not_emit() -> None:
     assert ambiguous["ambiguous_anchor_indices"] == [0]
 
 
-def test_degenerate_exclusion_is_bounded_and_bound_to_the_raw_line() -> None:
+def test_invalid_quad_exclusions_have_no_count_cap_and_remain_bound_to_raw_lines() -> None:
     raw_line = {
         "index": 0,
         "text": "收款方：张三",
@@ -216,16 +236,21 @@ def test_degenerate_exclusion_is_bounded_and_bound_to_the_raw_line() -> None:
         "quad_rectified": raw_line["quad_rectified"],
         "quad_rectified_normalized": raw_line["quad_rectified_normalized"],
         "classification": "repeated_points",
+        "polygon_area_pixels2": 0.0,
+        "convex_hull_area_pixels2": 0.0,
         "candidate_eligible": False,
+        "producer_contract_violation": True,
+        "record_candidate_eligible": False,
+        "canonicalized": False,
     }
     assert MODULE._validate_degenerate_exclusions(
         [diagnostic], [{"lines": [raw_line]}]
     ) == [diagnostic]
-    with pytest.raises(MODULE.FullLayoutShadowError, match="more than one"):
-        MODULE._validate_degenerate_exclusions(
-            [diagnostic, {**diagnostic, "record_index": 1}],
-            [{"lines": [raw_line]}, {"lines": [raw_line]}],
-        )
+    second = {**diagnostic, "record_index": 1}
+    assert MODULE._validate_degenerate_exclusions(
+        [diagnostic, second],
+        [{"lines": [raw_line]}, {"lines": [raw_line]}],
+    ) == [diagnostic, second]
     with pytest.raises(MODULE.FullLayoutShadowError, match="differs from raw"):
         MODULE._validate_degenerate_exclusions(
             [{**diagnostic, "text": "李四"}], [{"lines": [raw_line]}]
@@ -378,9 +403,8 @@ def test_evaluate_reports_target_shadow_only_and_control_regression_metrics(
         }
         for text in texts
     ]
-    # A producer-authentic zero-area DB line is retained in raw evidence but
-    # must never become a recipient label/value.  The following valid line
-    # keeps its original non-contiguous index after fail-closed exclusion.
+    # A contract-invalid line never removes ambiguity in its record.  Even the
+    # following valid recipient line must be ignored with the entire record.
     records[0]["lines"] = [
         _line(0, "收款方：恶意值"),
         _line(1, "收款方：张三"),
@@ -401,6 +425,23 @@ def test_evaluate_reports_target_shadow_only_and_control_regression_metrics(
         "bounding_width_pixels": 10.0,
         "bounding_height_pixels": 0.0,
         "candidate_eligible": False,
+        "producer_contract_violation": True,
+        "record_candidate_eligible": False,
+        "canonicalized": False,
+    }
+    self_intersection = {
+        **excluded,
+        "record_index": 3,
+        "line_index": 0,
+        "source": selection_rows[3]["source"],
+        "text": "收款方：错误值",
+        "quad_rectified": [[368, 913], [368, 930], [376, 922], [360, 922]],
+        "classification": MODULE.SELF_INTERSECTION_CLASSIFICATION,
+        "polygon_area_pixels2": 4.0,
+        "convex_hull_area_pixels2": 136.0,
+        "unique_points": 4,
+        "bounding_width_pixels": 16.0,
+        "bounding_height_pixels": 17.0,
     }
     layout_bindings = {
         "layout_summary": frozen["layout-summary.json"],
@@ -408,7 +449,7 @@ def test_evaluate_reports_target_shadow_only_and_control_regression_metrics(
         "paddle_bundle": {"directory": "bundle"},
         "paddle_drop_score": 0.5,
         "latency_ms": {"total": {"count": 6}},
-        "excluded_degenerate_quad_lines": [excluded],
+        "excluded_degenerate_quad_lines": [excluded, self_intersection],
     }
     monkeypatch.setattr(MODULE, "_load_selection", lambda *_, **__: fake_selection)
     monkeypatch.setattr(MODULE, "_validate_layout", lambda *_, **__: (records, layout_bindings))
@@ -425,75 +466,48 @@ def test_evaluate_reports_target_shadow_only_and_control_regression_metrics(
     assert summary["targets"] == {
         "records": 2,
         "truth_reported": False,
-        "shadow_candidate_records": 1,
+        "shadow_candidate_records": 0,
         "ambiguous_records": 0,
-        "unresolved_records": 1,
-        "by_state": {"shadow_candidate": 1, "unresolved": 1},
-        "by_shadow_route": {"full_layout_label_rhs_shadow": 1, "none": 1},
+        "unresolved_records": 2,
+        "by_state": {"unresolved": 2},
+        "by_shadow_route": {"none": 2},
     }
-    assert summary["controls"]["shadow_candidate_records"] == 3
+    assert summary["controls"]["shadow_candidate_records"] == 2
     assert summary["controls"]["shadow_exact_records"] == 2
-    assert summary["controls"]["false_positive_records"] == 1
-    assert summary["controls"]["correct_to_wrong_records"] == 1
+    assert summary["controls"]["false_positive_records"] == 0
+    assert summary["controls"]["correct_to_wrong_records"] == 0
     assert summary["controls"]["wrong_to_correct_records"] == 1
     assert summary["layout_geometry_safety"] == {
-        "intrinsically_degenerate_quad_lines": 1,
-        "records_with_intrinsically_degenerate_quad_lines": 1,
-        "order_cancellation_contract_violation_lines": 0,
-        "records_forced_candidate_ineligible": 0,
-        "maximum_allowed_exclusions": 1,
-        "non_degenerate_hull_order_cancellation_allowed": False,
-        "non_degenerate_hull_order_cancellation_canonicalized": 0,
+        "invalid_quad_contract_violation_lines": 2,
+        "records_forced_candidate_ineligible": 2,
+        "by_classification": {
+            "repeated_points": 1,
+            "self_intersects_nondegenerate_hull": 1,
+        },
+        "maximum_allowed_contract_violations": None,
+        "invalid_quad_geometry_used": False,
+        "invalid_quad_canonicalized": 0,
         "excluded_lines_candidate_eligible": False,
         "contract_violation_policy": "fail_closed_whole_record_unresolved",
-        "intrinsic_degenerate_policy": "fail_closed_exclude_line_from_labels_and_values",
+        "batch_fatal_integrity_failures": [
+            "non_finite_coordinate",
+            "normalized_quad_mismatch",
+            "rectified_or_source_bounds_violation",
+            "homography_or_projection_violation",
+            "summary_or_artifact_hash_mismatch",
+        ],
     }
     findings = [json.loads(line) for line in (output / "findings.jsonl").read_text().splitlines()]
-    assert findings[0]["shadow_candidate"] == "张三"
-    assert "恶意值" not in findings[0]["distinct_eligible_values"]
+    assert findings[0]["record_candidate_eligible"] is False
+    assert findings[0]["shadow_candidate"] is None
+    assert findings[0]["distinct_eligible_values"] == []
     assert findings[0]["excluded_degenerate_quad_lines"][0]["candidate_eligible"] is False
+    assert findings[2]["record_candidate_eligible"] is True
+    assert findings[2]["shadow_candidate"] == "张三"
+    assert findings[3]["record_candidate_eligible"] is False
+    assert findings[3]["shadow_candidate"] is None
+    assert findings[4]["record_candidate_eligible"] is True
+    assert findings[4]["shadow_candidate"] == "王五"
+    assert sum(row["shadow_candidate"] is not None for row in findings) == 2
     assert all("control_evaluation" not in row for row in findings[:2])
     assert all("external_reference" not in json.dumps(row) for row in findings[:2])
-
-    order_violation = {
-        **excluded,
-        "classification": MODULE.ORDER_CANCELLATION_CLASSIFICATION,
-        "polygon_area_pixels2": 0.0,
-        "convex_hull_area_pixels2": 100.0,
-        "producer_contract_violation": True,
-        "record_candidate_eligible": False,
-        "canonicalized": False,
-    }
-    layout_bindings["excluded_degenerate_quad_lines"] = [order_violation]
-    quarantined_output = tmp_path / "evaluation-order-quarantine"
-    MODULE.evaluate(
-        selection_directory=tmp_path,
-        layout_directory=tmp_path,
-        output_directory=quarantined_output,
-    )
-    quarantined_summary = json.loads(
-        (quarantined_output / "summary.json").read_text()
-    )
-    assert quarantined_summary["targets"]["shadow_candidate_records"] == 0
-    assert quarantined_summary["targets"]["unresolved_records"] == 2
-    assert quarantined_summary["layout_geometry_safety"] == {
-        "intrinsically_degenerate_quad_lines": 0,
-        "records_with_intrinsically_degenerate_quad_lines": 0,
-        "order_cancellation_contract_violation_lines": 1,
-        "records_forced_candidate_ineligible": 1,
-        "maximum_allowed_exclusions": 1,
-        "non_degenerate_hull_order_cancellation_allowed": False,
-        "non_degenerate_hull_order_cancellation_canonicalized": 0,
-        "excluded_lines_candidate_eligible": False,
-        "contract_violation_policy": "fail_closed_whole_record_unresolved",
-        "intrinsic_degenerate_policy": "fail_closed_exclude_line_from_labels_and_values",
-    }
-    quarantined = [
-        json.loads(line)
-        for line in (quarantined_output / "findings.jsonl").read_text().splitlines()
-    ]
-    assert quarantined[0]["record_candidate_eligible"] is False
-    assert quarantined[0]["state"] == "unresolved"
-    assert quarantined[0]["shadow_candidate"] is None
-    assert quarantined[0]["evidence"] == []
-    assert quarantined[1]["record_candidate_eligible"] is True

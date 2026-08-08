@@ -50,8 +50,9 @@ EVALUATION_SUMMARY_KIND = "receipt_mlnet_recipient_full_layout_shadow_summary_v1
 EVALUATION_RECORD_KIND = "receipt_mlnet_recipient_full_layout_shadow_record_v1"
 
 MINIMUM_LINE_CONFIDENCE = 0.80
-MAX_EXCLUDED_DEGENERATE_QUAD_LINES = 1
 ORDER_CANCELLATION_CLASSIFICATION = "order_cancels_nondegenerate_hull"
+SELF_INTERSECTION_CLASSIFICATION = "self_intersects_nondegenerate_hull"
+NONCONVEX_CLASSIFICATION = "nonconvex_nondegenerate_hull"
 LABELS = ("收款账户", "收款方", "收款人")
 LABEL_ALTERNATION = "|".join(map(re.escape, LABELS))
 LABEL_ONLY = re.compile(rf"^(?P<label>{LABEL_ALTERNATION})\s*[:：]?\s*$")
@@ -1115,10 +1116,7 @@ def _recipient_shadow_with_geometry_policy(
 ) -> tuple[dict[str, Any], bool]:
     """Apply exclusions without salvaging a contract-invalid record."""
 
-    if any(
-        item.get("classification") == ORDER_CANCELLATION_CLASSIFICATION
-        for item in excluded_lines
-    ):
+    if excluded_lines:
         return ({
             "state": "unresolved",
             "shadow_candidate": None,
@@ -1149,17 +1147,14 @@ def _validate_degenerate_exclusions(
 ) -> list[dict[str, Any]]:
     if not isinstance(excluded, list) or any(not isinstance(item, Mapping) for item in excluded):
         raise FullLayoutShadowError("layout validator did not report degenerate-line diagnostics")
-    if len(excluded) > MAX_EXCLUDED_DEGENERATE_QUAD_LINES:
-        raise FullLayoutShadowError(
-            "LayoutShadow contains more than one excluded quad line; "
-            "treating this as evidence damage instead of widening the exclusion"
-        )
     allowed_classifications = {
         "repeated_points",
         "axis_collapsed",
         "collinear_points",
         "sub_millipixel_area",
         ORDER_CANCELLATION_CLASSIFICATION,
+        SELF_INTERSECTION_CLASSIFICATION,
+        NONCONVEX_CLASSIFICATION,
     }
     seen_excluded: set[tuple[int, int]] = set()
     for item in excluded:
@@ -1185,27 +1180,50 @@ def _validate_degenerate_exclusions(
             != item.get("quad_rectified_normalized")
         ):
             raise FullLayoutShadowError("degenerate-line diagnostic differs from raw OCR record")
-        if item.get("classification") == ORDER_CANCELLATION_CLASSIFICATION:
-            polygon_area = _require_number(
-                item.get("polygon_area_pixels2"),
-                description="order-cancellation polygon area",
-                minimum=0,
+        polygon_area = _require_number(
+            item.get("polygon_area_pixels2"),
+            description="invalid-quad polygon area",
+            minimum=0,
+        )
+        hull_area = _require_number(
+            item.get("convex_hull_area_pixels2"),
+            description="invalid-quad convex-hull area",
+            minimum=0,
+        )
+        if (
+            item.get("producer_contract_violation") is not True
+            or item.get("record_candidate_eligible") is not False
+            or item.get("canonicalized") is not False
+        ):
+            raise FullLayoutShadowError(
+                "invalid-quad diagnostic does not prove fail-closed record quarantine"
             )
-            hull_area = _require_number(
-                item.get("convex_hull_area_pixels2"),
-                description="order-cancellation convex-hull area",
-                minimum=0,
-            )
-            if (
-                item.get("producer_contract_violation") is not True
-                or item.get("record_candidate_eligible") is not False
-                or item.get("canonicalized") is not False
-                or polygon_area > 1e-3
-                or hull_area <= 1e-3
+        classification = item.get("classification")
+        if classification == ORDER_CANCELLATION_CLASSIFICATION and (
+            polygon_area > 1e-3 or hull_area <= 1e-3
+        ):
+            raise FullLayoutShadowError("order-cancellation diagnostic areas are invalid")
+        if classification == SELF_INTERSECTION_CLASSIFICATION and (
+            polygon_area <= 1e-3 or hull_area <= 1e-3
+        ):
+            raise FullLayoutShadowError("self-intersection diagnostic areas are invalid")
+        if classification == NONCONVEX_CLASSIFICATION:
+            turns_raw = item.get("turn_crosses_pixels2")
+            if not isinstance(turns_raw, list) or len(turns_raw) != 4:
+                raise FullLayoutShadowError("non-convex diagnostic turns are missing")
+            turns = [
+                _require_number(value, description="non-convex turn cross")
+                for value in turns_raw
+            ]
+            turn_tolerance = max(1e-3, hull_area * 1e-9)
+            consistently_cyclic_convex = all(
+                value > turn_tolerance for value in turns
+            ) or all(value < -turn_tolerance for value in turns)
+            if polygon_area <= 1e-3 or (
+                consistently_cyclic_convex
+                and hull_area - polygon_area <= max(1e-3, hull_area * 1e-6)
             ):
-                raise FullLayoutShadowError(
-                    "order-cancellation diagnostic does not prove fail-closed record quarantine"
-                )
+                raise FullLayoutShadowError("non-convex diagnostic geometry is invalid")
     return [dict(item) for item in excluded]
 
 
@@ -1222,8 +1240,7 @@ def _validate_layout(
             selection["sources"],
             selection["source_identities"],
             missing_sets,
-            allow_intrinsically_degenerate_lines=True,
-            allow_order_cancellation_contract_violation_lines=True,
+            allow_invalid_quad_contract_violation_lines=True,
         )
     except (OSError, ValueError) as error:
         raise FullLayoutShadowError(f"LayoutShadow 339 closure is invalid: {error}") from error
@@ -1280,18 +1297,14 @@ def evaluate(
     excluded_by_record: dict[int, list[dict[str, Any]]] = defaultdict(list)
     for item in layout_bindings["excluded_degenerate_quad_lines"]:
         excluded_by_record[int(item["record_index"])].append(dict(item))
-    order_contract_violations = [
-        item
-        for item in layout_bindings["excluded_degenerate_quad_lines"]
-        if item.get("classification") == ORDER_CANCELLATION_CLASSIFICATION
-    ]
-    intrinsically_degenerate_lines = [
-        item
-        for item in layout_bindings["excluded_degenerate_quad_lines"]
-        if item.get("classification") != ORDER_CANCELLATION_CLASSIFICATION
-    ]
+    invalid_quad_contract_lines = list(
+        layout_bindings["excluded_degenerate_quad_lines"]
+    )
+    invalid_quad_classifications = Counter(
+        str(item["classification"]) for item in invalid_quad_contract_lines
+    )
     contract_invalid_records = {
-        int(item["record_index"]) for item in order_contract_violations
+        int(item["record_index"]) for item in invalid_quad_contract_lines
     }
 
     findings: list[dict[str, Any]] = []
@@ -1383,23 +1396,23 @@ def evaluate(
         "target_truth_used_for_candidate_selection": False,
         "records": EXPECTED_RECORDS,
         "layout_geometry_safety": {
-            "intrinsically_degenerate_quad_lines": len(intrinsically_degenerate_lines),
-            "records_with_intrinsically_degenerate_quad_lines": len(
-                {
-                    int(item["record_index"])
-                    for item in intrinsically_degenerate_lines
-                }
-            ),
-            "order_cancellation_contract_violation_lines": len(
-                order_contract_violations
+            "invalid_quad_contract_violation_lines": len(
+                invalid_quad_contract_lines
             ),
             "records_forced_candidate_ineligible": len(contract_invalid_records),
-            "maximum_allowed_exclusions": MAX_EXCLUDED_DEGENERATE_QUAD_LINES,
-            "non_degenerate_hull_order_cancellation_allowed": False,
-            "non_degenerate_hull_order_cancellation_canonicalized": 0,
+            "by_classification": dict(sorted(invalid_quad_classifications.items())),
+            "maximum_allowed_contract_violations": None,
+            "invalid_quad_geometry_used": False,
+            "invalid_quad_canonicalized": 0,
             "excluded_lines_candidate_eligible": False,
             "contract_violation_policy": "fail_closed_whole_record_unresolved",
-            "intrinsic_degenerate_policy": "fail_closed_exclude_line_from_labels_and_values",
+            "batch_fatal_integrity_failures": [
+                "non_finite_coordinate",
+                "normalized_quad_mismatch",
+                "rectified_or_source_bounds_violation",
+                "homography_or_projection_violation",
+                "summary_or_artifact_hash_mismatch",
+            ],
         },
         "targets": {
             "records": TARGET_RECORDS,

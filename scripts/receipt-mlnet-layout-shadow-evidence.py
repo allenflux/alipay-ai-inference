@@ -627,10 +627,10 @@ def _convex_hull_area(points: Sequence[tuple[float, float]]) -> float:
     ) / 2.0
 
 
-def _quad_has_proper_self_intersection(
+def _quad_has_self_intersection(
     points: Sequence[tuple[float, float]],
 ) -> bool:
-    """Return true only when a pair of non-adjacent edges crosses properly."""
+    """Return true when non-adjacent edges cross, touch, or overlap."""
 
     if len(points) != 4:
         return False
@@ -644,7 +644,7 @@ def _quad_has_proper_self_intersection(
             end[1] - start[1]
         ) * (point[0] - start[0])
 
-    def crosses(
+    def intersects(
         first_start: tuple[float, float],
         first_end: tuple[float, float],
         second_start: tuple[float, float],
@@ -656,16 +656,34 @@ def _quad_has_proper_self_intersection(
         second_right = cross(second_start, second_end, first_end)
 
         def strictly_opposite_sign(first: float, second: float) -> bool:
-            # Exact zero is an endpoint/collinear contact rather than a proper
-            # crossing.  Do not use an epsilon here: a near-endpoint crossing
-            # remains a real bow-tie and must stay fatal at any nonzero scale.
+            # Do not use an epsilon: a near-endpoint crossing remains a real
+            # bow-tie and must stay invalid at any nonzero scale.
             return (first < 0 < second) or (second < 0 < first)
 
-        return strictly_opposite_sign(first_left, first_right) and (
+        if strictly_opposite_sign(first_left, first_right) and (
             strictly_opposite_sign(second_left, second_right)
+        ):
+            return True
+
+        def lies_on_segment(
+            start: tuple[float, float],
+            end: tuple[float, float],
+            point: tuple[float, float],
+            orientation: float,
+        ) -> bool:
+            return orientation == 0.0 and (
+                min(start[0], end[0]) <= point[0] <= max(start[0], end[0])
+                and min(start[1], end[1]) <= point[1] <= max(start[1], end[1])
+            )
+
+        return (
+            lies_on_segment(first_start, first_end, second_start, first_left)
+            or lies_on_segment(first_start, first_end, second_end, first_right)
+            or lies_on_segment(second_start, second_end, first_start, second_left)
+            or lies_on_segment(second_start, second_end, first_end, second_right)
         )
 
-    return crosses(points[0], points[1], points[2], points[3]) or crosses(
+    return intersects(points[0], points[1], points[2], points[3]) or intersects(
         points[1], points[2], points[3], points[0]
     )
 
@@ -680,8 +698,7 @@ def _quad_geometry(
     source_width: int,
     source_height: int,
     rectified_to_source: Sequence[Sequence[float]],
-    allow_intrinsically_degenerate: bool = False,
-    allow_order_cancellation_contract_violation: bool = False,
+    allow_invalid_quad_contract_violation: bool = False,
 ) -> dict[str, Any]:
     raw = line.get("quad_rectified")
     normalized = line.get("quad_rectified_normalized")
@@ -721,17 +738,60 @@ def _quad_geometry(
         for item in range(4)
     )) / 2.0
     hull_area = _convex_hull_area(raw_points)
-    self_intersects = _quad_has_proper_self_intersection(raw_points)
+    self_intersects = _quad_has_self_intersection(raw_points)
+    turn_crosses = [
+        (
+            raw_points[(index + 1) % 4][0] - raw_points[index][0]
+        ) * (
+            raw_points[(index + 2) % 4][1]
+            - raw_points[(index + 1) % 4][1]
+        ) - (
+            raw_points[(index + 1) % 4][1] - raw_points[index][1]
+        ) * (
+            raw_points[(index + 2) % 4][0]
+            - raw_points[(index + 1) % 4][0]
+        )
+        for index in range(4)
+    ]
+    turn_tolerance = max(1e-3, hull_area * 1e-9)
+    consistently_cyclic_convex = all(
+        cross > turn_tolerance for cross in turn_crosses
+    ) or all(cross < -turn_tolerance for cross in turn_crosses)
+    unique_points = len(set(raw_points))
+    bounding_width = max(point[0] for point in raw_points) - min(
+        point[0] for point in raw_points
+    )
+    bounding_height = max(point[1] for point in raw_points) - min(
+        point[1] for point in raw_points
+    )
     degenerate_quad: dict[str, Any] | None = None
-    if polygon_area <= 1e-3:
-        # A zero shoelace area may also be caused by a bow-tie ordering over a
-        # perfectly non-degenerate point set.  That is a producer-contract
-        # violation, not a low-area DB box.  It stays fatal by default; the
-        # separate explicit mode below may only report it for whole-record
-        # quarantine and never turns the point order into usable geometry.
-        if hull_area > 1e-3 and not allow_order_cancellation_contract_violation:
+    classification: str | None = None
+    if unique_points < 4:
+        classification = "repeated_points"
+    elif bounding_width <= 1e-9 or bounding_height <= 1e-9:
+        classification = "axis_collapsed"
+    elif hull_area <= 1e-9:
+        classification = "collinear_points"
+    elif polygon_area <= 1e-3 and hull_area > 1e-3:
+        classification = "order_cancels_nondegenerate_hull"
+    elif polygon_area <= 1e-3:
+        classification = "sub_millipixel_area"
+    elif self_intersects:
+        classification = "self_intersects_nondegenerate_hull"
+    elif not consistently_cyclic_convex or (
+        hull_area - polygon_area > max(1e-3, hull_area * 1e-6)
+    ):
+        # A cyclic convex quadrilateral has the same shoelace and convex-hull
+        # area in either traversal direction.  A material gap proves that a
+        # four-point DB rectangle contract became concave/non-convex; retain
+        # only the diagnostic and quarantine its complete record.
+        classification = "nonconvex_nondegenerate_hull"
+
+    if classification is not None:
+        if not allow_invalid_quad_contract_violation:
             diagnostic = json.dumps(
                 {
+                    "classification": classification,
                     "quad_rectified": [list(point) for point in raw_points],
                     "polygon_area_pixels2": polygon_area,
                     "convex_hull_area_pixels2": hull_area,
@@ -740,31 +800,17 @@ def _quad_geometry(
                 allow_nan=False,
                 separators=(",", ":"),
             )
+            if classification == "order_cancels_nondegenerate_hull":
+                message = "quad order cancels a non-degenerate hull"
+            elif classification == "self_intersects_nondegenerate_hull":
+                message = "quad is self-intersecting with nonzero ordered area"
+            elif classification == "nonconvex_nondegenerate_hull":
+                message = "quad is non-convex relative to its hull"
+            else:
+                message = "quad is degenerate"
             raise EvidenceError(
-                f"layout record[{record_index}] line[{line_index}] quad order "
-                f"cancels a non-degenerate hull: {diagnostic}"
+                f"layout record[{record_index}] line[{line_index}] {message}: {diagnostic}"
             )
-        if hull_area <= 1e-3 and not allow_intrinsically_degenerate:
-            raise EvidenceError(
-                f"layout record[{record_index}] line[{line_index}] quad is degenerate"
-            )
-        unique_points = len(set(raw_points))
-        bounding_width = max(point[0] for point in raw_points) - min(
-            point[0] for point in raw_points
-        )
-        bounding_height = max(point[1] for point in raw_points) - min(
-            point[1] for point in raw_points
-        )
-        if hull_area > 1e-3:
-            classification = "order_cancels_nondegenerate_hull"
-        elif unique_points < 4:
-            classification = "repeated_points"
-        elif bounding_width <= 1e-9 or bounding_height <= 1e-9:
-            classification = "axis_collapsed"
-        elif hull_area <= 1e-9:
-            classification = "collinear_points"
-        else:
-            classification = "sub_millipixel_area"
         degenerate_quad = {
             "classification": classification,
             "polygon_area_pixels2": polygon_area,
@@ -773,34 +819,12 @@ def _quad_geometry(
             "bounding_width_pixels": bounding_width,
             "bounding_height_pixels": bounding_height,
             "candidate_eligible": False,
+            "producer_contract_violation": True,
+            "record_candidate_eligible": False,
+            "canonicalized": False,
         }
-        if classification == "order_cancels_nondegenerate_hull":
-            # The producer declares TL/TR/BR/BL.  Preserve the raw evidence,
-            # but never reinterpret or canonicalize this non-cyclic order.
-            # A caller opting into this diagnostic must quarantine the whole
-            # record rather than merely removing this line.
-            degenerate_quad.update(
-                {
-                    "producer_contract_violation": True,
-                    "record_candidate_eligible": False,
-                    "canonicalized": False,
-                }
-            )
-    elif self_intersects:
-        diagnostic = json.dumps(
-            {
-                "quad_rectified": [list(point) for point in raw_points],
-                "polygon_area_pixels2": polygon_area,
-                "convex_hull_area_pixels2": hull_area,
-            },
-            ensure_ascii=False,
-            allow_nan=False,
-            separators=(",", ":"),
-        )
-        raise EvidenceError(
-            f"layout record[{record_index}] line[{line_index}] quad is "
-            f"self-intersecting with nonzero ordered area: {diagnostic}"
-        )
+        if classification == "nonconvex_nondegenerate_hull":
+            degenerate_quad["turn_crosses_pixels2"] = turn_crosses
     source_normalized = [
         (
             min(1.0, max(0.0, x / (source_width - 1))),
@@ -1192,8 +1216,7 @@ def _validate_layout(
     source_identities: Sequence[Mapping[str, Any]],
     missing_sets: Mapping[str, set[str]],
     *,
-    allow_intrinsically_degenerate_lines: bool = False,
-    allow_order_cancellation_contract_violation_lines: bool = False,
+    allow_invalid_quad_contract_violation_lines: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     summary_path = layout_directory / "summary.json"
     records_path = layout_directory / "records.jsonl"
@@ -1345,9 +1368,8 @@ def _validate_layout(
                 source_width=source_width,
                 source_height=source_height,
                 rectified_to_source=rectified_to_source,
-                allow_intrinsically_degenerate=allow_intrinsically_degenerate_lines,
-                allow_order_cancellation_contract_violation=(
-                    allow_order_cancellation_contract_violation_lines
+                allow_invalid_quad_contract_violation=(
+                    allow_invalid_quad_contract_violation_lines
                 ),
             )
             prepared = dict(line)
@@ -1395,13 +1417,11 @@ def _validate_layout(
             _require_number(timing.get(stage), description=f"layout timing {stage}", minimum=0)
 
         source_key = _path_key(source)
-        record_has_order_contract_violation = any(
-            line["_geometry"].get("degenerate_quad", {}).get("classification")
-            == "order_cancels_nondegenerate_hull"
+        record_has_invalid_quad_contract = any(
+            isinstance(line["_geometry"].get("degenerate_quad"), Mapping)
             for line in prepared_lines
-            if isinstance(line["_geometry"].get("degenerate_quad"), Mapping)
         )
-        analysis_lines = [] if record_has_order_contract_violation else [
+        analysis_lines = [] if record_has_invalid_quad_contract else [
             line
             for line in prepared_lines
             if line["_geometry"].get("degenerate_quad") is None
@@ -1429,16 +1449,7 @@ def _validate_layout(
         "paddle_drop_score": drop_score,
         "layout_latency_ms": summary.get("latency_ms"),
     }
-    if allow_intrinsically_degenerate_lines:
-        bindings["excluded_intrinsically_degenerate_lines"] = [
-            item
-            for item in degenerate_lines
-            if item.get("classification") != "order_cancels_nondegenerate_hull"
-        ]
-    if (
-        allow_intrinsically_degenerate_lines
-        or allow_order_cancellation_contract_violation_lines
-    ):
+    if allow_invalid_quad_contract_violation_lines:
         bindings["excluded_quad_contract_lines"] = degenerate_lines
     return evidence_rows, bindings
 
