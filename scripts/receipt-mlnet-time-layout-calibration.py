@@ -1526,6 +1526,7 @@ def _load_layout_shard(
         summary.get("paddle_bundle"), shard_index=shard_index
     )
     analyzed: list[dict[str, Any]] = []
+    invalid_quad_contract_lines: list[dict[str, Any]] = []
     timing_by_stage: dict[str, list[float]] = {
         "image_load": [], "rectification": [], "layout_ocr": [], "total": [],
     }
@@ -1590,6 +1591,7 @@ def _load_layout_shard(
         if not isinstance(lines, list) or record.get("raw_line_count") != len(lines):
             raise CalibrationError(f"layout shard {shard_index} record[{index}] lines differ")
         prepared_lines: list[dict[str, Any]] = []
+        record_invalid_quad_contract_lines: list[dict[str, Any]] = []
         for line_index, line in enumerate(lines):
             if not isinstance(line, dict) or line.get("index") != line_index \
                     or not isinstance(line.get("text"), str):
@@ -1603,9 +1605,26 @@ def _load_layout_shard(
                 rectified_width=rw, rectified_height=rh,
                 source_width=sw, source_height=sh,
                 rectified_to_source=inverse,
+                allow_invalid_quad_contract_violation=True,
             )
             item["_rotation_degrees"] = rotation
             prepared_lines.append(item)
+            invalid_quad = item["_geometry"].get("degenerate_quad")
+            if isinstance(invalid_quad, Mapping):
+                diagnostic = {
+                    "shard_index": shard_index,
+                    "record_index": index,
+                    "line_index": line_index,
+                    "source": source,
+                    "text": line["text"],
+                    "confidence": confidence,
+                    "passes_drop_score": line["passes_drop_score"],
+                    "quad_rectified": line.get("quad_rectified"),
+                    "quad_rectified_normalized": line.get("quad_rectified_normalized"),
+                    **dict(invalid_quad),
+                }
+                record_invalid_quad_contract_lines.append(diagnostic)
+                invalid_quad_contract_lines.append(diagnostic)
         accepted = [line for line in prepared_lines if line["passes_drop_score"]]
         if record.get("accepted_line_count") != len(accepted):
             raise CalibrationError("layout accepted_line_count differs")
@@ -1627,13 +1646,26 @@ def _load_layout_shard(
                 observed_confidence, expected_confidence, rel_tol=0, abs_tol=2e-6
             ):
                 raise CalibrationError("layout accepted_confidence projection differs")
-        time_evidence = LAYOUT_EVIDENCE._time_evidence(prepared_lines)
-        strict_anchors = [
-            anchor for anchor in time_evidence["anchors"]
-            if anchor["status_bar_geometry_evidence"] and anchor["passes_drop_score"]
-        ]
-        candidate = strict_anchors[0]["visible_clock"] \
-            if time_evidence["unique_diagnostic_coverage"] and len(strict_anchors) == 1 else None
+        if record_invalid_quad_contract_lines:
+            # A malformed DB quadrilateral makes the producer's line geometry
+            # contract unreliable for the complete receipt.  Keep the receipt
+            # in the calibration denominator, but do not derive a candidate
+            # from any other line in that record.
+            time_evidence = LAYOUT_EVIDENCE._time_evidence(())
+            time_evidence["ambiguity"] = "invalid_quad_contract_record_quarantined"
+            time_evidence["record_candidate_eligible"] = False
+            time_evidence["invalid_quad_contract_lines"] = record_invalid_quad_contract_lines
+            candidate = None
+        else:
+            time_evidence = LAYOUT_EVIDENCE._time_evidence(prepared_lines)
+            time_evidence["record_candidate_eligible"] = True
+            time_evidence["invalid_quad_contract_lines"] = []
+            strict_anchors = [
+                anchor for anchor in time_evidence["anchors"]
+                if anchor["status_bar_geometry_evidence"] and anchor["passes_drop_score"]
+            ]
+            candidate = strict_anchors[0]["visible_clock"] \
+                if time_evidence["unique_diagnostic_coverage"] and len(strict_anchors) == 1 else None
         analyzed.append({
             "source": source,
             "source_image_sha256": source_identity["sha256"],
@@ -1642,6 +1674,7 @@ def _load_layout_shard(
             "rotation_degrees": rotation,
             "source_width": sw,
             "source_height": sh,
+            "invalid_quad_contract_lines": record_invalid_quad_contract_lines,
         })
         timing = record.get("timing_ms")
         if not isinstance(timing, Mapping):
@@ -1654,6 +1687,9 @@ def _load_layout_shard(
     _validate_latency_summary(
         summary.get("latency_ms"), timing_by_stage, shard_index=shard_index
     )
+    invalid_classifications = Counter(
+        str(item["classification"]) for item in invalid_quad_contract_lines
+    )
     return analyzed, {
         "summary": summary_identity,
         "records": records_identity,
@@ -1662,6 +1698,17 @@ def _load_layout_shard(
         "paddle_drop_score": drop_score,
         "bound_files": bundle_bindings,
         "cpu_latency_ms": _latency(timing_by_stage["total"]),
+        "layout_geometry_safety": {
+            "invalid_quad_contract_violation_lines": len(invalid_quad_contract_lines),
+            "records_forced_candidate_ineligible": len({
+                (int(item["shard_index"]), int(item["record_index"]))
+                for item in invalid_quad_contract_lines
+            }),
+            "by_classification": dict(sorted(invalid_classifications.items())),
+            "invalid_quad_geometry_used": False,
+            "invalid_quad_canonicalized": 0,
+            "contract_violation_policy": "fail_closed_whole_record_unresolved",
+        },
     }, timing_by_stage["total"]
 
 
@@ -1749,6 +1796,7 @@ def evaluate(
         reference = truth["reference_text"]
         exact = candidate == reference if candidate is not None else False
         old_exact = truth["old_v13_raw_exact"] is True
+        invalid_quad_lines = observed["invalid_quad_contract_lines"]
         comparisons.append({
             "schema_version": 1,
             "kind": COMPARISON_KIND,
@@ -1773,6 +1821,8 @@ def evaluate(
             "rotation_changed": observed["rotation_degrees"] != truth["rotation_degrees"],
             "size_bin": truth["size_bin"],
             "route_ambiguity": observed["time_evidence"]["ambiguity"],
+            "layout_record_quarantined": bool(invalid_quad_lines),
+            "invalid_quad_contract_lines": invalid_quad_lines,
             "cpu_latency_ms": observed["cpu_latency_ms"],
         })
     grouped: dict[str, Any] = {}
@@ -1786,6 +1836,14 @@ def evaluate(
         grouped[field] = {key: _metrics(rows) for key, rows in sorted(values.items())}
     comparison_bytes = _jsonl_bytes(comparisons)
     errors = [row for row in comparisons if not row["raw_exact"]]
+    quarantined_records = sum(
+        row["layout_record_quarantined"] for row in comparisons
+    )
+    invalid_classifications = Counter(
+        str(item["classification"])
+        for row in comparisons
+        for item in row["invalid_quad_contract_lines"]
+    )
     summary = {
         "schema_version": 1,
         "kind": EVALUATE_KIND,
@@ -1807,6 +1865,17 @@ def evaluate(
         "cpu_latency_ms": _latency(timings),
         "cpu_latency_ms_by_shard": [evidence["cpu_latency_ms"] for evidence in layout_evidence],
         "rotation_changed_records": sum(row["rotation_changed"] for row in comparisons),
+        "layout_geometry_safety": {
+            "invalid_quad_contract_violation_lines": sum(
+                len(row["invalid_quad_contract_lines"]) for row in comparisons
+            ),
+            "records_forced_candidate_ineligible": quarantined_records,
+            "by_classification": dict(sorted(invalid_classifications.items())),
+            "invalid_quad_geometry_used": False,
+            "invalid_quad_canonicalized": 0,
+            "contract_violation_policy": "fail_closed_whole_record_unresolved",
+            "quarantined_records_remain_in_accuracy_denominator": True,
+        },
         "error_examples": [
             {
                 key: row[key]

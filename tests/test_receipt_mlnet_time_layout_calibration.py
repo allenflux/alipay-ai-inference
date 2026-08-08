@@ -491,6 +491,35 @@ def _write_layout(
     })
 
 
+def _replace_layout_line_quad(
+    output: Path,
+    *,
+    record_index: int,
+    line_index: int,
+    quad: list[list[float]],
+) -> None:
+    records_path = output / "records.jsonl"
+    rows = [
+        json.loads(line)
+        for line in records_path.read_text(encoding="utf-8").splitlines()
+    ]
+    line = rows[record_index]["lines"][line_index]
+    line["quad_rectified"] = quad
+    line["quad_rectified_normalized"] = [
+        [point[0] / 999.0, point[1] / 1599.0]
+        for point in quad
+    ]
+    _write_jsonl(records_path, rows)
+    summary_path = output / "summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    identity = _identity(records_path)
+    summary["artifacts"]["records_jsonl"].update({
+        "sha256": identity["sha256"],
+        "size_bytes": identity["size_bytes"],
+    })
+    _write_json(summary_path, summary)
+
+
 def test_prepare_and_evaluate_two_frozen_shards(formal_fixture: dict[str, Any]) -> None:
     prepared = formal_fixture["root"] / "prepared"
     result = _prepare(formal_fixture, prepared)
@@ -540,6 +569,80 @@ def test_prepare_and_evaluate_two_frozen_shards(formal_fixture: dict[str, Any]) 
     assert evaluated["candidate_write_enabled"] is False
     assert evaluated["formal_delivery_gate"] is False
     assert evaluated["source_score_disposition"]["source_score_formal_delivery_gate"] is False
+
+
+def test_evaluate_quarantines_complete_record_with_invalid_quad_contract(
+    formal_fixture: dict[str, Any],
+) -> None:
+    prepared = formal_fixture["root"] / "prepared-invalid-quad"
+    _prepare(formal_fixture, prepared)
+    bundle = _bundle(formal_fixture["root"] / "bundle-invalid-quad")
+    layout_0 = formal_fixture["root"] / "layout-invalid-quad-0"
+    layout_1 = formal_fixture["root"] / "layout-invalid-quad-1"
+    _write_layout(layout_0, prepared, 0, bundle)
+    _write_layout(layout_1, prepared, 1, bundle)
+    # Keep the valid clock line intact and corrupt an unrelated accepted body
+    # line.  The complete record must still be candidate-ineligible.
+    _replace_layout_line_quad(
+        layout_0,
+        record_index=0,
+        line_index=1,
+        quad=[[306.0, 25.0], [292.0, 140.0], [321.0, 140.0], [306.0, 155.0]],
+    )
+
+    output = formal_fixture["root"] / "evaluated-invalid-quad"
+    evaluated = MODULE.evaluate(
+        prepared_directory=prepared,
+        layout_shard_0=layout_0,
+        layout_shard_1=layout_1,
+        output_directory=output,
+    )
+    comparisons = [
+        json.loads(line)
+        for line in (output / "comparisons.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    quarantined = [row for row in comparisons if row["layout_record_quarantined"]]
+    assert len(quarantined) == 1
+    assert quarantined[0]["candidate_text"] is None
+    assert quarantined[0]["candidate_present"] is False
+    assert quarantined[0]["route_ambiguity"] == "invalid_quad_contract_record_quarantined"
+    assert quarantined[0]["invalid_quad_contract_lines"][0]["classification"] \
+        == "self_intersects_nondegenerate_hull"
+    assert evaluated["overall"]["candidate_records"] == 5
+    assert evaluated["layout_geometry_safety"] == {
+        "invalid_quad_contract_violation_lines": 1,
+        "records_forced_candidate_ineligible": 1,
+        "by_classification": {"self_intersects_nondegenerate_hull": 1},
+        "invalid_quad_geometry_used": False,
+        "invalid_quad_canonicalized": 0,
+        "contract_violation_policy": "fail_closed_whole_record_unresolved",
+        "quarantined_records_remain_in_accuracy_denominator": True,
+    }
+
+
+def test_evaluate_still_rejects_out_of_bounds_quad(
+    formal_fixture: dict[str, Any],
+) -> None:
+    prepared = formal_fixture["root"] / "prepared-out-of-bounds"
+    _prepare(formal_fixture, prepared)
+    bundle = _bundle(formal_fixture["root"] / "bundle-out-of-bounds")
+    layout_0 = formal_fixture["root"] / "layout-out-of-bounds-0"
+    layout_1 = formal_fixture["root"] / "layout-out-of-bounds-1"
+    _write_layout(layout_0, prepared, 0, bundle)
+    _write_layout(layout_1, prepared, 1, bundle)
+    _replace_layout_line_quad(
+        layout_0,
+        record_index=0,
+        line_index=1,
+        quad=[[-1.0, 25.0], [30.0, 25.0], [30.0, 40.0], [-1.0, 40.0]],
+    )
+    with pytest.raises(ValueError, match="quad x"):
+        MODULE.evaluate(
+            prepared_directory=prepared,
+            layout_shard_0=layout_0,
+            layout_shard_1=layout_1,
+            output_directory=formal_fixture["root"] / "out-of-bounds-output",
+        )
 
 
 def test_prepare_rejects_duplicate_nonstrict_score_row(formal_fixture: dict[str, Any]) -> None:
