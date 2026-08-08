@@ -107,6 +107,7 @@ INIT_CHECKPOINT_MODE_RECIPIENT_INPUT_WIDTH_EXPANSION = "recipient_input_width_ex
 INIT_CHECKPOINT_MODE_RECIPIENT_CAPACITY_REINIT = "recipient_capacity_reinit"
 INIT_CHECKPOINT_MODE_RECIPIENT_OPEN_TEXT_ADAPTER = "recipient_open_text_adapter"
 INIT_CHECKPOINT_MODE_RECIPIENT_VISUAL_CONTEXT_REINIT = "recipient_visual_context_reinit"
+INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_WARMSTART = "recipient_full_crop_warmstart"
 INIT_CHECKPOINT_MODES = frozenset(
     (
         INIT_CHECKPOINT_MODE_STRICT,
@@ -115,6 +116,7 @@ INIT_CHECKPOINT_MODES = frozenset(
         INIT_CHECKPOINT_MODE_RECIPIENT_CAPACITY_REINIT,
         INIT_CHECKPOINT_MODE_RECIPIENT_OPEN_TEXT_ADAPTER,
         INIT_CHECKPOINT_MODE_RECIPIENT_VISUAL_CONTEXT_REINIT,
+        INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_WARMSTART,
     )
 )
 RECIPIENT_ONLY_INIT_CHECKPOINT_MODES = frozenset(
@@ -124,6 +126,7 @@ RECIPIENT_ONLY_INIT_CHECKPOINT_MODES = frozenset(
         INIT_CHECKPOINT_MODE_RECIPIENT_CAPACITY_REINIT,
         INIT_CHECKPOINT_MODE_RECIPIENT_OPEN_TEXT_ADAPTER,
         INIT_CHECKPOINT_MODE_RECIPIENT_VISUAL_CONTEXT_REINIT,
+        INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_WARMSTART,
     )
 )
 # These are the mature text heads that must not silently regress while a
@@ -1364,6 +1367,31 @@ def _recipient_train_split_policy(splits: Sequence[str]) -> dict[str, object]:
             "not independent generalisation."
         ),
     }
+
+
+def _require_manifest_without_test_rows(path: Path) -> None:
+    """Reject a full-crop training input before the model loader sees test labels."""
+
+    source = Path(path).expanduser().resolve()
+    if not source.is_file():
+        raise FileNotFoundError(source)
+    with source.open("r", encoding="utf-8") as stream:
+        for line_number, line in enumerate(stream, start=1):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise ValueError(f"{source}:{line_number}: invalid JSON") from error
+            if not isinstance(row, Mapping):
+                raise ValueError(f"{source}:{line_number}: record must be an object")
+            split = row.get("split")
+            if split not in {"train", "val"}:
+                if split == "test":
+                    raise ValueError(
+                        "recipient_full_crop_warmstart requires a manifest that physically excludes test rows"
+                    )
+                raise ValueError(f"{source}:{line_number}: invalid split {split!r}")
 
 
 def _validate_recipient_sampling_policy(policy: object) -> dict[str, object]:
@@ -5822,6 +5850,79 @@ def _validate_recipient_visual_context_reinit_config(
         )
 
 
+def _validate_recipient_full_crop_warmstart_config(
+    source_config: UnifiedReaderConfig,
+    target_config: UnifiedReaderConfig,
+) -> None:
+    """Permit exactly the v13 recipient-view change proven by the pilot.
+
+    The full-crop experiment is a preprocessing intervention, not another
+    architecture sweep.  It therefore keeps the v13 ONNX ABI and every model
+    field byte-compatible with the seed while changing only the recipient
+    high-resolution view from the historical 30 percent left trim to the
+    complete production detector crop.  Learned tensors are copied by
+    character in the same way as the established recipient-only expansion.
+    """
+
+    if not (_is_v13(source_config) and _is_v13(target_config)):
+        raise ValueError("recipient_full_crop_warmstart requires v13 source and target configs")
+    if not math.isclose(
+        source_config.recipient_value_left_trim,
+        0.30,
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    ):
+        raise ValueError("recipient_full_crop_warmstart requires a 0.30-trim v13 seed")
+    if not math.isclose(
+        target_config.recipient_value_left_trim,
+        0.0,
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    ):
+        raise ValueError("recipient_full_crop_warmstart requires target recipient_value_left_trim=0")
+    source_values = asdict(source_config)
+    target_values = asdict(target_config)
+    changed = [
+        key
+        for key in sorted(source_values)
+        if key != "recipient_value_left_trim" and source_values[key] != target_values.get(key)
+    ]
+    if changed:
+        raise ValueError(
+            "recipient_full_crop_warmstart may change only recipient_value_left_trim; "
+            f"incompatible config fields: {', '.join(changed)}"
+        )
+
+
+def _validate_recipient_full_crop_seed_policy(payload: Mapping[str, object]) -> None:
+    """Require proof that the warm-start recipient weights are train-only.
+
+    A physically blind train/validation manifest is not sufficient when the
+    starting recipient branch may itself have been optimised on validation or
+    test teacher labels.  Full-crop is an analysis of a preprocessing change,
+    so it must fail closed unless the checkpoint records the standard
+    train-only recipient supervision policy.
+    """
+
+    if payload.get("kind") != KIND_V13:
+        raise ValueError("recipient_full_crop_warmstart requires a v13 seed checkpoint")
+    policy = payload.get("recipient_train_split_policy")
+    if not isinstance(policy, Mapping):
+        raise ValueError(
+            "recipient_full_crop_warmstart seed does not prove train-only recipient supervision"
+        )
+    splits = policy.get("splits")
+    if (
+        policy.get("mode") != "standard_train_only"
+        or not isinstance(splits, Sequence)
+        or isinstance(splits, (str, bytes))
+        or list(splits) != ["train"]
+    ):
+        raise ValueError(
+            "recipient_full_crop_warmstart seed does not prove train-only recipient supervision"
+        )
+
+
 def _recipient_only_expansion_label_override(
     *,
     init_checkpoint: Path,
@@ -5847,12 +5948,13 @@ def _recipient_only_expansion_label_override(
     """
     if init_checkpoint_mode not in RECIPIENT_ONLY_INIT_CHECKPOINT_MODES:
         raise ValueError("recipient label override requires a recipient-only expansion init mode")
-    v13_visual_context_reinit = _is_v13(config) and (
-        init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_VISUAL_CONTEXT_REINIT
-    )
-    if not (_is_v12(config) or v13_visual_context_reinit):
+    v13_recipient_private_mode = _is_v13(config) and init_checkpoint_mode in {
+        INIT_CHECKPOINT_MODE_RECIPIENT_VISUAL_CONTEXT_REINIT,
+        INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_WARMSTART,
+    }
+    if not (_is_v12(config) or v13_recipient_private_mode):
         raise ValueError(
-            "recipient-only expansion is supported by architecture v12, or by v13 visual-context reinitialisation"
+            "recipient-only expansion is supported by architecture v12, or by an audited v13 private-recipient mode"
         )
     if recipient_characters is None or payment_bank_prefix_classes is None:
         raise ValueError("recipient_only_expansion requires v12 recipient and payment bank label maps")
@@ -5860,6 +5962,8 @@ def _recipient_only_expansion_label_override(
     if not checkpoint_path.is_file():
         raise FileNotFoundError(checkpoint_path)
     payload = _load_checkpoint(checkpoint_path, torch=torch)
+    if init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_WARMSTART:
+        _validate_recipient_full_crop_seed_policy(payload)
     source_config = _checkpoint_config(payload)
     if init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_INPUT_WIDTH_EXPANSION:
         # Validate even when the two dataclasses compare equal: this mode is a
@@ -5873,6 +5977,8 @@ def _recipient_only_expansion_label_override(
         _validate_recipient_open_text_adapter_config(source_config, config)
     elif init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_VISUAL_CONTEXT_REINIT:
         _validate_recipient_visual_context_reinit_config(source_config, config)
+    elif init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_WARMSTART:
+        _validate_recipient_full_crop_warmstart_config(source_config, config)
     elif source_config != config:
         raise ValueError(
             "init checkpoint model config does not match the requested training config; "
@@ -5923,7 +6029,12 @@ def _recipient_only_expansion_label_override(
                         else (
                             "checkpoint_financial_label_maps_recipient_open_text_adapter_v1"
                             if init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_OPEN_TEXT_ADAPTER
-                            else "checkpoint_financial_label_maps_v1"
+                            else (
+                                "checkpoint_financial_label_maps_recipient_full_crop_warmstart_v1"
+                                if init_checkpoint_mode
+                                == INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_WARMSTART
+                                else "checkpoint_financial_label_maps_v1"
+                            )
                         )
                     )
                 )
@@ -5941,6 +6052,14 @@ def _recipient_only_expansion_label_override(
                     INIT_CHECKPOINT_MODE_RECIPIENT_INPUT_WIDTH_EXPANSION,
                     INIT_CHECKPOINT_MODE_RECIPIENT_OPEN_TEXT_ADAPTER,
                 }
+                else {}
+            ),
+            **(
+                {
+                    "source_recipient_value_left_trim": source_config.recipient_value_left_trim,
+                    "target_recipient_value_left_trim": config.recipient_value_left_trim,
+                }
+                if init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_WARMSTART
                 else {}
             ),
             "payment_character_map": _label_map_provenance(
@@ -6329,6 +6448,8 @@ def _parameter_only_initialization(
     if not checkpoint_path.is_file():
         raise FileNotFoundError(checkpoint_path)
     payload = _load_checkpoint(checkpoint_path, torch=torch)
+    if init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_WARMSTART:
+        _validate_recipient_full_crop_seed_policy(payload)
     source_config = _checkpoint_config(payload)
     v12_status_text_expansion = (
         allow_v12_status_text_expansion and _is_v12(source_config) and _is_v13(config)
@@ -6344,6 +6465,8 @@ def _parameter_only_initialization(
         _validate_recipient_open_text_adapter_config(source_config, config)
     elif init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_VISUAL_CONTEXT_REINIT:
         _validate_recipient_visual_context_reinit_config(source_config, config)
+    elif init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_WARMSTART:
+        _validate_recipient_full_crop_warmstart_config(source_config, config)
     elif v12_status_text_expansion:
         source_values = asdict(source_config)
         target_values = asdict(config)
@@ -6400,6 +6523,15 @@ def _parameter_only_initialization(
         "source_config": asdict(source_config),
         "optimizer_restored": False,
         "epoch_reset": True,
+        **(
+            {
+                "source_recipient_train_split_policy": dict(
+                    payload["recipient_train_split_policy"]
+                )
+            }
+            if init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_WARMSTART
+            else {}
+        ),
     }
     if v12_status_text_expansion:
         if target_state_dict is None:
@@ -6465,12 +6597,13 @@ def _parameter_only_initialization(
             raise ValueError("init checkpoint status-text character map does not match the current training data")
         return state_dict, initialization
 
-    v13_visual_context_reinit = _is_v13(config) and (
-        init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_VISUAL_CONTEXT_REINIT
-    )
-    if not (_is_v12(config) or v13_visual_context_reinit):
+    v13_recipient_private_mode = _is_v13(config) and init_checkpoint_mode in {
+        INIT_CHECKPOINT_MODE_RECIPIENT_VISUAL_CONTEXT_REINIT,
+        INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_WARMSTART,
+    }
+    if not (_is_v12(config) or v13_recipient_private_mode):
         raise ValueError(
-            "recipient-only expansion init modes require architecture v12, or v13 visual-context reinitialisation"
+            "recipient-only expansion init modes require architecture v12, or an audited v13 private-recipient mode"
         )
     if source_recipient_characters is None or recipient_characters is None:
         raise ValueError("init checkpoint recipient character map does not match the current training data")
@@ -6542,7 +6675,11 @@ def _parameter_only_initialization(
             "mode": (
                 "parameter_only_recipient_input_width_expansion"
                 if init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_INPUT_WIDTH_EXPANSION
-                else "parameter_only_recipient_unicode_expansion"
+                else (
+                    "parameter_only_recipient_full_crop_warmstart"
+                    if init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_WARMSTART
+                    else "parameter_only_recipient_unicode_expansion"
+                )
             ),
             "init_checkpoint_mode": init_checkpoint_mode,
             "recipient_classifier_row_mapping": row_mapping,
@@ -6552,6 +6689,14 @@ def _parameter_only_initialization(
                     "target_recipient_input_width": config.recipient_input_width,
                 }
                 if init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_INPUT_WIDTH_EXPANSION
+                else {}
+            ),
+            **(
+                {
+                    "source_recipient_value_left_trim": source_config.recipient_value_left_trim,
+                    "target_recipient_value_left_trim": config.recipient_value_left_trim,
+                }
+                if init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_WARMSTART
                 else {}
             ),
         }
@@ -6677,7 +6822,11 @@ def _validate_validation_every(
         and init_checkpoint_mode in RECIPIENT_ONLY_INIT_CHECKPOINT_MODES
         and (
             _is_v12(config)
-            or init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_VISUAL_CONTEXT_REINIT
+            or init_checkpoint_mode
+            in {
+                INIT_CHECKPOINT_MODE_RECIPIENT_VISUAL_CONTEXT_REINIT,
+                INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_WARMSTART,
+            }
         )
     )
     status_text_private_safe = _is_v13(config) and status_text_only_fine_tune
@@ -6853,6 +7002,11 @@ def train_unified_reader(
         if init_checkpoint is None:
             raise ValueError("status_text_only_fine_tune requires a compatible v12 or v13 --init-checkpoint")
     recipient_train_split_policy = _recipient_train_split_policy(recipient_train_splits)
+    if (
+        init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_WARMSTART
+        and recipient_train_split_policy["mode"] != "standard_train_only"
+    ):
+        raise ValueError("recipient_full_crop_warmstart permits train-split supervision only")
     if recipient_only_fine_tune:
         if not _uses_v12_recipient_topology(config):
             raise ValueError("recipient_only_fine_tune is supported only by architecture v12 or v13")
@@ -6874,13 +7028,14 @@ def train_unified_reader(
             f"{', '.join(sorted(INIT_CHECKPOINT_MODES))}"
         )
     if init_checkpoint_mode in RECIPIENT_ONLY_INIT_CHECKPOINT_MODES:
-        v13_visual_context_reinit = _is_v13(config) and (
-            init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_VISUAL_CONTEXT_REINIT
-        )
-        if not recipient_only_fine_tune or not (_is_v12(config) or v13_visual_context_reinit):
+        v13_recipient_private_mode = _is_v13(config) and init_checkpoint_mode in {
+            INIT_CHECKPOINT_MODE_RECIPIENT_VISUAL_CONTEXT_REINIT,
+            INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_WARMSTART,
+        }
+        if not recipient_only_fine_tune or not (_is_v12(config) or v13_recipient_private_mode):
             raise ValueError(
                 "recipient-only expansion init modes require v12 recipient_only_fine_tune, "
-                "or v13 recipient visual-context reinitialisation"
+                "or a compatible v13 private-recipient warm start"
             )
         if init_checkpoint is None:
             raise ValueError("recipient-only expansion init modes require a compatible --init-checkpoint")
@@ -6984,6 +7139,8 @@ def train_unified_reader(
     output_dir = output_dir.resolve()
     if output_dir.exists() and any(output_dir.iterdir()):
         raise ValueError(f"training output already contains files: {output_dir}. Choose a new empty directory.")
+    if init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_WARMSTART:
+        _require_manifest_without_test_rows(records_path)
     records = load_records(records_path, dataset_root=dataset_root, config=config)
     train_records = [record for record in records if record["split"] == "train"]
     validation_records = [record for record in records if record["split"] == "val"]
@@ -7408,10 +7565,20 @@ def train_unified_reader(
     frozen_non_recipient_parameter_snapshot: dict[str, bytes] | None = None
     frozen_non_status_text_parameter_snapshot: dict[str, bytes] | None = None
     if (
-        validation_every > 1
-        and init_checkpoint_mode in RECIPIENT_ONLY_INIT_CHECKPOINT_MODES
+        (
+            validation_every > 1
+            and init_checkpoint_mode in RECIPIENT_ONLY_INIT_CHECKPOINT_MODES
+        )
+        or init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_WARMSTART
     ):
         frozen_non_recipient_parameter_snapshot = _non_recipient_parameter_bytes(model)
+        fine_tune_policy = {
+            **fine_tune_policy,
+            "frozen_non_recipient_byte_guard": "before_every_full_validation",
+            "frozen_non_recipient_state_entry_count": len(
+                frozen_non_recipient_parameter_snapshot
+            ),
+        }
     if status_text_only_fine_tune:
         frozen_non_status_text_parameter_snapshot = _non_status_text_parameter_bytes(model)
 
@@ -7497,10 +7664,13 @@ def train_unified_reader(
     if init_checkpoint_mode in {
         INIT_CHECKPOINT_MODE_RECIPIENT_INPUT_WIDTH_EXPANSION,
         INIT_CHECKPOINT_MODE_RECIPIENT_OPEN_TEXT_ADAPTER,
+        INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_WARMSTART,
     }:
         # Measure and persist the exact transplanted model as epoch zero so a
         # pilot cannot silently return a checkpoint worse than its own safe
-        # starting point.  The adapter route must be decision-identical here.
+        # starting point.  The adapter route must be decision-identical here;
+        # the full-crop route records the deliberate preprocessing change as
+        # its own epoch-zero baseline before any optimiser update.
         if init_checkpoint is None:
             raise AssertionError(f"{init_checkpoint_mode} has no seed checkpoint")
         initialization_started = perf_counter()
@@ -11292,7 +11462,8 @@ def build_parser() -> argparse.ArgumentParser:
             " recipient_open_text_adapter copies the complete seed, adds a zero-gated Transformer context "
             "encoder, and trains only that adapter. recipient_visual_context_reinit is v13-only: it copies "
             "every non-recipient tensor from a v13 seed and freshly trains the residual visual + direct "
-            "positional Transformer CTC recipient branch."
+            "positional Transformer CTC recipient branch. recipient_full_crop_warmstart is v13-only: it "
+            "copies the compatible seed and permits exactly recipient_value_left_trim 0.30 -> 0.0."
         ),
     )
     train.add_argument(
@@ -11351,7 +11522,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--recipient-value-left-trim",
         type=float,
         default=0.30,
-        help="v11/v12 only: fraction trimmed from the left of the anchored recipient crop before resize",
+        help="v11-v13 only: fraction trimmed from the left of the recipient crop before resize",
     )
     train.add_argument(
         "--recipient-input-height",
