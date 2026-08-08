@@ -344,11 +344,21 @@ def test_launcher_freezes_one_published_cli_and_hard_counts_formal_set() -> None
     assert '"--cli-assembly-sha256", $cliAssemblySha256' in source
     assert '"--cli-closure-manifest-sha256", $cliClosureManifestSha256' in source
     assert "score.input_selection.sha256 -ne $inputManifestSha256" in source
+    assert "score.input_selection.hash_bound -ne $true" in source
     assert "score.input_selection.records -ne $selectedInputs.Count" in source
+    assert "score.records_sha256 -ne $recordsSha256" in source
+    assert "score.accuracy_denominators.hash_bound -ne $true" in source
+    assert 'score.accuracy_denominators.source -ne "input_selection.field_reference_counts"' in source
     assert "[int]$score.coverage.expected_receipts -ne $requiredFormalReceipts" in source
     assert "$score.by_field.PSObject.Properties[$fieldName]" in source
-    assert "[int]$metricProperty.Value.records -ne $requiredFormalReceipts" in source
-    assert "[double]$metricProperty.Value.candidate_coverage -ne 1.0" in source
+    assert '$score.input_selection.PSObject.Properties["field_reference_counts"]' in source
+    assert "[int]$metricProperty.Value.records -ne [int]$referenceCountProperty.Value" in source
+    assert "[int]$denominatorProperty.Value -ne [int]$referenceCountProperty.Value" in source
+    assert "[double]$floorProperty.Value -ne $requiredFloor" in source
+    assert "[double]$metricProperty.Value.raw_exact_match -lt $requiredFloor" in source
+    assert '$score.PSObject.Properties["all_receipt_candidate_coverage"]' in source
+    assert "[int]$candidateProperty.Value.candidate_records -ne $selectedInputs.Count" in source
+    assert "[double]$candidateProperty.Value.candidate_coverage -ne 1.0" in source
     for field_name in (
         "amount",
         "time",

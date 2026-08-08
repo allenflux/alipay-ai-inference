@@ -139,6 +139,7 @@ foreach ($required in @(
         throw "Missing $($required.Name): $($required.Path)"
     }
 }
+$recordsSha256 = Get-Sha256 $Records
 
 $unifiedContract = [IO.Path]::ChangeExtension([IO.Path]::GetFullPath($UnifiedModel), ".contract.json")
 $unifiedLabels = [IO.Path]::ChangeExtension([IO.Path]::GetFullPath($UnifiedModel), ".labels.json")
@@ -350,6 +351,9 @@ if ($LASTEXITCODE -ne 0) {
 if ((Get-Sha256 $inputList) -ne $inputManifestSha256) {
     throw "Fixed val input manifest changed during hash-bound scoring."
 }
+if ((Get-Sha256 $Records) -ne $recordsSha256) {
+    throw "Validation records changed during hash-bound scoring."
+}
 
 $summary = Get-Content -LiteralPath (Join-Path $reportOutput "summary.json") -Raw -Encoding UTF8 | ConvertFrom-Json
 $score = Get-Content -LiteralPath (Join-Path $scoreOutput "summary.json") -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -372,15 +376,77 @@ if ([int]$summary.schema_version -ne 2 `
     -or [string]$summary.run_manifests.hybrid.sha256 -ne $hybridManifestSha256 `
     -or -not $scoreManifestPath.Equals($hybridManifestPath, [StringComparison]::OrdinalIgnoreCase) `
     -or [string]$score.manifest_sha256 -ne $hybridManifestSha256 `
+    -or [string]$score.records_sha256 -ne $recordsSha256 `
     -or -not ([IO.Path]::GetFullPath([string]$score.input_selection.path)).Equals(
         ([IO.Path]::GetFullPath($inputList)),
         [StringComparison]::OrdinalIgnoreCase) `
     -or [string]$score.input_selection.sha256 -ne $inputManifestSha256 `
+    -or $score.input_selection.hash_bound -ne $true `
     -or [int]$score.input_selection.records -ne $selectedInputs.Count `
     -or [string]$score.input_selection.selection_order -ne $expectedSelectionOrder `
     -or [string]$score.evaluation_scope.selection_order -ne $expectedSelectionOrder `
-    -or [string]$score.evaluation_scope.input_list_sha256 -ne $inputManifestSha256) {
+    -or [string]$score.evaluation_scope.input_list_sha256 -ne $inputManifestSha256 `
+    -or $score.accuracy_denominators.hash_bound -ne $true `
+    -or [string]$score.accuracy_denominators.source -ne "input_selection.field_reference_counts") {
     throw "Hybrid CPU A/B comparison and score are not schema/hash-bound to the frozen inputs, CLI and hybrid manifest."
+}
+$scoreFields = @(
+    "amount",
+    "time",
+    "payment_method_field",
+    "recipient_field",
+    "transfer_status"
+)
+$fixedFloors = @{
+    amount = 0.7885
+    time = 0.9840
+    payment_method_field = 0.9325
+    recipient_field = 0.90
+    transfer_status = 0.90
+}
+$candidateCoverageEvidence = $score.PSObject.Properties["all_receipt_candidate_coverage"]
+$referenceCountEvidence = $score.input_selection.PSObject.Properties["field_reference_counts"]
+if ($null -eq $candidateCoverageEvidence `
+    -or $null -eq $candidateCoverageEvidence.Value `
+    -or $null -eq $referenceCountEvidence `
+    -or $null -eq $referenceCountEvidence.Value `
+    -or [string]$candidateCoverageEvidence.Value.scope -ne "all_selected_receipts" `
+    -or [int]$score.coverage_contract_version -ne 2 `
+    -or [int]$score.coverage.coverage_contract_version -ne 2 `
+    -or [string]$score.coverage.candidate_coverage_domain -ne "all_expected_receipts" `
+    -or [int]$score.coverage.fully_candidate_covered_receipts -ne $selectedInputs.Count `
+    -or [double]$score.coverage.all_field_candidate_coverage -ne 1.0 `
+    -or [int]$candidateCoverageEvidence.Value.expected_receipts -ne $selectedInputs.Count `
+    -or [int]$candidateCoverageEvidence.Value.complete_receipts -ne $selectedInputs.Count `
+    -or [int]$candidateCoverageEvidence.Value.missing_complete_receipts -ne 0 `
+    -or [double]$candidateCoverageEvidence.Value.complete_coverage -ne 1.0) {
+    throw "Hybrid CPU A/B score lacks complete all-receipt five-field candidate evidence."
+}
+foreach ($fieldName in $scoreFields) {
+    $metricProperty = $score.by_field.PSObject.Properties[$fieldName]
+    $referenceCountProperty = $referenceCountEvidence.Value.PSObject.Properties[$fieldName]
+    $denominatorProperty = $score.accuracy_denominators.by_field.PSObject.Properties[$fieldName]
+    $candidateProperty = $candidateCoverageEvidence.Value.by_field.PSObject.Properties[$fieldName]
+    $floorProperty = $score.floors.PSObject.Properties[$fieldName]
+    $requiredFloor = [double]$fixedFloors[$fieldName]
+    if ($null -eq $metricProperty `
+        -or $null -eq $referenceCountProperty `
+        -or $null -eq $denominatorProperty `
+        -or $null -eq $floorProperty `
+        -or [int]$referenceCountProperty.Value -le 0 `
+        -or [int]$metricProperty.Value.records -ne [int]$referenceCountProperty.Value `
+        -or [int]$denominatorProperty.Value -ne [int]$referenceCountProperty.Value `
+        -or [double]$floorProperty.Value -ne $requiredFloor `
+        -or [double]::IsNaN([double]$metricProperty.Value.raw_exact_match) `
+        -or [double]::IsInfinity([double]$metricProperty.Value.raw_exact_match) `
+        -or [double]$metricProperty.Value.raw_exact_match -lt $requiredFloor `
+        -or $null -eq $candidateProperty `
+        -or [int]$candidateProperty.Value.expected_receipts -ne $selectedInputs.Count `
+        -or [int]$candidateProperty.Value.candidate_records -ne $selectedInputs.Count `
+        -or [int]$candidateProperty.Value.missing_candidate_records -ne 0 `
+        -or [double]$candidateProperty.Value.candidate_coverage -ne 1.0) {
+        throw "Hybrid CPU A/B $fieldName accuracy denominator or all-receipt candidate coverage is incomplete."
+    }
 }
 $formalGateProperty = $score.PSObject.Properties["formal_delivery_gate"]
 if ($modeName -eq "formal") {
@@ -390,20 +456,6 @@ if ($modeName -eq "formal") {
         -or $null -eq $formalGateProperty `
         -or $formalGateProperty.Value -ne $true) {
         throw "Formal CPU A/B must schema-bind exactly $requiredFormalReceipts receipts and declare formal_delivery_gate=true."
-    }
-    foreach ($fieldName in @(
-            "amount",
-            "time",
-            "payment_method_field",
-            "recipient_field",
-            "transfer_status"
-        )) {
-        $metricProperty = $score.by_field.PSObject.Properties[$fieldName]
-        if ($null -eq $metricProperty `
-            -or [int]$metricProperty.Value.records -ne $requiredFormalReceipts `
-            -or [double]$metricProperty.Value.candidate_coverage -ne 1.0) {
-            throw "Formal CPU A/B $fieldName evidence is not complete for all $requiredFormalReceipts receipts."
-        }
     }
     if ($score.accepted -ne $true -or $score.acceptance.passed -ne $true) {
         throw "Formal CPU A/B scorer did not accept the complete validation split."

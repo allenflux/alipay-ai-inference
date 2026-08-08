@@ -230,6 +230,10 @@ def test_formal_ab_requires_clean_full_10016_cpu_run(entrypoint: Path) -> None:
         "coverage.fully_scored_receipts -ne $requiredRecords",
         "coverage.result_coverage -ne 1.0",
         "coverage.fully_scored_coverage -ne 1.0",
+        "coverage_contract_version -ne 2",
+        'candidate_coverage_domain -ne "all_expected_receipts"',
+        "coverage.fully_candidate_covered_receipts -ne $requiredRecords",
+        "coverage.all_field_candidate_coverage -ne 1.0",
     ):
         assert token in source
 
@@ -244,8 +248,10 @@ def test_formal_ab_enforces_all_fixed_field_guards(entrypoint: Path) -> None:
         '@{ Field = "payment_method_field"; Floor = 0.9325 }',
         '@{ Field = "recipient_field"; Floor = 0.90 }',
         '@{ Field = "transfer_status"; Floor = 0.90 }',
-        "$metricProperty.Value.records -ne $requiredRecords",
-        "$metricProperty.Value.candidate_coverage -ne 1.0",
+        "$metricProperty.Value.records -ne [int]$referenceCountProperty.Value",
+        "$denominatorProperty.Value -ne [int]$referenceCountProperty.Value",
+        "$candidateProperty.Value.candidate_records -ne $requiredRecords",
+        "$candidateProperty.Value.candidate_coverage -ne 1.0",
         "$metricProperty.Value.raw_exact_match -lt $requiredFloor",
         "$accuracySummary.by_field.transfer_status.non_success_to_success -ne 0",
         'Properties["max_non_success_to_success"]',
@@ -343,12 +349,24 @@ def test_fresh_package_score_independently_repeats_the_full_formal_gate(
         "$Summary.coverage.fully_scored_receipts -ne $requiredRecords",
         "$Summary.coverage.result_coverage -ne 1.0",
         "$Summary.coverage.fully_scored_coverage -ne 1.0",
+        "$Summary.coverage_contract_version -ne 2",
+        "$Summary.coverage.coverage_contract_version -ne 2",
+        '$Summary.coverage.candidate_coverage_domain -ne "all_expected_receipts"',
+        "$Summary.coverage.fully_candidate_covered_receipts -ne $requiredRecords",
+        "$Summary.coverage.all_field_candidate_coverage -ne 1.0",
+        "$Summary.input_selection.hash_bound -ne $true",
+        "$Summary.input_selection.sha256 -ne $ExpectedInputManifestSha256",
+        '$Summary.accuracy_denominators.source -ne "input_selection.field_reference_counts"',
+        '$Summary.all_receipt_candidate_coverage.scope -ne "all_selected_receipts"',
+        "$Summary.all_receipt_candidate_coverage.complete_receipts -ne $requiredRecords",
         '@{ Field = "amount"; Floor = 0.7885 }',
         '@{ Field = "time"; Floor = 0.9840 }',
         '@{ Field = "payment_method_field"; Floor = 0.9325 }',
         '@{ Field = "recipient_field"; Floor = 0.90 }',
         '@{ Field = "transfer_status"; Floor = 0.90 }',
-        "$records -ne $requiredRecords",
+        "$records -ne [int]$referenceCountProperty.Value",
+        "$denominatorProperty.Value -ne [int]$referenceCountProperty.Value",
+        "$candidateProperty.Value.candidate_records -ne $requiredRecords",
         "$coverage -ne 1.0",
         "$exactMatch -lt $requiredFloor",
         'Properties["non_success_to_success"]',
@@ -363,7 +381,7 @@ def test_fresh_package_score_independently_repeats_the_full_formal_gate(
     aggregate_check = source.index("if ([int]$onnxValidation.schema_version", fresh_call)
     assert accepted_binding < fresh_call < aggregate_check
     assert "$endToEndSummary ([string]$UnifiedEvidence.ModelSha256)" in source[fresh_call:aggregate_check]
-    assert "([string]$Config.records_sha256) $manifestSha256" in source[fresh_call:aggregate_check]
+    assert "([string]$Config.records_sha256) $manifestSha256 (Get-Sha256 $validationInputListPath)" in source[fresh_call:aggregate_check]
 
 
 def test_single_and_batch_share_the_identical_fresh_package_gate() -> None:
@@ -379,6 +397,19 @@ def test_single_and_batch_share_the_identical_fresh_package_gate() -> None:
         "Assert-FreshFormalAccuracyEvidence",
         "Assert-AcceptedPackageBinding",
     )
+
+
+@pytest.mark.parametrize("entrypoint", ENTRYPOINTS, ids=lambda path: path.name)
+def test_runtime_entrypoints_require_packager_five_field_candidate_counters(
+    entrypoint: Path,
+) -> None:
+    source = _source(entrypoint)
+    gate = _function(source, "Assert-AcceptedPackageBinding", "Assert-ProductionGeometry")
+
+    assert "$Validation.candidate_complete -ne $requiredRecords" in gate
+    assert '$Validation.PSObject.Properties["candidates_by_field"]' in gate
+    assert '@("amount", "time", "recipient", "payment_method", "transfer_status")' in gate
+    assert "$candidateCountProperty.Value -ne $requiredRecords" in gate
 
 
 @pytest.mark.parametrize("entrypoint", ENTRYPOINTS, ids=lambda path: path.name)

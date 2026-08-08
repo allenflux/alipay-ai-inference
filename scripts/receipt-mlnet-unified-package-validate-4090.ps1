@@ -309,6 +309,8 @@ function Assert-HybridAbComparisonSchema([object]$Document) {
 function Assert-HybridAbScoreSchema([object]$Document) {
     Assert-JsonInteger (Get-RequiredJsonProperty $Document "schema_version" "Hybrid A/B score") `
         "Hybrid A/B score schema_version" 1
+    Assert-JsonInteger (Get-RequiredJsonProperty $Document "coverage_contract_version" "Hybrid A/B score") `
+        "Hybrid A/B score coverage_contract_version" 2
     foreach ($name in @("kind", "records", "records_sha256", "results_root", "manifest", "manifest_sha256", "evaluation_split", "model", "model_sha256")) {
         $value = Get-RequiredJsonProperty $Document $name "Hybrid A/B score"
         if ($name.EndsWith("sha256", [StringComparison]::Ordinal)) {
@@ -341,6 +343,39 @@ function Assert-HybridAbScoreSchema([object]$Document) {
         Assert-JsonNumber (Get-RequiredJsonProperty $coverage $name "Hybrid A/B score coverage") `
             "Hybrid A/B score coverage.$name"
     }
+    Assert-JsonInteger (Get-RequiredJsonProperty $coverage "coverage_contract_version" "Hybrid A/B score coverage") `
+        "Hybrid A/B score coverage.coverage_contract_version" 2
+    Assert-JsonString (Get-RequiredJsonProperty $coverage "candidate_coverage_domain" "Hybrid A/B score coverage") `
+        "Hybrid A/B score coverage.candidate_coverage_domain"
+    Assert-JsonInteger `
+        (Get-RequiredJsonProperty $coverage "fully_candidate_covered_receipts" "Hybrid A/B score coverage") `
+        "Hybrid A/B score coverage.fully_candidate_covered_receipts" 0
+    Assert-JsonNumber `
+        (Get-RequiredJsonProperty $coverage "all_field_candidate_coverage" "Hybrid A/B score coverage") `
+        "Hybrid A/B score coverage.all_field_candidate_coverage"
+    $inputSelection = Get-RequiredJsonProperty $Document "input_selection" "Hybrid A/B score"
+    Assert-JsonBoolean (Get-RequiredJsonProperty $inputSelection "hash_bound" "Hybrid A/B score input_selection") `
+        "Hybrid A/B score input_selection.hash_bound"
+    Assert-JsonString (Get-RequiredJsonProperty $inputSelection "path" "Hybrid A/B score input_selection") `
+        "Hybrid A/B score input_selection.path"
+    Assert-JsonSha256 (Get-RequiredJsonProperty $inputSelection "sha256" "Hybrid A/B score input_selection") `
+        "Hybrid A/B score input_selection.sha256"
+    Assert-JsonInteger (Get-RequiredJsonProperty $inputSelection "records" "Hybrid A/B score input_selection") `
+        "Hybrid A/B score input_selection.records" 1
+    $referenceCounts = Get-RequiredJsonProperty `
+        $inputSelection "field_reference_counts" "Hybrid A/B score input_selection"
+    $candidateCoverage = Get-RequiredJsonProperty `
+        $Document "all_receipt_candidate_coverage" "Hybrid A/B score"
+    Assert-JsonString (Get-RequiredJsonProperty $candidateCoverage "scope" "Hybrid A/B candidate coverage") `
+        "Hybrid A/B candidate coverage.scope"
+    foreach ($name in @("expected_receipts", "complete_receipts", "missing_complete_receipts")) {
+        Assert-JsonInteger (Get-RequiredJsonProperty $candidateCoverage $name "Hybrid A/B candidate coverage") `
+            "Hybrid A/B candidate coverage.$name" 0
+    }
+    Assert-JsonNumber (Get-RequiredJsonProperty $candidateCoverage "complete_coverage" "Hybrid A/B candidate coverage") `
+        "Hybrid A/B candidate coverage.complete_coverage"
+    $candidateByField = Get-RequiredJsonProperty `
+        $candidateCoverage "by_field" "Hybrid A/B candidate coverage"
     $acceptance = Get-RequiredJsonProperty $Document "acceptance" "Hybrid A/B score"
     foreach ($name in @("passed", "formal_delivery_gate")) {
         Assert-JsonBoolean (Get-RequiredJsonProperty $acceptance $name "Hybrid A/B score acceptance") `
@@ -361,6 +396,18 @@ function Assert-HybridAbScoreSchema([object]$Document) {
         }
         Assert-JsonNumber (Get-RequiredJsonProperty $floors $field "Hybrid A/B score floors") `
             "Hybrid A/B score floor $field"
+        Assert-JsonInteger (Get-RequiredJsonProperty $referenceCounts $field "Hybrid A/B reference counts") `
+            "Hybrid A/B reference count $field" 1
+        $candidateMetric = Get-RequiredJsonProperty `
+            $candidateByField $field "Hybrid A/B all-receipt candidate coverage"
+        foreach ($name in @("expected_receipts", "candidate_records", "missing_candidate_records")) {
+            Assert-JsonInteger `
+                (Get-RequiredJsonProperty $candidateMetric $name "Hybrid A/B candidate coverage $field") `
+                "Hybrid A/B candidate coverage $field.$name" 0
+        }
+        Assert-JsonNumber `
+            (Get-RequiredJsonProperty $candidateMetric "candidate_coverage" "Hybrid A/B candidate coverage $field") `
+            "Hybrid A/B candidate coverage $field.candidate_coverage"
     }
     Assert-JsonInteger `
         (Get-RequiredJsonProperty `
@@ -1814,9 +1861,11 @@ if ($hasHybridAbEvidence) {
     Assert-SafePathSyntax ([string]$hybridAbScore.manifest) "Hybrid A/B score manifest"
     Assert-SafePathSyntax ([string]$hybridAbScore.results_root) "Hybrid A/B score results_root"
     Assert-SafePathSyntax ([string]$hybridAbScore.records) "Hybrid A/B score records"
+    Assert-SafePathSyntax ([string]$hybridAbScore.input_selection.path) "Hybrid A/B score input_selection"
     $hybridAbScoreManifest = [IO.Path]::GetFullPath([string]$hybridAbScore.manifest)
     $hybridAbScoreResultsRoot = [IO.Path]::GetFullPath([string]$hybridAbScore.results_root)
     $hybridAbScoreRecords = [IO.Path]::GetFullPath([string]$hybridAbScore.records)
+    $hybridAbScoreInputList = [IO.Path]::GetFullPath([string]$hybridAbScore.input_selection.path)
     Require-File $hybridAbScoreManifest "Hybrid A/B score inference manifest"
     Require-File $hybridAbScoreRecords "Hybrid A/B score records"
     if (-not (Test-Path -LiteralPath $hybridAbScoreResultsRoot -PathType Container)) {
@@ -1836,10 +1885,18 @@ if ($hasHybridAbEvidence) {
         throw "Hybrid A/B score is not bound to the comparison's exact hybrid inference manifest/results source."
     }
     if ([int]$hybridAbScore.schema_version -ne 1 `
+        -or [int]$hybridAbScore.coverage_contract_version -ne 2 `
         -or [string]$hybridAbScore.kind -ne "receipt_mlnet_unified_candidate_evaluation_v1" `
         -or [string]$hybridAbScore.evaluation_split -ne "val" `
         -or [string]$hybridAbScore.model_sha256 -ne $unifiedModelSha256 `
         -or [string]$hybridAbScore.records_sha256 -ne $requestedRecordsSha256 `
+        -or $hybridAbScore.input_selection.hash_bound -ne $true `
+        -or -not $hybridAbScoreInputList.Equals($hybridAbInputManifestPath, [StringComparison]::OrdinalIgnoreCase) `
+        -or [string]$hybridAbScore.input_selection.sha256 -ne [string]$hybridAbSummary.input_set.input_manifest.sha256 `
+        -or [int]$hybridAbScore.input_selection.records -ne $requiredFormalReceiptCount `
+        -or [string]$hybridAbScore.input_selection.selection_order -ne "first_unique_source_in_records_manifest_order" `
+        -or $hybridAbScore.accuracy_denominators.hash_bound -ne $true `
+        -or [string]$hybridAbScore.accuracy_denominators.source -ne "input_selection.field_reference_counts" `
         -or $hybridAbScore.formal_delivery_gate -ne $true `
         -or $hybridAbScore.accepted -ne $true `
         -or $hybridAbScore.acceptance.passed -ne $true `
@@ -1855,7 +1912,16 @@ if ($hasHybridAbEvidence) {
         -or [int]$hybridAbScore.coverage.matched_result_receipts -ne [int]$hybridAbScore.coverage.expected_receipts `
         -or [int]$hybridAbScore.coverage.fully_scored_receipts -ne [int]$hybridAbScore.coverage.expected_receipts `
         -or [double]$hybridAbScore.coverage.result_coverage -ne 1.0 `
-        -or [double]$hybridAbScore.coverage.fully_scored_coverage -ne 1.0) {
+        -or [double]$hybridAbScore.coverage.fully_scored_coverage -ne 1.0 `
+        -or [int]$hybridAbScore.coverage.coverage_contract_version -ne 2 `
+        -or [string]$hybridAbScore.coverage.candidate_coverage_domain -ne "all_expected_receipts" `
+        -or [int]$hybridAbScore.coverage.fully_candidate_covered_receipts -ne $requiredFormalReceiptCount `
+        -or [double]$hybridAbScore.coverage.all_field_candidate_coverage -ne 1.0 `
+        -or [string]$hybridAbScore.all_receipt_candidate_coverage.scope -ne "all_selected_receipts" `
+        -or [int]$hybridAbScore.all_receipt_candidate_coverage.expected_receipts -ne $requiredFormalReceiptCount `
+        -or [int]$hybridAbScore.all_receipt_candidate_coverage.complete_receipts -ne $requiredFormalReceiptCount `
+        -or [int]$hybridAbScore.all_receipt_candidate_coverage.missing_complete_receipts -ne 0 `
+        -or [double]$hybridAbScore.all_receipt_candidate_coverage.complete_coverage -ne 1.0) {
         throw "Hybrid A/B accuracy evidence is not a complete, accepted, model/records-bound formal val score."
     }
     $hybridFixedGates = @(
@@ -1870,15 +1936,30 @@ if ($hasHybridAbEvidence) {
         $floor = [double]$gate.Floor
         $metricProperty = $hybridAbScore.by_field.PSObject.Properties[$fieldName]
         $floorProperty = $hybridAbScore.floors.PSObject.Properties[$fieldName]
-        if ($null -eq $metricProperty -or $null -eq $floorProperty) {
-            throw "Hybrid A/B accuracy evidence is missing $fieldName metrics or its fixed floor."
+        $referenceCountProperty = `
+            $hybridAbScore.input_selection.field_reference_counts.PSObject.Properties[$fieldName]
+        $denominatorProperty = `
+            $hybridAbScore.accuracy_denominators.by_field.PSObject.Properties[$fieldName]
+        $candidateProperty = `
+            $hybridAbScore.all_receipt_candidate_coverage.by_field.PSObject.Properties[$fieldName]
+        if ($null -eq $metricProperty `
+            -or $null -eq $floorProperty `
+            -or $null -eq $referenceCountProperty `
+            -or $null -eq $denominatorProperty `
+            -or $null -eq $candidateProperty) {
+            throw "Hybrid A/B accuracy evidence is missing $fieldName metrics, denominator, candidate coverage or fixed floor."
         }
         $metric = $metricProperty.Value
         if ([double]$floorProperty.Value -ne $floor `
-            -or [int]$metric.records -ne [int]$hybridAbScore.coverage.expected_receipts `
-            -or [double]$metric.candidate_coverage -ne 1.0 `
+            -or [int]$referenceCountProperty.Value -le 0 `
+            -or [int]$metric.records -ne [int]$referenceCountProperty.Value `
+            -or [int]$denominatorProperty.Value -ne [int]$referenceCountProperty.Value `
+            -or [int]$candidateProperty.Value.expected_receipts -ne $requiredFormalReceiptCount `
+            -or [int]$candidateProperty.Value.candidate_records -ne $requiredFormalReceiptCount `
+            -or [int]$candidateProperty.Value.missing_candidate_records -ne 0 `
+            -or [double]$candidateProperty.Value.candidate_coverage -ne 1.0 `
             -or [double]$metric.raw_exact_match -lt $floor) {
-            throw "Hybrid A/B accuracy evidence did not pass the fixed $fieldName floor and full candidate coverage."
+            throw "Hybrid A/B accuracy evidence did not pass the fixed $fieldName reference denominator/floor and all-receipt candidate coverage."
         }
     }
     if ([int]$hybridAbScore.by_field.transfer_status.non_success_to_success -ne 0) {
@@ -1911,6 +1992,8 @@ if ($hasHybridAbEvidence) {
         hybrid_runtime_summary = "evidence/hybrid-formal-hybrid-inference-summary.json"
         hybrid_runtime_summary_sha256 = [string]$hybridAbSummary.run_summaries.hybrid.sha256
         score_manifest_sha256 = [string]$hybridAbScore.manifest_sha256
+        field_reference_counts = $hybridAbScore.input_selection.field_reference_counts
+        all_receipt_candidate_coverage = $hybridAbScore.all_receipt_candidate_coverage
         cli_assembly = "app/ReceiptMlNet.Cli.dll"
         cli_assembly_sha256 = $hybridAbCliAssemblySha256
         cli_assembly_size_bytes = [long]$hybridAbSummary.cli_build.assembly.size_bytes
@@ -2389,6 +2472,7 @@ try {
         time = 0
         recipient = 0
         payment_method = 0
+        transfer_status = 0
     }
     $manifestSourceSet = @{}
     $resultEvidenceRows = @()
@@ -2636,6 +2720,7 @@ try {
                     -or [string]$statusDeliveryValue -ne [string]$statusTextReviewValue) {
                     throw "Result transfer_status escaped the v13 review-only delivery policy: $resultPath"
                 }
+                $candidateByField["transfer_status"]++
             }
         }
         $resultEvidenceRows += [ordered]@{
@@ -2660,6 +2745,16 @@ try {
             throw "Manifest source set differs from InputList: missing=$($missingManifestSources.Count) extra=$($extraManifestSources.Count)"
         }
     }
+    if ($hasRecords) {
+        if ($candidateComplete -ne $expectedRecords) {
+            throw "Formal package has only $candidateComplete/$expectedRecords receipts with all five candidates."
+        }
+        foreach ($fieldName in @("amount", "time", "recipient", "payment_method", "transfer_status")) {
+            if ([int]$candidateByField[$fieldName] -ne $expectedRecords) {
+                throw "Formal package $fieldName candidate presence is not complete for all $expectedRecords receipts."
+            }
+        }
+    }
 
     $endToEndSummaryPath = $null
     $endToEndComparisonsPath = $null
@@ -2671,6 +2766,8 @@ try {
             "--results", $Output,
             "--model", $unifiedModel,
             "--output", $EndToEndEvaluationDir,
+            "--input-list", $resolvedInputList,
+            "--input-list-sha256", (Get-Sha256 $resolvedInputList),
             "--split", "val",
             "--amount-floor", [Convert]::ToString($AmountFloor, [Globalization.CultureInfo]::InvariantCulture),
             "--time-floor", [Convert]::ToString($TimeFloor, [Globalization.CultureInfo]::InvariantCulture),
@@ -2715,6 +2812,21 @@ try {
         if ($endToEndSummary.artifact_audit.all_results_match_model -ne $true) {
             throw "ML.NET end-to-end evidence contains missing or mixed model hashes."
         }
+        $endToEndInputList = [IO.Path]::GetFullPath([string]$endToEndSummary.input_selection.path)
+        if ($endToEndSummary.input_selection.hash_bound -ne $true `
+            -or [int]$endToEndSummary.coverage_contract_version -ne 2 `
+            -or [int]$endToEndSummary.coverage.coverage_contract_version -ne 2 `
+            -or [string]$endToEndSummary.coverage.candidate_coverage_domain -ne "all_expected_receipts" `
+            -or [int]$endToEndSummary.coverage.fully_candidate_covered_receipts -ne $expectedRecords `
+            -or [double]$endToEndSummary.coverage.all_field_candidate_coverage -ne 1.0 `
+            -or -not $endToEndInputList.Equals($resolvedInputList, [StringComparison]::OrdinalIgnoreCase) `
+            -or [string]$endToEndSummary.input_selection.sha256 -ne (Get-Sha256 $resolvedInputList) `
+            -or [int]$endToEndSummary.input_selection.records -ne $expectedRecords `
+            -or [string]$endToEndSummary.input_selection.selection_order -ne "first_unique_source_in_records_manifest_order" `
+            -or $endToEndSummary.accuracy_denominators.hash_bound -ne $true `
+            -or [string]$endToEndSummary.accuracy_denominators.source -ne "input_selection.field_reference_counts") {
+            throw "ML.NET end-to-end score is not hash-bound to the exact formal input list and field reference counts."
+        }
         if ([int]$endToEndSummary.coverage.expected_receipts -ne $expectedRecords `
             -or [int]$endToEndSummary.coverage.matched_result_receipts -ne $expectedRecords `
             -or [int]$endToEndSummary.coverage.fully_scored_receipts -ne $expectedRecords) {
@@ -2722,6 +2834,11 @@ try {
         }
         if ([double]$endToEndSummary.coverage.result_coverage -ne 1.0 `
             -or [double]$endToEndSummary.coverage.fully_scored_coverage -ne 1.0 `
+            -or [string]$endToEndSummary.all_receipt_candidate_coverage.scope -ne "all_selected_receipts" `
+            -or [int]$endToEndSummary.all_receipt_candidate_coverage.expected_receipts -ne $expectedRecords `
+            -or [int]$endToEndSummary.all_receipt_candidate_coverage.complete_receipts -ne $expectedRecords `
+            -or [int]$endToEndSummary.all_receipt_candidate_coverage.missing_complete_receipts -ne 0 `
+            -or [double]$endToEndSummary.all_receipt_candidate_coverage.complete_coverage -ne 1.0 `
             -or $endToEndSummary.formal_delivery_gate -ne $true `
             -or $endToEndSummary.acceptance.formal_delivery_gate -ne $true `
             -or [string]$endToEndSummary.evaluation_scope.kind -ne "full_split" `
@@ -2745,14 +2862,28 @@ try {
             }
             $scoreMetric = $scoreMetricProperty.Value
             $scoreExactMatch = [double]$scoreMetric.raw_exact_match
-            $scoreCandidateCoverage = [double]$scoreMetric.candidate_coverage
-            if ([int]$scoreMetric.records -ne [int]$endToEndSummary.coverage.expected_receipts) {
-                throw "ML.NET end-to-end $fieldName records do not match the complete formal receipt set."
+            $referenceCountProperty = `
+                $endToEndSummary.input_selection.field_reference_counts.PSObject.Properties[$fieldName]
+            $denominatorProperty = `
+                $endToEndSummary.accuracy_denominators.by_field.PSObject.Properties[$fieldName]
+            $candidateProperty = `
+                $endToEndSummary.all_receipt_candidate_coverage.by_field.PSObject.Properties[$fieldName]
+            if ($null -eq $referenceCountProperty `
+                -or $null -eq $denominatorProperty `
+                -or $null -eq $candidateProperty `
+                -or [int]$referenceCountProperty.Value -le 0 `
+                -or [int]$scoreMetric.records -ne [int]$referenceCountProperty.Value `
+                -or [int]$denominatorProperty.Value -ne [int]$referenceCountProperty.Value) {
+                throw "ML.NET end-to-end $fieldName records do not match the hash-bound reference denominator."
             }
+            $scoreCandidateCoverage = [double]$candidateProperty.Value.candidate_coverage
             if ([double]$scoreFloorProperty.Value -lt $floor `
                 -or [double]::IsNaN($scoreExactMatch) `
                 -or [double]::IsInfinity($scoreExactMatch) `
                 -or $scoreExactMatch -lt $floor `
+                -or [int]$candidateProperty.Value.expected_receipts -ne $expectedRecords `
+                -or [int]$candidateProperty.Value.candidate_records -ne $expectedRecords `
+                -or [int]$candidateProperty.Value.missing_candidate_records -ne 0 `
                 -or $scoreCandidateCoverage -ne 1.0) {
                 throw "ML.NET end-to-end $fieldName did not meet exact-match or candidate-coverage gates."
             }
@@ -2760,6 +2891,9 @@ try {
                 exact_matches = [int]$scoreMetric.raw_exact_matches
                 records = [int]$scoreMetric.records
                 exact_match = $scoreExactMatch
+                reference_candidate_coverage = [double]$scoreMetric.candidate_coverage
+                candidate_records = [int]$candidateProperty.Value.candidate_records
+                candidate_expected_receipts = [int]$candidateProperty.Value.expected_receipts
                 candidate_coverage = $scoreCandidateCoverage
                 required_floor = $floor
             }
@@ -2775,10 +2909,24 @@ try {
             }
             $statusScoreMetric = $statusScoreMetricProperty.Value
             $statusScoreExactMatch = [double]$statusScoreMetric.raw_exact_match
-            $statusScoreCandidateCoverage = [double]$statusScoreMetric.candidate_coverage
+            $statusReferenceCountProperty = `
+                $endToEndSummary.input_selection.field_reference_counts.PSObject.Properties["transfer_status"]
+            $statusDenominatorProperty = `
+                $endToEndSummary.accuracy_denominators.by_field.PSObject.Properties["transfer_status"]
+            $statusCandidateProperty = `
+                $endToEndSummary.all_receipt_candidate_coverage.by_field.PSObject.Properties["transfer_status"]
+            if ($null -eq $statusReferenceCountProperty `
+                -or $null -eq $statusDenominatorProperty `
+                -or $null -eq $statusCandidateProperty) {
+                throw "ML.NET end-to-end visible transfer-status evidence lacks its reference denominator or all-receipt candidate coverage."
+            }
+            $statusScoreCandidateCoverage = [double]$statusCandidateProperty.Value.candidate_coverage
             $statusScoreMaxSafetyProperty = `
                 $endToEndSummary.acceptance.PSObject.Properties["max_non_success_to_success"]
-            if ([int]$statusScoreMetric.records -ne [int]$validatedMetrics["transfer_status"].records `
+            if ([int]$statusReferenceCountProperty.Value -le 0 `
+                -or [int]$statusScoreMetric.records -ne [int]$statusReferenceCountProperty.Value `
+                -or [int]$statusDenominatorProperty.Value -ne [int]$statusReferenceCountProperty.Value `
+                -or [int]$statusScoreMetric.records -ne [int]$validatedMetrics["transfer_status"].records `
                 -or [int]$statusScoreMetric.non_success_truth_records -ne $valNonSuccessTruthRecords `
                 -or ($statusScoreMetric.non_success_safety_calibrated -eq $true) -ne $valSafetyCalibrated `
                 -or [int]$statusScoreMetric.non_success_to_success -ne 0 `
@@ -2790,6 +2938,9 @@ try {
                 -or [double]::IsNaN($statusScoreExactMatch) `
                 -or [double]::IsInfinity($statusScoreExactMatch) `
                 -or $statusScoreExactMatch -lt $requiredStatusTextFloor `
+                -or [int]$statusCandidateProperty.Value.expected_receipts -ne $expectedRecords `
+                -or [int]$statusCandidateProperty.Value.candidate_records -ne $expectedRecords `
+                -or [int]$statusCandidateProperty.Value.missing_candidate_records -ne 0 `
                 -or $statusScoreCandidateCoverage -ne 1.0) {
                 throw "ML.NET end-to-end visible transfer-status OCR did not meet exact-match or candidate-coverage gates."
             }
@@ -2797,6 +2948,9 @@ try {
                 exact_matches = [int]$statusScoreMetric.raw_exact_matches
                 records = [int]$statusScoreMetric.records
                 exact_match = $statusScoreExactMatch
+                reference_candidate_coverage = [double]$statusScoreMetric.candidate_coverage
+                candidate_records = [int]$statusCandidateProperty.Value.candidate_records
+                candidate_expected_receipts = [int]$statusCandidateProperty.Value.expected_receipts
                 candidate_coverage = $statusScoreCandidateCoverage
                 non_success_truth_records = [int]$statusScoreMetric.non_success_truth_records
                 non_success_to_success = [int]$statusScoreMetric.non_success_to_success
@@ -2818,6 +2972,9 @@ try {
             manifest_sha256 = Get-Sha256 $manifestPath
             model_sha256 = [string]$endToEndSummary.model_sha256
             expected_receipts = [int]$endToEndSummary.coverage.expected_receipts
+            input_manifest_sha256 = [string]$endToEndSummary.input_selection.sha256
+            field_reference_counts = $endToEndSummary.input_selection.field_reference_counts
+            all_receipt_candidate_coverage = $endToEndSummary.all_receipt_candidate_coverage
             metrics = $validatedEndToEndMetrics
         }
     }
@@ -3061,6 +3218,14 @@ try {
     if ($hasRecords -and (Get-Sha256 $Records) -ne $requestedRecordsSha256) {
         throw "End-to-end records changed during CPU validation; refusing atomic publication."
     }
+    if ($hasRecords) {
+        $expectedInputManifestSha256 = [string]$endToEndSummary.input_selection.sha256
+        $stagedValidationInputList = Join-Path $evidenceDirectory "validation-input-list.txt"
+        if ((Get-Sha256 $resolvedInputList) -ne $expectedInputManifestSha256 `
+            -or (Get-Sha256 $stagedValidationInputList) -ne $expectedInputManifestSha256) {
+            throw "Formal validation input list changed before atomic publication."
+        }
+    }
     $finalPaddleDelivery = Assert-PaddleDeliveryBundle $PaddleDeliveryBundle
     if ([string]$finalPaddleDelivery.ContractSha256 -ne $paddleDeliveryContractSha256) {
         throw "PP-OCR delivery bundle changed during CPU validation; refusing atomic publication."
@@ -3101,6 +3266,11 @@ try {
     ConvertTo-Json -InputObject @($hashRows) -Depth 5 |
         Set-Content -LiteralPath (Join-Path $stagingRoot "SHA256SUMS.json") -Encoding UTF8
     Assert-PackageIntegrity $stagingRoot
+    if ($hasRecords `
+        -and (Get-Sha256 (Join-Path $evidenceDirectory "validation-input-list.txt")) -ne `
+            [string]$endToEndSummary.input_selection.sha256) {
+        throw "Packaged formal validation input list changed immediately before atomic publication."
+    }
 
     if (Test-Path -LiteralPath $DeliveryDir) {
         throw "Delivery directory appeared during validation; refusing to overwrite it: $DeliveryDir"

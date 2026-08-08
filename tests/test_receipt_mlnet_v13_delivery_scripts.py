@@ -203,6 +203,9 @@ def test_v13_direct_packaging_keeps_fixed_visible_status_ocr_gate() -> None:
     assert '$endToEndSummary.by_field.PSObject.Properties["transfer_status"]' in script
     assert '$statusScoreExactMatch -lt $requiredStatusTextFloor' in script
     assert "$statusScoreCandidateCoverage -ne 1.0" in script
+    assert '$endToEndSummary.input_selection.field_reference_counts.PSObject.Properties["transfer_status"]' in script
+    assert '$endToEndSummary.all_receipt_candidate_coverage.by_field.PSObject.Properties["transfer_status"]' in script
+    assert "$statusCandidateProperty.Value.candidate_records -ne $expectedRecords" in script
     assert '$validatedEndToEndMetrics["transfer_status"]' in script
     assert "$statusScoreMetric.non_success_to_success -ne 0" in script
     assert '$endToEndSummary.acceptance.PSObject.Properties["max_non_success_to_success"]' in script
@@ -235,9 +238,57 @@ def test_packager_floors_can_only_be_raised_not_weakened() -> None:
     assert 'Join-Path $evidenceDirectory "v13-onnx-test-summary.json"' in script
     assert 'Join-Path $evidenceDirectory "bound-unified-fields.jsonl"' in script
     assert '"--records", $scoringRecords' in script
+    assert '"--input-list", $resolvedInputList' in script
+    assert '"--input-list-sha256", (Get-Sha256 $resolvedInputList)' in script
     assert "Get-Sha256 $recordsSnapshot" in script
     assert "Get-Sha256 $Records) -ne $requestedRecordsSha256" in script
+    assert "Get-Sha256 $resolvedInputList) -ne $expectedInputManifestSha256" in script
+    assert "Get-Sha256 $stagedValidationInputList) -ne $expectedInputManifestSha256" in script
     assert "refusing atomic publication" in script
+    assert 'candidateByField["transfer_status"]++' in script
+    assert 'all_receipt_candidate_coverage = $endToEndSummary.all_receipt_candidate_coverage' in script
+
+
+@pytest.mark.parametrize("script_path", DELIVERY_SCRIPTS, ids=lambda path: path.name)
+def test_delivery_consumers_require_hash_bound_reference_denominators_and_all_receipt_candidates(
+    script_path: Path,
+) -> None:
+    script = script_path.read_text(encoding="utf-8")
+
+    assert "coverage_contract_version" in script
+    assert "input_selection.field_reference_counts" in script
+    assert "accuracy_denominators.by_field" in script
+    assert "all_receipt_candidate_coverage.by_field" in script
+    assert "candidate_records" in script
+    assert "missing_candidate_records" in script
+    assert "candidate_coverage" in script
+
+
+def test_add_production_entrypoints_rejects_partial_or_nonformal_score_evidence() -> None:
+    script = DELIVERY_SCRIPTS[0].read_text(encoding="utf-8")
+
+    for token in (
+        "$requiredRecords = 10016",
+        "$endToEndSummary.formal_delivery_gate -ne $true",
+        "$endToEndSummary.acceptance.formal_delivery_gate -ne $true",
+        '$endToEndSummary.evaluation_scope.kind -ne "full_split"',
+        "$null -eq $requestedLimitProperty",
+        "$null -ne $requestedLimitProperty.Value",
+        "$endToEndSummary.coverage.expected_receipts -ne $requiredRecords",
+        "$endToEndSummary.coverage.matched_result_receipts -ne $requiredRecords",
+        "$endToEndSummary.coverage.fully_scored_receipts -ne $requiredRecords",
+        "$endToEndSummary.coverage.result_coverage -ne 1.0",
+        "$validation.candidate_complete -ne $requiredRecords",
+        '$validation.PSObject.Properties["candidates_by_field"]',
+        '$fieldName in @("amount", "time", "recipient", "payment_method", "transfer_status")',
+        "$candidateCountProperty.Value -ne $requiredRecords",
+        '$endToEndSummary.all_receipt_candidate_coverage.scope -ne "all_selected_receipts"',
+        "$endToEndSummary.all_receipt_candidate_coverage.expected_receipts -ne $requiredRecords",
+        "$endToEndSummary.all_receipt_candidate_coverage.missing_complete_receipts -ne 0",
+        "$summaryMetric.raw_exact_match -lt $requiredFloor",
+        "$endToEndSummary.by_field.transfer_status.non_success_to_success -ne 0",
+    ):
+        assert token in script
 
 
 def test_v13_status_review_validation_does_not_change_four_field_scoring() -> None:

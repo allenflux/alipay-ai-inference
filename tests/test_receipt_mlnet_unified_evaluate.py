@@ -158,30 +158,41 @@ def test_score_matches_v12_references_and_accepts_uniform_model(tmp_path: Path) 
         output_dir=output,
     )
 
-    assert summary["accepted"]
+    assert summary["accepted"] is False
     assert summary["kind"] == "receipt_mlnet_unified_candidate_evaluation_v1"
     assert summary["evaluation_scope"]["kind"] == "full_split"
     assert summary["evaluation_scope"]["requested_limit"] is None
-    assert summary["formal_delivery_gate"] is True
-    assert summary["acceptance"]["formal_delivery_gate"] is True
+    assert summary["formal_delivery_gate"] is False
+    assert summary["acceptance"]["formal_delivery_gate"] is False
+    assert summary["diagnostic_thresholds_passed"] is True
+    assert summary["acceptance"]["diagnostic_thresholds_passed"] is True
+    assert summary["accuracy_denominators"]["hash_bound"] is False
+    assert "unbound_full_split" in summary["warning"]
     assert summary["failures"] == []
     assert summary["artifact_audit"]["all_results_match_model"]
     assert summary["coverage"]["result_coverage"] == 1.0
     assert summary["coverage"]["fully_scored_coverage"] == 1.0
+    assert summary["coverage_contract_version"] == 2
+    assert summary["coverage"]["coverage_contract_version"] == 2
+    assert summary["coverage"]["candidate_coverage_domain"] == "all_expected_receipts"
+    assert summary["coverage"]["fully_candidate_covered_receipts"] == 2
+    assert summary["coverage"]["all_field_candidate_coverage"] == 1.0
     for metrics in summary["by_field"].values():
         assert metrics["records"] == 2
+        assert metrics["reference_records"] == 2
         assert metrics["raw_exact_matches"] == 2
         assert metrics["raw_exact_match"] == 1.0
         assert metrics["candidate_coverage"] == 1.0
+        assert metrics["candidate_on_reference_coverage"] == 1.0
 
     comparisons = [json.loads(line) for line in (output / "comparisons.jsonl").read_text(encoding="utf-8").splitlines()]
     amounts = {row["id"]: row for row in comparisons if row["field"] == "amount"}
     assert amounts["one"]["reference_text"] == "¥ 1,234.56"
     assert amounts["two"]["reference_text"] == "2.00"
-    assert json.loads((output / "summary.json").read_text(encoding="utf-8"))["accepted"] is True
+    assert json.loads((output / "summary.json").read_text(encoding="utf-8"))["accepted"] is False
 
 
-def test_score_v13_status_uses_visible_raw_text_without_requiring_unlabeled_receipts(
+def test_score_v13_status_uses_visible_raw_text_and_checks_unlabeled_receipt_candidates(
     tmp_path: Path,
 ) -> None:
     model = tmp_path / "status-text-v13.onnx"
@@ -210,8 +221,9 @@ def test_score_v13_status_uses_visible_raw_text_without_requiring_unlabeled_rece
             "payment_method": "余额",
             "recipient": "商户甲",
         }
-        if status is not None:
-            candidates["transfer_status"] = status
+        # Candidate presence is required across all selected receipts, even
+        # when one receipt has no status accuracy reference.
+        candidates["transfer_status"] = status or "转账成功"
         _write_json(result_path, _result(source, model_sha256, **candidates))
         manifest.append({"source": str(source), "result": str(result_path), "status": "written"})
     _write_json(results / "inference_manifest.json", manifest)
@@ -224,19 +236,32 @@ def test_score_v13_status_uses_visible_raw_text_without_requiring_unlabeled_rece
         status_floor=0.90,
     )
 
-    assert summary["accepted"] is True
+    assert summary["accepted"] is False
+    assert summary["diagnostic_thresholds_passed"] is True
+    assert summary["formal_delivery_gate"] is False
     assert summary["floors"]["transfer_status"] == 0.90
     assert summary["acceptance"]["min_status_exact_match"] == 0.90
     assert summary["by_field"]["transfer_status"] == {
         "records": 1,
+        "reference_records": 1,
+        "denominator": "selected_reference_records",
         "raw_exact_matches": 1,
         "raw_exact_match": 1.0,
         "candidate_records": 1,
         "missing_candidate_records": 0,
         "candidate_coverage": 1.0,
+        "candidate_on_reference_records": 1,
+        "missing_candidate_on_reference_records": 0,
+        "candidate_on_reference_coverage": 1.0,
         "non_success_truth_records": 0,
         "non_success_safety_calibrated": False,
         "non_success_to_success": 0,
+    }
+    assert summary["all_receipt_candidate_coverage"]["by_field"]["transfer_status"] == {
+        "expected_receipts": 2,
+        "candidate_records": 2,
+        "missing_candidate_records": 0,
+        "candidate_coverage": 1.0,
     }
     status_rows = [
         json.loads(line)
@@ -297,7 +322,7 @@ def test_score_v13_status_missing_or_semantic_only_candidate_fails_raw_gate(
     assert summary["by_field"]["transfer_status"]["raw_exact_match"] == 0.0
     assert summary["by_field"]["transfer_status"]["candidate_coverage"] == 0.5
     assert any(
-        "transfer_status: candidate_coverage=0.5000 < 1.0000" in failure
+        "transfer_status: all_receipt_candidate_coverage=0.5000 < 1.0000" in failure
         for failure in summary["failures"]
     )
     assert any(
@@ -398,7 +423,10 @@ def test_score_counts_missing_result_and_candidate_as_errors(tmp_path: Path) -> 
     assert summary["by_field"]["recipient_field"]["missing_candidate_records"] == 2
     assert summary["coverage"]["result_coverage"] == 0.5
     assert any("result_coverage=0.5000" in failure for failure in summary["failures"])
-    assert any("recipient_field: candidate_coverage=0.0000" in failure for failure in summary["failures"])
+    assert any(
+        "recipient_field: all_receipt_candidate_coverage=0.0000" in failure
+        for failure in summary["failures"]
+    )
 
 
 def test_amount_semantic_is_diagnostic_only_and_preserves_digit_differences(tmp_path: Path) -> None:
@@ -658,9 +686,8 @@ def test_pilot_prepare_and_score_use_deterministic_hash_bound_five_field_selecti
             "time": "2026-08-06 07:08:09",
             "payment_method": "余额",
             "recipient": f"商户{source_index:02d}",
+            "transfer_status": "转账成功",
         }
-        if source_index >= 20:
-            candidates["transfer_status"] = "转账成功"
         _write_json(
             result_path,
             _result(source, model_sha256, **candidates),
@@ -708,6 +735,7 @@ def test_pilot_prepare_and_score_use_deterministic_hash_bound_five_field_selecti
     assert summary["input_selection"] == {
         "path": input_list.resolve().as_posix(),
         "sha256": input_sha256,
+        "hash_bound": True,
         "records": 20,
         "selection_order": "deterministic_min16_field_quota_then_records_manifest_order",
         "field_quotas": report["field_quotas"],
@@ -728,6 +756,86 @@ def test_pilot_prepare_and_score_use_deterministic_hash_bound_five_field_selecti
     assert {row["source"] for row in comparisons} == set(selected)
     assert summary["by_field"]["transfer_status"]["records"] == 16
     assert len(comparisons) == 96
+
+
+def test_hash_bound_accuracy_denominator_is_reference_count_but_candidate_gate_is_all_receipts(
+    tmp_path: Path,
+) -> None:
+    model = tmp_path / "v13.onnx"
+    model.write_bytes(b"v13-reference-denominator")
+    model_sha256 = hashlib.sha256(model.read_bytes()).hexdigest()
+    sources = [tmp_path / "with-recipient.png", tmp_path / "without-recipient.png"]
+    records = tmp_path / "records.jsonl"
+    with_recipient = _record("with", sources[0], recipient="商户甲", status="转账成功")
+    without_recipient = _record("without", sources[1], status="转账成功")
+    del without_recipient["slots"]["recipient_field"]  # type: ignore[index]
+    _write_jsonl(records, [with_recipient, without_recipient])
+
+    results = tmp_path / "results"
+    manifest: list[dict[str, object]] = []
+    for index, source in enumerate(sources):
+        result_path = results / f"{index}.json"
+        candidates: dict[str, str | None] = {
+            "amount": "¥ 1,234.56",
+            "time": "2026-08-06 07:08:09",
+            "payment_method": "余额",
+            "transfer_status": "转账成功",
+        }
+        if index == 0:
+            candidates["recipient"] = "商户甲"
+        _write_json(result_path, _result(source, model_sha256, **candidates))
+        manifest.append({"source": str(source), "result": str(result_path), "status": "written"})
+    _write_json(results / "inference_manifest.json", manifest)
+
+    input_list = tmp_path / "full-inputs.txt"
+    report = prepare_input_list(records_path=records, output_path=input_list)
+    input_sha256 = hashlib.sha256(input_list.read_bytes()).hexdigest()
+    summary = score_results(
+        records_path=records,
+        results_root=results,
+        model_path=model,
+        output_dir=tmp_path / "evaluation",
+        input_list_path=input_list,
+        input_list_sha256=input_sha256,
+        status_floor=0.90,
+    )
+
+    assert report["selected_field_reference_counts"]["recipient_field"] == 1
+    assert summary["input_selection"]["field_reference_counts"]["recipient_field"] == 1
+    assert summary["accuracy_denominators"] == {
+        "scope": "selected_reference_records",
+        "hash_bound": True,
+        "source": "input_selection.field_reference_counts",
+        "by_field": report["selected_field_reference_counts"],
+    }
+    assert summary["by_field"]["recipient_field"]["records"] == 1
+    assert summary["by_field"]["recipient_field"]["raw_exact_match"] == 1.0
+    assert summary["coverage"]["by_field"]["recipient_field"] == {
+        "references": 1,
+        "candidates": 1,
+        "missing": 0,
+        "coverage": 1.0,
+    }
+    assert summary["all_receipt_candidate_coverage"]["expected_receipts"] == 2
+    assert summary["all_receipt_candidate_coverage"]["complete_receipts"] == 1
+    assert summary["all_receipt_candidate_coverage"]["by_field"]["recipient_field"] == {
+        "expected_receipts": 2,
+        "candidate_records": 1,
+        "missing_candidate_records": 1,
+        "candidate_coverage": 0.5,
+    }
+    assert summary["coverage"]["by_field_all_receipts"]["recipient_field"] == {
+        "expected_receipts": 2,
+        "candidate_records": 1,
+        "missing_candidate_records": 1,
+        "candidate_coverage": 0.5,
+    }
+    assert summary["accepted"] is False
+    assert summary["formal_delivery_gate"] is False
+    assert any(
+        "recipient_field: all_receipt_candidate_coverage=0.5000 < 1.0000" in failure
+        for failure in summary["failures"]
+    )
 
 
 def _write_bound_v13_fixture(

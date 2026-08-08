@@ -863,6 +863,8 @@ function Read-AcceptedProductionPackage([string]$PackageRoot) {
         $PackageRoot "evidence/inference_manifest.json" "inference manifest"
     $resultEvidencePath = Resolve-ContainedPackageFile `
         $PackageRoot "evidence/result_evidence_sha256.json" "result evidence hashes"
+    $validationInputListPath = Resolve-ContainedPackageFile `
+        $PackageRoot "evidence/validation-input-list.txt" "formal validation input list"
     $onnxValidation = Get-Content -LiteralPath $onnxValidationPath -Raw -Encoding UTF8 | ConvertFrom-Json
     $endToEndSummary = Get-Content -LiteralPath $endToEndSummaryPath -Raw -Encoding UTF8 | ConvertFrom-Json
     $onnxFailures = @(
@@ -878,22 +880,69 @@ function Read-AcceptedProductionPackage([string]$PackageRoot) {
     $actualSummarySha256 = Get-Sha256 $endToEndSummaryPath
     $actualComparisonsSha256 = Get-Sha256 $endToEndComparisonsPath
     $actualManifestSha256 = Get-Sha256 $inferenceManifestPath
+    $actualInputManifestSha256 = Get-Sha256 $validationInputListPath
     $actualOnnxValidationSha256 = Get-Sha256 $onnxValidationPath
+    $requiredRecords = 10016
+    $requestedLimitProperty = $endToEndSummary.evaluation_scope.PSObject.Properties["requested_limit"]
+    $packageCandidateProperty = $validation.PSObject.Properties["candidates_by_field"]
     if ([string]$validation.model_sha256 -ne [string]$unifiedEvidence.ModelSha256 `
         -or [string]$validation.end_to_end_evaluation.model_sha256 -ne [string]$unifiedEvidence.ModelSha256 `
         -or [string]$validation.end_to_end_evaluation.summary_sha256 -ne $actualSummarySha256 `
         -or [string]$validation.end_to_end_evaluation.comparisons_sha256 -ne $actualComparisonsSha256 `
         -or [string]$validation.end_to_end_evaluation.manifest_sha256 -ne $actualManifestSha256 `
+        -or [string]$validation.end_to_end_evaluation.input_manifest_sha256 -ne $actualInputManifestSha256 `
+        -or [int]$validation.end_to_end_evaluation.expected_receipts -ne $requiredRecords `
+        -or [int]$validation.candidate_complete -ne $requiredRecords `
+        -or $null -eq $packageCandidateProperty `
+        -or $null -eq $packageCandidateProperty.Value `
         -or [string]$endToEndSummary.kind -ne "receipt_mlnet_unified_candidate_evaluation_v1" `
+        -or [int]$endToEndSummary.coverage_contract_version -ne 2 `
         -or [string]$endToEndSummary.evaluation_split -ne "val" `
         -or [string]$endToEndSummary.model_sha256 -ne [string]$unifiedEvidence.ModelSha256 `
         -or [string]$endToEndSummary.records_sha256 -ne [string]$validation.end_to_end_evaluation.records_sha256 `
         -or [string]$endToEndSummary.manifest_sha256 -ne $actualManifestSha256 `
+        -or $endToEndSummary.input_selection.hash_bound -ne $true `
+        -or [string]$endToEndSummary.input_selection.sha256 -ne $actualInputManifestSha256 `
+        -or [int]$endToEndSummary.input_selection.records -ne $requiredRecords `
+        -or [string]$endToEndSummary.input_selection.selection_order -ne "first_unique_source_in_records_manifest_order" `
+        -or $endToEndSummary.accuracy_denominators.hash_bound -ne $true `
+        -or [string]$endToEndSummary.accuracy_denominators.source -ne "input_selection.field_reference_counts" `
+        -or [int]$endToEndSummary.coverage.expected_receipts -ne $requiredRecords `
+        -or [int]$endToEndSummary.coverage.matched_result_receipts -ne $requiredRecords `
+        -or [int]$endToEndSummary.coverage.fully_scored_receipts -ne $requiredRecords `
+        -or [double]$endToEndSummary.coverage.result_coverage -ne 1.0 `
+        -or [double]$endToEndSummary.coverage.fully_scored_coverage -ne 1.0 `
+        -or [int]$endToEndSummary.coverage.coverage_contract_version -ne 2 `
+        -or [string]$endToEndSummary.coverage.candidate_coverage_domain -ne "all_expected_receipts" `
+        -or [int]$endToEndSummary.coverage.fully_candidate_covered_receipts -ne `
+            [int]$endToEndSummary.coverage.expected_receipts `
+        -or [double]$endToEndSummary.coverage.all_field_candidate_coverage -ne 1.0 `
+        -or [string]$endToEndSummary.all_receipt_candidate_coverage.scope -ne "all_selected_receipts" `
+        -or [int]$endToEndSummary.all_receipt_candidate_coverage.expected_receipts -ne $requiredRecords `
+        -or [int]$endToEndSummary.all_receipt_candidate_coverage.complete_receipts -ne `
+            $requiredRecords `
+        -or [int]$endToEndSummary.all_receipt_candidate_coverage.missing_complete_receipts -ne 0 `
+        -or [double]$endToEndSummary.all_receipt_candidate_coverage.complete_coverage -ne 1.0 `
+        -or $endToEndSummary.formal_delivery_gate -ne $true `
+        -or $endToEndSummary.acceptance.formal_delivery_gate -ne $true `
+        -or [string]$endToEndSummary.evaluation_scope.kind -ne "full_split" `
+        -or $null -eq $requestedLimitProperty `
+        -or $null -ne $requestedLimitProperty.Value `
+        -or [int]$endToEndSummary.evaluation_scope.evaluated_expected_receipts -ne $requiredRecords `
+        -or [int]$endToEndSummary.evaluation_scope.full_split_expected_receipts -ne $requiredRecords `
+        -or [string]$endToEndSummary.evaluation_scope.input_list_sha256 -ne $actualInputManifestSha256 `
         -or $endToEndSummary.artifact_audit.all_results_match_model -ne $true `
         -or $endToEndSummary.accepted -ne $true `
         -or $endToEndSummary.acceptance.passed -ne $true `
         -or $endToEndFailures.Count -ne 0) {
         throw "Package validation, end-to-end evidence, and delivered unified OCR artifacts are not cryptographically bound."
+    }
+    foreach ($fieldName in @("amount", "time", "recipient", "payment_method", "transfer_status")) {
+        $candidateCountProperty = $packageCandidateProperty.Value.PSObject.Properties[$fieldName]
+        if ($null -eq $candidateCountProperty `
+            -or [int]$candidateCountProperty.Value -ne $requiredRecords) {
+            throw "Package validation does not prove $requiredRecords $fieldName candidates."
+        }
     }
     if ([string]$onnxValidation.model_sha256 -ne [string]$unifiedEvidence.ModelSha256 `
         -or [string]$onnxValidation.evaluation_split -ne "val" `
@@ -910,20 +959,53 @@ function Read-AcceptedProductionPackage([string]$PackageRoot) {
         throw "Package validation onnx_validation.summary_sha256 does not match the packaged ONNX summary."
     }
 
-    foreach ($fieldName in @("amount", "time", "payment_method_field", "recipient_field")) {
+    $fixedFloors = @{
+        amount = 0.7885
+        time = 0.9840
+        payment_method_field = 0.9325
+        recipient_field = 0.90
+        transfer_status = 0.90
+    }
+    foreach ($fieldName in @("amount", "time", "payment_method_field", "recipient_field", "transfer_status")) {
         $validationMetricProperty = $validation.end_to_end_evaluation.metrics.PSObject.Properties[$fieldName]
         $summaryMetricProperty = $endToEndSummary.by_field.PSObject.Properties[$fieldName]
-        if ($null -eq $validationMetricProperty -or $null -eq $summaryMetricProperty) {
+        $floorProperty = $endToEndSummary.floors.PSObject.Properties[$fieldName]
+        $referenceCountProperty = `
+            $endToEndSummary.input_selection.field_reference_counts.PSObject.Properties[$fieldName]
+        $denominatorProperty = `
+            $endToEndSummary.accuracy_denominators.by_field.PSObject.Properties[$fieldName]
+        $candidateProperty = `
+            $endToEndSummary.all_receipt_candidate_coverage.by_field.PSObject.Properties[$fieldName]
+        if ($null -eq $validationMetricProperty `
+            -or $null -eq $summaryMetricProperty `
+            -or $null -eq $floorProperty `
+            -or $null -eq $referenceCountProperty `
+            -or $null -eq $denominatorProperty `
+            -or $null -eq $candidateProperty) {
             throw "End-to-end evidence is missing the $fieldName metric."
         }
         $validationMetric = $validationMetricProperty.Value
         $summaryMetric = $summaryMetricProperty.Value
-        if ([int]$validationMetric.records -ne [int]$summaryMetric.records `
+        $requiredFloor = [double]$fixedFloors[$fieldName]
+        if ([int]$referenceCountProperty.Value -le 0 `
+            -or [int]$summaryMetric.records -ne [int]$referenceCountProperty.Value `
+            -or [int]$denominatorProperty.Value -ne [int]$referenceCountProperty.Value `
+            -or [int]$validationMetric.records -ne [int]$summaryMetric.records `
             -or [double]$validationMetric.exact_match -ne [double]$summaryMetric.raw_exact_match `
+            -or [double]$floorProperty.Value -ne $requiredFloor `
+            -or [double]::IsNaN([double]$summaryMetric.raw_exact_match) `
+            -or [double]::IsInfinity([double]$summaryMetric.raw_exact_match) `
+            -or [double]$summaryMetric.raw_exact_match -lt $requiredFloor `
             -or [double]$validationMetric.candidate_coverage -ne 1.0 `
-            -or [double]$summaryMetric.candidate_coverage -ne 1.0) {
+            -or [int]$candidateProperty.Value.expected_receipts -ne [int]$endToEndSummary.coverage.expected_receipts `
+            -or [int]$candidateProperty.Value.candidate_records -ne [int]$endToEndSummary.coverage.expected_receipts `
+            -or [int]$candidateProperty.Value.missing_candidate_records -ne 0 `
+            -or [double]$candidateProperty.Value.candidate_coverage -ne 1.0) {
             throw "Package validation and end-to-end $fieldName metrics do not match."
         }
+    }
+    if ([int]$endToEndSummary.by_field.transfer_status.non_success_to_success -ne 0) {
+        throw "End-to-end transfer-status evidence crossed the zero non-success-to-success safety line."
     }
     $legacyResultCount = 0
     if ($null -eq $configDeclarationProperty) {

@@ -329,7 +329,28 @@ function Get-RawExactMetric([object]$Summary, [string]$Field) {
     return $value
 }
 
-function Assert-FiveFieldCoverage([object]$Summary, [int]$ExpectedRecords) {
+function Assert-FiveFieldCoverage(
+    [object]$Summary,
+    [int]$ExpectedRecords,
+    [string]$ExpectedInputManifestSha256
+) {
+    if ($Summary.input_selection.hash_bound -ne $true `
+        -or [int]$Summary.coverage_contract_version -ne 2 `
+        -or [int]$Summary.coverage.coverage_contract_version -ne 2 `
+        -or [string]$Summary.coverage.candidate_coverage_domain -ne "all_expected_receipts" `
+        -or [int]$Summary.coverage.fully_candidate_covered_receipts -ne $ExpectedRecords `
+        -or [double]$Summary.coverage.all_field_candidate_coverage -ne 1.0 `
+        -or [int]$Summary.input_selection.records -ne $ExpectedRecords `
+        -or [string]$Summary.input_selection.sha256 -ne $ExpectedInputManifestSha256 `
+        -or $Summary.accuracy_denominators.hash_bound -ne $true `
+        -or [string]$Summary.accuracy_denominators.source -ne "input_selection.field_reference_counts" `
+        -or [string]$Summary.all_receipt_candidate_coverage.scope -ne "all_selected_receipts" `
+        -or [int]$Summary.all_receipt_candidate_coverage.expected_receipts -ne $ExpectedRecords `
+        -or [int]$Summary.all_receipt_candidate_coverage.complete_receipts -ne $ExpectedRecords `
+        -or [int]$Summary.all_receipt_candidate_coverage.missing_complete_receipts -ne 0 `
+        -or [double]$Summary.all_receipt_candidate_coverage.complete_coverage -ne 1.0) {
+        throw "Formal hybrid evaluation is not hash-bound and candidate-complete for all $ExpectedRecords receipts."
+    }
     foreach ($fieldName in @(
             "amount",
             "time",
@@ -338,11 +359,25 @@ function Assert-FiveFieldCoverage([object]$Summary, [int]$ExpectedRecords) {
             "transfer_status"
         )) {
         $fieldProperty = $Summary.by_field.PSObject.Properties[$fieldName]
+        $referenceCountProperty = `
+            $Summary.input_selection.field_reference_counts.PSObject.Properties[$fieldName]
+        $denominatorProperty = `
+            $Summary.accuracy_denominators.by_field.PSObject.Properties[$fieldName]
+        $candidateProperty = `
+            $Summary.all_receipt_candidate_coverage.by_field.PSObject.Properties[$fieldName]
         if ($null -eq $fieldProperty `
             -or $null -eq $fieldProperty.Value `
-            -or [int]$fieldProperty.Value.records -ne $ExpectedRecords `
-            -or [double]$fieldProperty.Value.candidate_coverage -ne 1.0) {
-            throw "Formal hybrid evaluation does not have complete $fieldName coverage."
+            -or $null -eq $referenceCountProperty `
+            -or $null -eq $denominatorProperty `
+            -or $null -eq $candidateProperty `
+            -or [int]$referenceCountProperty.Value -le 0 `
+            -or [int]$fieldProperty.Value.records -ne [int]$referenceCountProperty.Value `
+            -or [int]$denominatorProperty.Value -ne [int]$referenceCountProperty.Value `
+            -or [int]$candidateProperty.Value.expected_receipts -ne $ExpectedRecords `
+            -or [int]$candidateProperty.Value.candidate_records -ne $ExpectedRecords `
+            -or [int]$candidateProperty.Value.missing_candidate_records -ne 0 `
+            -or [double]$candidateProperty.Value.candidate_coverage -ne 1.0) {
+            throw "Formal hybrid evaluation does not have the hash-bound $fieldName denominator and all-receipt candidate coverage."
         }
     }
 }
@@ -544,7 +579,7 @@ $statusExact = Get-RawExactMetric $scoreSummary "transfer_status"
 $p50 = [double]$formalSummary.inference_latency_ms.p50
 $p95 = [double]$formalSummary.inference_latency_ms.p95
 $errors = [int]$formalSummary.errors
-Assert-FiveFieldCoverage $scoreSummary $formalCount
+Assert-FiveFieldCoverage $scoreSummary $formalCount (Get-Sha256 $inputList)
 Assert-RecipientPpocrArtifact $packageValidation $formalDelivery $paddleContractSha256 "Formal validation"
 Assert-RecipientPpocrArtifact $packageConfig $formalDelivery $paddleContractSha256 "Formal package config"
 $atomicPublished = (
@@ -556,6 +591,12 @@ $atomicPublished = (
     -and [string]$packageValidation.runtime_flavor -eq "cpu" `
     -and [string]$packageValidation.kind -eq "receipt_mlnet_hybrid_recipient_package_validation_v1" `
     -and [int]$packageValidation.unified_ocr_architecture_version -eq 13 `
+    -and [int]$packageValidation.candidate_complete -eq $formalCount `
+    -and [int]$packageValidation.candidates_by_field.amount -eq $formalCount `
+    -and [int]$packageValidation.candidates_by_field.time -eq $formalCount `
+    -and [int]$packageValidation.candidates_by_field.recipient -eq $formalCount `
+    -and [int]$packageValidation.candidates_by_field.payment_method -eq $formalCount `
+    -and [int]$packageValidation.candidates_by_field.transfer_status -eq $formalCount `
     -and $packageValidation.include_device_model -eq $true `
     -and $null -ne $packageValidation.model_artifacts.device `
     -and $null -ne $packageConfig.model_artifacts.device `
@@ -576,7 +617,7 @@ if ([int]$formalSummary.input -ne $formalCount `
     -or $paymentExact -lt $paymentFloor `
     -or $recipientExact -lt $recipientFloor `
     -or $statusExact -lt $statusFloor `
-    -or [double]$scoreSummary.by_field.transfer_status.candidate_coverage -ne 1.0 `
+    -or [double]$scoreSummary.all_receipt_candidate_coverage.by_field.transfer_status.candidate_coverage -ne 1.0 `
     -or [int]$scoreSummary.by_field.transfer_status.non_success_to_success -ne 0 `
     -or [double]::IsNaN($p50) `
     -or [double]::IsInfinity($p50) `

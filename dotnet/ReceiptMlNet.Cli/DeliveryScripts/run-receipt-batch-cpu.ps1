@@ -1164,6 +1164,7 @@ function Assert-HybridFormalEvidence(
     $requestedLimitProperty = $accuracySummary.evaluation_scope.PSObject.Properties["requested_limit"]
     $maxStatusSafetyProperty = $accuracySummary.acceptance.PSObject.Properties["max_non_success_to_success"]
     if ([int]$accuracySummary.schema_version -ne 1 `
+        -or [int]$accuracySummary.coverage_contract_version -ne 2 `
         -or [string]$accuracySummary.kind -ne "receipt_mlnet_unified_candidate_evaluation_v1" `
         -or [string]$accuracySummary.evaluation_split -ne "val" `
         -or [string]$accuracySummary.model_sha256 -ne [string]$UnifiedEvidence.ModelSha256 `
@@ -1185,6 +1186,21 @@ function Assert-HybridFormalEvidence(
         -or [int]$accuracySummary.coverage.fully_scored_receipts -ne $requiredRecords `
         -or [double]$accuracySummary.coverage.result_coverage -ne 1.0 `
         -or [double]$accuracySummary.coverage.fully_scored_coverage -ne 1.0 `
+        -or [int]$accuracySummary.coverage.coverage_contract_version -ne 2 `
+        -or [string]$accuracySummary.coverage.candidate_coverage_domain -ne "all_expected_receipts" `
+        -or [int]$accuracySummary.coverage.fully_candidate_covered_receipts -ne $requiredRecords `
+        -or [double]$accuracySummary.coverage.all_field_candidate_coverage -ne 1.0 `
+        -or $accuracySummary.input_selection.hash_bound -ne $true `
+        -or [int]$accuracySummary.input_selection.records -ne $requiredRecords `
+        -or [string]$accuracySummary.input_selection.sha256 -ne `
+            [string]$comparisonSummary.input_set.input_manifest.sha256 `
+        -or $accuracySummary.accuracy_denominators.hash_bound -ne $true `
+        -or [string]$accuracySummary.accuracy_denominators.source -ne "input_selection.field_reference_counts" `
+        -or [string]$accuracySummary.all_receipt_candidate_coverage.scope -ne "all_selected_receipts" `
+        -or [int]$accuracySummary.all_receipt_candidate_coverage.expected_receipts -ne $requiredRecords `
+        -or [int]$accuracySummary.all_receipt_candidate_coverage.complete_receipts -ne $requiredRecords `
+        -or [int]$accuracySummary.all_receipt_candidate_coverage.missing_complete_receipts -ne 0 `
+        -or [double]$accuracySummary.all_receipt_candidate_coverage.complete_coverage -ne 1.0 `
         -or $null -eq $maxStatusSafetyProperty `
         -or $null -eq $maxStatusSafetyProperty.Value `
         -or (($maxStatusSafetyProperty.Value -isnot [int]) `
@@ -1204,13 +1220,27 @@ function Assert-HybridFormalEvidence(
         $requiredFloor = [double]$gate.Floor
         $metricProperty = $accuracySummary.by_field.PSObject.Properties[$fieldName]
         $floorProperty = $accuracySummary.floors.PSObject.Properties[$fieldName]
+        $referenceCountProperty = `
+            $accuracySummary.input_selection.field_reference_counts.PSObject.Properties[$fieldName]
+        $denominatorProperty = `
+            $accuracySummary.accuracy_denominators.by_field.PSObject.Properties[$fieldName]
+        $candidateProperty = `
+            $accuracySummary.all_receipt_candidate_coverage.by_field.PSObject.Properties[$fieldName]
         if ($null -eq $metricProperty `
             -or $null -eq $floorProperty `
+            -or $null -eq $referenceCountProperty `
+            -or $null -eq $denominatorProperty `
+            -or $null -eq $candidateProperty `
             -or [double]$floorProperty.Value -ne $requiredFloor `
-            -or [int]$metricProperty.Value.records -ne $requiredRecords `
-            -or [double]$metricProperty.Value.candidate_coverage -ne 1.0 `
+            -or [int]$referenceCountProperty.Value -le 0 `
+            -or [int]$metricProperty.Value.records -ne [int]$referenceCountProperty.Value `
+            -or [int]$denominatorProperty.Value -ne [int]$referenceCountProperty.Value `
+            -or [int]$candidateProperty.Value.expected_receipts -ne $requiredRecords `
+            -or [int]$candidateProperty.Value.candidate_records -ne $requiredRecords `
+            -or [int]$candidateProperty.Value.missing_candidate_records -ne 0 `
+            -or [double]$candidateProperty.Value.candidate_coverage -ne 1.0 `
             -or [double]$metricProperty.Value.raw_exact_match -lt $requiredFloor) {
-            throw "Formal hybrid CPU A/B accuracy did not pass the fixed $fieldName floor with 100% candidate coverage."
+            throw "Formal hybrid CPU A/B accuracy did not pass the fixed $fieldName reference denominator/floor with all-receipt candidate coverage."
         }
     }
     if ([int]$accuracySummary.by_field.transfer_status.non_success_to_success -ne 0) {
@@ -1291,7 +1321,8 @@ function Assert-FreshFormalAccuracyEvidence(
     [object]$Summary,
     [string]$ExpectedModelSha256,
     [string]$ExpectedRecordsSha256,
-    [string]$ExpectedManifestSha256
+    [string]$ExpectedManifestSha256,
+    [string]$ExpectedInputManifestSha256
 ) {
     $requiredRecords = 10016
     $failures = @(
@@ -1307,6 +1338,7 @@ function Assert-FreshFormalAccuracyEvidence(
     $requestedLimitProperty = $Summary.evaluation_scope.PSObject.Properties["requested_limit"]
     $maxStatusSafetyProperty = $Summary.acceptance.PSObject.Properties["max_non_success_to_success"]
     if ([int]$Summary.schema_version -ne 1 `
+        -or [int]$Summary.coverage_contract_version -ne 2 `
         -or [string]$Summary.kind -ne "receipt_mlnet_unified_candidate_evaluation_v1" `
         -or [string]$Summary.evaluation_split -ne "val" `
         -or [string]$Summary.model_sha256 -ne $ExpectedModelSha256 `
@@ -1329,6 +1361,20 @@ function Assert-FreshFormalAccuracyEvidence(
         -or [int]$Summary.coverage.fully_scored_receipts -ne $requiredRecords `
         -or [double]$Summary.coverage.result_coverage -ne 1.0 `
         -or [double]$Summary.coverage.fully_scored_coverage -ne 1.0 `
+        -or [int]$Summary.coverage.coverage_contract_version -ne 2 `
+        -or [string]$Summary.coverage.candidate_coverage_domain -ne "all_expected_receipts" `
+        -or [int]$Summary.coverage.fully_candidate_covered_receipts -ne $requiredRecords `
+        -or [double]$Summary.coverage.all_field_candidate_coverage -ne 1.0 `
+        -or $Summary.input_selection.hash_bound -ne $true `
+        -or [int]$Summary.input_selection.records -ne $requiredRecords `
+        -or [string]$Summary.input_selection.sha256 -ne $ExpectedInputManifestSha256 `
+        -or $Summary.accuracy_denominators.hash_bound -ne $true `
+        -or [string]$Summary.accuracy_denominators.source -ne "input_selection.field_reference_counts" `
+        -or [string]$Summary.all_receipt_candidate_coverage.scope -ne "all_selected_receipts" `
+        -or [int]$Summary.all_receipt_candidate_coverage.expected_receipts -ne $requiredRecords `
+        -or [int]$Summary.all_receipt_candidate_coverage.complete_receipts -ne $requiredRecords `
+        -or [int]$Summary.all_receipt_candidate_coverage.missing_complete_receipts -ne 0 `
+        -or [double]$Summary.all_receipt_candidate_coverage.complete_coverage -ne 1.0 `
         -or $null -eq $maxStatusSafetyProperty `
         -or $null -eq $maxStatusSafetyProperty.Value `
         -or (($maxStatusSafetyProperty.Value -isnot [int]) `
@@ -1353,17 +1399,33 @@ function Assert-FreshFormalAccuracyEvidence(
             throw "Fresh package accuracy evidence is missing $fieldName metrics or its fixed floor."
         }
         $records = [int]$metricProperty.Value.records
-        $coverage = [double]$metricProperty.Value.candidate_coverage
+        $referenceCountProperty = `
+            $Summary.input_selection.field_reference_counts.PSObject.Properties[$fieldName]
+        $denominatorProperty = `
+            $Summary.accuracy_denominators.by_field.PSObject.Properties[$fieldName]
+        $candidateProperty = `
+            $Summary.all_receipt_candidate_coverage.by_field.PSObject.Properties[$fieldName]
+        if ($null -eq $referenceCountProperty `
+            -or $null -eq $denominatorProperty `
+            -or $null -eq $candidateProperty) {
+            throw "Fresh package accuracy evidence is missing $fieldName denominator or all-receipt candidate coverage."
+        }
+        $coverage = [double]$candidateProperty.Value.candidate_coverage
         $exactMatch = [double]$metricProperty.Value.raw_exact_match
         if ([double]$floorProperty.Value -ne $requiredFloor `
-            -or $records -ne $requiredRecords `
+            -or [int]$referenceCountProperty.Value -le 0 `
+            -or $records -ne [int]$referenceCountProperty.Value `
+            -or [int]$denominatorProperty.Value -ne [int]$referenceCountProperty.Value `
             -or [double]::IsNaN($coverage) `
             -or [double]::IsInfinity($coverage) `
+            -or [int]$candidateProperty.Value.expected_receipts -ne $requiredRecords `
+            -or [int]$candidateProperty.Value.candidate_records -ne $requiredRecords `
+            -or [int]$candidateProperty.Value.missing_candidate_records -ne 0 `
             -or $coverage -ne 1.0 `
             -or [double]::IsNaN($exactMatch) `
             -or [double]::IsInfinity($exactMatch) `
             -or $exactMatch -lt $requiredFloor) {
-            throw "Fresh package accuracy evidence did not pass the fixed $fieldName floor with 100% candidate coverage."
+            throw "Fresh package accuracy evidence did not pass the fixed $fieldName reference denominator/floor with all-receipt candidate coverage."
         }
     }
     $statusSafetyProperty = `
@@ -1386,14 +1448,26 @@ function Assert-AcceptedPackageBinding(
     [object]$UnifiedEvidence,
     [object]$PaddleEvidence
 ) {
+    $requiredRecords = 10016
     $configDeclaration = $Config.PSObject.Properties["model_artifacts"]
     $validationDeclaration = $Validation.PSObject.Properties["model_artifacts"]
     $reviewValueProperty = $Config.PSObject.Properties["text_review_value"]
+    $candidateByFieldProperty = $Validation.PSObject.Properties["candidates_by_field"]
     if ($null -eq $configDeclaration `
         -or $null -eq $validationDeclaration `
         -or $null -eq $reviewValueProperty `
+        -or $null -eq $candidateByFieldProperty `
+        -or $null -eq $candidateByFieldProperty.Value `
+        -or [int]$Validation.candidate_complete -ne $requiredRecords `
         -or [string]$reviewValueProperty.Value -ne [string]$UnifiedEvidence.ReviewValue) {
-        throw "Package lacks an explicit config/validation model and review-policy binding."
+        throw "Package lacks an explicit model/review binding or all-receipt five-field candidate evidence."
+    }
+    foreach ($fieldName in @("amount", "time", "recipient", "payment_method", "transfer_status")) {
+        $candidateCountProperty = $candidateByFieldProperty.Value.PSObject.Properties[$fieldName]
+        if ($null -eq $candidateCountProperty `
+            -or [int]$candidateCountProperty.Value -ne $requiredRecords) {
+            throw "Package validation does not prove $requiredRecords $fieldName candidates."
+        }
     }
     Assert-DeclaredModelArtifacts `
         $configDeclaration.Value $PackageRoot `
@@ -1413,6 +1487,8 @@ function Assert-AcceptedPackageBinding(
         $PackageRoot "evidence/end-to-end-comparisons.jsonl" "end-to-end comparisons"
     $inferenceManifestPath = Resolve-ContainedPackageFile `
         $PackageRoot "evidence/inference_manifest.json" "inference manifest"
+    $validationInputListPath = Resolve-ContainedPackageFile `
+        $PackageRoot "evidence/validation-input-list.txt" "formal validation input list"
     $onnxValidation = Get-Content -LiteralPath $onnxValidationPath -Raw -Encoding UTF8 | ConvertFrom-Json
     $endToEndSummary = Get-Content -LiteralPath $endToEndSummaryPath -Raw -Encoding UTF8 | ConvertFrom-Json
     $onnxFailures = @(
@@ -1432,7 +1508,7 @@ function Assert-AcceptedPackageBinding(
     $manifestSha256 = Get-Sha256 $inferenceManifestPath
     Assert-FreshFormalAccuracyEvidence `
         $endToEndSummary ([string]$UnifiedEvidence.ModelSha256) `
-        ([string]$Config.records_sha256) $manifestSha256
+        ([string]$Config.records_sha256) $manifestSha256 (Get-Sha256 $validationInputListPath)
     if ([int]$onnxValidation.schema_version -ne 1 `
         -or [int]$endToEndSummary.schema_version -ne 1 `
         -or [string]$Validation.model_sha256 -ne [string]$UnifiedEvidence.ModelSha256 `
@@ -1441,6 +1517,8 @@ function Assert-AcceptedPackageBinding(
         -or [string]$Validation.end_to_end_evaluation.summary_sha256 -ne (Get-Sha256 $endToEndSummaryPath) `
         -or [string]$Validation.end_to_end_evaluation.comparisons_sha256 -ne (Get-Sha256 $endToEndComparisonsPath) `
         -or [string]$Validation.end_to_end_evaluation.manifest_sha256 -ne $manifestSha256 `
+        -or [string]$Validation.end_to_end_evaluation.input_manifest_sha256 -ne `
+            (Get-Sha256 $validationInputListPath) `
         -or [string]$onnxValidation.model_sha256 -ne [string]$UnifiedEvidence.ModelSha256 `
         -or [string]$onnxValidation.evaluation_split -ne "val" `
         -or $onnxValidation.acceptance.requested -ne $true `

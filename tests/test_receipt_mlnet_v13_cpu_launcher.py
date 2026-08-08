@@ -108,8 +108,15 @@ def test_launcher_reports_formal_metrics_latency_paths_and_atomic_publication() 
     assert 'full_val_end_to_end_scored_cpu' in source
     assert 'unified_artifact_source.binding -eq "explicit_run_contained"' in source
     assert 'receipt_mlnet_unified_delivery_package_v1' in source
-    assert 'scoreSummary.by_field.transfer_status.candidate_coverage -ne 1.0' in source
+    assert 'scoreSummary.all_receipt_candidate_coverage.by_field.transfer_status.candidate_coverage -ne 1.0' in source
     assert 'scoreSummary.by_field.transfer_status.non_success_to_success -ne 0' in source
+    assert "Summary.input_selection.field_reference_counts" in source
+    assert "Summary.accuracy_denominators.by_field" in source
+    assert "Summary.all_receipt_candidate_coverage.by_field" in source
+    assert "Summary.coverage_contract_version -ne 2" in source
+    assert "Summary.coverage.fully_candidate_covered_receipts -ne $ExpectedRecords" in source
+    assert "candidateProperty.Value.candidate_records -ne $ExpectedRecords" in source
+    assert "packageValidation.candidates_by_field.transfer_status -eq $formalCount" in source
 
 
 def test_launcher_powershell_parses_when_powershell_is_available() -> None:

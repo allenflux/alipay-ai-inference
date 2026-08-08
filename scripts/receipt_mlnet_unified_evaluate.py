@@ -439,7 +439,7 @@ def _candidate(result: Mapping[str, Any], result_key: str) -> tuple[str | None, 
     if not isinstance(field, Mapping):
         return None, "field_missing"
     candidate = field.get("candidate")
-    if not isinstance(candidate, str) or not candidate:
+    if not isinstance(candidate, str) or not candidate.strip():
         return None, "candidate_missing"
     return candidate, None
 
@@ -674,11 +674,16 @@ def _field_metrics(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     candidates = sum(bool(row["candidate_present"]) for row in rows)
     return {
         "records": records,
+        "reference_records": records,
+        "denominator": "selected_reference_records",
         "raw_exact_matches": exact_matches,
         "raw_exact_match": exact_matches / records if records else None,
         "candidate_records": candidates,
         "missing_candidate_records": records - candidates,
         "candidate_coverage": candidates / records if records else None,
+        "candidate_on_reference_records": candidates,
+        "missing_candidate_on_reference_records": records - candidates,
+        "candidate_on_reference_coverage": candidates / records if records else None,
     }
 
 
@@ -787,6 +792,7 @@ def score_results(
     )
     full_expected_count = len(full_expected)
     input_selection: dict[str, Any] | None = None
+    selected_field_counts: dict[str, int]
     if input_list_path is not None:
         input_sources, input_keys, observed_input_sha256 = _load_bound_input_list(
             input_list_path,
@@ -834,6 +840,7 @@ def score_results(
         input_selection = {
             "path": input_list_path.as_posix(),
             "sha256": observed_input_sha256,
+            "hash_bound": True,
             "records": len(input_keys),
             "selection_order": selection_order,
             "field_quotas": quotas,
@@ -842,6 +849,10 @@ def score_results(
     else:
         expected = full_expected
         selection_order = FULL_SELECTION_ORDER
+        selected_field_counts = {
+            field: sum(_has_reference(entry, field) for entry in expected.values())
+            for field in field_result_keys
+        }
     results, artifact_audit, integrity_failures = _load_manifest_results(
         manifest_path=manifest_path,
         model_sha256=model_sha256,
@@ -850,8 +861,19 @@ def score_results(
 
     comparisons: list[dict[str, Any]] = []
     missing_result_sources: list[str] = []
-    missing_field_sources: dict[str, list[str]] = {field: [] for field in field_result_keys}
+    # Accuracy is defined only where the hash-bound records manifest provides a
+    # reference.  Candidate presence is a separate release invariant and must
+    # cover every selected receipt, including receipts with no reference for a
+    # particular field.
+    missing_reference_field_sources: dict[str, list[str]] = {
+        field: [] for field in field_result_keys
+    }
+    missing_all_receipt_field_sources: dict[str, list[str]] = {
+        field: [] for field in field_result_keys
+    }
+    candidate_records_by_field = {field: 0 for field in field_result_keys}
     fully_scored_receipts = 0
+    fully_candidate_covered_receipts = 0
     matched_receipts = 0
     for source_key, truth in expected.items():
         result_entry = results.get(source_key)
@@ -860,18 +882,28 @@ def score_results(
             missing_result_sources.append(str(truth["source"]))
         else:
             matched_receipts += 1
-        receipt_complete = result is not None
-        references = truth["references"]
-        for field, reference in references.items():
-            result_key = field_result_keys[field]
+        reference_receipt_complete = result is not None
+        all_candidate_complete = result is not None
+        candidates_by_field: dict[str, tuple[str | None, str | None]] = {}
+        for field, result_key in field_result_keys.items():
             if result is None:
                 candidate, missing_reason = None, "result_missing"
             else:
                 candidate, missing_reason = _candidate(result, result_key)
+            candidates_by_field[field] = (candidate, missing_reason)
+            if candidate is None:
+                missing_all_receipt_field_sources[field].append(str(truth["source"]))
+                all_candidate_complete = False
+            else:
+                candidate_records_by_field[field] += 1
+        references = truth["references"]
+        for field, reference in references.items():
+            result_key = field_result_keys[field]
+            candidate, missing_reason = candidates_by_field[field]
             candidate_present = candidate is not None
             if not candidate_present:
-                missing_field_sources[field].append(str(truth["source"]))
-                receipt_complete = False
+                missing_reference_field_sources[field].append(str(truth["source"]))
+                reference_receipt_complete = False
             comparison = {
                 "schema_version": SCHEMA_VERSION,
                 "kind": "receipt_mlnet_unified_comparison_v1",
@@ -921,8 +953,10 @@ def score_results(
                     }
                 )
             comparisons.append(comparison)
-        if receipt_complete:
+        if reference_receipt_complete:
             fully_scored_receipts += 1
+        if all_candidate_complete:
+            fully_candidate_covered_receipts += 1
 
     comparisons.sort(key=lambda row: (str(row["field"]), str(row["id"]), str(row["source"])))
     by_field = {}
@@ -931,6 +965,11 @@ def score_results(
         by_field[field] = (
             _status_metrics(field_rows) if field == "transfer_status" else _field_metrics(field_rows)
         )
+        if by_field[field]["records"] != selected_field_counts[field]:
+            raise EvaluationInputError(
+                f"internal {field} reference count mismatch: "
+                f"selected={selected_field_counts[field]}, scored={by_field[field]['records']}"
+            )
     amount_semantic = _amount_semantic_metrics(
         [row for row in comparisons if row["field"] == "amount"]
     )
@@ -938,13 +977,37 @@ def score_results(
     extra_manifest_sources = sorted(
         str(entry["source"]) for key, entry in results.items() if key not in expected_keys
     )
+    all_receipt_candidate_by_field = {
+        field: {
+            "expected_receipts": len(expected),
+            "candidate_records": candidate_records_by_field[field],
+            "missing_candidate_records": len(expected) - candidate_records_by_field[field],
+            "candidate_coverage": candidate_records_by_field[field] / len(expected),
+        }
+        for field in field_result_keys
+    }
+    all_receipt_candidate_coverage = {
+        "scope": "all_selected_receipts",
+        "expected_receipts": len(expected),
+        "complete_receipts": fully_candidate_covered_receipts,
+        "missing_complete_receipts": len(expected) - fully_candidate_covered_receipts,
+        "complete_coverage": fully_candidate_covered_receipts / len(expected),
+        "by_field": all_receipt_candidate_by_field,
+    }
     coverage = {
         "expected_receipts": len(expected),
         "matched_result_receipts": matched_receipts,
         "result_coverage": matched_receipts / len(expected),
         "fully_scored_receipts": fully_scored_receipts,
         "fully_scored_coverage": fully_scored_receipts / len(expected),
+        "coverage_contract_version": 2,
+        "candidate_coverage_domain": "all_expected_receipts",
+        "fully_candidate_covered_receipts": fully_candidate_covered_receipts,
+        "all_field_candidate_coverage": fully_candidate_covered_receipts / len(expected),
         "extra_manifest_sources": extra_manifest_sources,
+        "all_receipt_candidates": all_receipt_candidate_coverage,
+        "by_field_all_receipts": all_receipt_candidate_by_field,
+        # Preserve the legacy reference-domain view for diagnostic consumers.
         "by_field": {
             field: {
                 "references": metrics["records"],
@@ -960,7 +1023,11 @@ def score_results(
         "result_sources": sorted(missing_result_sources),
         "field_candidates": {
             field: {"records": len(sources), "sources": sorted(sources)}
-            for field, sources in missing_field_sources.items()
+            for field, sources in missing_reference_field_sources.items()
+        },
+        "all_receipt_field_candidates": {
+            field: {"records": len(sources), "sources": sorted(sources)}
+            for field, sources in missing_all_receipt_field_sources.items()
         },
         "manifest_result_files": artifact_audit["missing_result_files"],
         "invalid_result_files": artifact_audit["invalid_result_files"],
@@ -987,13 +1054,15 @@ def score_results(
     for field, floor in floors.items():
         metrics = by_field[field]
         observed = metrics["raw_exact_match"]
-        candidate_coverage = metrics["candidate_coverage"]
+        candidate_coverage = all_receipt_candidate_by_field[field]["candidate_coverage"]
+        if candidate_coverage is None or float(candidate_coverage) < 1.0:
+            rendered = "n/a" if candidate_coverage is None else f"{float(candidate_coverage):.4f}"
+            failures.append(
+                f"{field}: all_receipt_candidate_coverage={rendered} < 1.0000"
+            )
         if observed is None:
             failures.append(f"{field}: no {split} reference labels")
             continue
-        if candidate_coverage is None or float(candidate_coverage) < 1.0:
-            rendered = "n/a" if candidate_coverage is None else f"{float(candidate_coverage):.4f}"
-            failures.append(f"{field}: candidate_coverage={rendered} < 1.0000")
         if float(observed) < floor:
             failures.append(f"{field}: raw_exact_match={float(observed):.4f} < {floor:.4f}")
     status_metrics = by_field.get("transfer_status")
@@ -1011,6 +1080,7 @@ def score_results(
     summary: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "kind": "receipt_mlnet_unified_candidate_evaluation_v1",
+        "coverage_contract_version": 2,
         "records": records_path.as_posix(),
         "records_sha256": _sha256(records_path),
         "results_root": results_root.as_posix(),
@@ -1022,6 +1092,17 @@ def score_results(
         "model_sha256": model_sha256,
         "artifact_audit": artifact_audit,
         "by_field": by_field,
+        "accuracy_denominators": {
+            "scope": "selected_reference_records",
+            "hash_bound": input_selection is not None,
+            "source": (
+                "input_selection.field_reference_counts"
+                if input_selection is not None
+                else "records_manifest_selected_field_reference_counts"
+            ),
+            "by_field": selected_field_counts,
+        },
+        "all_receipt_candidate_coverage": all_receipt_candidate_coverage,
         "amount_semantic": amount_semantic,
         "floors": floors,
         "coverage": coverage,
@@ -1080,9 +1161,12 @@ def score_results(
             "independently verified business truth, and business values remain review-only."
         )
     else:
-        # An unbounded invocation evaluates every expected receipt in the
-        # requested split.  Keep this explicit so release automation cannot
-        # mistake a passing partial pilot for formal evidence.
+        # An unbounded invocation evaluates every expected receipt, but only
+        # an explicit SHA-256-bound canonical input list can qualify as formal
+        # delivery evidence.  Unbound full-split runs remain useful diagnostics
+        # and keep a successful process exit when their thresholds pass.
+        formal_evidence_bound = input_selection is not None
+        formal_gate_passed = sample_thresholds_passed and formal_evidence_bound
         summary["evaluation_scope"] = {
             "kind": "full_split",
             "requested_limit": None,
@@ -1093,10 +1177,20 @@ def score_results(
                 input_selection["sha256"] if input_selection is not None else None
             ),
             "selection_order": selection_order,
-            "formal_delivery_gate": sample_thresholds_passed,
+            "formal_delivery_gate": formal_gate_passed,
         }
-        summary["formal_delivery_gate"] = sample_thresholds_passed
-        summary["acceptance"]["formal_delivery_gate"] = sample_thresholds_passed
+        summary["diagnostic_thresholds_passed"] = sample_thresholds_passed
+        summary["formal_delivery_gate"] = formal_gate_passed
+        summary["accepted"] = formal_gate_passed
+        summary["acceptance"]["passed"] = formal_gate_passed
+        summary["acceptance"]["formal_delivery_gate"] = formal_gate_passed
+        summary["acceptance"]["diagnostic_thresholds_passed"] = sample_thresholds_passed
+        if not formal_evidence_bound:
+            summary["warning"] = (
+                "unbound_full_split: thresholds were evaluated over the records-derived full split, "
+                "but no explicit SHA-256-bound canonical input list was supplied; "
+                "formal_delivery_gate=false and this report cannot be accepted as delivery evidence."
+            )
     output_dir.mkdir(parents=True, exist_ok=True)
     _atomic_write_jsonl(output_dir / "comparisons.jsonl", comparisons)
     _atomic_write_json(output_dir / "summary.json", summary)
