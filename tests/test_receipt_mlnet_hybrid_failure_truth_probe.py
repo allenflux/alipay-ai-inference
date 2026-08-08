@@ -168,6 +168,12 @@ def test_atomic_probe_separates_raw_consensus_strict_shadow_and_external_truth(
         retry=[(0.95, "低检测商户")],
         recipient_score=0.67,
     )
+    dominant = _finding(
+        8,
+        first=[(0.96, "三路商户"), (0.95, "两路商户")],
+        retry=[(0.94, "三路商户"), (0.93, "两路商户")],
+        right=[(0.92, "三路商户")],
+    )
     unreported = _finding(7)
     unreported.update(
         {
@@ -196,6 +202,7 @@ def test_atomic_probe_separates_raw_consensus_strict_shadow_and_external_truth(
             5: wide_envelope_only,
             6: low_detector,
             7: unreported,
+            8: dominant,
         },
     )
     before = {path: path.read_bytes() for path in source.iterdir()}
@@ -244,6 +251,15 @@ def test_atomic_probe_separates_raw_consensus_strict_shadow_and_external_truth(
     assert summary["paddle_teacher_consensus"]["contract"][
         "ascii_ui_line_keys"
     ] == sorted(MODULE.ASCII_UI_LINE_KEYS)
+    assert summary["paddle_teacher_consensus"]["contract"][
+        "dominant_fallback_requires_multiple_eligible_candidates"
+    ] is True
+    assert summary["paddle_teacher_consensus"]["contract"][
+        "dominant_fallback_requires_same_exact_line_in_all_crops"
+    ] == 3
+    assert summary["paddle_teacher_consensus"]["contract"][
+        "dominant_fallback_requires_unique_all_crop_candidate"
+    ] is True
     assert summary["first_alternative_route_by_geometry"] == [
         {"name": "alternative_route=none|geometry=not_evaluated", "records": 203},
         {"name": "alternative_route=unreported|geometry=unreported", "records": 1},
@@ -263,6 +279,51 @@ def test_atomic_probe_separates_raw_consensus_strict_shadow_and_external_truth(
         for groups in remaining["groups"].values()
         for group in groups
     )
+    global_gate = summary["global_gate_failure_analysis"]
+    assert global_gate["records"] == 3
+    assert global_gate["selected_consensus_records"] == 3
+    assert global_gate["single_eligible_candidate_records"] == 3
+    assert global_gate["candidate_derivation_intact"] is True
+    assert global_gate["parser_bypass_allowed"] is False
+    assert global_gate["protection_floor_changes_allowed"] is False
+    assert global_gate["repair_surface_definitions"][
+        "rectification_or_projection"
+    ] == "repair direction, homography, or coordinate projection"
+    assert {
+        group["name"]: group["records"]
+        for group in global_gate["groups"]["repair_surface_record_incidence"]
+    } == {
+        "alternative_envelope_generation_or_verification": 1,
+        "detector_layout_geometry": 1,
+        "detector_score": 1,
+    }
+    overlay = summary["remaining_global_gate_overlay_analysis"]
+    assert overlay["records"] == 6
+    assert overlay["any_global_gate_failure_records"] == 4
+    assert overlay["clear_global_gate_records"] == 2
+    assert {
+        group["name"]: group["records"]
+        for group in overlay["groups"]["strict_state_by_gate_presence"]
+    } == {
+        "strict_state=ambiguous|global_gates=clear": 1,
+        "strict_state=rejected_by_global_gate|global_gates=failed": 3,
+        "strict_state=unresolved|global_gates=clear": 1,
+        "strict_state=unresolved|global_gates=failed": 1,
+    }
+    unresolved = summary["unresolved_filter_analysis"]
+    assert unresolved["records"] == 2
+    assert unresolved["line_filters_remain_protective"] is True
+    assert unresolved["protection_floor_changes_allowed"] is False
+    assert unresolved["rejected_line_occurrences"] == [
+        {"name": "low_confidence", "occurrences": 1}
+    ]
+    assert {
+        group["name"]: group["records"]
+        for group in unresolved["groups"]["primary_filter_blocker"]
+    } == {
+        "failure_evidence_unreported": 1,
+        "raw_consensus_filtered:insufficient_high_confidence_crop_agreement": 1,
+    }
 
     first = findings[0]
     assert first["attempts"]["first"]["lines"][0]["text"] == "商户甲"
@@ -305,6 +366,14 @@ def test_atomic_probe_separates_raw_consensus_strict_shadow_and_external_truth(
     assert findings[7]["remaining_failure_cluster"]["unresolved_primary_blocker"] == (
         "failure_evidence_unreported"
     )
+    assert findings[8]["strict_runtime_shadow"]["candidate"] == "三路商户"
+    assert findings[8]["strict_runtime_shadow"]["runtime_route"] == (
+        "independent_crop_dominant_three_crop_consensus"
+    )
+    assert findings[8]["strict_runtime_shadow"]["selected_consensus_route"] == (
+        findings[8]["strict_runtime_shadow"]["runtime_route"]
+    )
+    assert findings[8]["remaining_failure_cluster"] is None
     assert all(path.read_bytes() == contents for path, contents in before.items())
     assert not list(tmp_path.glob(".truth-probe.*.tmp"))
 
@@ -349,6 +418,48 @@ def test_probe_rejects_duplicate_normalized_windows_source(tmp_path: Path) -> No
 
     with pytest.raises(MODULE.ProbeError, match="duplicate finding source"):
         MODULE._load_input(source)
+
+
+@pytest.mark.parametrize(
+    "gate_overrides",
+    [
+        {"recipient_score": 0.67},
+        {"geometry_reasons": ["payment_edge_overlap"]},
+        {"envelope": False},
+    ],
+)
+def test_dominant_three_crop_shadow_never_bypasses_global_gates(
+    gate_overrides: dict[str, object],
+) -> None:
+    row = _finding(
+        0,
+        first=[(0.96, "三路商户"), (0.95, "两路商户")],
+        retry=[(0.94, "三路商户"), (0.93, "两路商户")],
+        right=[(0.92, "三路商户")],
+        **gate_overrides,
+    )
+    analyzed = MODULE._analyze_finding(row, index=0)
+    shadow = analyzed["strict_runtime_shadow"]
+    assert shadow["candidate"] is None
+    assert shadow["state"] == "rejected_by_global_gate"
+    assert shadow["runtime_route"] is None
+    assert shadow["selected_consensus_route"] == (
+        "independent_crop_dominant_three_crop_consensus"
+    )
+    assert shadow["global_gate_failures"]
+
+
+def test_dominant_three_crop_shadow_keeps_two_dominant_values_ambiguous() -> None:
+    row = _finding(
+        0,
+        first=[(0.96, "商户甲"), (0.95, "商户乙")],
+        retry=[(0.94, "商户甲"), (0.93, "商户乙")],
+        right=[(0.92, "商户甲"), (0.91, "商户乙")],
+    )
+    shadow = MODULE._analyze_finding(row, index=0)["strict_runtime_shadow"]
+    assert shadow["candidate"] is None
+    assert shadow["state"] == "ambiguous"
+    assert shadow["runtime_route"] is None
 
 
 def test_probe_rejects_missing_failure_reason_with_partial_ocr_evidence(
@@ -418,7 +529,7 @@ def test_real_shape_all_external_references_missing_and_one_route_unreported(
     assert remaining["unreported_failure_reason_records"] == 1
 
 
-def test_real_204_shape_matches_frozen_v2_state_transitions(
+def test_real_204_shape_matches_frozen_v3_state_transitions(
     tmp_path: Path,
 ) -> None:
     replacements: dict[int, dict[str, object]] = {}
@@ -446,13 +557,23 @@ def test_real_204_shape_matches_frozen_v2_state_transitions(
         )
 
     # Twenty old records have two independently repeated strings. Two pair a
-    # real payee with the UI label and move ambiguous -> candidate; the other
-    # eighteen remain ambiguous.
+    # real payee with the UI label and move ambiguous -> candidate. Frozen v3
+    # has three more records where one candidate alone spans all three crops;
+    # one still fails the global envelope gate, so only two become candidates.
     for index in range(75, 95):
         replacements[index] = _finding(
             index,
             first=[(0.96, f"商户甲{index}"), (0.95, f"商户乙{index}")],
             retry=[(0.94, f"商户甲{index}"), (0.93, f"商户乙{index}")],
+            right=(
+                [(0.92, f"商户甲{index}")]
+                if index in (77, 78, 79)
+                else None
+            ),
+            # Real v3 overlay: one dominant row and five still-ambiguous rows
+            # also carry a global-envelope failure. The parser must never use
+            # dominant evidence to clear that independent gate.
+            envelope=index not in {79, 80, 81, 82, 83, 84},
         )
     for index, label in zip(
         (75, 76), ("shoukuanfang", "shou kuan ting"), strict=True
@@ -491,6 +612,9 @@ def test_real_204_shape_matches_frozen_v2_state_transitions(
             index,
             first=[(0.99, "¥1,234.00"), (0.98, "付款方式")],
             retry=[(0.97, "¥1,234.00"), (0.96, "付款方式")],
+            # Together with row 95 and the unreported row, these 29 overlays
+            # reproduce the real 31 unresolved records with failed gates.
+            envelope=index > 155,
         )
 
     unreported = _finding(203)
@@ -516,12 +640,16 @@ def test_real_204_shape_matches_frozen_v2_state_transitions(
     findings, evidence = MODULE._load_input(source)
     summary = MODULE.summarize(findings, evidence=evidence)
 
-    assert summary["paddle_teacher_consensus"]["records"] == 73
+    assert summary["paddle_teacher_consensus"]["records"] == 75
     assert summary["paddle_teacher_consensus"]["by_state"] == [
-        {"name": "ambiguous", "records": 18},
-        {"name": "candidate", "records": 73},
-        {"name": "rejected_by_global_gate", "records": 29},
+        {"name": "ambiguous", "records": 15},
+        {"name": "candidate", "records": 75},
+        {"name": "rejected_by_global_gate", "records": 30},
         {"name": "unresolved", "records": 84},
+    ]
+    assert summary["paddle_teacher_consensus"]["by_runtime_route"] == [
+        {"name": "independent_crop_dominant_three_crop_consensus", "records": 2},
+        {"name": "independent_crop_exact_consensus", "records": 73},
     ]
     assert summary["raw_consensus"]["by_state"] == [
         {"name": "multiple", "records": 172},
@@ -530,8 +658,8 @@ def test_real_204_shape_matches_frozen_v2_state_transitions(
     ]
 
     remaining = summary["remaining_failure_analysis"]
-    assert remaining["records"] == 131
-    assert remaining["strict_candidate_records"] == 73
+    assert remaining["records"] == 129
+    assert remaining["strict_candidate_records"] == 75
     assert remaining["unreported_failure_reason_records"] == 1
     assert remaining["by_failure_reason_type_all_records"] == [
         {"name": "anchored_or_alternative_parse_failed", "records": 203},
@@ -542,9 +670,9 @@ def test_real_204_shape_matches_frozen_v2_state_transitions(
     assert {
         group["name"]: group["records"]
         for group in groups["eligible_candidate_count"]
-    } == {"0": 84, "1": 29, "2": 18}
+    } == {"0": 84, "1": 29, "2": 16}
     assert groups["ambiguous_candidate_count"][0]["name"] == "2"
-    assert groups["ambiguous_candidate_count"][0]["records"] == 18
+    assert groups["ambiguous_candidate_count"][0]["records"] == 15
     blocker_counts = {
         group["name"]: group["records"]
         for group in groups["unresolved_primary_blocker"]
@@ -573,7 +701,23 @@ def test_real_204_shape_matches_frozen_v2_state_transitions(
         for index in (75, 76)
     )
     assert findings[75]["strict_runtime_shadow"]["candidate"] == "商户75"
-    assert findings[77]["remaining_failure_cluster"]["ambiguous_candidate_count"] == 2
+    assert findings[77]["strict_runtime_shadow"]["candidate"] == "商户甲77"
+    assert findings[77]["strict_runtime_shadow"]["runtime_route"] == (
+        "independent_crop_dominant_three_crop_consensus"
+    )
+    assert findings[77]["strict_runtime_shadow"]["selected_consensus_route"] == (
+        findings[77]["strict_runtime_shadow"]["runtime_route"]
+    )
+    assert findings[77]["remaining_failure_cluster"] is None
+    assert findings[79]["strict_runtime_shadow"]["state"] == "rejected_by_global_gate"
+    assert findings[79]["strict_runtime_shadow"]["runtime_route"] is None
+    assert findings[79]["strict_runtime_shadow"]["selected_consensus_route"] == (
+        "independent_crop_dominant_three_crop_consensus"
+    )
+    assert findings[79]["strict_runtime_shadow"]["global_gate_failures"] == [
+        "alternative_envelope_not_verified"
+    ]
+    assert findings[80]["remaining_failure_cluster"]["ambiguous_candidate_count"] == 2
     assert findings[95]["strict_runtime_shadow"]["state"] == "unresolved"
     assert findings[95]["remaining_failure_cluster"][
         "global_gate_failures_combination"
@@ -593,6 +737,78 @@ def test_real_204_shape_matches_frozen_v2_state_transitions(
         "geometry=failed:recipient_box_invalid+recipient_score_missing|"
         "score=unreported"
     )
+
+    global_gate = summary["global_gate_failure_analysis"]
+    assert global_gate["records"] == 30
+    assert global_gate["selected_consensus_records"] == 30
+    assert global_gate["single_eligible_candidate_records"] == 29
+    assert global_gate["candidate_derivation_intact"] is True
+    assert global_gate["parser_bypass_allowed"] is False
+    assert global_gate["groups"]["geometry_reason_combination"] == [
+        {
+            "name": "verified",
+            "records": 30,
+            "examples": [
+                rf"C:\Receipt Inputs\formal\{index:05d}.jpg"
+                for index in (79, 98, 99)
+            ],
+        }
+    ]
+    assert {
+        group["name"]: group["records"]
+        for group in global_gate["groups"]["repair_surface_combination"]
+    } == {"alternative_envelope_generation_or_verification": 30}
+
+    overlay = summary["remaining_global_gate_overlay_analysis"]
+    assert overlay["records"] == 129
+    assert overlay["any_global_gate_failure_records"] == 66
+    assert overlay["clear_global_gate_records"] == 63
+    assert overlay["gate_failure_is_decisive_only_for_state"] == (
+        "rejected_by_global_gate"
+    )
+    assert {
+        group["name"]: group["records"]
+        for group in overlay["groups"]["strict_state_by_gate_presence"]
+    } == {
+        "strict_state=ambiguous|global_gates=clear": 10,
+        "strict_state=ambiguous|global_gates=failed": 5,
+        "strict_state=rejected_by_global_gate|global_gates=failed": 30,
+        "strict_state=unresolved|global_gates=clear": 53,
+        "strict_state=unresolved|global_gates=failed": 31,
+    }
+
+    unresolved = summary["unresolved_filter_analysis"]
+    assert unresolved["records"] == 84
+    assert unresolved["parser_bypass_allowed"] is False
+    assert unresolved["rejected_line_occurrences"] == [
+        {"name": "amount", "occurrences": 154},
+        {"name": "negative_token", "occurrences": 166},
+    ]
+    unresolved_groups = unresolved["groups"]
+    assert {
+        group["name"]: group["records"]
+        for group in unresolved_groups["raw_consensus_state"]
+    } == {"multiple": 77, "none": 1, "one": 6}
+    assert {
+        group["name"]: group["records"]
+        for group in unresolved_groups["raw_candidate_filter_reason_combination"]
+    } == {
+        "line_contract:amount+line_contract:negative_token": 77,
+        "line_contract:negative_token": 6,
+        "none": 1,
+    }
+    assert {
+        group["name"]: group["records"]
+        for group in unresolved_groups["rejected_line_reason_record_incidence"]
+    } == {"amount": 77, "negative_token": 83}
+    assert {
+        group["name"]: group["records"]
+        for group in unresolved_groups["rejected_line_occurrence_signature"]
+    } == {
+        "amount=2|negative_token=2": 77,
+        "negative_token=2": 6,
+        "none": 1,
+    }
 
 
 @pytest.mark.parametrize(
@@ -654,6 +870,26 @@ def test_every_canonical_ascii_ui_key_is_rejected() -> None:
         MODULE._shadow_line_allowed(value) == (False, "negative_token")
         for value in MODULE.ASCII_UI_LINE_KEYS
     )
+
+
+@pytest.mark.parametrize(
+    ("reason", "category"),
+    [
+        ("recipient_score_below_0.68", "detector_score"),
+        ("payment_box_invalid", "detector_box"),
+        ("recipient_left_edge", "layout_relation"),
+        (
+            "H_original_to_rectified_missing_or_invalid",
+            "rectification_or_projection",
+        ),
+        ("recipient_box_projection_invalid", "rectification_or_projection"),
+        ("future_reason", "unclassified"),
+    ],
+)
+def test_geometry_reason_categories_keep_repair_surfaces_explicit(
+    reason: str, category: str
+) -> None:
+    assert MODULE._geometry_reason_category(reason) == category
 
 
 def test_probe_rejects_nonformal_summary_and_output_inside_input(tmp_path: Path) -> None:

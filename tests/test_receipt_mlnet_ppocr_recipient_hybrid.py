@@ -295,8 +295,9 @@ def test_final_independent_crop_consensus_exactly_mirrors_strict_probe_contract(
 
     existing_right_route = router.index("ParseTruncatedRecipientLabelEmptyMaskThreeCropAgreement")
     consensus_call = router.index("ParseIndependentCropExactConsensus")
+    dominant_call = router.index("ParseIndependentCropDominantThreeCropConsensus")
     diagnostic_build = router.index("var diagnostic = new PaddleRecipientDiagnostic")
-    assert existing_right_route < consensus_call < diagnostic_build
+    assert existing_right_route < consensus_call < dominant_call < diagnostic_build
     assert router.count("paddleOcr.Recognize(") == 3
     assert "firstRead.Lines.Select(line => line.Text)" in router
     assert "retryReadEvidence?.Lines.Select(line => line.Text)" in router
@@ -305,21 +306,38 @@ def test_final_independent_crop_consensus_exactly_mirrors_strict_probe_contract(
     assert "ordinaryGeometryVerified: verifiedDefaultAlternativeEnvelope" in router
     assert "alternativeEnvelopeVerified: verifiedAlternativeEnvelope" in router
     assert "candidateConfidenceOverride = consensusAlternative.CandidateConfidence" in router
+    assert (
+        "candidateConfidenceOverride = dominantConsensusAlternative.CandidateConfidence"
+        in router
+    )
 
     assert '"independent_crop_exact_consensus"' in parser
+    assert '"independent_crop_dominant_three_crop_consensus"' in parser
     consensus = parser.split("ParseIndependentCropExactConsensus", 1)[1].split(
-        "AllowsExactCjkPaymentOverlapException", 1
+        "ParseIndependentCropDominantThreeCropConsensus", 1
     )[0]
-    assert "recipientDetectorScore < 0.68f" in consensus
-    assert "recipientDetectorScore > 1.0f" in consensus
-    assert "!ordinaryGeometryVerified" in consensus
-    assert "!alternativeEnvelopeVerified" in consensus
-    assert "confidence < 0.80f" in consensus
-    assert "confidence > 1.0f" in consensus
+    dominant = parser.split(
+        "ParseIndependentCropDominantThreeCropConsensus", 1
+    )[1].split(
+        "private static bool TryCollectIndependentCropConsensusCandidates", 1
+    )[0]
+    collector = parser.split(
+        "private static bool TryCollectIndependentCropConsensusCandidates", 1
+    )[1].split("AllowsExactCjkPaymentOverlapException", 1)[0]
+    assert "TryCollectIndependentCropConsensusCandidates" in consensus
     assert "item.Value.Count >= 2" in consensus
     assert "eligible.Length != 1" in consensus
-    assert "ReceiptFieldNormalizer.CleanText" in consensus
-    assert "IsIndependentCropConsensusLineAllowed(text)" in consensus
+    assert "eligible.Length < 2" in dominant
+    assert "item.Value.Count == 3" in dominant
+    assert "dominant.Length != 1" in dominant
+    assert "recipientDetectorScore < 0.68f" in collector
+    assert "recipientDetectorScore > 1.0f" in collector
+    assert "!ordinaryGeometryVerified" in collector
+    assert "!alternativeEnvelopeVerified" in collector
+    assert "confidence < 0.80f" in collector
+    assert "confidence > 1.0f" in collector
+    assert "ReceiptFieldNormalizer.CleanText" in collector
+    assert "IsIndependentCropConsensusLineAllowed(text)" in collector
     assert "ConsensusPureAmountPattern" in parser
     assert "ConsensusCurrencyCodePattern" in parser
     assert "ConsensusTimePattern" in parser
@@ -331,6 +349,17 @@ def test_final_independent_crop_consensus_exactly_mirrors_strict_probe_contract(
     probe = (
         ROOT / "scripts" / "receipt-mlnet-hybrid-failure-truth-probe.py"
     ).read_text(encoding="utf-8")
+    assert 'selected_consensus_route = "independent_crop_exact_consensus"' in probe
+    assert (
+        'selected_consensus_route = ('
+        in probe
+    )
+    assert '"independent_crop_dominant_three_crop_consensus"' in probe
+    assert '"runtime_route": selected_consensus_route' in probe
+    assert '"runtime_route": None' in probe
+    assert '"selected_consensus_route": selected_consensus_route' in probe
+    assert 'len(candidate["crops"]) == len(ATTEMPTS)' in probe
+    assert "if selected is not None and not global_gate_failures" in probe
     csharp_ascii_block = parser.split(
         "private static readonly string[] ConsensusAsciiUiLineKeys =", 1
     )[1].split("];", 1)[0]
@@ -366,6 +395,14 @@ def test_final_independent_crop_consensus_exactly_mirrors_strict_probe_contract(
         "consensus ordinary 25-percent geometry must be verified",
         "consensus alternative envelope must be verified",
         "multiple exact consensus candidates are ambiguous",
+        "ordinary exact consensus remains ambiguous before 3-of-3 fallback",
+        "unique eligible candidate across all three existing crops",
+        "sole 3-of-3 candidate belongs to earlier exact consensus route",
+        "two 3-of-3 candidates remain ambiguous",
+        "dominant consensus rejects line-confidence count mismatch",
+        "dominant consensus cannot bypass recipient detector floor",
+        "dominant consensus cannot bypass ordinary 25-percent geometry",
+        "dominant consensus cannot bypass alternative envelope",
         "forbidden consensus line",
         "duplicate lines within one crop are not independent evidence",
     ):

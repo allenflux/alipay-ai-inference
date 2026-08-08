@@ -758,6 +758,103 @@ internal static class Program
                     null,
                     null),
                 "multiple exact consensus candidates are ambiguous");
+            AssertAlternativeNull(
+                ParseConsensus(
+                    ["\u53f8\u6e90(**\u6e90)", "\u5c0f\u738b(**\u6d77)"],
+                    [0.99f, 0.98f],
+                    ["\u53f8\u6e90(**\u6e90)", "\u5c0f\u738b(**\u6d77)"],
+                    [0.97f, 0.96f],
+                    ["\u53f8\u6e90(**\u6e90)"],
+                    [0.95f]),
+                "ordinary exact consensus remains ambiguous before 3-of-3 fallback");
+            AssertAlternative(
+                "\u53f8\u6e90(**\u6e90)",
+                "independent_crop_dominant_three_crop_consensus",
+                null,
+                ParseDominantConsensus(
+                    ["\u53f8\u6e90(**\u6e90)", "\u5c0f\u738b(**\u6d77)"],
+                    [0.99f, 0.98f],
+                    ["\u53f8\u6e90(**\u6e90)", "\u5c0f\u738b(**\u6d77)"],
+                    [0.97f, 0.96f],
+                    ["  \u53f8\u6e90(**\u6e90)  "],
+                    [0.80f]),
+                "unique eligible candidate across all three existing crops",
+                0.80f);
+            AssertAlternativeNull(
+                ParseDominantConsensus(
+                    ["\u53f8\u6e90(**\u6e90)"],
+                    [0.99f],
+                    ["\u53f8\u6e90(**\u6e90)"],
+                    [0.97f],
+                    ["\u53f8\u6e90(**\u6e90)"],
+                    [0.95f]),
+                "sole 3-of-3 candidate belongs to earlier exact consensus route");
+            AssertAlternativeNull(
+                ParseDominantConsensus(
+                    ["\u53f8\u6e90(**\u6e90)", "\u5c0f\u738b(**\u6d77)"],
+                    [0.99f, 0.98f],
+                    ["\u53f8\u6e90(**\u6e90)", "\u5c0f\u738b(**\u6d77)"],
+                    [0.97f, 0.96f],
+                    ["\u53f8\u6e90(**\u6e90)", "\u5c0f\u738b(**\u6d77)"],
+                    [0.95f, 0.94f]),
+                "two 3-of-3 candidates remain ambiguous");
+            AssertAlternativeNull(
+                ParseDominantConsensus(
+                    ["\u53f8\u6e90(**\u6e90)", "\u5c0f\u738b(**\u6d77)"],
+                    [0.99f, 0.98f],
+                    ["\u53f8\u6e90(**\u6e90)", "\u5c0f\u738b(**\u6d77)"],
+                    [0.97f, 0.96f],
+                    ["\u53f8\u6e90(**\u6e90)"],
+                    [0.799f]),
+                "dominant candidate must pass line floor in the third crop");
+            AssertAlternativeNull(
+                ParseDominantConsensus(
+                    ["\u53f8\u6e90(**\u6e90)", "\u5c0f\u738b(**\u6d77)"],
+                    [0.99f, 0.98f],
+                    ["\u53f8\u6e90(**\u6e90)", "\u5c0f\u738b(**\u6d77)"],
+                    [0.97f, 0.96f],
+                    ["\u53f8\u6e90(**\u6e90)"],
+                    [0.95f],
+                    detectorScore: 0.679f),
+                "dominant consensus cannot bypass recipient detector floor");
+            AssertAlternativeNull(
+                ParseDominantConsensus(
+                    ["\u53f8\u6e90(**\u6e90)", "\u5c0f\u738b(**\u6d77)"],
+                    [0.99f, 0.98f],
+                    ["\u53f8\u6e90(**\u6e90)", "\u5c0f\u738b(**\u6d77)"],
+                    [0.97f, 0.96f],
+                    ["\u53f8\u6e90(**\u6e90)"],
+                    [0.95f],
+                    ordinaryGeometryVerified: false),
+                "dominant consensus cannot bypass ordinary 25-percent geometry");
+            AssertAlternativeNull(
+                ParseDominantConsensus(
+                    ["\u53f8\u6e90(**\u6e90)", "\u5c0f\u738b(**\u6d77)"],
+                    [0.99f, 0.98f],
+                    ["\u53f8\u6e90(**\u6e90)", "\u5c0f\u738b(**\u6d77)"],
+                    [0.97f, 0.96f],
+                    ["\u53f8\u6e90(**\u6e90)"],
+                    [0.95f],
+                    alternativeEnvelopeVerified: false),
+                "dominant consensus cannot bypass alternative envelope");
+            AssertAlternativeNull(
+                ParseDominantConsensus(
+                    ["Payment Method", "\u5c0f\u738b(**\u6d77)"],
+                    [0.99f, 0.98f],
+                    ["Payment Method", "\u5c0f\u738b(**\u6d77)"],
+                    [0.97f, 0.96f],
+                    ["Payment Method"],
+                    [0.95f]),
+                "dominant consensus preserves the exact UI and value filters");
+            AssertAlternativeNull(
+                ParseDominantConsensus(
+                    ["\u53f8\u6e90(**\u6e90)", "\u5c0f\u738b(**\u6d77)"],
+                    [0.99f, 0.98f],
+                    ["\u53f8\u6e90(**\u6e90)", "\u5c0f\u738b(**\u6d77)"],
+                    [0.97f, 0.96f],
+                    ["\u53f8\u6e90(**\u6e90)"],
+                    []),
+                "dominant consensus rejects line-confidence count mismatch");
             foreach (var forbiddenConsensusLine in new[]
             {
                 "\u00a5200.00",
@@ -1094,6 +1191,29 @@ internal static class Program
         bool alternativeEnvelopeVerified = true)
     {
         return PaddleRecipientValueParser.ParseIndependentCropExactConsensus(
+            firstLines,
+            firstConfidences,
+            retryLines,
+            retryConfidences,
+            rightValueLines,
+            rightValueConfidences,
+            detectorScore,
+            ordinaryGeometryVerified,
+            alternativeEnvelopeVerified);
+    }
+
+    private static PaddleRecipientAlternativeParseResult? ParseDominantConsensus(
+        IReadOnlyList<string>? firstLines,
+        IReadOnlyList<float>? firstConfidences,
+        IReadOnlyList<string>? retryLines,
+        IReadOnlyList<float>? retryConfidences,
+        IReadOnlyList<string>? rightValueLines,
+        IReadOnlyList<float>? rightValueConfidences,
+        float detectorScore = 0.95f,
+        bool ordinaryGeometryVerified = true,
+        bool alternativeEnvelopeVerified = true)
+    {
+        return PaddleRecipientValueParser.ParseIndependentCropDominantThreeCropConsensus(
             firstLines,
             firstConfidences,
             retryLines,

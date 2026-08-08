@@ -24,6 +24,8 @@ internal static class PaddleRecipientValueParser
         "unlabelled_cjk_discount_arithmetic_exact";
     internal const string IndependentCropExactConsensusRoute =
         "independent_crop_exact_consensus";
+    internal const string IndependentCropDominantThreeCropConsensusRoute =
+        "independent_crop_dominant_three_crop_consensus";
 
     private static readonly string[] RecipientLabels =
         ["\u6536\u6b3e\u65b9", "\u6536\u6b3e\u4eba", "\u6536\u6b3e\u8d26\u6237", "\u6536\u6b3e\u8d26\u53f7"];
@@ -507,8 +509,8 @@ internal static class PaddleRecipientValueParser
     }
 
     /// <summary>
-    /// Final fail-closed recovery after every anchored and calibrated route
-    /// has failed.  It mirrors the frozen failure probe's strict runtime
+    /// Fail-closed recovery after every anchored and calibrated route has
+    /// failed.  It mirrors the frozen failure probe's strict runtime
     /// shadow: exactly one cleaned, line-level value must occur in at least
     /// two distinct deterministic crops, every participating occurrence must
     /// meet the 0.80 line floor, and both the ordinary 25-percent geometry and
@@ -527,13 +529,111 @@ internal static class PaddleRecipientValueParser
         bool ordinaryGeometryVerified,
         bool alternativeEnvelopeVerified)
     {
+        if (!TryCollectIndependentCropConsensusCandidates(
+                firstRawLines,
+                firstRawLineConfidences,
+                retryRawLines,
+                retryRawLineConfidences,
+                rightValueRawLines,
+                rightValueRawLineConfidences,
+                recipientDetectorScore,
+                ordinaryGeometryVerified,
+                alternativeEnvelopeVerified,
+                out var cropsByCandidate))
+        {
+            return null;
+        }
+
+        var eligible = cropsByCandidate
+            .Where(item => item.Value.Count >= 2)
+            .ToArray();
+        if (eligible.Length != 1)
+        {
+            return null;
+        }
+        return new PaddleRecipientAlternativeParseResult(
+            eligible[0].Key,
+            IndependentCropExactConsensusRoute,
+            CandidateConfidence: eligible[0].Value.Values.Min());
+    }
+
+    /// <summary>
+    /// Last zero-inference fallback after ordinary two-crop exact consensus
+    /// remains ambiguous.  Exactly one eligible value must occur in all three
+    /// already-computed deterministic crops; every other eligible value may
+    /// occur in at most two.  It deliberately shares the complete strict line
+    /// and global-gate collector with the ordinary consensus route.
+    /// </summary>
+    public static PaddleRecipientAlternativeParseResult?
+        ParseIndependentCropDominantThreeCropConsensus(
+            IReadOnlyList<string>? firstRawLines,
+            IReadOnlyList<float>? firstRawLineConfidences,
+            IReadOnlyList<string>? retryRawLines,
+            IReadOnlyList<float>? retryRawLineConfidences,
+            IReadOnlyList<string>? rightValueRawLines,
+            IReadOnlyList<float>? rightValueRawLineConfidences,
+            float recipientDetectorScore,
+            bool ordinaryGeometryVerified,
+            bool alternativeEnvelopeVerified)
+    {
+        if (!TryCollectIndependentCropConsensusCandidates(
+                firstRawLines,
+                firstRawLineConfidences,
+                retryRawLines,
+                retryRawLineConfidences,
+                rightValueRawLines,
+                rightValueRawLineConfidences,
+                recipientDetectorScore,
+                ordinaryGeometryVerified,
+                alternativeEnvelopeVerified,
+                out var cropsByCandidate))
+        {
+            return null;
+        }
+
+        var eligible = cropsByCandidate
+            .Where(item => item.Value.Count >= 2)
+            .ToArray();
+        if (eligible.Length < 2)
+        {
+            // A sole eligible candidate belongs to the earlier ordinary
+            // exact-consensus route, never to this ambiguity fallback.
+            return null;
+        }
+        var dominant = eligible
+            .Where(item => item.Value.Count == 3)
+            .ToArray();
+        if (dominant.Length != 1)
+        {
+            return null;
+        }
+        return new PaddleRecipientAlternativeParseResult(
+            dominant[0].Key,
+            IndependentCropDominantThreeCropConsensusRoute,
+            CandidateConfidence: dominant[0].Value.Values.Min());
+    }
+
+    private static bool TryCollectIndependentCropConsensusCandidates(
+        IReadOnlyList<string>? firstRawLines,
+        IReadOnlyList<float>? firstRawLineConfidences,
+        IReadOnlyList<string>? retryRawLines,
+        IReadOnlyList<float>? retryRawLineConfidences,
+        IReadOnlyList<string>? rightValueRawLines,
+        IReadOnlyList<float>? rightValueRawLineConfidences,
+        float recipientDetectorScore,
+        bool ordinaryGeometryVerified,
+        bool alternativeEnvelopeVerified,
+        out Dictionary<string, Dictionary<int, float>> cropsByCandidate)
+    {
+        cropsByCandidate = new Dictionary<string, Dictionary<int, float>>(
+            StringComparer.Ordinal);
         if (!float.IsFinite(recipientDetectorScore)
             || recipientDetectorScore < 0.68f
             || recipientDetectorScore > 1.0f
             || !ordinaryGeometryVerified
             || !alternativeEnvelopeVerified)
         {
-            return null;
+            return false;
         }
 
         var crops = new[]
@@ -542,8 +642,6 @@ internal static class PaddleRecipientValueParser
             (Lines: retryRawLines, Confidences: retryRawLineConfidences),
             (Lines: rightValueRawLines, Confidences: rightValueRawLineConfidences),
         };
-        var cropsByCandidate = new Dictionary<string, Dictionary<int, float>>(
-            StringComparer.Ordinal);
         for (var cropIndex = 0; cropIndex < crops.Length; cropIndex++)
         {
             var (rawLines, rawConfidences) = crops[cropIndex];
@@ -555,7 +653,7 @@ internal static class PaddleRecipientValueParser
                 || rawConfidences is null
                 || rawLines.Count != rawConfidences.Count)
             {
-                return null;
+                return false;
             }
 
             var bestByText = new Dictionary<string, float>(StringComparer.Ordinal);
@@ -586,18 +684,7 @@ internal static class PaddleRecipientValueParser
                 cropConfidences[cropIndex] = confidence;
             }
         }
-
-        var eligible = cropsByCandidate
-            .Where(item => item.Value.Count >= 2)
-            .ToArray();
-        if (eligible.Length != 1)
-        {
-            return null;
-        }
-        return new PaddleRecipientAlternativeParseResult(
-            eligible[0].Key,
-            IndependentCropExactConsensusRoute,
-            CandidateConfidence: eligible[0].Value.Values.Min());
+        return true;
     }
 
     /// <summary>

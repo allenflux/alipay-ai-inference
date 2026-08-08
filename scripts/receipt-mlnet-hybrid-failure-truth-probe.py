@@ -549,14 +549,32 @@ def _strict_runtime_shadow(
         global_gate_failures.append("ordinary_25pct_geometry_not_verified")
     if alternative_envelope is not True:
         global_gate_failures.append("alternative_envelope_not_verified")
-    if len(eligible) == 1 and not global_gate_failures:
-        candidate = eligible[0]["candidate"]
-        crops = eligible[0]["crops"]
+    selected: Mapping[str, Any] | None = None
+    selected_consensus_route: str | None = None
+    if len(eligible) == 1:
+        selected = eligible[0]
+        selected_consensus_route = "independent_crop_exact_consensus"
+    elif len(eligible) > 1:
+        dominant = [
+            candidate
+            for candidate in eligible
+            if len(candidate["crops"]) == len(ATTEMPTS)
+        ]
+        if len(dominant) == 1:
+            selected = dominant[0]
+            selected_consensus_route = (
+                "independent_crop_dominant_three_crop_consensus"
+            )
+    if selected is not None and not global_gate_failures:
+        candidate = selected["candidate"]
+        crops = selected["crops"]
         return {
             "candidate": candidate,
             "state": "candidate",
+            "runtime_route": selected_consensus_route,
+            "selected_consensus_route": selected_consensus_route,
             "consensus_crops": crops,
-            "minimum_confidence": eligible[0]["minimum_confidence"],
+            "minimum_confidence": selected["minimum_confidence"],
             "eligible_candidates": eligible,
             "rejected_line_occurrences": dict(sorted(rejection_reasons.items())),
             "pseudo_truth_source": "ppocr_independent_crop_exact_consensus",
@@ -571,10 +589,14 @@ def _strict_runtime_shadow(
         "state": (
             "unresolved"
             if not eligible
+            else "rejected_by_global_gate"
+            if selected is not None and global_gate_failures
             else "ambiguous"
             if len(eligible) > 1
             else "rejected_by_global_gate"
         ),
+        "runtime_route": None,
+        "selected_consensus_route": selected_consensus_route,
         "consensus_crops": [],
         "minimum_confidence": None,
         "eligible_candidates": eligible,
@@ -628,6 +650,63 @@ def _score_gate_key(score: float | None) -> str:
     if score < MINIMUM_RECIPIENT_DETECTOR_SCORE:
         return "below_0.68"
     return "verified_0.68_plus"
+
+
+LAYOUT_GEOMETRY_REASONS = frozenset(
+    (
+        "recipient_left_edge",
+        "recipient_right_edge",
+        "recipient_width",
+        "recipient_height",
+        "amount_before_recipient",
+        "recipient_before_payment",
+        "amount_edge_overlap",
+        "payment_edge_overlap",
+    )
+)
+
+
+def _geometry_reason_category(reason: str) -> str:
+    if "_score_missing" in reason or "_score_below_" in reason:
+        return "detector_score"
+    if reason.endswith("_box_invalid") or reason.endswith("_box_outside_source"):
+        return "detector_box"
+    if (
+        reason
+        in {
+            "geometry_missing",
+            "source_size_missing_or_invalid",
+            "rectified_size_missing_or_invalid",
+            "H_original_to_rectified_missing_or_invalid",
+        }
+        or reason.endswith("_box_projection_invalid")
+        or reason.endswith("_box_outside_rectified")
+    ):
+        return "rectification_or_projection"
+    if reason in LAYOUT_GEOMETRY_REASONS:
+        return "layout_relation"
+    return "unclassified"
+
+
+def _global_gate_repair_surfaces(finding: Mapping[str, Any]) -> list[str]:
+    surfaces: set[str] = set()
+    if finding["alternative_envelope"] is not True:
+        surfaces.add("alternative_envelope_generation_or_verification")
+    score = finding["recipient_detector_score"]
+    if score is None or float(score) < MINIMUM_RECIPIENT_DETECTOR_SCORE:
+        surfaces.add("detector_score")
+    for reason in finding["geometry_reasons"]:
+        category = _geometry_reason_category(str(reason))
+        surfaces.add(
+            {
+                "detector_score": "detector_score",
+                "detector_box": "detector_box",
+                "layout_relation": "detector_layout_geometry",
+                "rectification_or_projection": "rectification_or_projection",
+                "unclassified": "unclassified_geometry_evidence",
+            }[category]
+        )
+    return sorted(surfaces)
 
 
 def _raw_cardinality_key(state: str) -> str:
@@ -912,6 +991,13 @@ def _count_rows(counter: Counter[str]) -> list[dict[str, Any]]:
     ]
 
 
+def _occurrence_rows(counter: Counter[str]) -> list[dict[str, Any]]:
+    return [
+        {"name": name, "occurrences": occurrences}
+        for name, occurrences in sorted(counter.items(), key=lambda item: item[0])
+    ]
+
+
 def _group_rows(groups: Mapping[str, list[str]]) -> list[dict[str, Any]]:
     return [
         {
@@ -950,6 +1036,7 @@ def summarize(
     raw_consensus_state = Counter()
     teacher_confidence = Counter()
     teacher_crop_combinations = Counter()
+    teacher_runtime_routes = Counter()
     first_alt_geometry = Counter()
     retry_alt_geometry = Counter()
     groups: dict[str, dict[str, list[str]]] = {
@@ -965,6 +1052,35 @@ def summarize(
         "unresolved_primary_blocker": defaultdict(list),
         "raw_vs_strict": defaultdict(list),
         "alternative_envelope_geometry_score": defaultdict(list),
+    }
+    global_gate_groups: dict[str, dict[str, list[str]]] = {
+        "global_gate_failures_combination": defaultdict(list),
+        "geometry_reason_combination": defaultdict(list),
+        "geometry_reason_category_combination": defaultdict(list),
+        "geometry_reason_record_incidence": defaultdict(list),
+        "alternative_envelope": defaultdict(list),
+        "recipient_detector_score_gate": defaultdict(list),
+        "alternative_envelope_geometry_score": defaultdict(list),
+        "repair_surface_combination": defaultdict(list),
+        "repair_surface_record_incidence": defaultdict(list),
+    }
+    unresolved_groups: dict[str, dict[str, list[str]]] = {
+        "primary_filter_blocker": defaultdict(list),
+        "raw_consensus_state": defaultdict(list),
+        "raw_candidate_filter_reason_combination": defaultdict(list),
+        "rejected_line_reason_record_incidence": defaultdict(list),
+        "rejected_line_occurrence_signature": defaultdict(list),
+        "failure_reason_type": defaultdict(list),
+    }
+    unresolved_rejected_line_occurrences: Counter[str] = Counter()
+    global_gate_records = 0
+    global_gate_selected_consensus_records = 0
+    global_gate_single_eligible_candidate_records = 0
+    unresolved_records = 0
+    remaining_with_global_gate_failures = 0
+    remaining_gate_overlay_groups: dict[str, dict[str, list[str]]] = {
+        "strict_state_by_gate_presence": defaultdict(list),
+        "strict_state_by_global_gate_failures_combination": defaultdict(list),
     }
     all_strict_states = Counter()
     all_failure_reason_types = Counter()
@@ -995,7 +1111,88 @@ def summarize(
         raw_consensus_state.update([finding["raw_consensus"]["state"]])
         shadow_truth.update([finding["strict_runtime_shadow"]["truth_outcome"]])
         shadow_state.update([shadow["state"]])
+        if shadow["state"] == "rejected_by_global_gate":
+            global_gate_records += 1
+            if len(shadow["eligible_candidates"]) == 1:
+                global_gate_single_eligible_candidate_records += 1
+            if shadow.get("selected_consensus_route") is not None:
+                global_gate_selected_consensus_records += 1
+            failures_key = _global_gate_failure_key(
+                shadow["global_gate_failures"]
+            )
+            geometry_reasons = sorted(set(finding["geometry_reasons"]))
+            geometry_key = _geometry_reason_key(geometry_reasons)
+            geometry_categories = sorted(
+                {_geometry_reason_category(reason) for reason in geometry_reasons}
+            )
+            geometry_category_key = (
+                "+".join(geometry_categories) if geometry_categories else "verified"
+            )
+            envelope_key = (
+                "unreported"
+                if finding["alternative_envelope"] is None
+                else str(finding["alternative_envelope"]).lower()
+            )
+            score_key = _score_gate_key(finding["recipient_detector_score"])
+            combined_key = (
+                f"envelope={envelope_key}|geometry={geometry_key}|score={score_key}"
+            )
+            repair_surfaces = _global_gate_repair_surfaces(finding)
+            repair_surface_key = "+".join(repair_surfaces) or "none"
+            for group_name, key in (
+                ("global_gate_failures_combination", failures_key),
+                ("geometry_reason_combination", geometry_key),
+                ("geometry_reason_category_combination", geometry_category_key),
+                ("alternative_envelope", envelope_key),
+                ("recipient_detector_score_gate", score_key),
+                ("alternative_envelope_geometry_score", combined_key),
+                ("repair_surface_combination", repair_surface_key),
+            ):
+                global_gate_groups[group_name][key].append(source)
+            for reason in geometry_reasons:
+                global_gate_groups["geometry_reason_record_incidence"][reason].append(
+                    source
+                )
+            for surface in repair_surfaces:
+                global_gate_groups["repair_surface_record_incidence"][surface].append(
+                    source
+                )
+        elif shadow["state"] == "unresolved":
+            unresolved_records += 1
+            remaining_cluster = finding["remaining_failure_cluster"]
+            if not isinstance(remaining_cluster, Mapping):
+                raise ProbeError("unresolved record has no remaining-failure cluster")
+            primary_blocker = remaining_cluster["unresolved_primary_blocker"]
+            raw_consensus = finding["raw_consensus"]
+            raw_blockers = _raw_candidate_blockers(raw_consensus)
+            raw_blocker_key = "+".join(raw_blockers) if raw_blockers else "none"
+            rejected_occurrences = shadow["rejected_line_occurrences"]
+            occurrence_signature = (
+                "|".join(
+                    f"{reason}={int(count)}"
+                    for reason, count in sorted(rejected_occurrences.items())
+                    if int(count) > 0
+                )
+                or "none"
+            )
+            for group_name, key in (
+                ("primary_filter_blocker", str(primary_blocker)),
+                ("raw_consensus_state", str(raw_consensus["state"])),
+                ("raw_candidate_filter_reason_combination", raw_blocker_key),
+                ("rejected_line_occurrence_signature", occurrence_signature),
+                ("failure_reason_type", str(finding["failure_reason_type"])),
+            ):
+                unresolved_groups[group_name][key].append(source)
+            for reason, count in rejected_occurrences.items():
+                count = int(count)
+                if count <= 0:
+                    continue
+                unresolved_rejected_line_occurrences[str(reason)] += count
+                unresolved_groups["rejected_line_reason_record_incidence"][
+                    str(reason)
+                ].append(source)
         if shadow["candidate"] is not None:
+            teacher_runtime_routes.update([str(shadow["runtime_route"])])
             teacher_confidence.update(
                 [_confidence_bucket(float(shadow["minimum_confidence"]))]
             )
@@ -1009,6 +1206,18 @@ def summarize(
         remaining_cluster = finding["remaining_failure_cluster"]
         if remaining_cluster is not None:
             remaining_records += 1
+            global_gate_failures = shadow["global_gate_failures"]
+            gate_presence = "failed" if global_gate_failures else "clear"
+            remaining_with_global_gate_failures += int(bool(global_gate_failures))
+            remaining_gate_overlay_groups["strict_state_by_gate_presence"][
+                f"strict_state={shadow['state']}|global_gates={gate_presence}"
+            ].append(source)
+            remaining_gate_overlay_groups[
+                "strict_state_by_global_gate_failures_combination"
+            ][
+                f"strict_state={shadow['state']}|failures="
+                f"{_global_gate_failure_key(global_gate_failures)}"
+            ].append(source)
             remaining_groups["global_gate_failures_combination"][
                 str(remaining_cluster["global_gate_failures_combination"])
             ].append(source)
@@ -1089,6 +1298,7 @@ def summarize(
             "coverage": teacher_consensus_records / len(findings),
             "by_state": _count_rows(shadow_state),
             "by_attempt_combination": _count_rows(teacher_crop_combinations),
+            "by_runtime_route": _count_rows(teacher_runtime_routes),
             "by_minimum_confidence_bucket": _count_rows(teacher_confidence),
             "contract": {
                 "minimum_visible_characters": 2,
@@ -1099,13 +1309,18 @@ def summarize(
                 "requires_empty_geometry_reasons": True,
                 "requires_verified_alternative_envelope": True,
                 "requires_same_exact_line_in_independent_crops": 2,
+                "dominant_fallback_requires_multiple_eligible_candidates": True,
+                "dominant_fallback_requires_same_exact_line_in_all_crops": len(
+                    ATTEMPTS
+                ),
+                "dominant_fallback_requires_unique_all_crop_candidate": True,
                 "negative_tokens": list(NEGATIVE_TOKENS),
                 "recipient_label_pinyin_keys": sorted(
                     RECIPIENT_LABEL_PINYIN_KEYS
                 ),
                 "ascii_ui_line_keys": sorted(ASCII_UI_LINE_KEYS),
                 "amount_time_and_character_filters": True,
-                "ambiguous_consensus_is_absent": True,
+                "multiple_eligible_candidates_are_absent_unless_one_is_unique_across_all_three_crops": True,
             },
         },
         "shadow_candidate_truth_free": {
@@ -1131,6 +1346,77 @@ def summarize(
             "groups": {
                 name: _group_rows(values)
                 for name, values in remaining_groups.items()
+            },
+        },
+        "global_gate_failure_analysis": {
+            "scope": "strict_runtime_shadow.state == rejected_by_global_gate",
+            "records": global_gate_records,
+            "selected_consensus_records": (
+                global_gate_selected_consensus_records
+            ),
+            "single_eligible_candidate_records": (
+                global_gate_single_eligible_candidate_records
+            ),
+            "candidate_derivation_intact": (
+                global_gate_selected_consensus_records == global_gate_records
+            ),
+            "parser_bypass_allowed": False,
+            "protection_floor_changes_allowed": False,
+            "remediation_must_restore_failed_gate_evidence": True,
+            "repair_surface_definitions": {
+                "alternative_envelope_generation_or_verification": (
+                    "repair alternative-envelope evidence"
+                ),
+                "detector_score": (
+                    "repair detector confidence without lowering its floor"
+                ),
+                "detector_box": "repair detector localization",
+                "detector_layout_geometry": (
+                    "repair field detection or layout ordering"
+                ),
+                "rectification_or_projection": (
+                    "repair direction, homography, or coordinate projection"
+                ),
+                "unclassified_geometry_evidence": (
+                    "diagnose new geometry evidence before changing runtime"
+                ),
+            },
+            "groups": {
+                name: _group_rows(values)
+                for name, values in global_gate_groups.items()
+            },
+        },
+        "remaining_global_gate_overlay_analysis": {
+            "scope": "strict_runtime_shadow.state != candidate",
+            "records": remaining_records,
+            "any_global_gate_failure_records": (
+                remaining_with_global_gate_failures
+            ),
+            "clear_global_gate_records": (
+                remaining_records - remaining_with_global_gate_failures
+            ),
+            "gate_failure_is_decisive_only_for_state": (
+                "rejected_by_global_gate"
+            ),
+            "unresolved_or_ambiguous_gate_failures_are_overlays_not_parser_remediation": True,
+            "groups": {
+                name: _group_rows(values)
+                for name, values in remaining_gate_overlay_groups.items()
+            },
+        },
+        "unresolved_filter_analysis": {
+            "scope": "strict_runtime_shadow.state == unresolved",
+            "records": unresolved_records,
+            "parser_bypass_allowed": False,
+            "protection_floor_changes_allowed": False,
+            "line_filters_remain_protective": True,
+            "global_gate_bypass_is_not_a_filter_remediation": True,
+            "rejected_line_occurrences": _occurrence_rows(
+                unresolved_rejected_line_occurrences
+            ),
+            "groups": {
+                name: _group_rows(values)
+                for name, values in unresolved_groups.items()
             },
         },
         "groups": {

@@ -21,7 +21,9 @@ internal static class PaddleRecipientHybrid
     /// a narrower right-value crop first tries the independently calibrated
     /// layout routes.  Only after every existing route fails, the same three
     /// reads may recover one value under the strict independent-crop exact
-    /// consensus contract; no additional OCR call is made.
+    /// consensus contract.  If ordinary consensus is ambiguous, a final
+    /// zero-inference fallback requires one unique value in all three crops;
+    /// no additional OCR call is made.
     /// </summary>
     public static UnifiedOcrReadResult OverrideRecipient(
         Image<Rgb24> source,
@@ -227,9 +229,9 @@ internal static class PaddleRecipientHybrid
             }
         }
 
-        // This is deliberately last: no existing anchored or calibrated route
-        // is weakened.  It reuses the three OCR reads already collected above
-        // and accepts only the strict analysis-probe consensus contract.
+        // No existing anchored or calibrated route is weakened.  This reuses
+        // the three OCR reads already collected above and accepts only the
+        // strict analysis-probe consensus contract.
         if (value is null)
         {
             var consensusAlternative =
@@ -248,6 +250,30 @@ internal static class PaddleRecipientHybrid
                 value = consensusAlternative.Value;
                 route = consensusAlternative.Route;
                 candidateConfidenceOverride = consensusAlternative.CandidateConfidence;
+            }
+        }
+
+        // Ordinary exact consensus above remains authoritative whenever it
+        // has one eligible value.  This zero-inference fallback can accept
+        // only its ambiguous multi-candidate shape with one 3-of-3 dominant.
+        if (value is null)
+        {
+            var dominantConsensusAlternative =
+                PaddleRecipientValueParser.ParseIndependentCropDominantThreeCropConsensus(
+                    firstRead.Lines.Select(line => line.Text).ToArray(),
+                    firstRead.Lines.Select(line => line.Confidence).ToArray(),
+                    retryReadEvidence?.Lines.Select(line => line.Text).ToArray(),
+                    retryReadEvidence?.Lines.Select(line => line.Confidence).ToArray(),
+                    rightValueReadEvidence?.Lines.Select(line => line.Text).ToArray(),
+                    rightValueReadEvidence?.Lines.Select(line => line.Confidence).ToArray(),
+                    detection.Score,
+                    ordinaryGeometryVerified: verifiedDefaultAlternativeEnvelope,
+                    alternativeEnvelopeVerified: verifiedAlternativeEnvelope);
+            if (dominantConsensusAlternative is not null)
+            {
+                value = dominantConsensusAlternative.Value;
+                route = dominantConsensusAlternative.Route;
+                candidateConfidenceOverride = dominantConsensusAlternative.CandidateConfidence;
             }
         }
 
