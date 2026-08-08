@@ -418,16 +418,16 @@ def test_real_shape_all_external_references_missing_and_one_route_unreported(
     assert remaining["unreported_failure_reason_records"] == 1
 
 
-def test_real_204_shape_clusters_136_remaining_after_pinyin_label_filter(
+def test_real_204_shape_matches_frozen_v2_state_transitions(
     tmp_path: Path,
 ) -> None:
     replacements: dict[int, dict[str, object]] = {}
 
-    # Seven real-shape raw consensus rows are the pinyin recipient-row label,
-    # not a payee. Five share the canonical spelling; the other two are the
-    # exact OCR confusions observed in the frozen formal evidence.
+    # Six old candidate rows contain only the pinyin recipient-row label and
+    # therefore move candidate -> unresolved. Keep all three exact observed
+    # spellings represented without changing the raw-consensus cardinality.
     for index, label in enumerate(
-        ["shoukuanfang"] * 5 + ["shou kuan ting", "shoukudnfang"]
+        ["shoukuanfang"] * 4 + ["shou kuan ting", "shoukudnfang"]
     ):
         replacements[index] = _finding(
             index,
@@ -435,7 +435,7 @@ def test_real_204_shape_clusters_136_remaining_after_pinyin_label_filter(
             retry=[(0.95, label)],
         )
 
-    # The other 24 raw-unique rows remain strict candidates. Add
+    # The other 25 raw-unique rows remain strict candidates. Add
     # 44 raw-multiple rows whose amount line is removed by the strict contract,
     # leaving exactly one eligible merchant candidate.
     for index in range(31, 75):
@@ -445,13 +445,22 @@ def test_real_204_shape_clusters_136_remaining_after_pinyin_label_filter(
             retry=[(0.95, f"商户{index}"), (0.98, "¥1,234.00")],
         )
 
-    # Twenty records retain two independently repeated, strictly eligible
-    # strings and therefore remain ambiguous.
+    # Twenty old records have two independently repeated strings. Two pair a
+    # real payee with the UI label and move ambiguous -> candidate; the other
+    # eighteen remain ambiguous.
     for index in range(75, 95):
         replacements[index] = _finding(
             index,
             first=[(0.96, f"商户甲{index}"), (0.95, f"商户乙{index}")],
             retry=[(0.94, f"商户甲{index}"), (0.93, f"商户乙{index}")],
+        )
+    for index, label in zip(
+        (75, 76), ("shoukuanfang", "shou kuan ting"), strict=True
+    ):
+        replacements[index] = _finding(
+            index,
+            first=[(0.96, f"商户{index}"), (0.95, label)],
+            retry=[(0.94, f"商户{index}"), (0.93, label)],
         )
 
     # Thirty-two records have one strict candidate but fail the frozen global
@@ -464,6 +473,15 @@ def test_real_204_shape_clusters_136_remaining_after_pinyin_label_filter(
             retry=[(0.95, f"商户{index}"), (0.98, "¥1,234.00")],
             envelope=False,
         )
+    # One old rejected-by-envelope row has only the label as its eligible
+    # string (the amount remains descriptive raw consensus), so it moves
+    # rejected_by_global_gate -> unresolved.
+    replacements[95] = _finding(
+        95,
+        first=[(0.96, "shoukudnfang"), (0.99, "¥1,234.00")],
+        retry=[(0.95, "shoukudnfang"), (0.98, "¥1,234.00")],
+        envelope=False,
+    )
 
     # Seventy-six records have multiple raw consensus strings, but every one
     # is rejected by an explicit strict line contract.
@@ -497,11 +515,11 @@ def test_real_204_shape_clusters_136_remaining_after_pinyin_label_filter(
     findings, evidence = MODULE._load_input(source)
     summary = MODULE.summarize(findings, evidence=evidence)
 
-    assert summary["paddle_teacher_consensus"]["records"] == 68
+    assert summary["paddle_teacher_consensus"]["records"] == 71
     assert summary["paddle_teacher_consensus"]["by_state"] == [
-        {"name": "ambiguous", "records": 20},
-        {"name": "candidate", "records": 68},
-        {"name": "rejected_by_global_gate", "records": 32},
+        {"name": "ambiguous", "records": 18},
+        {"name": "candidate", "records": 71},
+        {"name": "rejected_by_global_gate", "records": 31},
         {"name": "unresolved", "records": 84},
     ]
     assert summary["raw_consensus"]["by_state"] == [
@@ -511,8 +529,8 @@ def test_real_204_shape_clusters_136_remaining_after_pinyin_label_filter(
     ]
 
     remaining = summary["remaining_failure_analysis"]
-    assert remaining["records"] == 136
-    assert remaining["strict_candidate_records"] == 68
+    assert remaining["records"] == 133
+    assert remaining["strict_candidate_records"] == 71
     assert remaining["unreported_failure_reason_records"] == 1
     assert remaining["by_failure_reason_type_all_records"] == [
         {"name": "anchored_or_alternative_parse_failed", "records": 203},
@@ -523,17 +541,17 @@ def test_real_204_shape_clusters_136_remaining_after_pinyin_label_filter(
     assert {
         group["name"]: group["records"]
         for group in groups["eligible_candidate_count"]
-    } == {"0": 84, "1": 32, "2": 20}
+    } == {"0": 84, "1": 31, "2": 18}
     assert groups["ambiguous_candidate_count"][0]["name"] == "2"
-    assert groups["ambiguous_candidate_count"][0]["records"] == 20
+    assert groups["ambiguous_candidate_count"][0]["records"] == 18
     blocker_counts = {
         group["name"]: group["records"]
         for group in groups["unresolved_primary_blocker"]
     }
     assert blocker_counts == {
         "failure_evidence_unreported": 1,
-        "raw_consensus_filtered:line_contract:negative_token": 7,
-        "raw_consensus_filtered:line_contract:amount+line_contract:negative_token": 76,
+        "raw_consensus_filtered:line_contract:negative_token": 6,
+        "raw_consensus_filtered:line_contract:amount+line_contract:negative_token": 77,
     }
     assert all(
         len(group["examples"]) <= 3
@@ -544,8 +562,18 @@ def test_real_204_shape_clusters_136_remaining_after_pinyin_label_filter(
     assert findings[0]["remaining_failure_cluster"][
         "unresolved_primary_blocker"
     ] == "raw_consensus_filtered:line_contract:negative_token"
+    assert all(
+        findings[index]["strict_runtime_shadow"]["state"] == "unresolved"
+        for index in range(6)
+    )
     assert findings[7]["remaining_failure_cluster"] is None
-    assert findings[75]["remaining_failure_cluster"]["ambiguous_candidate_count"] == 2
+    assert all(
+        findings[index]["strict_runtime_shadow"]["state"] == "candidate"
+        for index in (75, 76)
+    )
+    assert findings[75]["strict_runtime_shadow"]["candidate"] == "商户75"
+    assert findings[77]["remaining_failure_cluster"]["ambiguous_candidate_count"] == 2
+    assert findings[95]["strict_runtime_shadow"]["state"] == "unresolved"
     assert findings[95]["remaining_failure_cluster"][
         "global_gate_failures_combination"
     ] == "alternative_envelope_not_verified"
