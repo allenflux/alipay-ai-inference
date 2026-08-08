@@ -177,40 +177,86 @@ def formal_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str,
         record_rows.append({
             "id": f"id-{index}", "group_id": f"group-{index // 2}", "split": "val", "source": source,
             "slots": {
+                "amount": {"text": "10.00", "visible_text": "10.00"},
                 "time": {"text": reference, "visible_text": reference},
-                "transfer_status": {"class_name": status},
+                "payment_method_field": {"text": "余额"},
+                "recipient_field": {"text": "商户甲"},
+                "transfer_status": {"text": status, "class_name": status},
             },
         })
     _write_jsonl(records_path, record_rows)
     score = formal / "hybrid-val-score"
     score_rows = []
-    for source, reference, candidate in zip(rendered, references, candidates, strict=True):
-        score_rows.append({
-            "schema_version": 1, "kind": "receipt_mlnet_unified_comparison_v1",
-            "field": "time", "source": source, "reference_text": reference,
-            "candidate_text": candidate, "candidate_present": True,
-            "raw_exact": candidate == reference,
-        })
+    field_values = {
+        "amount": ("10.00", lambda index: "10.00"),
+        "time": (None, lambda index: candidates[index]),
+        "payment_method_field": ("余额", lambda index: "余额"),
+        "recipient_field": ("商户甲", lambda index: "商户甲"),
+        "transfer_status": (None, lambda index: statuses[index]),
+    }
+    for index, source in enumerate(rendered):
+        for field, (fixed_reference, candidate_fn) in field_values.items():
+            reference = (
+                references[index] if field == "time"
+                else statuses[index] if field == "transfer_status"
+                else fixed_reference
+            )
+            candidate = candidate_fn(index)
+            score_rows.append({
+                "schema_version": 1, "kind": "receipt_mlnet_unified_comparison_v1",
+                "field": field, "source": source, "reference_text": reference,
+                "candidate_text": candidate, "candidate_present": candidate is not None,
+                "raw_exact": candidate is not None and candidate == reference,
+                "result_json": (
+                    formal / "hybrid-recipient" / "results" / f"{index}.json"
+                ).resolve().as_posix(),
+            })
     _write_jsonl(score / "comparisons.jsonl", score_rows)
-    exact = sum(row["raw_exact"] for row in score_rows)
+    model = tmp_path / "v13.onnx"
+    model.write_bytes(b"fixture-v13")
+    by_field: dict[str, dict[str, Any]] = {}
+    for field in field_values:
+        field_rows = [row for row in score_rows if row["field"] == field]
+        exact = sum(row["raw_exact"] for row in field_rows)
+        by_field[field] = {
+            "records": 8, "raw_exact_matches": exact, "raw_exact_match": exact / 8,
+        }
+    field_reference_counts = {field: 8 for field in field_values}
     _write_json(score / "summary.json", {
         "schema_version": 1, "kind": MODULE.SCORE_KIND,
-        "formal_delivery_gate": True, "accepted": True,
+        "coverage_contract_version": 2, "evaluation_split": "val",
+        "formal_delivery_gate": False, "accepted": False,
+        "diagnostic_thresholds_passed": False,
+        "failures": ["recipient exact/coverage floor not met"],
+        "acceptance": {
+            "passed": False, "formal_delivery_gate": False,
+            "diagnostic_thresholds_passed": False,
+            "failures": ["recipient exact/coverage floor not met"],
+        },
         "evaluation_scope": {
-            "kind": "full_split", "formal_delivery_gate": True,
+            "kind": "full_split", "formal_delivery_gate": False,
+            "requested_limit": None,
             "evaluated_expected_receipts": 8, "full_split_expected_receipts": 8,
+            "input_list_path": input_path.resolve().as_posix(),
+            "input_list_sha256": input_identity["sha256"],
+            "selection_order": MODULE.FORMAL_AUDIT.FULL_SELECTION_ORDER,
         },
         "records": records_path.resolve().as_posix(),
         "records_sha256": hashlib.sha256(records_path.read_bytes()).hexdigest(),
         "manifest": Path(hybrid_ids["manifest"]["path"]).resolve().as_posix(),
         "manifest_sha256": hybrid_ids["manifest"]["sha256"],
+        "results_root": (formal / "hybrid-recipient").resolve().as_posix(),
+        "model": model.resolve().as_posix(),
+        "model_sha256": hashlib.sha256(model.read_bytes()).hexdigest(),
+        "floors": dict(MODULE.FORMAL_AUDIT.FIXED_FLOORS),
         "input_selection": {
             "path": input_path.resolve().as_posix(), "sha256": input_identity["sha256"],
             "records": 8, "hash_bound": True,
+            "selection_order": MODULE.FORMAL_AUDIT.FULL_SELECTION_ORDER,
+            "field_reference_counts": field_reference_counts,
         },
-        "by_field": {"time": {
-            "records": 8, "raw_exact_matches": exact, "raw_exact_match": exact / 8,
-        }},
+        "accuracy_denominators": {"hash_bound": True, "by_field": field_reference_counts},
+        "by_field": by_field,
     })
     return {
         "root": tmp_path, "formal": formal, "sources": sources, "references": references,
@@ -347,6 +393,16 @@ def test_prepare_and_evaluate_two_frozen_shards(formal_fixture: dict[str, Any]) 
     shard_0 = (prepared / "shard-0-inputs.txt").read_text(encoding="utf-8").splitlines()
     shard_1 = (prepared / "shard-1-inputs.txt").read_text(encoding="utf-8").splitlines()
     truth = [json.loads(line) for line in (prepared / "truth.jsonl").read_text(encoding="utf-8").splitlines()]
+    selection_payload = json.loads((prepared / "selection.json").read_text(encoding="utf-8"))
+    assert selection_payload["source_score_disposition"] == {
+        "source_score_accepted": False,
+        "source_score_formal_delivery_gate": False,
+        "source_score_diagnostic_thresholds_passed": False,
+        "source_score_failures": ["recipient exact/coverage floor not met"],
+        "source_score_scope": "hash_bound_full_split_val",
+        "source_score_five_field_floors": MODULE.FORMAL_AUDIT.FIXED_FLOORS,
+        "inherited_delivery_authority": False,
+    }
     assert len(shard_0) == len(shard_1) == 3
     assert shard_0 + shard_1 == [row["source"] for row in truth]
     assert len(set(shard_0 + shard_1)) == 6
@@ -378,6 +434,7 @@ def test_prepare_and_evaluate_two_frozen_shards(formal_fixture: dict[str, Any]) 
     assert len(evaluated["cpu_latency_ms_by_shard"]) == 2
     assert evaluated["candidate_write_enabled"] is False
     assert evaluated["formal_delivery_gate"] is False
+    assert evaluated["source_score_disposition"]["source_score_formal_delivery_gate"] is False
 
 
 def test_prepare_rejects_duplicate_nonstrict_score_row(formal_fixture: dict[str, Any]) -> None:
@@ -400,6 +457,65 @@ def test_prepare_requires_real_comparator_canonical_order(formal_fixture: dict[s
     )
     with pytest.raises(MODULE.CalibrationError, match="comparator canonical"):
         _prepare(formal_fixture, formal_fixture["root"] / "wrong-comparison-order")
+
+
+def test_prepare_rejects_floor_or_five_field_closure_drift(formal_fixture: dict[str, Any]) -> None:
+    summary_path = formal_fixture["score"] / "summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["floors"]["time"] = 0.1
+    _write_json(summary_path, summary)
+    with pytest.raises(MODULE.CalibrationError, match="five-field floors"):
+        _prepare(formal_fixture, formal_fixture["root"] / "bad-floor")
+
+    summary["floors"] = dict(MODULE.FORMAL_AUDIT.FIXED_FLOORS)
+    _write_json(summary_path, summary)
+    comparisons_path = formal_fixture["score"] / "comparisons.jsonl"
+    rows = [json.loads(line) for line in comparisons_path.read_text(encoding="utf-8").splitlines()]
+    payment = next(row for row in rows if row["field"] == "payment_method_field")
+    payment["candidate_text"] = "花呗"
+    _write_jsonl(comparisons_path, rows)
+    with pytest.raises(MODULE.CalibrationError, match="five-field comparison closure"):
+        _prepare(formal_fixture, formal_fixture["root"] / "bad-five-field")
+
+
+def test_prepare_rejects_inconsistent_acceptance_failures(
+    formal_fixture: dict[str, Any],
+) -> None:
+    summary_path = formal_fixture["score"] / "summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["acceptance"]["failures"] = []
+    _write_json(summary_path, summary)
+    with pytest.raises(MODULE.CalibrationError, match="disposition flags/failures"):
+        _prepare(formal_fixture, formal_fixture["root"] / "bad-acceptance-failures")
+
+
+def test_load_prepared_rejects_rehashed_non_time_score_tamper(
+    formal_fixture: dict[str, Any],
+) -> None:
+    prepared = formal_fixture["root"] / "prepared-score-tamper"
+    _prepare(formal_fixture, prepared)
+
+    comparisons_path = formal_fixture["score"] / "comparisons.jsonl"
+    rows = [
+        json.loads(line)
+        for line in comparisons_path.read_text(encoding="utf-8").splitlines()
+    ]
+    payment = next(row for row in rows if row["field"] == "payment_method_field")
+    payment["candidate_text"] = "花呗"
+    payment["raw_exact"] = False
+    _write_jsonl(comparisons_path, rows)
+
+    selection_path = prepared / "selection.json"
+    selection = json.loads(selection_path.read_text(encoding="utf-8"))
+    selection["source_evidence"]["score_comparisons"] = _identity(comparisons_path)
+    _write_json(selection_path, selection)
+    summary_path = prepared / "summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["artifacts"]["selection"].update(_identity(selection_path))
+    _write_json(summary_path, summary)
+
+    with pytest.raises(MODULE.CalibrationError, match="five-field comparison closure"):
+        MODULE._load_prepared(prepared)
 
 
 def test_evaluate_rejects_rehashed_truth_semantic_tamper(formal_fixture: dict[str, Any]) -> None:

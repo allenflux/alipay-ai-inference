@@ -50,6 +50,10 @@ LAYOUT_EVIDENCE = _load_script(
     "receipt_mlnet_layout_shadow_evidence_validator",
     SCRIPTS_ROOT / "receipt-mlnet-layout-shadow-evidence.py",
 )
+FORMAL_AUDIT = _load_script(
+    "receipt_mlnet_formal_missing_fields_audit_validator",
+    SCRIPTS_ROOT / "receipt-mlnet-formal-missing-fields-audit.py",
+)
 
 
 FORMAL_RECORDS = 10016
@@ -417,7 +421,7 @@ def _load_score(
     formal: Mapping[str, Any],
     records_identity: Mapping[str, Any],
     truth_by_source: Mapping[str, Mapping[str, Any]],
-) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any], dict[str, Any]]:
     summary, summary_identity = _load_json(
         score_directory / "summary.json", description="formal scorer summary"
     )
@@ -426,14 +430,34 @@ def _load_score(
     )
     if summary.get("schema_version") != 1 or summary.get("kind") != SCORE_KIND:
         raise CalibrationError("formal scorer summary schema/kind is unsupported")
-    if summary.get("formal_delivery_gate") is not True or summary.get("accepted") is not True:
-        raise CalibrationError("formal scorer was not an accepted formal delivery gate")
     scope = summary.get("evaluation_scope")
+    formal_gate = summary.get("formal_delivery_gate")
+    accepted = summary.get("accepted")
+    diagnostic_passed = summary.get("diagnostic_thresholds_passed")
+    acceptance = summary.get("acceptance")
+    failures = summary.get("failures")
+    if type(formal_gate) is not bool or type(accepted) is not bool \
+            or type(diagnostic_passed) is not bool or not isinstance(acceptance, Mapping) \
+            or not isinstance(failures, list) \
+            or not all(isinstance(value, str) and value for value in failures):
+        raise CalibrationError("formal scorer disposition is incomplete")
+    if accepted is not formal_gate or diagnostic_passed is not formal_gate \
+            or acceptance.get("passed") is not formal_gate \
+            or acceptance.get("formal_delivery_gate") is not formal_gate \
+            or acceptance.get("diagnostic_thresholds_passed") is not diagnostic_passed \
+            or acceptance.get("failures") != failures \
+            or bool(failures) is diagnostic_passed:
+        raise CalibrationError("formal scorer disposition flags/failures are inconsistent")
     if not isinstance(scope, Mapping) or scope.get("kind") != "full_split" \
-            or scope.get("formal_delivery_gate") is not True \
+            or scope.get("formal_delivery_gate") is not formal_gate \
+            or scope.get("requested_limit") is not None \
             or scope.get("evaluated_expected_receipts") != FORMAL_RECORDS \
             or scope.get("full_split_expected_receipts") != FORMAL_RECORDS:
         raise CalibrationError("formal scorer evaluation scope is not the full frozen input set")
+    if summary.get("coverage_contract_version") != 2 or summary.get("evaluation_split") != "val":
+        raise CalibrationError("formal scorer coverage/split contract differs")
+    if summary.get("floors") != FORMAL_AUDIT.FIXED_FLOORS:
+        raise CalibrationError("formal scorer five-field floors differ from fixed delivery floors")
     if summary.get("records_sha256") != records_identity["sha256"] or not _same_path(
         summary.get("records"), Path(str(records_identity["path"]))
     ):
@@ -443,12 +467,87 @@ def _load_score(
         summary.get("manifest"), hybrid["manifest_path"]
     ):
         raise CalibrationError("formal scorer hybrid manifest binding differs")
+    results_root = summary.get("results_root")
+    results_path = Path(str(results_root))
+    if not results_path.is_absolute():
+        results_path = score_directory / results_path
+    if not _same_path(str(results_path), hybrid["root"]):
+        raise CalibrationError("formal scorer results_root differs from the frozen hybrid run")
     selection = summary.get("input_selection")
     if not isinstance(selection, Mapping) or selection.get("hash_bound") is not True \
             or selection.get("records") != FORMAL_RECORDS \
+            or selection.get("selection_order") != FORMAL_AUDIT.FULL_SELECTION_ORDER \
             or selection.get("sha256") != formal["input_identity"]["sha256"] \
             or not _same_path(selection.get("path"), Path(str(formal["input_identity"]["path"]))):
         raise CalibrationError("formal scorer input selection binding differs")
+    if scope.get("selection_order") != FORMAL_AUDIT.FULL_SELECTION_ORDER \
+            or scope.get("input_list_sha256") != formal["input_identity"]["sha256"] \
+            or not _same_path(scope.get("input_list_path"), Path(str(formal["input_identity"]["path"]))):
+        raise CalibrationError("formal scorer evaluation-scope input binding differs")
+
+    model_raw = summary.get("model")
+    if not isinstance(model_raw, str) or not model_raw:
+        raise CalibrationError("formal scorer model path is missing")
+    model_path = Path(model_raw)
+    if not model_path.is_absolute():
+        model_path = score_directory / model_path
+    try:
+        model_identity = TARGETED._file_identity(model_path, description="formal scorer model")
+    except TARGETED.ReplayError as error:
+        raise CalibrationError(str(error)) from error
+    if summary.get("model_sha256") != model_identity["sha256"]:
+        raise CalibrationError("formal scorer model SHA-256 differs")
+
+    try:
+        audit_references = FORMAL_AUDIT._record_references(
+            Path(str(records_identity["path"])),
+            selected_order=[FORMAL_AUDIT._source_key(source) for source in formal["input_sources"]],
+            split="val",
+        )
+        audit_hybrid_results = {
+            FORMAL_AUDIT._source_key(value["source"]): value["payload"]
+            for value in hybrid["results"].values()
+        }
+        audit_hybrid_ids = {
+            FORMAL_AUDIT._source_key(value["source"]): value["identity"]
+            for value in hybrid["results"].values()
+        }
+        validated_rows, reference_counts = FORMAL_AUDIT._score_comparisons(
+            score_directory / "comparisons.jsonl",
+            selected_keys=set(audit_references),
+            references=audit_references,
+            hybrid_results=audit_hybrid_results,
+            hybrid_result_ids=audit_hybrid_ids,
+        )
+    except FORMAL_AUDIT.AuditError as error:
+        raise CalibrationError(f"formal scorer five-field comparison closure differs: {error}") from error
+
+    by_field = summary.get("by_field")
+    denominators = summary.get("accuracy_denominators")
+    denominator_fields = denominators.get("by_field") if isinstance(denominators, Mapping) else None
+    input_reference_counts = selection.get("field_reference_counts")
+    if not isinstance(by_field, Mapping) or not isinstance(denominators, Mapping) \
+            or denominators.get("hash_bound") is not True \
+            or not isinstance(denominator_fields, Mapping) \
+            or not isinstance(input_reference_counts, Mapping):
+        raise CalibrationError("formal scorer five-field denominator closure is incomplete")
+    for field in FORMAL_AUDIT.FIELD_SPECS:
+        field_rows = [row for (source_key, row_field), row in validated_rows.items() if row_field == field]
+        metric = by_field.get(field)
+        exact_matches = sum(row["raw_exact"] is True for row in field_rows)
+        observed_exact_rate = _require_number(
+            metric.get("raw_exact_match") if isinstance(metric, Mapping) else None,
+            description=f"formal scorer {field} raw_exact_match",
+            minimum=0,
+        )
+        expected_exact_rate = exact_matches / len(field_rows) if field_rows else 0.0
+        if not isinstance(metric, Mapping) or metric.get("records") != reference_counts.get(field, 0) \
+                or metric.get("raw_exact_matches") != exact_matches \
+                or observed_exact_rate > 1 \
+                or not math.isclose(observed_exact_rate, expected_exact_rate, rel_tol=0, abs_tol=1e-12) \
+                or denominator_fields.get(field) != reference_counts.get(field, 0) \
+                or input_reference_counts.get(field) != reference_counts.get(field, 0):
+            raise CalibrationError(f"formal scorer {field} metric/denominator differs")
     all_time_by_source: dict[str, dict[str, Any]] = {}
     by_source: dict[str, dict[str, Any]] = {}
     for index, row in enumerate(rows):
@@ -509,6 +608,15 @@ def _load_score(
     return by_source, {
         "score_summary": summary_identity,
         "score_comparisons": rows_identity,
+        "score_model": model_identity,
+    }, {
+        "source_score_accepted": accepted,
+        "source_score_formal_delivery_gate": formal_gate,
+        "source_score_diagnostic_thresholds_passed": diagnostic_passed,
+        "source_score_failures": list(failures),
+        "source_score_scope": "hash_bound_full_split_val",
+        "source_score_five_field_floors": dict(FORMAL_AUDIT.FIXED_FLOORS),
+        "inherited_delivery_authority": False,
     }
 
 
@@ -615,7 +723,7 @@ def prepare(
     formal = _load_formal(formal_root)
     input_keys = {_path_key(source) for source in formal["input_sources"]}
     records_by_source, records_identity = _load_records(records_path, input_keys)
-    score_by_source, score_evidence = _load_score(
+    score_by_source, score_evidence, score_disposition = _load_score(
         score_directory,
         formal=formal,
         records_identity=records_identity,
@@ -750,6 +858,7 @@ def prepare(
                 for name in ("device_platform", "status_class", "rotation_degrees", "size_bin")
             },
             "source_evidence": source_evidence,
+            "source_score_disposition": score_disposition,
             "source_closure_sha256": _source_closure(source_files),
             "source_total_bytes": sum(int(value["size_bytes"]) for value in source_files),
             "artifacts": {
@@ -776,6 +885,7 @@ def prepare(
             "records": TARGET_RECORDS,
             "shards": 2,
             "counts": selection["counts"],
+            "source_score_disposition": score_disposition,
             "artifacts": {
                 "selection": {
                     "relative_path": "selection.json", "sha256": _sha(selection_bytes),
@@ -939,6 +1049,103 @@ def _validate_pool_manifest_closure(
                 raise CalibrationError(f"prepared {run_name} manifest row[{index}] result binding differs")
 
 
+def _revalidate_source_score_contract(
+    *,
+    selection: Mapping[str, Any],
+    source_evidence: Mapping[str, Any],
+    pool_rows: Sequence[Mapping[str, Any]],
+    formal_sources: Sequence[str],
+) -> None:
+    """Re-run the original full five-field scorer closure from bound inputs.
+
+    Prepared artifacts are self-describing rather than signed.  Rechecking only
+    their stored hashes would let a caller rewrite a non-time comparison and
+    update the prepared hashes together.  Reuse ``_load_score`` so evaluate has
+    the same records/result/model/floor/disposition closure as prepare.
+    """
+    formal_input = source_evidence.get("formal_input_list")
+    records_contract = source_evidence.get("records")
+    hybrid_manifest = source_evidence.get("hybrid_manifest")
+    score_summary = source_evidence.get("score_summary")
+    if not all(
+        isinstance(value, Mapping) and isinstance(value.get("path"), str)
+        for value in (formal_input, records_contract, hybrid_manifest, score_summary)
+    ):
+        raise CalibrationError("prepared source scorer closure bindings are missing")
+
+    input_keys = {_path_key(source) for source in formal_sources}
+    records_by_source, observed_records = _load_records(
+        Path(str(records_contract["path"])), input_keys
+    )
+    if not _same_path(records_contract.get("path"), Path(str(observed_records["path"]))) \
+            or any(
+                records_contract.get(key) != observed_records[key]
+                for key in ("sha256", "size_bytes")
+            ):
+        raise CalibrationError("prepared source scorer records identity differs")
+
+    hybrid_results: dict[str, dict[str, Any]] = {}
+    for index, (pool, source) in enumerate(zip(pool_rows, formal_sources, strict=True)):
+        result_contract = pool.get("hybrid_result")
+        if not isinstance(result_contract, Mapping) or not isinstance(
+            result_contract.get("path"), str
+        ):
+            raise CalibrationError(
+                f"prepared source scorer hybrid result[{index}] binding is missing"
+            )
+        payload, observed = _load_json(
+            Path(str(result_contract["path"])),
+            description=f"prepared source scorer hybrid result[{index}]",
+        )
+        if not _same_path(result_contract.get("path"), Path(str(observed["path"]))) \
+                or any(
+                    result_contract.get(key) != observed[key]
+                    for key in ("sha256", "size_bytes")
+                ):
+            raise CalibrationError(
+                f"prepared source scorer hybrid result[{index}] identity differs"
+            )
+        key = _path_key(source)
+        if _path_key(payload.get("source")) != key or key in hybrid_results:
+            raise CalibrationError(
+                f"prepared source scorer hybrid result[{index}] source differs"
+            )
+        hybrid_results[key] = {
+            "source": source,
+            "payload": payload,
+            "identity": observed,
+        }
+
+    manifest_path = Path(str(hybrid_manifest["path"]))
+    score_summary_path = Path(str(score_summary["path"]))
+    if score_summary_path.name != "summary.json":
+        raise CalibrationError("prepared source scorer summary path differs")
+    formal = {
+        "input_sources": list(formal_sources),
+        "input_identity": dict(formal_input),
+        "hybrid": {
+            "root": manifest_path.parent,
+            "manifest_path": manifest_path,
+            "manifest_identity": dict(hybrid_manifest),
+            "results": hybrid_results,
+        },
+    }
+    _, observed_evidence, observed_disposition = _load_score(
+        score_summary_path.parent,
+        formal=formal,
+        records_identity=observed_records,
+        truth_by_source=records_by_source,
+    )
+    for name, observed in observed_evidence.items():
+        expected = source_evidence.get(name)
+        if not isinstance(expected, Mapping) \
+                or not _same_path(expected.get("path"), Path(str(observed["path"]))) \
+                or any(expected.get(key) != observed[key] for key in ("sha256", "size_bytes")):
+            raise CalibrationError(f"prepared source scorer {name} identity differs")
+    if selection.get("source_score_disposition") != observed_disposition:
+        raise CalibrationError("prepared source scorer disposition differs from full closure")
+
+
 def _load_prepared(prepared_directory: Path) -> dict[str, Any]:
     if prepared_directory.is_symlink():
         raise CalibrationError(f"prepared directory must not be a symbolic link: {prepared_directory}")
@@ -1014,6 +1221,8 @@ def _load_prepared(prepared_directory: Path) -> dict[str, Any]:
     source_evidence = selection.get("source_evidence")
     if not isinstance(source_evidence, Mapping):
         raise CalibrationError("prepared source evidence is missing")
+    if summary.get("source_score_disposition") != selection.get("source_score_disposition"):
+        raise CalibrationError("prepared summary source scorer disposition differs")
     bindings = [dict(value) for value in source_evidence.values() if isinstance(value, Mapping)]
     pool_sources: list[str] = []
     for pool_index, row in enumerate(pool_rows):
@@ -1038,6 +1247,12 @@ def _load_prepared(prepared_directory: Path) -> dict[str, Any]:
         pool_rows=pool_rows,
         formal_sources=formal_sources,
         source_evidence=source_evidence,
+    )
+    _revalidate_source_score_contract(
+        selection=selection,
+        source_evidence=source_evidence,
+        pool_rows=pool_rows,
+        formal_sources=formal_sources,
     )
     truth_source_identities: list[dict[str, Any]] = []
     for row_index, row in enumerate(truth_rows):
@@ -1548,6 +1763,7 @@ def evaluate(
         "execution_provider": "cpu",
         "truth_semantics": "external_records_visible_status_bar_h_mm_or_hh_mm_raw_exact",
         "truth_provenance": "frozen_unified_records_external_to_layout_route_not_independent_human_truth",
+        "source_score_disposition": prepared["selection"]["source_score_disposition"],
         "route_semantics": "shared_receipt_mlnet_layout_shadow_evidence_strict_time_route",
         "overall": _metrics(comparisons),
         "grouped": grouped,
