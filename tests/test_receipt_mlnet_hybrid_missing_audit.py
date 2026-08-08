@@ -471,7 +471,7 @@ def test_main_text_format_is_complete_and_terminal_width_bounded(
     assert "Finding 1/2" in lines
     assert '  basename: "bad.jpg"' in lines
     collapsed = "".join(line.strip() for line in lines)
-    assert sources[1].as_posix() in collapsed
+    assert MODULE._text_value(str(sources[1])) in collapsed
     assert "hybrid recipient candidate missing" in output
     assert "  baseline recipient:" in lines
     assert "  hybrid recipient:" in lines
