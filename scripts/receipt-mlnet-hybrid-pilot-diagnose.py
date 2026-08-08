@@ -263,10 +263,8 @@ def _manifest_result_paths(
         if not isinstance(fields, Mapping):
             raise DiagnosticError(f"hybrid result fields must be an object: {result_path}")
         recipient = fields.get("recipient")
-        if not isinstance(recipient, Mapping) or "candidate" not in recipient:
-            raise DiagnosticError(
-                f"hybrid result recipient candidate is absent: {result_path}"
-            )
+        if not isinstance(recipient, Mapping):
+            raise DiagnosticError(f"hybrid result recipient must be an object: {result_path}")
         recipient_candidate = recipient.get("candidate")
         if recipient_candidate is not None and not isinstance(recipient_candidate, str):
             raise DiagnosticError(

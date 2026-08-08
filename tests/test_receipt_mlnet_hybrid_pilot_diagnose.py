@@ -403,6 +403,44 @@ def test_diagnose_rejects_comparison_candidate_that_differs_from_bound_result(
         MODULE.diagnose(comparison, hybrid)
 
 
+def test_diagnose_treats_omitted_result_candidate_as_comparator_null(
+    tmp_path: Path,
+) -> None:
+    comparison, hybrid = _fixture(tmp_path / "candidate-omitted" / "ab")
+    result_path = hybrid / "results" / "1.json"
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    del result["fields"]["recipient"]["candidate"]
+    _write_json(result_path, result)
+
+    diagnostics = MODULE.diagnose(comparison, hybrid)
+
+    missing = next(row for row in diagnostics if row["recipient_candidate"] is None)
+    assert missing["failures"] == [MODULE.RECIPIENT_MISSING_FAILURE]
+
+
+def test_diagnose_accepts_matching_present_result_candidate(tmp_path: Path) -> None:
+    comparison, hybrid = _fixture(tmp_path / "candidate-present" / "ab")
+
+    diagnostics = MODULE.diagnose(comparison, hybrid)
+
+    changed = next(row for row in diagnostics if row["recipient_candidate"] == "商户乙")
+    assert changed["failures"] == ["fields.amount changed"]
+
+
+def test_diagnose_rejects_non_string_non_null_result_candidate(tmp_path: Path) -> None:
+    comparison, hybrid = _fixture(tmp_path / "candidate-type" / "ab")
+    result_path = hybrid / "results" / "1.json"
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    result["fields"]["recipient"]["candidate"] = 7
+    _write_json(result_path, result)
+
+    with pytest.raises(
+        MODULE.DiagnosticError,
+        match="recipient candidate must be a string or null",
+    ):
+        MODULE.diagnose(comparison, hybrid)
+
+
 @pytest.mark.parametrize(
     ("case", "message"),
     [
