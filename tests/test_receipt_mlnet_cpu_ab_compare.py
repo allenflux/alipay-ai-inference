@@ -255,12 +255,24 @@ def _fixture_plan(
     *,
     ocr_mode: str = "unified",
     allow_incomplete_recipient: bool = False,
+    repetitions: int = 3,
+    warmup_runs: int = 1,
+    expected_input_count: int | None = None,
+    sources: list[Path] | None = None,
+    identity_plan: Path | None = None,
 ) -> Path:
     if allow_incomplete_recipient and ocr_mode != "hybrid-recipient":
         raise ValueError("recipient-only incomplete fixtures require hybrid-recipient OCR")
-    sources = [tmp_path / "input-1.jpg", tmp_path / "input-2.jpg"]
-    for index, source in enumerate(sources):
-        source.write_bytes(f"image-{index}".encode())
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    if sources is None:
+        sources = [tmp_path / "input-1.jpg", tmp_path / "input-2.jpg"]
+        for index, source in enumerate(sources):
+            source.write_bytes(f"image-{index}".encode())
+    else:
+        sources = list(sources)
+        for source in sources:
+            if not source.is_file():
+                raise ValueError(f"shared fixture input does not exist: {source}")
     fixed_list = tmp_path / "fixed-inputs.txt"
     fixed_list.write_text("\n".join(str(item) for item in sources) + "\n", encoding="utf-8")
     input_evidence = tmp_path / "input-evidence.json"
@@ -272,24 +284,42 @@ def _fixture_plan(
         ],
     )
 
-    artifacts: dict[str, dict[str, object]] = {}
-    artifact_hashes: dict[str, str] = {}
-    for name in compare.MODEL_HASH_FIELDS:
-        path = tmp_path / f"{name}.bin"
-        path.write_bytes(f"artifact-{name}".encode())
-        artifacts[name] = _evidence(path)
-        artifact_hashes[name] = _sha256(path)
-    paddle_contract_sha256: str | None = None
-    if ocr_mode == "hybrid-recipient":
-        paddle_bundle, paddle_contract_sha256 = _paddle_bundle(tmp_path)
-        artifacts["paddle_ocr_bundle"] = paddle_bundle
-    variants = {variant: _app_variant(tmp_path, variant) for variant in compare.VARIANTS}
+    if identity_plan is None:
+        artifacts: dict[str, dict[str, object]] = {}
+        artifact_hashes: dict[str, str] = {}
+        for name in compare.MODEL_HASH_FIELDS:
+            path = tmp_path / f"{name}.bin"
+            path.write_bytes(f"artifact-{name}".encode())
+            artifacts[name] = _evidence(path)
+            artifact_hashes[name] = _sha256(path)
+        paddle_contract_sha256: str | None = None
+        if ocr_mode == "hybrid-recipient":
+            paddle_bundle, paddle_contract_sha256 = _paddle_bundle(tmp_path)
+            artifacts["paddle_ocr_bundle"] = paddle_bundle
+        variants = {
+            variant: _app_variant(tmp_path, variant) for variant in compare.VARIANTS
+        }
+    else:
+        identity = json.loads(identity_plan.read_text(encoding="utf-8"))
+        artifacts = identity["artifacts"]
+        variants = identity["variants"]
+        artifact_hashes = {
+            name: str(artifacts[name]["sha256"])
+            for name in compare.MODEL_HASH_FIELDS
+        }
+        paddle_contract_sha256 = None
+        if ocr_mode == "hybrid-recipient":
+            paddle_contract_sha256 = str(
+                compare._verify_paddle_bundle(artifacts["paddle_ocr_bundle"])[
+                    "contract_sha256"
+                ]
+            )
 
     runs: list[dict[str, object]] = []
     execution_order = 0
     for phase, count, expected_sources in (
-        ("warmup", 1, sources[:1]),
-        ("measured", 3, sources),
+        ("warmup", warmup_runs, sources[:1]),
+        ("measured", repetitions, sources),
     ):
         for iteration in range(1, count + 1):
             order = compare.VARIANTS if iteration % 2 else tuple(reversed(compare.VARIANTS))
@@ -353,13 +383,13 @@ def _fixture_plan(
             "input_limit_requested": 0,
             "available_count": len(sources),
             "selected_count": len(sources),
-            "expected_input_count": None,
+            "expected_input_count": expected_input_count,
         },
         "fixed_input_list": _evidence(fixed_list),
         "input_evidence": _evidence(input_evidence),
-        "warmup_runs": 1,
+        "warmup_runs": warmup_runs,
         "warmup_limit": 1,
-        "repetitions": 3,
+        "repetitions": repetitions,
         "cli_contract": {
             "device": "cpu",
             "unified_provider": "cpu",
@@ -397,6 +427,60 @@ def _fixture_plan(
     plan_path = tmp_path / "ab-plan.json"
     _write_json(plan_path, plan)
     return plan_path
+
+
+def _equivalence_only_once_fixture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Path, Path, Path]:
+    monkeypatch.setattr(compare, "FULL_EQUIVALENCE_INPUTS", 3)
+    monkeypatch.setattr(compare, "PERFORMANCE_EVIDENCE_INPUTS", 2)
+    shared = tmp_path / "shared-inputs"
+    shared.mkdir(parents=True)
+    sources = [shared / f"input-{index}.jpg" for index in range(1, 4)]
+    for index, source in enumerate(sources):
+        source.write_bytes(f"shared-image-{index}".encode())
+
+    full_plan_path = _fixture_plan(
+        tmp_path / "full",
+        ocr_mode="hybrid-recipient",
+        allow_incomplete_recipient=True,
+        repetitions=1,
+        expected_input_count=3,
+        sources=sources,
+    )
+    performance_plan_path = _fixture_plan(
+        tmp_path / "performance",
+        ocr_mode="hybrid-recipient",
+        allow_incomplete_recipient=True,
+        repetitions=3,
+        expected_input_count=2,
+        # A route-diverse targeted subset need not be the canonical first-N.
+        sources=[sources[0], sources[2]],
+        identity_plan=full_plan_path,
+    )
+    performance_report, differences = compare.analyze_plan(performance_plan_path)
+    assert differences == []
+    assert performance_report["accepted"] is True
+    performance_report_path = performance_plan_path.parent / "ab-report.json"
+    _write_json(performance_report_path, performance_report)
+
+    full_plan = json.loads(full_plan_path.read_text(encoding="utf-8"))
+    full_plan["execution_mode"] = compare.EQUIVALENCE_ONLY_ONCE_MODE
+    full_plan["performance_evidence"] = {
+        "expected_input_count": 2,
+        "expected_repetitions_per_variant": 3,
+        "measurement": "external_process_wall_clock",
+        "report": _evidence(performance_report_path),
+        "plan": _evidence(performance_plan_path),
+    }
+    _write_json(full_plan_path, full_plan)
+    return full_plan_path, performance_plan_path, performance_report_path
+
+
+def _refresh_external_evidence_binding(full_plan_path: Path, name: str, path: Path) -> None:
+    plan = json.loads(full_plan_path.read_text(encoding="utf-8"))
+    plan["performance_evidence"][name] = _evidence(path)
+    _write_json(full_plan_path, plan)
 
 
 def _result_paths(plan_path: Path) -> list[Path]:
@@ -460,10 +544,259 @@ def test_cpu_ab_accepts_exact_predictions_and_reports_pooled_performance(tmp_pat
         > report["performance"]["baseline"]["throughput_images_per_second"]["aggregate"]
     )
     assert report["performance"]["baseline"]["stage_latency_ms"]["device"]["count"] == 6
+    assert "execution_mode" not in report
+    assert "external_performance_evidence" not in report
+    assert "full_once_observation" not in report["performance"]
     assert (
         report["variant_identities"]["baseline"]["managed_entrypoint_sha256"]
         != report["variant_identities"]["candidate"]["managed_entrypoint_sha256"]
     )
+
+
+def test_cpu_ab_equivalence_only_once_uses_revalidated_external_performance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan_path, performance_plan_path, performance_report_path = (
+        _equivalence_only_once_fixture(tmp_path, monkeypatch)
+    )
+
+    report, differences = compare.analyze_plan(plan_path)
+
+    assert differences == []
+    assert report["accepted"] is True
+    assert report["execution_mode"] == compare.EQUIVALENCE_ONLY_ONCE_MODE
+    assert report["input_count"] == 3
+    assert report["measured_repetitions_per_variant"] == 1
+    evidence = report["external_performance_evidence"]
+    assert evidence["accepted"] is True
+    assert evidence["source"] == compare.EXTERNAL_PERFORMANCE_EVIDENCE_SOURCE
+    assert evidence["input_count"] == 2
+    assert evidence["measured_repetitions_per_variant"] == 3
+    assert evidence["report_sha256"] == _sha256(performance_report_path)
+    assert evidence["plan_sha256"] == _sha256(performance_plan_path)
+    assert report["performance"]["accepted"] is True
+    assert report["performance"]["evidence_source"] == evidence["source"]
+    assert report["performance"]["baseline"]["repetitions"] == 3
+    observation = report["performance"]["full_once_observation"]
+    assert observation["acceptance_applicable"] is False
+    assert observation["baseline"]["repetitions"] == 1
+    assert report["prediction_consistency"]["compared_runs"] == 3
+
+
+def test_cpu_ab_standard_mode_does_not_allow_one_repetition(tmp_path: Path) -> None:
+    plan_path = _fixture_plan(tmp_path, repetitions=1)
+
+    with pytest.raises(compare.ValidationError, match="at least three"):
+        compare.analyze_plan(plan_path)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (lambda plan: plan.update(repetitions=2), "exactly one measured"),
+        (lambda plan: plan.update(warmup_runs=2), "exactly one warmup"),
+        (
+            lambda plan: plan["input_selection"].update(input_limit_requested=1),
+            "first-N canonical selection|complete expected",
+        ),
+        (
+            lambda plan: plan["cli_contract"].update(
+                require_complete=True,
+                equivalence_only=False,
+                allowed_incomplete_field=None,
+            ),
+            "only recipient allowed incomplete",
+        ),
+        (lambda plan: plan.pop("performance_evidence"), "requires hash-bound"),
+    ],
+)
+def test_cpu_ab_equivalence_only_once_hard_locks_formal_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: object,
+    message: str,
+) -> None:
+    plan_path, _, _ = _equivalence_only_once_fixture(tmp_path, monkeypatch)
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    mutation(plan)  # type: ignore[operator]
+    _write_json(plan_path, plan)
+
+    with pytest.raises(compare.ValidationError, match=message):
+        compare.analyze_plan(plan_path)
+
+
+def test_cpu_ab_equivalence_only_once_rejects_a_forged_external_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan_path, _, performance_report_path = _equivalence_only_once_fixture(
+        tmp_path, monkeypatch
+    )
+    supplied = json.loads(performance_report_path.read_text(encoding="utf-8"))
+    supplied["performance"]["candidate"]["inference_latency_ms"]["p95"] = 0.001
+    _write_json(performance_report_path, supplied)
+    _refresh_external_evidence_binding(
+        plan_path, "report", performance_report_path
+    )
+
+    with pytest.raises(compare.ValidationError, match="current-analyzer recomputation"):
+        compare.analyze_plan(plan_path)
+
+
+def test_cpu_ab_equivalence_only_once_rejects_changed_external_raw_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan_path, performance_plan_path, _ = _equivalence_only_once_fixture(
+        tmp_path, monkeypatch
+    )
+    performance_plan = json.loads(performance_plan_path.read_text(encoding="utf-8"))
+    candidate = next(
+        row
+        for row in performance_plan["runs"]
+        if row["phase"] == "measured"
+        and row["variant"] == "candidate"
+        and row["iteration"] == 2
+    )
+    manifest = json.loads(
+        (Path(candidate["output_directory"]) / "inference_manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    result_path = Path(manifest[0]["result"])
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    result["fields"]["recipient"]["candidate"] = "篡改的外部证据"
+    _write_json(result_path, result)
+
+    with pytest.raises(compare.ValidationError, match="non-exact|recomputation"):
+        compare.analyze_plan(plan_path)
+
+
+def test_cpu_ab_equivalence_only_once_rejects_chained_performance_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan_path, performance_plan_path, performance_report_path = (
+        _equivalence_only_once_fixture(tmp_path, monkeypatch)
+    )
+    performance_plan = json.loads(performance_plan_path.read_text(encoding="utf-8"))
+    performance_plan["execution_mode"] = compare.EQUIVALENCE_ONLY_ONCE_MODE
+    _write_json(performance_plan_path, performance_plan)
+    supplied = json.loads(performance_report_path.read_text(encoding="utf-8"))
+    supplied["plan_sha256"] = _sha256(performance_plan_path)
+    _write_json(performance_report_path, supplied)
+    _refresh_external_evidence_binding(plan_path, "plan", performance_plan_path)
+    _refresh_external_evidence_binding(plan_path, "report", performance_report_path)
+
+    with pytest.raises(compare.ValidationError, match="not chained"):
+        compare.analyze_plan(plan_path)
+
+
+def test_cpu_ab_equivalence_only_once_rejects_nonformal_performance_inputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan_path, _, _ = _equivalence_only_once_fixture(tmp_path, monkeypatch)
+    full = json.loads(plan_path.read_text(encoding="utf-8"))
+    rogue_sources = [tmp_path / "rogue-1.jpg", tmp_path / "rogue-2.jpg"]
+    for index, source in enumerate(rogue_sources):
+        source.write_bytes(f"rogue-{index}".encode())
+    rogue_plan_path = _fixture_plan(
+        tmp_path / "rogue-performance",
+        ocr_mode="hybrid-recipient",
+        allow_incomplete_recipient=True,
+        repetitions=3,
+        expected_input_count=2,
+        sources=rogue_sources,
+        identity_plan=plan_path,
+    )
+    rogue_report, differences = compare.analyze_plan(rogue_plan_path)
+    assert differences == [] and rogue_report["accepted"] is True
+    rogue_report_path = rogue_plan_path.parent / "ab-report.json"
+    _write_json(rogue_report_path, rogue_report)
+    full["performance_evidence"]["plan"] = _evidence(rogue_plan_path)
+    full["performance_evidence"]["report"] = _evidence(rogue_report_path)
+    _write_json(plan_path, full)
+
+    with pytest.raises(compare.ValidationError, match="not a subset"):
+        compare.analyze_plan(plan_path)
+
+
+def test_cpu_ab_equivalence_only_once_rejects_changed_candidate_app_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan_path, _, _ = _equivalence_only_once_fixture(tmp_path, monkeypatch)
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    plan["variants"]["candidate"] = _app_variant(
+        plan_path.parent, "candidate-full-only"
+    )
+    _write_json(plan_path, plan)
+
+    with pytest.raises(compare.ValidationError, match="candidate app identity"):
+        compare.analyze_plan(plan_path)
+
+
+def test_cpu_ab_equivalence_only_once_rejects_changed_model_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan_path, _, _ = _equivalence_only_once_fixture(tmp_path, monkeypatch)
+    changed_detector = plan_path.parent / "changed-detector.onnx"
+    changed_detector.write_bytes(b"different-detector-model")
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    plan["artifacts"]["detector"] = _evidence(changed_detector)
+    changed_hash = _sha256(changed_detector)
+    for result_path in _result_paths(plan_path):
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+        result["model_contracts"][compare.MODEL_HASH_FIELDS["detector"]] = changed_hash
+        _write_json(result_path, result)
+    _write_json(plan_path, plan)
+
+    with pytest.raises(compare.ValidationError, match="fixed artifact detector differs"):
+        compare.analyze_plan(plan_path)
+
+
+def test_cpu_ab_equivalence_only_once_rejects_changed_thread_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan_path, _, _ = _equivalence_only_once_fixture(tmp_path, monkeypatch)
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    plan["cli_contract"]["detector_intra_op_threads"]["candidate"] = 8
+    for run in plan["runs"]:
+        if run["variant"] != "candidate":
+            continue
+        run["detector_intra_op_threads"] = 8
+        summary_path = Path(run["output_directory"]) / "inference_summary.json"
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        summary["detector_intra_op_threads"] = 8
+        _write_json(summary_path, summary)
+    _write_json(plan_path, plan)
+
+    with pytest.raises(compare.ValidationError, match="external CLI contract differs"):
+        compare.analyze_plan(plan_path)
+
+
+def test_cpu_ab_equivalence_only_once_still_requires_full_exact_predictions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan_path, _, _ = _equivalence_only_once_fixture(tmp_path, monkeypatch)
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    candidate = next(
+        row
+        for row in plan["runs"]
+        if row["phase"] == "measured" and row["variant"] == "candidate"
+    )
+    manifest = json.loads(
+        (Path(candidate["output_directory"]) / "inference_manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    result_path = Path(manifest[0]["result"])
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    result["device"]["confidence"] = 0.5
+    _write_json(result_path, result)
+
+    report, differences = compare.analyze_plan(plan_path)
+
+    assert report["accepted"] is False
+    assert report["prediction_consistency"]["accepted"] is False
+    assert differences[0]["json_pointer"] == "/device/confidence"
+    assert report["performance"]["accepted"] is True
 
 
 @pytest.mark.parametrize(
@@ -1264,6 +1597,18 @@ def test_cpu_ab_powershell_v2_freezes_and_runs_the_complete_hybrid_cpu_route() -
     assert "[string]$PaddleOcrBundle" in script
     assert "[int]$ExpectedInputCount = 0" in script
     assert "[switch]$AllowIncompleteRecipientEquivalence" in script
+    assert "[switch]$EquivalenceOnlyOnce" in script
+    assert "[string]$PerformanceEvidenceReport" in script
+    assert '[ValidateRange(1, 20)]\n    [int]$Repetitions = 3' in script
+    assert '$Repetitions -lt 3' in script
+    assert '$Repetitions -ne 1' in script
+    assert '$WarmupRuns -ne 1' in script
+    assert '$InputLimit -ne 0 -or $ExpectedInputCount -ne 10016' in script
+    assert '$OcrMode -ne "hybrid-recipient" -or -not $AllowIncompleteRecipientEquivalence' in script
+    assert '[int]$performanceReportPayload.input_count -ne 332' in script
+    assert '[int]$performanceReportPayload.measured_repetitions_per_variant -ne 3' in script
+    assert '$plan["execution_mode"] = "equivalence_only_once"' in script
+    assert '$plan["performance_evidence"] = $performanceEvidence' in script
     assert "$inputs.Count -ne $ExpectedInputCount" in script
     assert "expected_input_count = if ($ExpectedInputCount -gt 0)" in script
     assert '"--ocr", $SelectedOcrMode' in script

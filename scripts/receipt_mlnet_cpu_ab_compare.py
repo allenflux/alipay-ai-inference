@@ -92,6 +92,14 @@ MINIMUM_THROUGHPUT_GAIN_PERCENT = 2.0
 MAXIMUM_P50_REGRESSION_PERCENT = 0.0
 MAXIMUM_P95_REGRESSION_PERCENT = 0.0
 MAXIMUM_DETECTOR_INTRA_OP_THREADS = 256
+STANDARD_EXECUTION_MODE = "performance_and_equivalence"
+EQUIVALENCE_ONLY_ONCE_MODE = "equivalence_only_once"
+FULL_EQUIVALENCE_INPUTS = 10016
+PERFORMANCE_EVIDENCE_INPUTS = 332
+PERFORMANCE_EVIDENCE_REPETITIONS = 3
+EXTERNAL_PERFORMANCE_EVIDENCE_SOURCE = (
+    "hash_bound_external_332_three_repetition_report"
+)
 
 
 class ValidationError(RuntimeError):
@@ -110,13 +118,25 @@ def _load_json(path: Path, description: str) -> Any:
     if not path.is_file():
         raise ValidationError(f"missing {description}: {path}")
     try:
+        raw = path.read_bytes()
+    except OSError as exception:
+        raise ValidationError(f"cannot read {description} {path}: {exception}") from exception
+    return _load_json_bytes(raw, description=f"{description} {path}")
+
+
+def _load_json_bytes(raw: bytes, description: str) -> Any:
+    try:
         return json.loads(
-            path.read_text(encoding="utf-8-sig"),
-            parse_constant=_reject_json_constant,
+            raw.decode("utf-8-sig"), parse_constant=_reject_json_constant
         )
-    except json.JSONDecodeError as exception:
+    except (UnicodeDecodeError, json.JSONDecodeError) as exception:
+        detail = (
+            exception.msg
+            if isinstance(exception, json.JSONDecodeError)
+            else "invalid UTF-8"
+        )
         raise ValidationError(
-            f"invalid {description} {path}: {exception.msg}"
+            f"invalid {description}: {detail}"
         ) from exception
 
 
@@ -126,6 +146,10 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _sha256_bytes(raw: bytes) -> str:
+    return hashlib.sha256(raw).hexdigest()
 
 
 def _path_key(value: str | Path) -> str:
@@ -710,7 +734,7 @@ def _validate_performance_gate(plan: Mapping[str, Any]) -> Mapping[str, Any]:
 
 def _validate_plan(
     plan: Mapping[str, Any],
-) -> tuple[int, int, int, int, str, dict[str, int | None], str | None]:
+) -> tuple[int, int, int, int, str, dict[str, int | None], str | None, str]:
     schema_version = plan.get("schema_version")
     kind = plan.get("kind")
     if type(schema_version) is not int or (schema_version, kind) not in (
@@ -721,10 +745,33 @@ def _validate_plan(
     repetitions = plan.get("repetitions")
     warmup_runs = plan.get("warmup_runs")
     warmup_limit = plan.get("warmup_limit")
-    if isinstance(repetitions, bool) or not isinstance(repetitions, int) or repetitions < 3:
-        raise ValidationError("CPU A/B requires at least three measured repetitions")
+    if "execution_mode" not in plan:
+        execution_mode = STANDARD_EXECUTION_MODE
+    elif schema_version == 2 and plan.get("execution_mode") == EQUIVALENCE_ONLY_ONCE_MODE:
+        execution_mode = EQUIVALENCE_ONLY_ONCE_MODE
+    else:
+        raise ValidationError("unsupported CPU A/B execution_mode")
+    if execution_mode == STANDARD_EXECUTION_MODE:
+        if (
+            isinstance(repetitions, bool)
+            or not isinstance(repetitions, int)
+            or repetitions < 3
+        ):
+            raise ValidationError("CPU A/B requires at least three measured repetitions")
+        if "performance_evidence" in plan:
+            raise ValidationError(
+                "standard CPU A/B plans cannot import external performance evidence"
+            )
+    elif repetitions != 1 or isinstance(repetitions, bool):
+        raise ValidationError(
+            "equivalence-only-once CPU A/B requires exactly one measured repetition"
+        )
     if isinstance(warmup_runs, bool) or not isinstance(warmup_runs, int) or warmup_runs < 1:
         raise ValidationError("CPU A/B requires at least one warmup run per variant")
+    if execution_mode == EQUIVALENCE_ONLY_ONCE_MODE and warmup_runs != 1:
+        raise ValidationError(
+            "equivalence-only-once CPU A/B requires exactly one warmup run per variant"
+        )
     if isinstance(warmup_limit, bool) or not isinstance(warmup_limit, int) or warmup_limit < 1:
         raise ValidationError("CPU A/B warmup_limit must be positive")
     (
@@ -732,6 +779,13 @@ def _validate_plan(
         detector_thread_contract,
         allowed_incomplete_field,
     ) = _validate_cli_contract(plan, schema_version)
+    if execution_mode == EQUIVALENCE_ONLY_ONCE_MODE and (
+        ocr_mode != "hybrid-recipient"
+        or allowed_incomplete_field != ALLOWED_INCOMPLETE_RECIPIENT_FIELD
+    ):
+        raise ValidationError(
+            "equivalence-only-once requires hybrid-recipient OCR with only recipient allowed incomplete"
+        )
     _validate_performance_gate(plan)
     return (
         schema_version,
@@ -741,6 +795,7 @@ def _validate_plan(
         ocr_mode,
         detector_thread_contract,
         allowed_incomplete_field,
+        execution_mode,
     )
 
 
@@ -1447,8 +1502,391 @@ def _evaluate_performance_gate(
     }
 
 
-def analyze_plan(plan_path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    plan = _require_mapping(_load_json(plan_path, "CPU A/B plan"), "CPU A/B plan")
+def _json_values_are_type_sensitive_equal(left: Any, right: Any) -> bool:
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, Mapping):
+        return set(left) == set(right) and all(
+            _json_values_are_type_sensitive_equal(left[key], right[key])
+            for key in left
+        )
+    if isinstance(left, list):
+        return len(left) == len(right) and all(
+            _json_values_are_type_sensitive_equal(left_item, right_item)
+            for left_item, right_item in zip(left, right)
+        )
+    return bool(left == right)
+
+
+def _require_exact_json_identity(left: Any, right: Any, description: str) -> None:
+    if not _json_values_are_type_sensitive_equal(left, right):
+        raise ValidationError(f"{description} differs from the full equivalence plan")
+
+
+def _file_evidence_identity(evidence: Any, description: str) -> tuple[str, int]:
+    row = _require_mapping(evidence, description)
+    digest = row.get("sha256")
+    byte_count = row.get("bytes")
+    if not isinstance(digest, str) or len(digest) != 64:
+        raise ValidationError(f"{description} has no valid SHA-256")
+    if (
+        isinstance(byte_count, bool)
+        or not isinstance(byte_count, int)
+        or byte_count < 0
+    ):
+        raise ValidationError(f"{description} has no valid byte count")
+    return digest.casefold(), byte_count
+
+
+def _read_bound_json_evidence(
+    evidence: Any, description: str
+) -> tuple[Path, Mapping[str, Any], bytes]:
+    row = _require_mapping(evidence, description)
+    raw_path = row.get("path")
+    if not isinstance(raw_path, str) or not raw_path:
+        raise ValidationError(f"{description} has no path")
+    expected_digest, expected_bytes = _file_evidence_identity(evidence, description)
+    path = Path(raw_path)
+    if path.is_symlink():
+        raise ValidationError(f"{description} must not be a symbolic link")
+    try:
+        raw = path.read_bytes()
+    except OSError as exception:
+        raise ValidationError(f"cannot read {description}: {path}") from exception
+    if len(raw) != expected_bytes or _sha256_bytes(raw) != expected_digest:
+        raise ValidationError(
+            f"{description} changed after the A/B plan was frozen: {path}"
+        )
+    payload = _require_mapping(
+        _load_json_bytes(raw, description=f"{description} {path}"), description
+    )
+    return path, payload, raw
+
+
+def _stable_variant_identity(identity: Any, description: str) -> dict[str, Any]:
+    row = _require_mapping(identity, description)
+    return {
+        name: row.get(name)
+        for name in (
+            "payload_sha256",
+            "payload_file_count",
+            "executable_sha256",
+            "managed_entrypoint",
+            "managed_entrypoint_sha256",
+        )
+    }
+
+
+def _stable_paddle_identity(identity: Any, description: str) -> dict[str, Any]:
+    row = _require_mapping(identity, description)
+    return {
+        name: row.get(name)
+        for name in (
+            "payload_sha256",
+            "payload_file_count",
+            "contract",
+            "contract_sha256",
+            "package_size_bytes",
+        )
+    }
+
+
+def _validate_external_performance_evidence(
+    *,
+    current_plan_path: Path,
+    current_plan: Mapping[str, Any],
+    current_fixed_inputs: Sequence[str],
+    current_input_evidence: Mapping[str, Mapping[str, Any]],
+    current_artifacts: Mapping[str, Any],
+    current_paddle_identity: Mapping[str, Any],
+    current_variant_identities: Mapping[str, Mapping[str, Any]],
+    current_warmup_runs: int,
+    current_warmup_limit: int,
+) -> dict[str, Any]:
+    evidence = _require_mapping(
+        current_plan.get("performance_evidence"), "external performance evidence"
+    )
+    expected_keys = {
+        "expected_input_count",
+        "expected_repetitions_per_variant",
+        "measurement",
+        "report",
+        "plan",
+    }
+    if set(evidence) != expected_keys:
+        raise ValidationError(
+            "external performance evidence must contain exactly its count, repetitions, measurement, report, and plan bindings"
+        )
+    if evidence.get("expected_input_count") != PERFORMANCE_EVIDENCE_INPUTS:
+        raise ValidationError("external performance evidence must bind exactly 332 inputs")
+    if (
+        evidence.get("expected_repetitions_per_variant")
+        != PERFORMANCE_EVIDENCE_REPETITIONS
+    ):
+        raise ValidationError(
+            "external performance evidence must bind exactly three measured repetitions"
+        )
+    if evidence.get("measurement") != "external_process_wall_clock":
+        raise ValidationError(
+            "external performance evidence must use external process wall clock timing"
+        )
+
+    report_evidence = evidence.get("report")
+    performance_plan_evidence = evidence.get("plan")
+    report_path, supplied_report, report_snapshot = _read_bound_json_evidence(
+        report_evidence, "external 332-image performance report"
+    )
+    (
+        performance_plan_path,
+        performance_plan,
+        performance_plan_snapshot,
+    ) = _read_bound_json_evidence(
+        performance_plan_evidence, "external 332-image performance plan"
+    )
+    if (
+        _path_key(report_path) == _path_key(performance_plan_path)
+        or _path_key(performance_plan_path) == _path_key(current_plan_path)
+    ):
+        raise ValidationError(
+            "external performance report and plan must be distinct from each other and the current plan"
+        )
+
+    if "execution_mode" in performance_plan or "performance_evidence" in performance_plan:
+        raise ValidationError(
+            "external performance evidence must be one standard plan, not chained evidence"
+        )
+    if performance_plan.get("schema_version") != 2 or performance_plan.get("kind") != PLAN_KIND:
+        raise ValidationError("external performance plan has the wrong schema/kind")
+    if performance_plan.get("input_count") != PERFORMANCE_EVIDENCE_INPUTS:
+        raise ValidationError("external performance plan must cover exactly 332 inputs")
+    if performance_plan.get("repetitions") != PERFORMANCE_EVIDENCE_REPETITIONS:
+        raise ValidationError(
+            "external performance plan must contain exactly three measured repetitions"
+        )
+    if (
+        supplied_report.get("schema_version") != 2
+        or supplied_report.get("kind") != REPORT_KIND
+        or supplied_report.get("input_count") != PERFORMANCE_EVIDENCE_INPUTS
+        or supplied_report.get("measured_repetitions_per_variant")
+        != PERFORMANCE_EVIDENCE_REPETITIONS
+    ):
+        raise ValidationError(
+            "external performance report is not a 332-image, three-repetition v2 report"
+        )
+    if (
+        not isinstance(supplied_report.get("created_utc"), str)
+        or not supplied_report.get("created_utc")
+        or _path_key(str(supplied_report.get("plan", "")))
+        != _path_key(performance_plan_path)
+        or supplied_report.get("plan_sha256")
+        != _sha256_bytes(performance_plan_snapshot)
+    ):
+        raise ValidationError(
+            "external performance report is not bound to its supplied plan"
+        )
+
+    recomputed_report, recomputed_differences = analyze_plan(
+        performance_plan_path,
+        _plan_snapshot=performance_plan,
+        _plan_snapshot_sha256=_sha256_bytes(performance_plan_snapshot),
+    )
+    if recomputed_differences:
+        raise ValidationError(
+            "external performance evidence has non-exact baseline/candidate predictions"
+        )
+    supplied_without_time = dict(supplied_report)
+    recomputed_without_time = dict(recomputed_report)
+    supplied_without_time.pop("created_utc")
+    recomputed_without_time.pop("created_utc")
+    if not _json_values_are_type_sensitive_equal(
+        supplied_without_time, recomputed_without_time
+    ):
+        raise ValidationError(
+            "external performance report differs from a current-analyzer recomputation"
+        )
+    if (
+        recomputed_report.get("accepted") is not True
+        or _require_mapping(
+            recomputed_report.get("prediction_consistency"),
+            "external prediction consistency",
+        ).get("accepted")
+        is not True
+        or _require_mapping(
+            recomputed_report.get("route_consistency"),
+            "external route consistency",
+        ).get("accepted")
+        is not True
+        or _require_mapping(
+            recomputed_report.get("performance"), "external performance"
+        ).get("accepted")
+        is not True
+    ):
+        raise ValidationError("external CPU performance evidence was not accepted")
+    external_baseline = _require_mapping(
+        recomputed_report["performance"].get("baseline"),
+        "external baseline performance",
+    )
+    external_candidate = _require_mapping(
+        recomputed_report["performance"].get("candidate"),
+        "external candidate performance",
+    )
+    for variant, aggregate in (
+        ("baseline", external_baseline),
+        ("candidate", external_candidate),
+    ):
+        throughput = _require_mapping(
+            aggregate.get("throughput_images_per_second"),
+            f"external {variant} throughput",
+        )
+        if throughput.get("measurement") != "external_process_wall_clock":
+            raise ValidationError(
+                f"external {variant} performance is not process-wall-clock evidence"
+            )
+
+    external_fixed_inputs, external_input_evidence = _read_fixed_inputs(
+        performance_plan
+    )
+    external_selection = _validate_input_selection(
+        performance_plan, external_fixed_inputs, 2
+    )
+    if (
+        len(external_fixed_inputs) != PERFORMANCE_EVIDENCE_INPUTS
+        or external_selection.get("input_limit_requested") != 0
+        or external_selection.get("available_count") != PERFORMANCE_EVIDENCE_INPUTS
+        or external_selection.get("selected_count") != PERFORMANCE_EVIDENCE_INPUTS
+        or external_selection.get("expected_input_count")
+        != PERFORMANCE_EVIDENCE_INPUTS
+    ):
+        raise ValidationError(
+            "external performance plan must bind its complete, expected 332-input list"
+        )
+    current_keys = {_path_key(source) for source in current_fixed_inputs}
+    for source in external_fixed_inputs:
+        source_key = _path_key(source)
+        if source_key not in current_keys or source_key not in current_input_evidence:
+            raise ValidationError(
+                "external performance inputs are not a subset of the current formal inputs"
+            )
+        current_row = current_input_evidence[source_key]
+        external_row = external_input_evidence[source_key]
+        if (
+            str(current_row.get("sha256", "")).casefold()
+            != str(external_row.get("sha256", "")).casefold()
+            or current_row.get("bytes") != external_row.get("bytes")
+        ):
+            raise ValidationError(
+                "external performance input bytes differ from the current formal evidence"
+            )
+
+    external_artifacts = _require_mapping(
+        performance_plan.get("artifacts"), "external fixed artifacts"
+    )
+    for name in MODEL_HASH_FIELDS:
+        if _file_evidence_identity(
+            external_artifacts.get(name), f"external fixed artifact {name}"
+        ) != _file_evidence_identity(
+            current_artifacts.get(name), f"current fixed artifact {name}"
+        ):
+            raise ValidationError(
+                f"external fixed artifact {name} differs from the current formal plan"
+            )
+    _require_exact_json_identity(
+        _stable_paddle_identity(
+            recomputed_report.get("fixed_paddle_ocr_bundle"),
+            "external Paddle OCR identity",
+        ),
+        _stable_paddle_identity(
+            current_paddle_identity, "current Paddle OCR identity"
+        ),
+        "external Paddle OCR bundle identity",
+    )
+    external_variant_identities = _require_mapping(
+        recomputed_report.get("variant_identities"),
+        "external variant identities",
+    )
+    for variant in VARIANTS:
+        _require_exact_json_identity(
+            _stable_variant_identity(
+                external_variant_identities.get(variant),
+                f"external {variant} app identity",
+            ),
+            _stable_variant_identity(
+                current_variant_identities.get(variant),
+                f"current {variant} app identity",
+            ),
+            f"external {variant} app identity",
+        )
+    _require_exact_json_identity(
+        performance_plan.get("cli_contract"),
+        current_plan.get("cli_contract"),
+        "external CLI contract",
+    )
+    _require_exact_json_identity(
+        performance_plan.get("performance_gate"),
+        current_plan.get("performance_gate"),
+        "external performance gate",
+    )
+    if (
+        performance_plan.get("warmup_runs") != current_warmup_runs
+        or performance_plan.get("warmup_limit") != current_warmup_limit
+    ):
+        raise ValidationError(
+            "external warmup parameters differ from the current formal plan"
+        )
+
+    # Analysis above used the already hash-verified byte snapshots. Re-read
+    # the paths as an additional fail-closed check for persistent mutation;
+    # path restoration cannot alter the snapshots that were actually parsed.
+    _verify_file_evidence(report_evidence, "external 332-image performance report")
+    _verify_file_evidence(performance_plan_evidence, "external 332-image performance plan")
+    report_digest = _sha256_bytes(report_snapshot)
+    report_bytes = len(report_snapshot)
+    plan_digest = _sha256_bytes(performance_plan_snapshot)
+    plan_bytes = len(performance_plan_snapshot)
+    return {
+        "accepted": True,
+        "source": EXTERNAL_PERFORMANCE_EVIDENCE_SOURCE,
+        "report_path": str(report_path.resolve()),
+        "report_sha256": report_digest,
+        "report_bytes": report_bytes,
+        "plan_path": str(performance_plan_path.resolve()),
+        "plan_sha256": plan_digest,
+        "plan_bytes": plan_bytes,
+        "input_count": PERFORMANCE_EVIDENCE_INPUTS,
+        "measured_repetitions_per_variant": PERFORMANCE_EVIDENCE_REPETITIONS,
+        "measurement": "external_process_wall_clock",
+        "revalidated_with_current_analyzer": True,
+        "identity_match": True,
+        "report": recomputed_report,
+    }
+
+
+def analyze_plan(
+    plan_path: Path,
+    *,
+    _plan_snapshot: Mapping[str, Any] | None = None,
+    _plan_snapshot_sha256: str | None = None,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    if _plan_snapshot is None:
+        try:
+            plan_snapshot_bytes = plan_path.read_bytes()
+        except OSError as exception:
+            raise ValidationError(f"cannot read CPU A/B plan: {plan_path}") from exception
+        initial_plan_sha256 = _sha256_bytes(plan_snapshot_bytes)
+        plan = _require_mapping(
+            _load_json_bytes(
+                plan_snapshot_bytes, description=f"CPU A/B plan {plan_path}"
+            ),
+            "CPU A/B plan",
+        )
+    else:
+        if (
+            not isinstance(_plan_snapshot_sha256, str)
+            or len(_plan_snapshot_sha256) != 64
+        ):
+            raise ValidationError("internal CPU A/B plan snapshot has no SHA-256")
+        initial_plan_sha256 = _plan_snapshot_sha256.casefold()
+        plan = _plan_snapshot
     (
         schema_version,
         repetitions,
@@ -1457,11 +1895,31 @@ def analyze_plan(plan_path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]
         ocr_mode,
         detector_thread_contract,
         allowed_incomplete_field,
+        execution_mode,
     ) = _validate_plan(plan)
-    fixed_inputs, _ = _read_fixed_inputs(plan)
+    fixed_inputs, fixed_input_evidence = _read_fixed_inputs(plan)
     input_selection = _validate_input_selection(plan, fixed_inputs, schema_version)
     if warmup_limit > len(fixed_inputs):
         raise ValidationError("warmup_limit exceeds the fixed input count")
+    if execution_mode == EQUIVALENCE_ONLY_ONCE_MODE:
+        if len(fixed_inputs) != FULL_EQUIVALENCE_INPUTS:
+            raise ValidationError(
+                "equivalence-only-once CPU A/B must cover exactly 10016 formal inputs"
+            )
+        if (
+            input_selection.get("input_limit_requested") != 0
+            or input_selection.get("available_count") != FULL_EQUIVALENCE_INPUTS
+            or input_selection.get("selected_count") != FULL_EQUIVALENCE_INPUTS
+            or input_selection.get("expected_input_count")
+            != FULL_EQUIVALENCE_INPUTS
+        ):
+            raise ValidationError(
+                "equivalence-only-once must bind the complete expected 10016-input list"
+            )
+        if "performance_evidence" not in plan:
+            raise ValidationError(
+                "equivalence-only-once requires hash-bound external performance evidence"
+            )
 
     artifacts = _require_mapping(plan.get("artifacts"), "fixed artifacts")
     artifact_hashes: dict[str, str] = {}
@@ -1666,20 +2124,47 @@ def analyze_plan(plan_path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]
     performance_delta = _performance_delta(
         aggregate["baseline"], aggregate["candidate"]
     )
-    performance_acceptance = _evaluate_performance_gate(
-        _require_mapping(plan["performance_gate"], "performance gate"),
-        aggregate["baseline"],
-        aggregate["candidate"],
-        performance_delta,
-    )
-    accepted = prediction_accepted and performance_acceptance["accepted"]
+    external_performance: dict[str, Any] | None = None
+    if execution_mode == EQUIVALENCE_ONLY_ONCE_MODE:
+        external_performance = _validate_external_performance_evidence(
+            current_plan_path=plan_path,
+            current_plan=plan,
+            current_fixed_inputs=fixed_inputs,
+            current_input_evidence=fixed_input_evidence,
+            current_artifacts=artifacts,
+            current_paddle_identity=_require_mapping(
+                paddle_bundle_identity, "current Paddle OCR identity"
+            ),
+            current_variant_identities=variant_identities,
+            current_warmup_runs=warmup_runs,
+            current_warmup_limit=warmup_limit,
+        )
+        external_report = _require_mapping(
+            external_performance.get("report"), "recomputed external report"
+        )
+        external_performance_payload = _require_mapping(
+            external_report.get("performance"), "recomputed external performance"
+        )
+        performance_acceptance = _require_mapping(
+            external_performance_payload.get("gate"),
+            "recomputed external performance gate",
+        )
+        accepted = prediction_accepted and external_performance["accepted"]
+    else:
+        performance_acceptance = _evaluate_performance_gate(
+            _require_mapping(plan["performance_gate"], "performance gate"),
+            aggregate["baseline"],
+            aggregate["candidate"],
+            performance_delta,
+        )
+        accepted = prediction_accepted and performance_acceptance["accepted"]
     report = {
         "schema_version": 2,
         "kind": REPORT_KIND,
         "created_utc": _utc_now(),
         "accepted": accepted,
         "plan": str(plan_path.resolve()),
-        "plan_sha256": _sha256(plan_path),
+        "plan_sha256": initial_plan_sha256,
         "input_count": len(fixed_inputs),
         "input_selection": dict(input_selection),
         "warmup_runs_per_variant": warmup_runs,
@@ -1708,14 +2193,53 @@ def analyze_plan(plan_path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]
             "by_run": route_counts_by_run,
             "failures": route_count_failures,
         },
-        "performance": {
+    }
+    if execution_mode == EQUIVALENCE_ONLY_ONCE_MODE:
+        if external_performance is None:
+            raise ValidationError("external performance evidence was not resolved")
+        external_report = _require_mapping(
+            external_performance["report"], "recomputed external report"
+        )
+        external_performance_payload = _require_mapping(
+            external_report.get("performance"), "recomputed external performance"
+        )
+        report["execution_mode"] = EQUIVALENCE_ONLY_ONCE_MODE
+        report["external_performance_evidence"] = {
+            key: value
+            for key, value in external_performance.items()
+            if key != "report"
+        }
+        report["performance"] = {
+            "accepted": external_performance_payload.get("accepted") is True,
+            "evidence_source": EXTERNAL_PERFORMANCE_EVIDENCE_SOURCE,
+            "gate": external_performance_payload.get("gate"),
+            "baseline": external_performance_payload.get("baseline"),
+            "candidate": external_performance_payload.get("candidate"),
+            "candidate_vs_baseline": external_performance_payload.get(
+                "candidate_vs_baseline"
+            ),
+            "full_once_observation": {
+                "acceptance_applicable": False,
+                "interpretation": (
+                    "Informational single-repetition latency only; performance "
+                    "acceptance comes exclusively from the hash-bound 332-image "
+                    "three-repetition report."
+                ),
+                "baseline": aggregate["baseline"],
+                "candidate": aggregate["candidate"],
+                "candidate_vs_baseline": performance_delta,
+            },
+        }
+    else:
+        report["performance"] = {
             "accepted": performance_acceptance["accepted"],
             "gate": performance_acceptance,
             "baseline": aggregate["baseline"],
             "candidate": aggregate["candidate"],
             "candidate_vs_baseline": performance_delta,
-        },
-    }
+        }
+    if _sha256(plan_path) != initial_plan_sha256:
+        raise ValidationError("CPU A/B plan changed during analysis")
     return report, differences
 
 

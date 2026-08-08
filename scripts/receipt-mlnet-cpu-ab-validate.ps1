@@ -20,7 +20,7 @@ param(
     [int]$WarmupRuns = 1,
     [ValidateRange(1, 10000)]
     [int]$WarmupImages = 8,
-    [ValidateRange(3, 20)]
+    [ValidateRange(1, 20)]
     [int]$Repetitions = 3,
     [ValidateRange(0, 256)]
     [int]$CandidateDetectorIntraOpThreads = 0,
@@ -30,7 +30,9 @@ param(
     [string]$PaddleOcrBundle,
     [ValidateRange(0, 1000000)]
     [int]$ExpectedInputCount = 0,
-    [switch]$AllowIncompleteRecipientEquivalence
+    [switch]$AllowIncompleteRecipientEquivalence,
+    [switch]$EquivalenceOnlyOnce,
+    [string]$PerformanceEvidenceReport
 )
 
 Set-StrictMode -Version Latest
@@ -433,6 +435,86 @@ $DeviceModel = Get-ProviderFullPath $DeviceModel
 $UnifiedModel = Get-ProviderFullPath $UnifiedModel
 $InputList = Get-ProviderFullPath $InputList
 $OutputRoot = Get-ProviderFullPath $OutputRoot
+$performanceEvidence = $null
+if ($EquivalenceOnlyOnce) {
+    if ([string]::IsNullOrWhiteSpace($PerformanceEvidenceReport)) {
+        throw "-EquivalenceOnlyOnce requires -PerformanceEvidenceReport."
+    }
+    if ($Repetitions -ne 1) {
+        throw "-EquivalenceOnlyOnce requires -Repetitions 1."
+    }
+    if ($WarmupRuns -ne 1) {
+        throw "-EquivalenceOnlyOnce requires -WarmupRuns 1."
+    }
+    if ($InputLimit -ne 0 -or $ExpectedInputCount -ne 10016) {
+        throw "-EquivalenceOnlyOnce requires the complete formal set: -InputLimit 0 -ExpectedInputCount 10016."
+    }
+    if ($OcrMode -ne "hybrid-recipient" -or -not $AllowIncompleteRecipientEquivalence) {
+        throw "-EquivalenceOnlyOnce requires hybrid-recipient OCR with -AllowIncompleteRecipientEquivalence."
+    }
+
+    $PerformanceEvidenceReport = Get-ProviderFullPath $PerformanceEvidenceReport
+    Require-File $PerformanceEvidenceReport "accepted 332-image CPU performance report"
+    if (Test-PathWithin $PerformanceEvidenceReport $OutputRoot) {
+        throw "The external performance report must be outside the new OutputRoot."
+    }
+    $performanceReportPayload = Get-Content -LiteralPath $PerformanceEvidenceReport -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ([int]$performanceReportPayload.schema_version -ne 2 `
+        -or [string]$performanceReportPayload.kind -ne "receipt_mlnet_cpu_ab_report_v2" `
+        -or $performanceReportPayload.accepted -ne $true `
+        -or $performanceReportPayload.prediction_consistency.accepted -ne $true `
+        -or [int]$performanceReportPayload.prediction_consistency.difference_count -ne 0 `
+        -or $performanceReportPayload.route_consistency.accepted -ne $true `
+        -or $performanceReportPayload.performance.accepted -ne $true `
+        -or [int]$performanceReportPayload.input_count -ne 332 `
+        -or [int]$performanceReportPayload.measured_repetitions_per_variant -ne 3) {
+        throw "-PerformanceEvidenceReport must be an accepted standard 332-image, three-repetition CPU A/B report."
+    }
+    if ($null -ne $performanceReportPayload.PSObject.Properties["execution_mode"]) {
+        throw "External performance evidence cannot itself use an equivalence-only-once report."
+    }
+    $performancePlanRaw = [string]$performanceReportPayload.plan
+    if ([string]::IsNullOrWhiteSpace($performancePlanRaw)) {
+        throw "The external performance report does not identify its frozen plan."
+    }
+    if ([IO.Path]::IsPathRooted($performancePlanRaw)) {
+        $performancePlanPath = Get-ProviderFullPath $performancePlanRaw
+    }
+    else {
+        $performancePlanPath = Get-ProviderFullPath (Join-Path (Split-Path -Parent $PerformanceEvidenceReport) $performancePlanRaw)
+    }
+    Require-File $performancePlanPath "332-image CPU performance plan"
+    if ((Test-PathWithin $performancePlanPath $OutputRoot) `
+        -or $performancePlanPath.Equals($PerformanceEvidenceReport, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "The external performance plan must be a distinct file outside the new OutputRoot."
+    }
+    if ([string]$performanceReportPayload.plan_sha256 -ne (Get-Sha256 $performancePlanPath)) {
+        throw "The external performance report is not bound to the referenced plan SHA-256."
+    }
+    $performancePlanPayload = Get-Content -LiteralPath $performancePlanPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ([int]$performancePlanPayload.schema_version -ne 2 `
+        -or [string]$performancePlanPayload.kind -ne "receipt_mlnet_cpu_ab_plan_v2" `
+        -or [int]$performancePlanPayload.input_count -ne 332 `
+        -or [int]$performancePlanPayload.repetitions -ne 3 `
+        -or $null -ne $performancePlanPayload.PSObject.Properties["execution_mode"]) {
+        throw "The external performance plan must be one standard 332-image, three-repetition v2 plan."
+    }
+    $performanceEvidence = [ordered]@{
+        expected_input_count = 332
+        expected_repetitions_per_variant = 3
+        measurement = "external_process_wall_clock"
+        report = Get-FileEvidence $PerformanceEvidenceReport "332-image CPU performance report"
+        plan = Get-FileEvidence $performancePlanPath "332-image CPU performance plan"
+    }
+}
+else {
+    if ($Repetitions -lt 3) {
+        throw "Standard CPU A/B requires -Repetitions 3 or greater."
+    }
+    if (-not [string]::IsNullOrWhiteSpace($PerformanceEvidenceReport)) {
+        throw "-PerformanceEvidenceReport is valid only with -EquivalenceOnlyOnce."
+    }
+}
 $paddleContractPath = $null
 if ($OcrMode -eq "hybrid-recipient") {
     if ([string]::IsNullOrWhiteSpace($PaddleOcrBundle)) {
@@ -667,6 +749,10 @@ $plan = [ordered]@{
     variants = $variants
     runs = $runPlan
 }
+if ($EquivalenceOnlyOnce) {
+    $plan["execution_mode"] = "equivalence_only_once"
+    $plan["performance_evidence"] = $performanceEvidence
+}
 Write-JsonNoBom $planPath $plan 12
 $frozenPlanSha256 = Get-Sha256 $planPath
 
@@ -681,6 +767,9 @@ if ($InputLimit -gt 0) {
 }
 Write-Host "Warmup      : $WarmupRuns x $warmupLimit image(s) per variant"
 Write-Host "Measured    : $Repetitions full repeat(s) per variant"
+if ($EquivalenceOnlyOnce) {
+    Write-Host "Evidence    : accepted external 332-image x3 performance report"
+}
 Write-Host "OCR mode    : $OcrMode"
 Write-Host "Completeness: $(if ($AllowIncompleteRecipientEquivalence) { 'recipient-only incomplete equivalence' } else { 'require-complete' })"
 Write-Host "Throughput  : external process wall clock"
@@ -725,6 +814,13 @@ if ($report.accepted -ne $true `
     -or $report.route_consistency.accepted -ne $true `
     -or $report.performance.accepted -ne $true) {
     throw "CPU A/B prediction consistency or performance improvement was not accepted."
+}
+if ($EquivalenceOnlyOnce `
+    -and ([string]$report.execution_mode -ne "equivalence_only_once" `
+        -or [string]$report.performance.evidence_source -ne "hash_bound_external_332_three_repetition_report" `
+        -or $report.external_performance_evidence.accepted -ne $true `
+        -or $report.performance.full_once_observation.acceptance_applicable -ne $false)) {
+    throw "Equivalence-only-once report did not retain its external performance provenance."
 }
 
 Write-Host ""
