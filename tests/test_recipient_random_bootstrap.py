@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 from pathlib import Path
 
+import numpy as np
 import pytest
+from PIL import Image, PngImagePlugin
 
 from transfer_receipt_ai.recipient_blind_manifest import build_blind_manifest
 from transfer_receipt_ai.recipient_random_bootstrap import (
@@ -19,14 +22,19 @@ from transfer_receipt_ai.recipient_random_bootstrap import (
 )
 
 
-def _sha256_bytes(value: bytes) -> str:
-    return hashlib.sha256(value).hexdigest()
+def _decoded_crop_sha256(path: Path) -> str:
+    with Image.open(path) as image:
+        image_rgb = np.asarray(image.convert("RGB"))
+    digest = hashlib.sha256()
+    digest.update(str(image_rgb.shape).encode("ascii"))
+    digest.update(image_rgb.tobytes(order="C"))
+    return digest.hexdigest()
 
 
-def _row(*, record_id: str, split: str, image: str, crop: bytes) -> dict[str, object]:
+def _row(*, record_id: str, split: str, image: str, crop_sha256: str) -> dict[str, object]:
     common_slot = {
         "image": image,
-        "crop_sha256": _sha256_bytes(crop),
+        "crop_sha256": crop_sha256,
     }
     return {
         "schema_version": 1,
@@ -51,20 +59,35 @@ def _row(*, record_id: str, split: str, image: str, crop: bytes) -> dict[str, ob
 
 
 def _write_contract_fixture(
-    tmp_path: Path, *, train_image: str = "train.bin"
+    tmp_path: Path, *, train_image: str = "train.png"
 ) -> dict[str, Path]:
     dataset = tmp_path / "dataset"
     dataset.mkdir()
-    train_crop = b"train-crop"
-    val_crop = b"val-crop"
-    (dataset / "train.bin").write_bytes(train_crop)
-    (dataset / "val.bin").write_bytes(val_crop)
+    train_crop = dataset / "train.png"
+    val_crop = dataset / "val.png"
+    Image.new("RGB", (3, 2), (12, 34, 56)).save(train_crop)
+    Image.new("RGB", (2, 3), (65, 43, 21)).save(val_crop)
     # Deliberately do not materialize the test crop.  Input binding must open
     # only the physically separated train/val manifest.
     rows = [
-        _row(record_id="train-1", split="train", image=train_image, crop=train_crop),
-        _row(record_id="val-1", split="val", image="val.bin", crop=val_crop),
-        _row(record_id="test-1", split="test", image="does-not-exist.bin", crop=b"test"),
+        _row(
+            record_id="train-1",
+            split="train",
+            image=train_image,
+            crop_sha256=_decoded_crop_sha256(train_crop),
+        ),
+        _row(
+            record_id="val-1",
+            split="val",
+            image="val.png",
+            crop_sha256=_decoded_crop_sha256(val_crop),
+        ),
+        _row(
+            record_id="test-1",
+            split="test",
+            image="does-not-exist.png",
+            crop_sha256="f" * 64,
+        ),
     ]
     source = tmp_path / "unified_fields.jsonl"
     source.write_text(
@@ -110,9 +133,9 @@ def test_input_contract_binds_only_blind_train_val_crops(tmp_path: Path) -> None
     assert payload["dataset_binding"]["split_counts"] == {"train": 1, "val": 1}
     assert payload["dataset_binding"]["crop_reference_count"] == 10
     assert payload["dataset_binding"]["field_counts"]["recipient_field"] == {"train": 1, "val": 1}
-    assert (snapshot / "train.bin").read_bytes() == b"train-crop"
-    assert (snapshot / "val.bin").read_bytes() == b"val-crop"
-    assert not (snapshot / "does-not-exist.bin").exists()
+    assert (snapshot / "train.png").read_bytes() == (paths["dataset"] / "train.png").read_bytes()
+    assert (snapshot / "val.png").read_bytes() == (paths["dataset"] / "val.png").read_bytes()
+    assert not (snapshot / "does-not-exist.png").exists()
     assert payload["test_rows_physically_present_in_training_manifest"] is False
     assert payload["test_labels_used_by_training"] is False
     assert payload["fixed_topology"] == FIXED_TOPOLOGY
@@ -120,9 +143,40 @@ def test_input_contract_binds_only_blind_train_val_crops(tmp_path: Path) -> None
     assert payload["production_route_authorized"] is False
 
 
+def test_input_contract_uses_decoded_pixels_but_snapshots_exact_container_bytes(
+    tmp_path: Path,
+) -> None:
+    paths = _write_contract_fixture(tmp_path)
+    train_crop = paths["dataset"] / "train.png"
+    original_container = train_crop.read_bytes()
+    with Image.open(train_crop) as image:
+        image_rgb = image.convert("RGB")
+    metadata = PngImagePlugin.PngInfo()
+    metadata.add_text("contract-test", "same decoded RGB, different PNG bytes")
+    image_rgb.save(train_crop, pnginfo=metadata)
+    assert train_crop.read_bytes() != original_container
+
+    snapshot = tmp_path / "snapshot"
+    payload = build_input_contract(
+        source_manifest=paths["source"],
+        blind_manifest=paths["blind"],
+        blind_contract=paths["blind_contract"],
+        dataset_root=paths["dataset"],
+        snapshot_root=snapshot,
+        output=tmp_path / "input.json",
+        runner=paths["runner"],
+        trainer=paths["trainer"],
+        blind_builder=paths["blind_builder"],
+        verifier=paths["verifier"],
+    )
+
+    assert payload["dataset_binding"]["all_declared_crop_hashes_verified"] is True
+    assert (snapshot / "train.png").read_bytes() == train_crop.read_bytes()
+
+
 def test_input_contract_rejects_crop_hash_mismatch(tmp_path: Path) -> None:
     paths = _write_contract_fixture(tmp_path)
-    (paths["dataset"] / "train.bin").write_bytes(b"changed")
+    Image.new("RGB", (3, 2), (99, 88, 77)).save(paths["dataset"] / "train.png")
     with pytest.raises(ValueError, match="crop SHA-256 mismatch"):
         build_input_contract(
             source_manifest=paths["source"],
@@ -140,9 +194,9 @@ def test_input_contract_rejects_crop_hash_mismatch(tmp_path: Path) -> None:
 
 def test_input_contract_rejects_reparse_crop(tmp_path: Path) -> None:
     paths = _write_contract_fixture(tmp_path)
-    real = paths["dataset"] / "real.bin"
-    real.write_bytes(b"train-crop")
-    crop = paths["dataset"] / "train.bin"
+    real = paths["dataset"] / "real.png"
+    shutil.copyfile(paths["dataset"] / "train.png", real)
+    crop = paths["dataset"] / "train.png"
     crop.unlink()
     try:
         crop.symlink_to(real.name)
@@ -164,7 +218,7 @@ def test_input_contract_rejects_reparse_crop(tmp_path: Path) -> None:
 
 
 def test_input_contract_rejects_parent_alias_that_would_escape_snapshot(tmp_path: Path) -> None:
-    paths = _write_contract_fixture(tmp_path, train_image="../dataset/train.bin")
+    paths = _write_contract_fixture(tmp_path, train_image="../dataset/train.png")
     with pytest.raises(ValueError, match="normalized and relative"):
         build_input_contract(
             source_manifest=paths["source"],

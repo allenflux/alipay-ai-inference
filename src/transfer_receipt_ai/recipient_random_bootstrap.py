@@ -28,6 +28,9 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+from PIL import Image
+
 
 SCHEMA_VERSION = 1
 INPUT_KIND = "receipt_recipient_random_bootstrap_input_contract_v1"
@@ -87,6 +90,21 @@ def _sha256(path: Path) -> str:
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _decoded_crop_sha256(path: Path) -> str:
+    """Return the decoded-RGB crop identity stored in unified manifests.
+
+    ``crop_sha256`` deliberately excludes PNG container bytes so lossless
+    encoder or metadata changes do not alter the dataset identity.
+    """
+
+    with Image.open(path) as image:
+        image_rgb = np.asarray(image.convert("RGB"))
+    digest = hashlib.sha256()
+    digest.update(str(image_rgb.shape).encode("ascii"))
+    digest.update(image_rgb.tobytes(order="C"))
     return digest.hexdigest()
 
 
@@ -194,12 +212,12 @@ def _require_sha(value: object, description: str) -> str:
     return value
 
 
-def _copy_bound_crop(*, source: Path, target: Path, expected_sha256: str) -> None:
+def _copy_bound_crop(*, source: Path, target: Path, expected_file_sha256: str) -> None:
     if target.exists():
         if (
             not target.is_file()
             or bool(target.stat().st_mode & stat.S_IWUSR)
-            or _sha256(target) != expected_sha256
+            or _sha256(target) != expected_file_sha256
         ):
             raise ValueError(f"snapshot crop collision: {target}")
         return
@@ -210,8 +228,8 @@ def _copy_bound_crop(*, source: Path, target: Path, expected_sha256: str) -> Non
     try:
         with source.open("rb") as reader, temporary.open("xb") as writer:
             shutil.copyfileobj(reader, writer, length=1024 * 1024)
-        if _sha256(temporary) != expected_sha256:
-            raise ValueError(f"snapshot crop SHA-256 mismatch: {source}")
+        if _sha256(temporary) != expected_file_sha256:
+            raise ValueError(f"snapshot crop file SHA-256 mismatch: {source}")
         temporary.replace(target)
         target.chmod(0o444)
     except BaseException:
@@ -229,7 +247,8 @@ def _blind_crop_fingerprint(
     snapshot_root: Path | None = None,
     require_read_only: bool = False,
 ) -> dict[str, object]:
-    entries: list[tuple[str, str, str, str, int, str]] = []
+    entries: list[tuple[str, str, str, str, int, str, str]] = []
+    observed_files: dict[Path, tuple[int, str, str]] = {}
     seen_ids: set[str] = set()
     split_counts = {"train": 0, "val": 0}
     field_counts: defaultdict[str, dict[str, int]] = defaultdict(lambda: {"train": 0, "val": 0})
@@ -285,8 +304,17 @@ def _blind_crop_fingerprint(
                 if require_read_only and bool(crop.stat().st_mode & stat.S_IWUSR):
                     raise ValueError(f"bound crop snapshot is no longer read-only: {crop}")
                 declared = _require_sha(raw_slot.get("crop_sha256"), "crop_sha256")
-                observed = _sha256(crop)
-                if observed != declared:
+                observed = observed_files.get(crop)
+                if observed is None:
+                    size_bytes = crop.stat().st_size
+                    file_sha256 = _sha256(crop)
+                    pixel_sha256 = _decoded_crop_sha256(crop)
+                    if _sha256(crop) != file_sha256 or crop.stat().st_size != size_bytes:
+                        raise RuntimeError(f"crop changed while it was being decoded: {crop}")
+                    observed = (size_bytes, file_sha256, pixel_sha256)
+                    observed_files[crop] = observed
+                size_bytes, file_sha256, pixel_sha256 = observed
+                if pixel_sha256 != declared:
                     raise ValueError(f"crop SHA-256 mismatch: {crop}")
                 if snapshot_root is not None:
                     target = (snapshot_root / relative).resolve()
@@ -296,9 +324,21 @@ def _blind_crop_fingerprint(
                         raise ValueError(
                             f"{blind_manifest}:{line_number}: snapshot crop escapes snapshot root"
                         ) from None
-                    _copy_bound_crop(source=crop, target=target, expected_sha256=declared)
+                    _copy_bound_crop(
+                        source=crop,
+                        target=target,
+                        expected_file_sha256=file_sha256,
+                    )
                 entries.append(
-                    (str(split), record_id, field, relative.as_posix(), crop.stat().st_size, declared)
+                    (
+                        str(split),
+                        record_id,
+                        field,
+                        relative.as_posix(),
+                        size_bytes,
+                        file_sha256,
+                        declared,
+                    )
                 )
                 field_counts[field][str(split)] += 1
     if split_counts["train"] <= 0 or split_counts["val"] <= 0:
