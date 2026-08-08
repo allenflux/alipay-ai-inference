@@ -388,6 +388,19 @@ def _fixture_plan(tmp_path: Path, *, ocr_mode: str = "unified") -> Path:
     return plan_path
 
 
+def _result_paths(plan_path: Path) -> list[Path]:
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    paths: list[Path] = []
+    for run in plan["runs"]:
+        manifest = json.loads(
+            (
+                Path(run["output_directory"]) / "inference_manifest.json"
+            ).read_text(encoding="utf-8")
+        )
+        paths.extend(Path(record["result"]) for record in manifest)
+    return paths
+
+
 def test_cpu_ab_accepts_exact_predictions_and_reports_pooled_performance(tmp_path: Path) -> None:
     plan_path = _fixture_plan(tmp_path)
 
@@ -410,6 +423,91 @@ def test_cpu_ab_accepts_exact_predictions_and_reports_pooled_performance(tmp_pat
     assert (
         report["variant_identities"]["baseline"]["managed_entrypoint_sha256"]
         != report["variant_identities"]["candidate"]["managed_entrypoint_sha256"]
+    )
+
+
+@pytest.mark.parametrize(
+    "labels",
+    [
+        [],
+        ["amount"],
+        ["time", "recipient_field", "payment_method_field"],
+    ],
+)
+def test_cpu_ab_accepts_matching_unique_known_detection_subsets(
+    tmp_path: Path,
+    labels: list[str],
+) -> None:
+    plan_path = _fixture_plan(tmp_path)
+    for result_path in _result_paths(plan_path):
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+        result["detections"] = [
+            detection
+            for detection in result["detections"]
+            if detection["label"] in labels
+        ]
+        _write_json(result_path, result)
+
+    report, differences = compare.analyze_plan(plan_path)
+
+    assert report["accepted"] is True
+    assert differences == []
+
+
+@pytest.mark.parametrize(
+    ("detections", "message"),
+    [
+        ([{"label": "unknown_field"}], "unknown label"),
+        ([{"label": "amount"}, {"label": "amount"}], "duplicate detector label"),
+        (["amount"], "must be one JSON object"),
+    ],
+)
+def test_cpu_ab_rejects_invalid_detection_collection_shapes(
+    tmp_path: Path,
+    detections: list[object],
+    message: str,
+) -> None:
+    plan_path = _fixture_plan(tmp_path)
+    result_path = _result_paths(plan_path)[0]
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    result["detections"] = detections
+    _write_json(result_path, result)
+
+    with pytest.raises(compare.ValidationError, match=message):
+        compare.analyze_plan(plan_path)
+
+
+def test_cpu_ab_still_deep_compares_valid_detection_subsets(tmp_path: Path) -> None:
+    plan_path = _fixture_plan(tmp_path)
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    run = next(
+        row
+        for row in plan["runs"]
+        if row["phase"] == "measured"
+        and row["variant"] == "candidate"
+        and row["iteration"] == 2
+    )
+    manifest = json.loads(
+        (Path(run["output_directory"]) / "inference_manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    result_path = Path(manifest[0]["result"])
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    result["detections"] = [
+        detection
+        for detection in result["detections"]
+        if detection["label"] != "time"
+    ]
+    _write_json(result_path, result)
+
+    report, differences = compare.analyze_plan(plan_path)
+
+    assert report["accepted"] is False
+    assert any(
+        difference["json_pointer"] == "/detections"
+        and difference["reason"] == "list_length"
+        for difference in differences
     )
 
 

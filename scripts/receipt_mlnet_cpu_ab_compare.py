@@ -823,9 +823,25 @@ def _validate_result_contract(
     detections = result.get("detections")
     if not isinstance(detections, list):
         raise ValidationError(f"{description} omitted detector outputs")
-    labels = [item.get("label") for item in detections if isinstance(item, Mapping)]
-    if len(labels) != len(detections) or frozenset(labels) != EXPECTED_DETECTIONS:
-        raise ValidationError(f"{description} did not preserve the complete detector field set")
+    # The persisted detector list contains only emitted boxes; the stable
+    # five-field result shape above is the completeness contract. Keep this
+    # structural check independent from the later exact cross-run comparison.
+    labels: set[str] = set()
+    for index, detection in enumerate(detections):
+        if not isinstance(detection, Mapping):
+            raise ValidationError(
+                f"{description} detection {index + 1} must be one JSON object"
+            )
+        label = detection.get("label")
+        if not isinstance(label, str) or label not in EXPECTED_DETECTIONS:
+            raise ValidationError(
+                f"{description} detection {index + 1} has an unknown label: {label!r}"
+            )
+        if label in labels:
+            raise ValidationError(
+                f"{description} contains duplicate detector label: {label}"
+            )
+        labels.add(label)
     contracts = _require_mapping(result.get("model_contracts"), f"{description} model contracts")
     for artifact_name, result_name in MODEL_HASH_FIELDS.items():
         if contracts.get(result_name) != artifact_hashes[artifact_name]:
