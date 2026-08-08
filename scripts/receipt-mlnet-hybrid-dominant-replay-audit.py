@@ -431,7 +431,9 @@ def _load_cli_closure(directory: Path) -> dict[str, Any]:
     }
 
 
-def _recipient_detection(result: Mapping[str, Any], *, description: str) -> Mapping[str, Any]:
+def _recipient_detection(
+    result: Mapping[str, Any], *, description: str
+) -> Mapping[str, Any] | None:
     detections = result.get("detections")
     if not isinstance(detections, list):
         _fail(f"{description} has no detections array")
@@ -440,9 +442,9 @@ def _recipient_detection(result: Mapping[str, Any], *, description: str) -> Mapp
         for detection in detections
         if isinstance(detection, Mapping) and detection.get("label") == "recipient_field"
     ]
-    if len(matches) != 1:
-        _fail(f"{description} must have exactly one recipient_field detection")
-    return matches[0]
+    if len(matches) > 1:
+        _fail(f"{description} has more than one recipient_field detection")
+    return matches[0] if matches else None
 
 
 def _effective_detector_score(field: Mapping[str, Any], *, description: str) -> float:
@@ -537,6 +539,28 @@ def _assert_recipient_contract(
 
     old_detection = _recipient_detection(old, description=f"old result {source!r}")
     new_detection = _recipient_detection(new, description=f"fresh result {source!r}")
+    if (old_detection is None) != (new_detection is None):
+        _fail(f"fresh replay {source!r} changed recipient detection presence")
+    if old_detection is None or new_detection is None:
+        if expected_candidate is not None:
+            _fail(f"fresh replay {source!r} cannot recover recipient without a detection")
+        for label, field in (("old", old_field), ("fresh", new_field)):
+            if (
+                field.get("state") != "absent"
+                or field.get("raw") is not None
+                or field.get("candidate") is not None
+                or field.get("ctc_candidate") is not None
+                or field.get("detector_score") is not None
+                or field.get("score") is not None
+                or field.get("ocr_confidence") is not None
+                or field.get("ctc_confidence") is not None
+                or field.get("hybrid_ocr_route") is not None
+            ):
+                _fail(
+                    f"{label} missing-detection recipient {source!r} is not absent"
+                )
+        return {"candidate": None, "route": None, "ctc_matches": True}
+
     detector_score = _finite_confidence(
         new_detection.get("score"), description=f"fresh result {source!r} detection score"
     )

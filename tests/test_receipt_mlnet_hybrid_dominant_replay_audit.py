@@ -297,6 +297,49 @@ def test_audit_mirrors_runtime_six_decimal_confidence_projection(
     )
 
 
+def test_recipient_contract_accepts_a_stable_missing_detection_as_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _fixture(tmp_path, monkeypatch)
+    source = fixture["manifest"][1]["source"]
+    new_path = Path(fixture["manifest"][1]["result"])
+    old_manifest = json.loads(
+        (
+            fixture["formal"]
+            / "hybrid-recipient"
+            / "inference_manifest.json"
+        ).read_text()
+    )
+    old_path = Path(next(row["result"] for row in old_manifest if row["source"] == source))
+
+    results = []
+    for result_path in (old_path, new_path):
+        result = json.loads(result_path.read_text())
+        result["detections"] = [
+            detection
+            for detection in result["detections"]
+            if detection["label"] != "recipient_field"
+        ]
+        field = result["fields"]["recipient"]
+        for key in list(field):
+            if key in MODULE.RECIPIENT_DYNAMIC_KEYS or key.startswith(
+                MODULE.RECIPIENT_DIAGNOSTIC_PREFIX
+            ):
+                field[key] = None
+        field["state"] = "absent"
+        results.append(result)
+
+    observed = MODULE._assert_recipient_contract(
+        results[0],
+        results[1],
+        source=source,
+        expected_candidate=None,
+        expected_route=None,
+    )
+
+    assert observed == {"candidate": None, "route": None, "ctc_matches": True}
+
+
 def test_audit_rejects_nonrecipient_or_ctc_regression(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
