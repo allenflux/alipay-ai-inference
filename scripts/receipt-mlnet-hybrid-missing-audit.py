@@ -14,6 +14,13 @@ from typing import Any
 
 
 WINDOWS_ABSOLUTE_PATH = re.compile(r"^[A-Za-z]:[\\/]")
+UNIFIED_SCORE_FIELDS = {
+    "amount",
+    "time",
+    "payment_method_field",
+    "recipient_field",
+    "transfer_status",
+}
 
 
 class AuditError(RuntimeError):
@@ -107,6 +114,72 @@ def _comparison_rows(path: Path) -> tuple[list[dict[str, Any]], dict[str, dict[s
     return rows, indexed
 
 
+def _recipient_reference_evidence(
+    path: Path, *, comparison_keys: set[str]
+) -> dict[str, dict[str, Any]]:
+    rows = _load_jsonl(path, description="hybrid val score comparisons")
+    observed_sources: set[str] = set()
+    observed_fields: set[tuple[str, str]] = set()
+    recipients: dict[str, dict[str, Any]] = {}
+    for index, row in enumerate(rows):
+        if row.get("schema_version") != 1 or row.get("kind") != (
+            "receipt_mlnet_unified_comparison_v1"
+        ):
+            raise AuditError(
+                f"hybrid score comparison[{index}] has an unsupported schema"
+            )
+        source = _nonempty_string(
+            row.get("source"), description=f"hybrid score comparison[{index}].source"
+        )
+        field = _nonempty_string(
+            row.get("field"), description=f"hybrid score comparison[{index}].field"
+        )
+        if field not in UNIFIED_SCORE_FIELDS:
+            raise AuditError(
+                f"hybrid score comparison[{index}] has unsupported field {field!r}"
+            )
+        source_key = _source_key(source)
+        observed_sources.add(source_key)
+        source_field = (source_key, field)
+        if source_field in observed_fields:
+            raise AuditError(
+                f"duplicate hybrid score field {field!r} for source {source!r}"
+            )
+        observed_fields.add(source_field)
+        if field != "recipient_field":
+            continue
+        reference = row.get("reference_text")
+        candidate = row.get("candidate_text")
+        raw_exact = row.get("raw_exact")
+        if not isinstance(reference, str):
+            raise AuditError(
+                f"hybrid score comparison[{index}].reference_text must be a string"
+            )
+        if candidate is not None and not isinstance(candidate, str):
+            raise AuditError(
+                f"hybrid score comparison[{index}].candidate_text must be a string or null"
+            )
+        if not isinstance(raw_exact, bool):
+            raise AuditError(
+                f"hybrid score comparison[{index}].raw_exact must be a boolean"
+            )
+        recipients[source_key] = {
+            "field": field,
+            "reference_text": reference,
+            "candidate_text": candidate,
+            "raw_exact": raw_exact,
+        }
+
+    if observed_sources != comparison_keys:
+        missing = comparison_keys - observed_sources
+        extra = observed_sources - comparison_keys
+        raise AuditError(
+            "hybrid val score source set differs from A/B comparisons: "
+            f"missing={len(missing)} extra={len(extra)}"
+        )
+    return recipients
+
+
 def _contained_result_path(raw: str, *, run_root: Path, manifest_path: Path) -> Path:
     candidate = Path(raw)
     if not candidate.is_absolute():
@@ -181,18 +254,18 @@ def _recipient_field(result: Mapping[str, Any]) -> dict[str, Any] | None:
     return dict(recipient) if isinstance(recipient, Mapping) else None
 
 
-def _recipient_detection(result: Mapping[str, Any]) -> dict[str, Any] | None:
+def _field_detection(result: Mapping[str, Any], label: str) -> dict[str, Any] | None:
     detections = result.get("detections")
     if not isinstance(detections, list):
         return None
-    recipients = [
+    matches = [
         dict(detection)
         for detection in detections
-        if isinstance(detection, Mapping) and detection.get("label") == "recipient_field"
+        if isinstance(detection, Mapping) and detection.get("label") == label
     ]
-    if len(recipients) > 1:
-        raise AuditError("result contains duplicate recipient_field detections")
-    return recipients[0] if recipients else None
+    if len(matches) > 1:
+        raise AuditError(f"result contains duplicate {label} detections")
+    return matches[0] if matches else None
 
 
 def _model_contracts(result: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -220,6 +293,10 @@ def audit(root: Path) -> dict[str, Any]:
         raise AuditError(f"A/B root is not a directory: {root}")
     comparison_rows, comparisons = _comparison_rows(
         root / "comparison" / "comparisons.jsonl"
+    )
+    recipient_references = _recipient_reference_evidence(
+        root / "hybrid-val-score" / "comparisons.jsonl",
+        comparison_keys=set(comparisons),
     )
     baseline = _manifest_results(root / "baseline-v13", label="baseline")
     hybrid = _manifest_results(root / "hybrid-recipient", label="hybrid")
@@ -258,8 +335,23 @@ def audit(root: Path) -> dict[str, Any]:
                 "failures": row["failures"],
                 "baseline_recipient_field": baseline_recipient,
                 "hybrid_recipient_field": hybrid_recipient,
-                "baseline_recipient_detection": _recipient_detection(baseline_result),
-                "hybrid_recipient_detection": _recipient_detection(hybrid_result),
+                "baseline_recipient_detection": _field_detection(
+                    baseline_result, "recipient_field"
+                ),
+                "hybrid_recipient_detection": _field_detection(
+                    hybrid_result, "recipient_field"
+                ),
+                "baseline_amount_detection": _field_detection(
+                    baseline_result, "amount"
+                ),
+                "hybrid_amount_detection": _field_detection(hybrid_result, "amount"),
+                "baseline_payment_method_field_detection": _field_detection(
+                    baseline_result, "payment_method_field"
+                ),
+                "hybrid_payment_method_field_detection": _field_detection(
+                    hybrid_result, "payment_method_field"
+                ),
+                "hybrid_recipient_reference_evidence": recipient_references.get(key),
                 "baseline_model_contracts": _model_contracts(baseline_result),
                 "hybrid_model_contracts": _model_contracts(hybrid_result),
                 "hybrid_ppocr_evidence": _ppocr_evidence(hybrid_recipient),
@@ -339,7 +431,7 @@ def _append_recipient_summary(
 def _append_detection_summary(
     lines: list[str], label: str, detection: object, *, width: int
 ) -> None:
-    lines.append(f"  {label} recipient detection:")
+    lines.append(f"  {label} detection:")
     mapping = detection if isinstance(detection, Mapping) else {}
     bbox = mapping.get("bbox_image", mapping.get("bbox", _MISSING))
     _append_text_value(lines, "bbox", bbox, indent=4, width=width)
@@ -403,6 +495,19 @@ def _append_ppocr_summary(lines: list[str], evidence: object, *, width: int) -> 
         _append_text_value(lines, "extra", extra, indent=4, width=width)
 
 
+def _append_reference_summary(lines: list[str], evidence: object, *, width: int) -> None:
+    lines.append("  hybrid recipient reference evidence:")
+    mapping = evidence if isinstance(evidence, Mapping) else {}
+    for key in ("field", "reference_text", "candidate_text", "raw_exact"):
+        _append_text_value(
+            lines,
+            key,
+            mapping.get(key, _MISSING),
+            indent=4,
+            width=width,
+        )
+
+
 def format_text(payload: Mapping[str, Any], *, width: int = _TEXT_WIDTH) -> str:
     """Render audit evidence as a compact multi-line terminal report."""
 
@@ -459,14 +564,43 @@ def format_text(payload: Mapping[str, Any], *, width: int = _TEXT_WIDTH) -> str:
         )
         _append_detection_summary(
             lines,
-            "baseline",
+            "baseline recipient",
             mapping.get("baseline_recipient_detection"),
             width=width,
         )
         _append_detection_summary(
             lines,
-            "hybrid",
+            "hybrid recipient",
             mapping.get("hybrid_recipient_detection"),
+            width=width,
+        )
+        _append_detection_summary(
+            lines,
+            "baseline amount",
+            mapping.get("baseline_amount_detection"),
+            width=width,
+        )
+        _append_detection_summary(
+            lines,
+            "hybrid amount",
+            mapping.get("hybrid_amount_detection"),
+            width=width,
+        )
+        _append_detection_summary(
+            lines,
+            "baseline payment_method_field",
+            mapping.get("baseline_payment_method_field_detection"),
+            width=width,
+        )
+        _append_detection_summary(
+            lines,
+            "hybrid payment_method_field",
+            mapping.get("hybrid_payment_method_field_detection"),
+            width=width,
+        )
+        _append_reference_summary(
+            lines,
+            mapping.get("hybrid_recipient_reference_evidence"),
             width=width,
         )
         _append_ppocr_summary(

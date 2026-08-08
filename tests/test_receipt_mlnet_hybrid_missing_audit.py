@@ -53,7 +53,13 @@ def _result(source: Path, *, hybrid: bool, missing: bool = False) -> dict[str, o
         "source": str(source),
         "fields": {"recipient": recipient},
         "detections": [
-            {"label": "recipient_field", "score": 0.93, "bbox_image": [1, 2, 3, 4]}
+            {"label": "recipient_field", "score": 0.93, "bbox_image": [1, 2, 3, 4]},
+            {"label": "amount", "score": 0.94, "bbox_image": [5, 6, 7, 8]},
+            {
+                "label": "payment_method_field",
+                "score": 0.95,
+                "bbox_image": [9, 10, 11, 12],
+            },
         ],
         "model_contracts": {
             "unified_ocr_model_sha256": "a" * 64,
@@ -78,6 +84,29 @@ def _write_fixture(root: Path) -> tuple[list[Path], dict[str, Path], dict[str, P
     comparison_path.parent.mkdir(parents=True)
     comparison_path.write_text(
         "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in comparisons),
+        encoding="utf-8",
+    )
+    score_comparisons = [
+        {
+            "schema_version": 1,
+            "kind": "receipt_mlnet_unified_comparison_v1",
+            "id": source.stem,
+            "group_id": source.stem,
+            "split": "val",
+            "source": str(source),
+            "field": "recipient_field",
+            "reference_text": f"真实商户{index}",
+            "candidate_text": None if index > 0 else "真实商户0",
+            "candidate_present": index == 0,
+            "missing_reason": "candidate_missing" if index > 0 else None,
+            "raw_exact": index == 0,
+        }
+        for index, source in enumerate(sources)
+    ]
+    score_path = root / "hybrid-val-score" / "comparisons.jsonl"
+    score_path.parent.mkdir(parents=True)
+    score_path.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in score_comparisons),
         encoding="utf-8",
     )
     baseline_paths: dict[str, Path] = {}
@@ -120,6 +149,22 @@ def test_audit_outputs_only_failed_or_missing_rows_with_ppocr_evidence(
     failure = payload["findings"][0]
     assert failure["baseline_recipient_field"]["candidate"] is None
     assert failure["hybrid_recipient_detection"]["score"] == 0.93
+    assert failure["baseline_amount_detection"] == {
+        "label": "amount",
+        "score": 0.94,
+        "bbox_image": [5, 6, 7, 8],
+    }
+    assert failure["hybrid_payment_method_field_detection"] == {
+        "label": "payment_method_field",
+        "score": 0.95,
+        "bbox_image": [9, 10, 11, 12],
+    }
+    assert failure["hybrid_recipient_reference_evidence"] == {
+        "field": "recipient_field",
+        "reference_text": "真实商户1",
+        "candidate_text": None,
+        "raw_exact": False,
+    }
     assert failure["hybrid_model_contracts"]["ocr_bundle_contract_sha256"] == "b" * 64
     assert failure["hybrid_ppocr_evidence"] == {
         "failure_reason": "anchored_or_alternative_parse_failed;first=lines=[0:0.61:商户]",
@@ -179,6 +224,22 @@ def test_audit_rejects_unbound_or_escaping_results(
         MODULE.audit(root)
 
 
+@pytest.mark.parametrize("label", ["recipient_field", "amount", "payment_method_field"])
+def test_audit_rejects_duplicate_requested_field_detections(
+    tmp_path: Path, label: str
+) -> None:
+    root = tmp_path / "ab"
+    sources, _, hybrid_paths = _write_fixture(root)
+    result_path = hybrid_paths[str(sources[1])]
+    payload = json.loads(result_path.read_text(encoding="utf-8"))
+    duplicate = next(item for item in payload["detections"] if item["label"] == label)
+    payload["detections"].append(dict(duplicate))
+    _write_json(result_path, payload)
+
+    with pytest.raises(MODULE.AuditError, match=f"duplicate {label} detections"):
+        MODULE.audit(root)
+
+
 @pytest.mark.parametrize(
     ("contents", "message"),
     [
@@ -195,6 +256,42 @@ def test_audit_rejects_non_strict_comparison_jsonl(
     root = tmp_path / "ab"
     _write_fixture(root)
     (root / "comparison" / "comparisons.jsonl").write_text(contents, encoding="utf-8")
+
+    with pytest.raises(MODULE.AuditError, match=message):
+        MODULE.audit(root)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("source_set", "hybrid val score source set differs"),
+        ("unsupported_field", "unsupported field"),
+        ("duplicate_source_field", "duplicate hybrid score field"),
+        ("invalid_candidate", "candidate_text must be a string or null"),
+        ("invalid_raw_exact", "raw_exact must be a boolean"),
+    ],
+)
+def test_audit_strictly_binds_hybrid_recipient_reference_evidence(
+    tmp_path: Path, mutation: str, message: str
+) -> None:
+    root = tmp_path / "ab"
+    _write_fixture(root)
+    path = root / "hybrid-val-score" / "comparisons.jsonl"
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    if mutation == "source_set":
+        rows.pop()
+    elif mutation == "unsupported_field":
+        rows[0]["field"] = "recipient"
+    elif mutation == "duplicate_source_field":
+        rows.append(dict(rows[0]))
+    elif mutation == "invalid_candidate":
+        rows[0]["candidate_text"] = 7
+    else:
+        rows[0]["raw_exact"] = "true"
+    path.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+        encoding="utf-8",
+    )
 
     with pytest.raises(MODULE.AuditError, match=message):
         MODULE.audit(root)
@@ -241,6 +338,17 @@ def test_main_text_format_is_complete_and_terminal_width_bounded(
     assert "  baseline recipient detection:" in lines
     assert "    bbox: [1,2,3,4]" in lines
     assert "    score: 0.93" in lines
+    assert "  baseline amount detection:" in lines
+    assert "    bbox: [5,6,7,8]" in lines
+    assert "    score: 0.94" in lines
+    assert "  hybrid payment_method_field detection:" in lines
+    assert "    bbox: [9,10,11,12]" in lines
+    assert "    score: 0.95" in lines
+    assert "  hybrid recipient reference evidence:" in lines
+    assert '    field: "recipient_field"' in lines
+    assert '    reference_text: "真实商户1"' in lines
+    assert "    candidate_text: null" in lines
+    assert "    raw_exact: false" in lines
     assert "  hybrid PP-OCR evidence:" in lines
     assert '    route: "none"' in lines
     assert "anchored_or_alternative_parse_failed" in output
