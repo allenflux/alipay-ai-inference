@@ -24,7 +24,12 @@ param(
     [int]$Repetitions = 3,
     [ValidateRange(0, 256)]
     [int]$CandidateDetectorIntraOpThreads = 0,
-    [string]$PythonExecutable
+    [string]$PythonExecutable,
+    [ValidateSet("unified", "hybrid-recipient")]
+    [string]$OcrMode = "unified",
+    [string]$PaddleOcrBundle,
+    [ValidateRange(0, 1000000)]
+    [int]$ExpectedInputCount = 0
 )
 
 Set-StrictMode -Version Latest
@@ -160,6 +165,41 @@ function Freeze-AppPayload(
     }
 }
 
+function Freeze-DirectoryPayload(
+    [string]$Directory,
+    [string]$Description,
+    [string]$EvidenceRoot,
+    [string]$ManifestName
+) {
+    $root = Get-ProviderFullPath $Directory
+    $rootPrefix = $root
+    if (-not $rootPrefix.EndsWith([IO.Path]::DirectorySeparatorChar.ToString(), [StringComparison]::Ordinal)) {
+        $rootPrefix += [IO.Path]::DirectorySeparatorChar
+    }
+    $rows = [Collections.Generic.List[object]]::new()
+    foreach ($file in @(Get-AppPayloadFiles $root $Description)) {
+        $fullPath = Get-ProviderFullPath ([string]$file.FullName)
+        if (-not $fullPath.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "$Description file escapes its root: $fullPath"
+        }
+        $rows.Add([ordered]@{
+            path = $fullPath.Substring($rootPrefix.Length).Replace('\', '/')
+            sha256 = Get-Sha256 $fullPath
+            bytes = [long]$file.Length
+        })
+    }
+    if ($rows.Count -le 0) {
+        throw "$Description is empty: $root"
+    }
+    $manifestPath = Join-Path $EvidenceRoot $ManifestName
+    Write-JsonNoBom $manifestPath $rows 5
+    return [ordered]@{
+        bundle_root = $root
+        bundle_payload = Get-FileEvidence $manifestPath "$Description payload manifest"
+        contract_relative_path = "paddle_ocr_delivery.contract.json"
+    }
+}
+
 function Write-JsonNoBom([string]$Path, [object]$Payload, [int]$Depth = 12) {
     $json = $Payload | ConvertTo-Json -Depth $Depth
     [IO.File]::WriteAllText(
@@ -241,6 +281,7 @@ function Assert-CompletedCpuRun(
     [string]$OutputDirectory,
     [int]$ExpectedCount,
     [string]$RunId,
+    [string]$ExpectedOcrMode,
     [AllowNull()]
     [object]$ExpectedDetectorIntraOpThreads
 ) {
@@ -259,6 +300,19 @@ function Assert-CompletedCpuRun(
     else {
         $detectorThreadsProperty.Value
     }
+    $paddleProviderProperty = $summary.PSObject.Properties["paddle_ocr_provider"]
+    $actualPaddleProvider = if ($null -eq $paddleProviderProperty) {
+        $null
+    }
+    else {
+        $paddleProviderProperty.Value
+    }
+    $paddleProviderMismatch = if ($ExpectedOcrMode -eq "hybrid-recipient") {
+        [string]$actualPaddleProvider -ne "cpu"
+    }
+    else {
+        $null -ne $actualPaddleProvider
+    }
     $detectorThreadsMismatch = if ($null -eq $ExpectedDetectorIntraOpThreads) {
         $null -ne $actualDetectorIntraOpThreads
     }
@@ -269,13 +323,14 @@ function Assert-CompletedCpuRun(
     }
     if ([string]$summary.requested_device -ne "cpu" `
         -or [string]$summary.unified_provider -ne "cpu" `
+        -or $paddleProviderMismatch `
         -or [int]$summary.input -ne $ExpectedCount `
         -or [int]$summary.written -ne $ExpectedCount `
         -or [int]$summary.skipped -ne 0 `
         -or [int]$summary.errors -ne 0 `
         -or $detectorThreadsMismatch `
         -or -not [string]::IsNullOrWhiteSpace($errorText)) {
-        throw "$RunId did not complete the fixed three-model CPU workload without errors."
+        throw "$RunId did not complete the fixed protected CPU workload without errors."
     }
 }
 
@@ -286,21 +341,28 @@ function Invoke-CpuRun(
     [string]$Detector,
     [string]$Device,
     [string]$Unified,
-    [int]$CandidateDetectorThreads
+    [int]$CandidateDetectorThreads,
+    [string]$SelectedOcrMode,
+    [AllowNull()]
+    [string]$PaddleBundle
 ) {
     $variant = [string]$Descriptor.variant
     $executable = [string]$Variants[$variant]["executable"]["path"]
     $outputDirectory = [string]$Descriptor.output_directory
     $consoleLog = [string]$Descriptor.console_log
+    $wallClockEvidence = [string]$Descriptor.wall_clock_evidence
     if (Test-Path -LiteralPath $outputDirectory) {
         throw "Refusing to reuse A/B output directory: $outputDirectory"
+    }
+    if (Test-Path -LiteralPath $wallClockEvidence) {
+        throw "Refusing to reuse A/B wall-clock evidence: $wallClockEvidence"
     }
     $runContainer = Split-Path -Parent $outputDirectory
     New-Item -ItemType Directory -Path $runContainer -Force | Out-Null
     $arguments = @(
         "--detector", $Detector,
         "--device-model", $Device,
-        "--ocr", "unified",
+        "--ocr", $SelectedOcrMode,
         "--ocr-model", $Unified,
         "--input-list", $FixedInputList,
         "--output", $outputDirectory,
@@ -310,6 +372,9 @@ function Invoke-CpuRun(
         "--annotate", "none",
         "--require-complete"
     )
+    if ($SelectedOcrMode -eq "hybrid-recipient") {
+        $arguments += @("--ocr-bundle", $PaddleBundle)
+    }
     if ([string]$Descriptor.phase -eq "warmup") {
         $arguments += @("--limit", [string]$Descriptor.expected_count)
     }
@@ -328,14 +393,31 @@ function Invoke-CpuRun(
             $variant.ToUpperInvariant(),
             [int]$Descriptor.iteration,
             [int]$Descriptor.expected_count)
+    $startedUtc = (Get-Date).ToUniversalTime().ToString("o")
+    $wallClock = [Diagnostics.Stopwatch]::StartNew()
     & $executable @arguments 2>&1 | Tee-Object -FilePath $consoleLog
     $exitCode = $LASTEXITCODE
+    $wallClock.Stop()
+    $finishedUtc = (Get-Date).ToUniversalTime().ToString("o")
+    Write-JsonNoBom $wallClockEvidence ([ordered]@{
+        schema_version = 1
+        kind = "receipt_mlnet_cpu_ab_wall_clock_v1"
+        run_id = [string]$Descriptor.id
+        phase = [string]$Descriptor.phase
+        variant = $variant
+        iteration = [int]$Descriptor.iteration
+        expected_count = [int]$Descriptor.expected_count
+        exit_code = [int]$exitCode
+        started_utc = $startedUtc
+        finished_utc = $finishedUtc
+        elapsed_seconds = [Math]::Round($wallClock.Elapsed.TotalSeconds, 6)
+    }) 5
     if ($exitCode -ne 0) {
         throw "$($Descriptor.id) failed with exit code $exitCode; see $consoleLog"
     }
     Assert-CompletedCpuRun `
         $outputDirectory ([int]$Descriptor.expected_count) ([string]$Descriptor.id) `
-        $expectedDetectorThreads
+        $SelectedOcrMode $expectedDetectorThreads
 }
 
 Require-File $analyzer "CPU A/B analyzer"
@@ -347,6 +429,29 @@ $DeviceModel = Get-ProviderFullPath $DeviceModel
 $UnifiedModel = Get-ProviderFullPath $UnifiedModel
 $InputList = Get-ProviderFullPath $InputList
 $OutputRoot = Get-ProviderFullPath $OutputRoot
+$paddleContractPath = $null
+if ($OcrMode -eq "hybrid-recipient") {
+    if ([string]::IsNullOrWhiteSpace($PaddleOcrBundle)) {
+        throw "-PaddleOcrBundle is required when -OcrMode hybrid-recipient."
+    }
+    $PaddleOcrBundle = Get-ProviderFullPath $PaddleOcrBundle
+    if (-not (Test-Path -LiteralPath $PaddleOcrBundle -PathType Container)) {
+        throw "Missing Paddle OCR delivery bundle: $PaddleOcrBundle"
+    }
+    $paddleContractPath = Join-Path $PaddleOcrBundle "paddle_ocr_delivery.contract.json"
+    Require-File $paddleContractPath "Paddle OCR delivery contract"
+    $paddleContract = Get-Content -LiteralPath $paddleContractPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ([int]$paddleContract.schema_version -ne 1 `
+        -or [string]$paddleContract.kind -ne "paddle_ocr_v2_delivery" `
+        -or $null -eq $paddleContract.models.det `
+        -or $null -eq $paddleContract.models.cls `
+        -or $null -eq $paddleContract.models.rec) {
+        throw "Paddle OCR delivery bundle must be a complete det/cls/rec ONNX package."
+    }
+}
+elseif (-not [string]::IsNullOrWhiteSpace($PaddleOcrBundle)) {
+    throw "-PaddleOcrBundle is valid only when -OcrMode hybrid-recipient."
+}
 $baselineAppRoot = Get-ProviderFullPath (Split-Path -Parent $BaselineExecutable)
 $candidateAppRoot = Get-ProviderFullPath (Split-Path -Parent $CandidateExecutable)
 
@@ -373,6 +478,11 @@ foreach ($appRoot in @($baselineAppRoot, $candidateAppRoot)) {
         throw "OutputRoot and each immutable app payload must be separate, non-nested directories."
     }
 }
+if ($OcrMode -eq "hybrid-recipient" `
+    -and ((Test-PathWithin $OutputRoot $PaddleOcrBundle) `
+        -or (Test-PathWithin $PaddleOcrBundle $OutputRoot))) {
+    throw "OutputRoot and the immutable Paddle OCR bundle must be separate, non-nested directories."
+}
 $outputParent = Split-Path -Parent $OutputRoot
 if ([string]::IsNullOrWhiteSpace($outputParent)) {
     throw "OutputRoot must have a parent directory."
@@ -390,6 +500,9 @@ else {
 $inputs = [Collections.Generic.List[string]]::new()
 for ($inputIndex = 0; $inputIndex -lt $selectedInputCount; $inputIndex++) {
     $inputs.Add([string]$availableInputs[$inputIndex])
+}
+if ($ExpectedInputCount -gt 0 -and $inputs.Count -ne $ExpectedInputCount) {
+    throw "Selected input count differs from -ExpectedInputCount: expected $ExpectedInputCount, got $($inputs.Count)."
 }
 $warmupLimit = [Math]::Min($WarmupImages, $inputs.Count)
 $fixedInputListPath = Join-Path $OutputRoot "fixed-inputs.txt"
@@ -423,6 +536,11 @@ $artifacts = [ordered]@{
     unified_ocr = Get-FileEvidence $UnifiedModel "unified OCR model"
     unified_labels = Get-FileEvidence $unifiedLabels "unified OCR labels"
     unified_contract = Get-FileEvidence $unifiedContract "unified OCR contract"
+}
+if ($OcrMode -eq "hybrid-recipient") {
+    $artifacts["paddle_ocr_bundle"] = Freeze-DirectoryPayload `
+        $PaddleOcrBundle "Paddle OCR delivery bundle" $OutputRoot `
+        "paddle-ocr-bundle-payload.json"
 }
 $variants = [ordered]@{
     baseline = Freeze-AppPayload $BaselineExecutable "baseline" $OutputRoot
@@ -472,6 +590,7 @@ foreach ($phaseSpec in @(
                 }
                 output_directory = Join-Path $runContainer "output"
                 console_log = Join-Path $runContainer "console.log"
+                wall_clock_evidence = Join-Path $runContainer "wall-clock.json"
             })
         }
     }
@@ -479,8 +598,8 @@ foreach ($phaseSpec in @(
 
 $planPath = Join-Path $OutputRoot "ab-plan.json"
 $plan = [ordered]@{
-    schema_version = 1
-    kind = "receipt_mlnet_cpu_ab_plan_v1"
+    schema_version = 2
+    kind = "receipt_mlnet_cpu_ab_plan_v2"
     created_utc = (Get-Date).ToUniversalTime().ToString("o")
     output_root = $OutputRoot
     input_count = $inputs.Count
@@ -490,6 +609,12 @@ $plan = [ordered]@{
         input_limit_requested = $InputLimit
         available_count = $availableInputs.Count
         selected_count = $inputs.Count
+        expected_input_count = if ($ExpectedInputCount -gt 0) {
+            $ExpectedInputCount
+        }
+        else {
+            $null
+        }
     }
     fixed_input_list = Get-FileEvidence $fixedInputListPath "fixed input list"
     input_evidence = Get-FileEvidence $inputEvidencePath "input evidence"
@@ -499,7 +624,8 @@ $plan = [ordered]@{
     cli_contract = [ordered]@{
         device = "cpu"
         unified_provider = "cpu"
-        ocr = "unified"
+        paddle_ocr_provider = if ($OcrMode -eq "hybrid-recipient") { "cpu" } else { $null }
+        ocr = $OcrMode
         score_threshold = [double]0.50
         rectification = "max-side-1600"
         annotate = "none"
@@ -507,6 +633,7 @@ $plan = [ordered]@{
         continue_on_error = $false
         skip_existing = $false
         includes_device_model = $true
+        includes_paddle_ocr_bundle = ($OcrMode -eq "hybrid-recipient")
         detector_intra_op_threads = [ordered]@{
             baseline = $null
             candidate = if ($CandidateDetectorIntraOpThreads -gt 0) {
@@ -532,7 +659,7 @@ $frozenPlanSha256 = Get-Sha256 $planPath
 Write-Host ""
 Write-Host "============================================================" -ForegroundColor DarkCyan
 Write-Host " Receipt ML.NET - CPU performance/consistency A/B" -ForegroundColor Cyan
-Write-Host " fixed detector + device + unified OCR; CPU only" -ForegroundColor DarkGray
+Write-Host " fixed detector + device + $OcrMode OCR; CPU only" -ForegroundColor DarkGray
 Write-Host "============================================================" -ForegroundColor DarkCyan
 Write-Host "Inputs      : $($inputs.Count)"
 if ($InputLimit -gt 0) {
@@ -540,6 +667,8 @@ if ($InputLimit -gt 0) {
 }
 Write-Host "Warmup      : $WarmupRuns x $warmupLimit image(s) per variant"
 Write-Host "Measured    : $Repetitions full repeat(s) per variant"
+Write-Host "OCR mode    : $OcrMode"
+Write-Host "Throughput  : external process wall clock"
 $candidateThreadDescription = if ($CandidateDetectorIntraOpThreads -gt 0) {
     [string]$CandidateDetectorIntraOpThreads
 }
@@ -554,7 +683,7 @@ foreach ($descriptor in @($runPlan | Sort-Object execution_order)) {
     Invoke-CpuRun `
         $descriptor $variants $fixedInputListPath `
         $DetectorModel $DeviceModel $UnifiedModel `
-        $CandidateDetectorIntraOpThreads
+        $CandidateDetectorIntraOpThreads $OcrMode $PaddleOcrBundle
 }
 if ((Get-Sha256 $planPath) -ne $frozenPlanSha256) {
     throw "CPU A/B plan changed while the runs were executing."
@@ -577,6 +706,7 @@ $report = Get-Content -LiteralPath $reportPath -Raw -Encoding UTF8 | ConvertFrom
 if ($report.accepted -ne $true `
     -or $report.prediction_consistency.accepted -ne $true `
     -or [int]$report.prediction_consistency.difference_count -ne 0 `
+    -or $report.route_consistency.accepted -ne $true `
     -or $report.performance.accepted -ne $true) {
     throw "CPU A/B prediction consistency or performance improvement was not accepted."
 }
@@ -607,6 +737,7 @@ $stageRows = foreach ($stage in @(
     "detector_preprocess",
     "detector_inference",
     "detector_postprocess",
+    "paddle_ocr",
     "unified_ocr_preprocess",
     "unified_ocr_inference",
     "unified_ocr_postprocess",
@@ -627,4 +758,4 @@ $stageRows = foreach ($stage in @(
 $stageRows | Format-Table -AutoSize
 Write-Host "Report      : $reportPath"
 Write-Host "Differences : $differencesPath"
-Write-Host "PASS: candidate predictions exactly match every baseline/warmup/repeat result." -ForegroundColor Green
+Write-Host "PASS: candidate predictions and route counts exactly match every baseline/warmup/repeat result." -ForegroundColor Green

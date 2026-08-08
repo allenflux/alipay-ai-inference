@@ -2,10 +2,11 @@
 """Fail-closed consistency and performance analysis for ML.NET CPU A/B runs.
 
 The PowerShell orchestrator writes an immutable run plan and invokes the same
-three-model CLI for a baseline and a candidate.  This analyzer validates every
-run, compares every prediction with type-sensitive JSON semantics, and pools
-per-image timing from the manifests.  Paths and top-level timing metadata are
-the only result properties excluded from prediction comparison.
+protected unified or hybrid-recipient workload for a baseline and a candidate.
+This analyzer validates every run, compares every prediction with type-sensitive
+JSON semantics, and pools per-image timing from the manifests. Paths and
+top-level timing metadata are the only result properties excluded from
+prediction comparison.
 """
 
 from __future__ import annotations
@@ -22,8 +23,9 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 
-PLAN_KIND = "receipt_mlnet_cpu_ab_plan_v1"
-REPORT_KIND = "receipt_mlnet_cpu_ab_report_v1"
+LEGACY_PLAN_KIND = "receipt_mlnet_cpu_ab_plan_v1"
+PLAN_KIND = "receipt_mlnet_cpu_ab_plan_v2"
+REPORT_KIND = "receipt_mlnet_cpu_ab_report_v2"
 VARIANTS = ("baseline", "candidate")
 RESULT_EXCLUDED_TOP_LEVEL_KEYS = frozenset(
     {
@@ -73,6 +75,10 @@ MODEL_HASH_FIELDS = {
     "unified_labels": "unified_ocr_labels_sha256",
     "unified_contract": "unified_ocr_contract_sha256",
 }
+PADDLE_BUNDLE_CONTRACT = "paddle_ocr_delivery.contract.json"
+PADDLE_RESULT_HASH_FIELD = "ocr_bundle_contract_sha256"
+WALL_CLOCK_KIND = "receipt_mlnet_cpu_ab_wall_clock_v1"
+ROUTE_FIELDS = ("hybrid_ocr_route", "hybrid_ocr_third_route")
 MAX_REPORTED_DIFFERENCES = 200
 MINIMUM_THROUGHPUT_GAIN_PERCENT = 2.0
 MAXIMUM_P50_REGRESSION_PERCENT = 0.0
@@ -281,6 +287,185 @@ def _verify_app_payload(variant: str, payload: Mapping[str, Any]) -> dict[str, A
     }
 
 
+def _verify_paddle_bundle(payload: Any) -> dict[str, Any]:
+    bundle = _require_mapping(payload, "fixed Paddle OCR bundle")
+    root_raw = bundle.get("bundle_root")
+    if not isinstance(root_raw, str) or not root_raw:
+        raise ValidationError("fixed Paddle OCR bundle has no bundle_root")
+    root = Path(root_raw)
+    if not root.is_dir():
+        raise ValidationError(f"fixed Paddle OCR bundle root is missing: {root}")
+    root = root.resolve()
+    manifest_path = _verify_file_evidence(
+        bundle.get("bundle_payload"), "fixed Paddle OCR bundle payload manifest"
+    )
+    rows = _load_json(manifest_path, "fixed Paddle OCR bundle payload manifest")
+    if not isinstance(rows, list) or not rows:
+        raise ValidationError("fixed Paddle OCR bundle payload manifest is empty")
+
+    listed: dict[str, Mapping[str, Any]] = {}
+    for index, raw_row in enumerate(rows):
+        row = _require_mapping(raw_row, f"Paddle OCR bundle payload row {index + 1}")
+        relative = _safe_relative_payload_path(
+            row.get("path"), f"Paddle OCR bundle payload row {index + 1}"
+        )
+        key = relative.casefold()
+        if key in listed:
+            raise ValidationError(
+                f"Paddle OCR bundle payload has duplicate path: {relative}"
+            )
+        sha = row.get("sha256")
+        byte_count = row.get("bytes")
+        if not isinstance(sha, str) or len(sha) != 64:
+            raise ValidationError(
+                f"Paddle OCR bundle payload has invalid SHA-256: {relative}"
+            )
+        if (
+            isinstance(byte_count, bool)
+            or not isinstance(byte_count, int)
+            or byte_count < 0
+        ):
+            raise ValidationError(
+                f"Paddle OCR bundle payload has invalid bytes: {relative}"
+            )
+        target = (root / Path(*relative.split("/"))).resolve()
+        try:
+            common = os.path.commonpath([_path_key(target), _path_key(root)])
+        except ValueError as exception:
+            raise ValidationError(
+                f"Paddle OCR bundle payload escapes to another volume: {relative}"
+            ) from exception
+        if common != _path_key(root) or target == root or not target.is_file():
+            raise ValidationError(
+                f"Paddle OCR bundle payload path is missing/unsafe: {relative}"
+            )
+        if target.stat().st_size != byte_count or _sha256(target) != sha.casefold():
+            raise ValidationError(
+                f"Paddle OCR bundle payload changed during A/B execution: {relative}"
+            )
+        listed[key] = row
+
+    actual: dict[str, str] = {}
+    for target in root.rglob("*"):
+        if target.is_symlink():
+            raise ValidationError(
+                f"Paddle OCR bundle payload contains a symbolic link: {target}"
+            )
+        if not target.is_file():
+            continue
+        relative = target.relative_to(root).as_posix()
+        key = relative.casefold()
+        if key in actual:
+            raise ValidationError(
+                f"Paddle OCR bundle payload has duplicate canonical path: {relative}"
+            )
+        actual[key] = relative
+    missing = sorted(set(listed) - set(actual))
+    extra = sorted(set(actual) - set(listed))
+    if missing or extra:
+        raise ValidationError(
+            "Paddle OCR bundle payload manifest is not closed: "
+            f"missing={len(missing)} extra={len(extra)}"
+        )
+
+    contract_relative = _safe_relative_payload_path(
+        bundle.get("contract_relative_path"),
+        "fixed Paddle OCR bundle contract_relative_path",
+    )
+    if contract_relative != PADDLE_BUNDLE_CONTRACT:
+        raise ValidationError(
+            "fixed Paddle OCR bundle contract path changed: "
+            f"expected {PADDLE_BUNDLE_CONTRACT}, found {contract_relative}"
+        )
+    contract_key = contract_relative.casefold()
+    if contract_key not in listed:
+        raise ValidationError("fixed Paddle OCR bundle payload omits its contract")
+    contract_path = root / Path(*contract_relative.split("/"))
+    contract = _require_mapping(
+        _load_json(contract_path, "fixed Paddle OCR bundle contract"),
+        "fixed Paddle OCR bundle contract",
+    )
+    if (
+        type(contract.get("schema_version")) is not int
+        or contract.get("schema_version") != 1
+        or contract.get("kind") != "paddle_ocr_v2_delivery"
+    ):
+        raise ValidationError("fixed Paddle OCR bundle contract has the wrong schema/kind")
+    models = _require_mapping(
+        contract.get("models"), "fixed Paddle OCR bundle models"
+    )
+    if set(models) != {"det", "cls", "rec"}:
+        raise ValidationError(
+            "fixed Paddle OCR bundle contract must contain exactly det/cls/rec models"
+        )
+    package_payload_bytes = 0
+    for role in ("det", "cls", "rec"):
+        model = _require_mapping(
+            models.get(role), f"fixed Paddle OCR bundle {role} model"
+        )
+        relative = _safe_relative_payload_path(
+            model.get("path"), f"fixed Paddle OCR bundle {role} model path"
+        )
+        row = listed.get(relative.casefold())
+        if row is None or not relative.casefold().endswith(".onnx"):
+            raise ValidationError(
+                f"fixed Paddle OCR bundle {role} model is not a frozen ONNX payload"
+            )
+        model_sha = model.get("sha256")
+        model_bytes = model.get("size_bytes")
+        if (
+            not isinstance(model_sha, str)
+            or model_sha.casefold() != str(row.get("sha256", "")).casefold()
+            or isinstance(model_bytes, bool)
+            or not isinstance(model_bytes, int)
+            or model_bytes != row.get("bytes")
+        ):
+            raise ValidationError(
+                f"fixed Paddle OCR bundle {role} contract evidence differs from its payload"
+            )
+        package_payload_bytes += model_bytes
+    dictionary = _require_mapping(
+        contract.get("dictionary"), "fixed Paddle OCR bundle dictionary"
+    )
+    dictionary_relative = _safe_relative_payload_path(
+        dictionary.get("path"), "fixed Paddle OCR bundle dictionary path"
+    )
+    dictionary_row = listed.get(dictionary_relative.casefold())
+    dictionary_sha = dictionary.get("sha256")
+    dictionary_bytes = dictionary.get("size_bytes")
+    if (
+        dictionary_row is None
+        or not isinstance(dictionary_sha, str)
+        or dictionary_sha.casefold()
+        != str(dictionary_row.get("sha256", "")).casefold()
+        or isinstance(dictionary_bytes, bool)
+        or not isinstance(dictionary_bytes, int)
+        or dictionary_bytes != dictionary_row.get("bytes")
+    ):
+        raise ValidationError(
+            "fixed Paddle OCR bundle dictionary contract evidence differs from its payload"
+        )
+    package_payload_bytes += dictionary_bytes
+    package_size = contract.get("package_size_bytes")
+    if (
+        isinstance(package_size, bool)
+        or not isinstance(package_size, int)
+        or package_size != package_payload_bytes
+    ):
+        raise ValidationError(
+            "fixed Paddle OCR bundle package_size_bytes differs from its models/dictionary"
+        )
+    return {
+        "bundle_root": str(root),
+        "payload_manifest": str(manifest_path.resolve()),
+        "payload_sha256": _sha256(manifest_path),
+        "payload_file_count": len(rows),
+        "contract": contract_relative,
+        "contract_sha256": _sha256(contract_path),
+        "package_size_bytes": package_size,
+    }
+
+
 def _read_fixed_inputs(plan: Mapping[str, Any]) -> tuple[list[str], Mapping[str, Any]]:
     fixed_list = _verify_file_evidence(plan.get("fixed_input_list"), "fixed input list")
     evidence_path = _verify_file_evidence(plan.get("input_evidence"), "input evidence")
@@ -334,7 +519,9 @@ def _read_fixed_inputs(plan: Mapping[str, Any]) -> tuple[list[str], Mapping[str,
     return inputs, {key: evidence_by_key[key] for key in keys}
 
 
-def _validate_input_selection(plan: Mapping[str, Any], fixed_inputs: Sequence[str]) -> Mapping[str, Any]:
+def _validate_input_selection(
+    plan: Mapping[str, Any], fixed_inputs: Sequence[str], schema_version: int = 1
+) -> Mapping[str, Any]:
     selection = _require_mapping(plan.get("input_selection"), "input selection")
     if selection.get("rule") != "deduplicate_in_order_then_first_n":
         raise ValidationError("input selection rule changed")
@@ -343,6 +530,19 @@ def _validate_input_selection(plan: Mapping[str, Any], fixed_inputs: Sequence[st
         raise ValidationError("input_limit_requested must be a non-negative integer")
     if selection.get("selected_count") != len(fixed_inputs):
         raise ValidationError("input selection selected_count differs from fixed inputs")
+    if schema_version >= 2:
+        if "expected_input_count" not in selection:
+            raise ValidationError("v2 input selection omits expected_input_count")
+        expected_count = selection.get("expected_input_count")
+        if expected_count is not None and (
+            isinstance(expected_count, bool)
+            or not isinstance(expected_count, int)
+            or expected_count <= 0
+            or expected_count != len(fixed_inputs)
+        ):
+            raise ValidationError(
+                "input selection expected_input_count differs from fixed inputs"
+            )
     source_list = _verify_file_evidence(
         selection.get("source_input_list"), "source input list"
     )
@@ -369,12 +569,13 @@ def _validate_input_selection(plan: Mapping[str, Any], fixed_inputs: Sequence[st
     return selection
 
 
-def _validate_cli_contract(plan: Mapping[str, Any]) -> dict[str, int | None]:
+def _validate_cli_contract(
+    plan: Mapping[str, Any], schema_version: int
+) -> tuple[str, dict[str, int | None]]:
     contract = _require_mapping(plan.get("cli_contract"), "CLI contract")
     exact = {
         "device": "cpu",
         "unified_provider": "cpu",
-        "ocr": "unified",
         "score_threshold": 0.5,
         "rectification": "max-side-1600",
         "annotate": "none",
@@ -388,6 +589,32 @@ def _validate_cli_contract(plan: Mapping[str, Any]) -> dict[str, int | None]:
         if type(value) is not type(expected) or value != expected:
             raise ValidationError(
                 f"CLI protection setting {name} changed: expected {expected!r}, found {value!r}"
+            )
+    ocr_mode = contract.get("ocr")
+    allowed_modes = {"unified"} if schema_version == 1 else {"unified", "hybrid-recipient"}
+    if type(ocr_mode) is not str or ocr_mode not in allowed_modes:
+        raise ValidationError(
+            f"CLI protection setting ocr changed: expected one of {sorted(allowed_modes)!r}, "
+            f"found {ocr_mode!r}"
+        )
+    if schema_version >= 2:
+        expected_paddle_provider = "cpu" if ocr_mode == "hybrid-recipient" else None
+        if "paddle_ocr_provider" not in contract:
+            raise ValidationError("CLI contract omits paddle_ocr_provider")
+        paddle_provider = contract.get("paddle_ocr_provider")
+        if type(paddle_provider) is not type(expected_paddle_provider) or paddle_provider != expected_paddle_provider:
+            raise ValidationError(
+                "CLI Paddle OCR provider contract changed: "
+                f"expected {expected_paddle_provider!r}, found {paddle_provider!r}"
+            )
+        expected_bundle = ocr_mode == "hybrid-recipient"
+        if (
+            "includes_paddle_ocr_bundle" not in contract
+            or type(contract.get("includes_paddle_ocr_bundle")) is not bool
+            or contract.get("includes_paddle_ocr_bundle") is not expected_bundle
+        ):
+            raise ValidationError(
+                "CLI Paddle OCR bundle contract is inconsistent with the OCR mode"
             )
     thread_contract = _require_mapping(
         contract.get("detector_intra_op_threads"),
@@ -412,7 +639,7 @@ def _validate_cli_contract(plan: Mapping[str, Any]) -> dict[str, int | None]:
             "candidate detector intra-op threads must be null/default or an integer in "
             f"[1, {MAXIMUM_DETECTOR_INTRA_OP_THREADS}]"
         )
-    return {"baseline": None, "candidate": candidate_threads}
+    return ocr_mode, {"baseline": None, "candidate": candidate_threads}
 
 
 def _validate_performance_gate(plan: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -438,8 +665,13 @@ def _validate_performance_gate(plan: Mapping[str, Any]) -> Mapping[str, Any]:
 
 def _validate_plan(
     plan: Mapping[str, Any],
-) -> tuple[int, int, int, dict[str, int | None]]:
-    if plan.get("schema_version") != 1 or plan.get("kind") != PLAN_KIND:
+) -> tuple[int, int, int, int, str, dict[str, int | None]]:
+    schema_version = plan.get("schema_version")
+    kind = plan.get("kind")
+    if type(schema_version) is not int or (schema_version, kind) not in (
+        (1, LEGACY_PLAN_KIND),
+        (2, PLAN_KIND),
+    ):
         raise ValidationError("unsupported CPU A/B plan schema/kind")
     repetitions = plan.get("repetitions")
     warmup_runs = plan.get("warmup_runs")
@@ -450,9 +682,16 @@ def _validate_plan(
         raise ValidationError("CPU A/B requires at least one warmup run per variant")
     if isinstance(warmup_limit, bool) or not isinstance(warmup_limit, int) or warmup_limit < 1:
         raise ValidationError("CPU A/B warmup_limit must be positive")
-    detector_thread_contract = _validate_cli_contract(plan)
+    ocr_mode, detector_thread_contract = _validate_cli_contract(plan, schema_version)
     _validate_performance_gate(plan)
-    return repetitions, warmup_runs, warmup_limit, detector_thread_contract
+    return (
+        schema_version,
+        repetitions,
+        warmup_runs,
+        warmup_limit,
+        ocr_mode,
+        detector_thread_contract,
+    )
 
 
 def _percentile(sorted_values: Sequence[float], quantile: float) -> float:
@@ -563,6 +802,7 @@ def _validate_result_contract(
     result: Mapping[str, Any],
     source: str,
     artifact_hashes: Mapping[str, str],
+    ocr_mode: str,
     description: str,
 ) -> None:
     if _path_key(str(result.get("source", ""))) != _path_key(source):
@@ -592,6 +832,108 @@ def _validate_result_contract(
             raise ValidationError(
                 f"{description} {result_name} differs from the fixed A/B artifact"
             )
+    if ocr_mode == "hybrid-recipient":
+        if contracts.get(PADDLE_RESULT_HASH_FIELD) != artifact_hashes.get(
+            "paddle_ocr_contract"
+        ):
+            raise ValidationError(
+                f"{description} {PADDLE_RESULT_HASH_FIELD} differs from the frozen Paddle OCR bundle"
+            )
+        if contracts.get("ocr_bundle") != PADDLE_BUNDLE_CONTRACT:
+            raise ValidationError(
+                f"{description} did not bind the expected Paddle OCR bundle contract"
+            )
+    elif (
+        "ocr_bundle" in contracts
+        or PADDLE_RESULT_HASH_FIELD in contracts
+    ):
+        raise ValidationError(
+            f"{description} unified-only result unexpectedly binds a Paddle OCR bundle"
+        )
+
+
+def _load_outer_wall_seconds(
+    descriptor: Mapping[str, Any],
+    output: Path,
+    expected_count: int,
+    schema_version: int,
+) -> float | None:
+    if schema_version == 1:
+        return None
+    run_id = str(descriptor["id"])
+    raw_path = descriptor.get("wall_clock_evidence")
+    if not isinstance(raw_path, str) or not raw_path:
+        raise ValidationError(f"run {run_id} has no outer wall-clock evidence path")
+    path = Path(raw_path).resolve()
+    if path.parent != output.resolve().parent:
+        raise ValidationError(
+            f"run {run_id} wall-clock evidence is not beside its fresh output directory"
+        )
+    evidence = _require_mapping(
+        _load_json(path, f"run {run_id} outer wall-clock evidence"),
+        f"run {run_id} outer wall-clock evidence",
+    )
+    exact = {
+        "schema_version": 1,
+        "kind": WALL_CLOCK_KIND,
+        "run_id": run_id,
+        "phase": descriptor.get("phase"),
+        "variant": descriptor.get("variant"),
+        "iteration": descriptor.get("iteration"),
+        "expected_count": expected_count,
+        "exit_code": 0,
+    }
+    for name, expected in exact.items():
+        value = evidence.get(name)
+        if type(value) is not type(expected) or value != expected:
+            raise ValidationError(
+                f"run {run_id} wall-clock evidence {name} differs from its frozen descriptor"
+            )
+    for name in ("started_utc", "finished_utc"):
+        value = evidence.get(name)
+        if not isinstance(value, str) or not value:
+            raise ValidationError(
+                f"run {run_id} wall-clock evidence has no {name} timestamp"
+            )
+    return _finite_number(
+        evidence.get("elapsed_seconds"),
+        f"run {run_id} outer wall elapsed_seconds",
+        positive=True,
+    )
+
+
+def _recipient_route_counts(
+    results: Mapping[str, Mapping[str, Any]], ocr_mode: str, description: str
+) -> dict[str, dict[str, int]]:
+    if ocr_mode != "hybrid-recipient":
+        return {}
+    counts: dict[str, dict[str, int]] = {
+        field: defaultdict(int) for field in ROUTE_FIELDS
+    }
+    for result in results.values():
+        fields = _require_mapping(result.get("fields"), f"{description} fields")
+        recipient = _require_mapping(
+            fields.get("recipient"), f"{description} recipient field"
+        )
+        primary = recipient.get("hybrid_ocr_route")
+        if not isinstance(primary, str) or not primary:
+            raise ValidationError(
+                f"{description} hybrid recipient has no string hybrid_ocr_route"
+            )
+        counts["hybrid_ocr_route"][primary] += 1
+        third = recipient.get("hybrid_ocr_third_route")
+        if third is None:
+            counts["hybrid_ocr_third_route"]["<missing>"] += 1
+        elif isinstance(third, str) and third:
+            counts["hybrid_ocr_third_route"][third] += 1
+        else:
+            raise ValidationError(
+                f"{description} hybrid recipient has an invalid hybrid_ocr_third_route"
+            )
+    return {
+        field: dict(sorted(field_counts.items()))
+        for field, field_counts in counts.items()
+    }
 
 
 def _load_run(
@@ -599,6 +941,8 @@ def _load_run(
     expected_sources: Sequence[str],
     artifact_hashes: Mapping[str, str],
     expected_detector_intra_op_threads: int | None,
+    ocr_mode: str,
+    schema_version: int,
 ) -> dict[str, Any]:
     run_id = descriptor.get("id")
     output_raw = descriptor.get("output_directory")
@@ -620,9 +964,12 @@ def _load_run(
     if not errors_path.is_file() or errors_path.read_text(encoding="utf-8-sig").strip():
         raise ValidationError(f"run {run_id} contains inference errors")
     expected_count = len(expected_sources)
+    expected_paddle_provider = "cpu" if ocr_mode == "hybrid-recipient" else None
     if (
-        summary.get("requested_device") != "cpu"
+        (schema_version >= 2 and "paddle_ocr_provider" not in summary)
+        or summary.get("requested_device") != "cpu"
         or summary.get("unified_provider") != "cpu"
+        or summary.get("paddle_ocr_provider") != expected_paddle_provider
         or summary.get("input") != expected_count
         or summary.get("written") != expected_count
         or summary.get("skipped") != 0
@@ -670,6 +1017,7 @@ def _load_run(
             result,
             expected_by_key[key],
             artifact_hashes,
+            ocr_mode,
             f"run {run_id} result {result_path}",
         )
         results[key] = result
@@ -683,9 +1031,15 @@ def _load_run(
             stage_values[stage].append(
                 _finite_number(stages.get(stage), f"run {run_id} {stage} latency")
             )
-        if stages.get("paddle_ocr") is not None:
+        if ocr_mode == "hybrid-recipient":
             stage_values["paddle_ocr"].append(
-                _finite_number(stages["paddle_ocr"], f"run {run_id} paddle OCR latency")
+                _finite_number(
+                    stages.get("paddle_ocr"), f"run {run_id} paddle OCR latency"
+                )
+            )
+        elif stages.get("paddle_ocr") is not None:
+            raise ValidationError(
+                f"run {run_id} unified-only record unexpectedly used Paddle OCR"
             )
     if set(results) != set(expected_by_key):
         raise ValidationError(f"run {run_id} omitted fixed input sources")
@@ -703,16 +1057,36 @@ def _load_run(
     total_seconds = _finite_number(
         summary.get("total_seconds"), f"run {run_id} total_seconds", positive=True
     )
+    outer_wall_seconds = _load_outer_wall_seconds(
+        descriptor, output, expected_count, schema_version
+    )
+    if (
+        outer_wall_seconds is not None
+        and outer_wall_seconds + 0.0001 < total_seconds
+    ):
+        raise ValidationError(
+            f"run {run_id} outer wall time is shorter than CLI total_seconds"
+        )
+    throughput_seconds = (
+        total_seconds if outer_wall_seconds is None else outer_wall_seconds
+    )
+    route_counts = _recipient_route_counts(results, ocr_mode, f"run {run_id}")
     return {
         "descriptor": dict(descriptor),
         "summary": dict(summary),
         "results": results,
         "inference_values": inference_values,
         "stage_values": dict(stage_values),
+        "route_counts": route_counts,
         "metrics": {
             "input": expected_count,
             "total_seconds": total_seconds,
-            "throughput_images_per_second": round(expected_count / total_seconds, 6),
+            "cli_total_seconds": total_seconds,
+            "outer_wall_seconds": outer_wall_seconds,
+            "throughput_seconds": throughput_seconds,
+            "throughput_images_per_second": round(
+                expected_count / throughput_seconds, 6
+            ),
             "inference_latency_ms": _summarize(inference_values),
             "stage_latency_ms": {
                 stage: _summarize(stage_values.get(stage, [])) for stage in ALL_STAGES
@@ -775,7 +1149,9 @@ def _collect_differences(
 def _aggregate_variant(runs: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     inference_values: list[float] = []
     stage_values: dict[str, list[float]] = defaultdict(list)
-    total_seconds: list[float] = []
+    cli_total_seconds: list[float] = []
+    throughput_seconds: list[float] = []
+    outer_wall_seconds: list[float] = []
     throughputs: list[float] = []
     total_images = 0
     run_metrics: list[Mapping[str, Any]] = []
@@ -785,7 +1161,10 @@ def _aggregate_variant(runs: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
             stage_values[stage].extend(values)
         metrics = run["metrics"]
         total_images += metrics["input"]
-        total_seconds.append(metrics["total_seconds"])
+        cli_total_seconds.append(metrics["cli_total_seconds"])
+        throughput_seconds.append(metrics["throughput_seconds"])
+        if metrics["outer_wall_seconds"] is not None:
+            outer_wall_seconds.append(metrics["outer_wall_seconds"])
         throughputs.append(metrics["throughput_images_per_second"])
         run_metrics.append(
             {
@@ -794,15 +1173,23 @@ def _aggregate_variant(runs: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
                 **metrics,
             }
         )
-    summed_seconds = sum(total_seconds)
+    summed_throughput_seconds = sum(throughput_seconds)
     return {
         "repetitions": len(runs),
         "total_images": total_images,
-        "sum_total_seconds": round(summed_seconds, 4),
-        "total_seconds_per_run": _summarize(total_seconds),
+        "sum_total_seconds": round(sum(cli_total_seconds), 4),
+        "total_seconds_per_run": _summarize(cli_total_seconds),
+        "sum_throughput_seconds": round(summed_throughput_seconds, 6),
+        "cli_total_seconds_per_run": _summarize(cli_total_seconds),
+        "outer_wall_seconds_per_run": _summarize(outer_wall_seconds),
         "throughput_images_per_second": {
-            "aggregate": round(total_images / summed_seconds, 6),
+            "aggregate": round(total_images / summed_throughput_seconds, 6),
             "per_run": _summarize(throughputs),
+            "measurement": (
+                "external_process_wall_clock"
+                if len(outer_wall_seconds) == len(runs)
+                else "legacy_inference_summary_total_seconds"
+            ),
         },
         "inference_latency_ms": _summarize(inference_values),
         "stage_latency_ms": {
@@ -853,6 +1240,7 @@ def _performance_delta(
         "inference_latency_ms": latency,
         "stage_latency_ms": stages,
         "interpretation": (
+            "Throughput uses pooled external process wall time for v2 evidence. "
             "Positive throughput percent is faster; negative latency percent is faster. "
             "Performance is reported, not used to weaken prediction or accuracy gates."
         ),
@@ -908,13 +1296,15 @@ def _evaluate_performance_gate(
 def analyze_plan(plan_path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     plan = _require_mapping(_load_json(plan_path, "CPU A/B plan"), "CPU A/B plan")
     (
+        schema_version,
         repetitions,
         warmup_runs,
         warmup_limit,
+        ocr_mode,
         detector_thread_contract,
     ) = _validate_plan(plan)
     fixed_inputs, _ = _read_fixed_inputs(plan)
-    input_selection = _validate_input_selection(plan, fixed_inputs)
+    input_selection = _validate_input_selection(plan, fixed_inputs, schema_version)
     if warmup_limit > len(fixed_inputs):
         raise ValidationError("warmup_limit exceeds the fixed input count")
 
@@ -923,6 +1313,18 @@ def analyze_plan(plan_path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]
     for name in MODEL_HASH_FIELDS:
         path = _verify_file_evidence(artifacts.get(name), f"fixed artifact {name}")
         artifact_hashes[name] = _sha256(path)
+    paddle_bundle_identity: dict[str, Any] | None = None
+    if ocr_mode == "hybrid-recipient":
+        paddle_bundle_identity = _verify_paddle_bundle(
+            artifacts.get("paddle_ocr_bundle")
+        )
+        artifact_hashes["paddle_ocr_contract"] = paddle_bundle_identity[
+            "contract_sha256"
+        ]
+    elif "paddle_ocr_bundle" in artifacts:
+        raise ValidationError(
+            "unified-only CPU A/B plan unexpectedly freezes a Paddle OCR bundle"
+        )
     variants = _require_mapping(plan.get("variants"), "A/B variants")
     variant_identities: dict[str, dict[str, Any]] = {}
     for variant in VARIANTS:
@@ -954,6 +1356,7 @@ def analyze_plan(plan_path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]
     }
     descriptors: dict[tuple[str, str, int], Mapping[str, Any]] = {}
     output_keys: set[str] = set()
+    wall_clock_keys: set[str] = set()
     order_values: set[int] = set()
     for raw_descriptor in raw_runs:
         descriptor = _require_mapping(raw_descriptor, "run descriptor")
@@ -962,6 +1365,7 @@ def analyze_plan(plan_path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]
         iteration = descriptor.get("iteration")
         order = descriptor.get("execution_order")
         output = descriptor.get("output_directory")
+        wall_clock = descriptor.get("wall_clock_evidence")
         if (
             phase not in ("warmup", "measured")
             or variant not in VARIANTS
@@ -970,19 +1374,50 @@ def analyze_plan(plan_path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]
             or isinstance(order, bool)
             or not isinstance(order, int)
             or not isinstance(output, str)
+            or (
+                schema_version >= 2
+                and (not isinstance(wall_clock, str) or not wall_clock)
+            )
         ):
             raise ValidationError("plan contains a malformed run descriptor")
         key = (phase, variant, iteration)
         output_key = _path_key(output)
-        if key in descriptors or output_key in output_keys or order in order_values:
+        wall_clock_key = _path_key(wall_clock) if schema_version >= 2 else None
+        if (
+            key in descriptors
+            or output_key in output_keys
+            or order in order_values
+            or (wall_clock_key is not None and wall_clock_key in wall_clock_keys)
+        ):
             raise ValidationError("plan contains duplicate run identity/output/order")
         descriptors[key] = descriptor
         output_keys.add(output_key)
+        if wall_clock_key is not None:
+            wall_clock_keys.add(wall_clock_key)
         order_values.add(order)
     if set(descriptors) != expected_descriptors:
         raise ValidationError("plan does not contain every required warmup/measured A/B run")
     if order_values != set(range(1, len(raw_runs) + 1)):
         raise ValidationError("run execution_order must be contiguous and unique")
+    expected_execution_sequence: list[tuple[str, str, int]] = []
+    for phase, count in (("warmup", warmup_runs), ("measured", repetitions)):
+        for iteration in range(1, count + 1):
+            variants_in_order = (
+                VARIANTS if iteration % 2 == 1 else tuple(reversed(VARIANTS))
+            )
+            expected_execution_sequence.extend(
+                (phase, variant, iteration) for variant in variants_in_order
+            )
+    actual_execution_sequence = [
+        key
+        for key, _ in sorted(
+            descriptors.items(), key=lambda item: item[1]["execution_order"]
+        )
+    ]
+    if actual_execution_sequence != expected_execution_sequence:
+        raise ValidationError(
+            "run execution_order does not preserve the frozen alternating AB/BA schedule"
+        )
 
     loaded_runs: dict[tuple[str, str, int], Mapping[str, Any]] = {}
     for key, descriptor in descriptors.items():
@@ -1004,6 +1439,8 @@ def analyze_plan(plan_path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]
             expected_sources,
             artifact_hashes,
             expected_detector_threads,
+            ocr_mode,
+            schema_version,
         )
 
     reference_key = ("measured", "baseline", 1)
@@ -1046,6 +1483,21 @@ def analyze_plan(plan_path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]
                 emit,
             )
 
+    route_count_failures: list[str] = []
+    route_counts_by_run: dict[str, Any] = {}
+    if ocr_mode == "hybrid-recipient":
+        for phase, count in (("warmup", warmup_runs), ("measured", repetitions)):
+            phase_reference = loaded_runs[(phase, "baseline", 1)]["route_counts"]
+            for iteration in range(1, count + 1):
+                for variant in VARIANTS:
+                    run = loaded_runs[(phase, variant, iteration)]
+                    run_id = run["descriptor"]["id"]
+                    route_counts_by_run[run_id] = run["route_counts"]
+                    if run["route_counts"] != phase_reference:
+                        route_count_failures.append(
+                            f"{run_id} route counts differ from {phase}-01-baseline"
+                        )
+
     measured_by_variant = {
         variant: [loaded_runs[("measured", variant, index)] for index in range(1, repetitions + 1)]
         for variant in VARIANTS
@@ -1053,7 +1505,8 @@ def analyze_plan(plan_path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]
     aggregate = {
         variant: _aggregate_variant(measured_by_variant[variant]) for variant in VARIANTS
     }
-    prediction_accepted = difference_count == 0
+    route_counts_accepted = not route_count_failures
+    prediction_accepted = difference_count == 0 and route_counts_accepted
     performance_delta = _performance_delta(
         aggregate["baseline"], aggregate["candidate"]
     )
@@ -1065,7 +1518,7 @@ def analyze_plan(plan_path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]
     )
     accepted = prediction_accepted and performance_acceptance["accepted"]
     report = {
-        "schema_version": 1,
+        "schema_version": 2,
         "kind": REPORT_KIND,
         "created_utc": _utc_now(),
         "accepted": accepted,
@@ -1078,6 +1531,7 @@ def analyze_plan(plan_path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]
         "measured_repetitions_per_variant": repetitions,
         "cli_contract": dict(plan["cli_contract"]),
         "performance_gate": dict(plan["performance_gate"]),
+        "fixed_paddle_ocr_bundle": paddle_bundle_identity,
         "variant_identities": variant_identities,
         "prediction_consistency": {
             "accepted": prediction_accepted,
@@ -1090,6 +1544,13 @@ def analyze_plan(plan_path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]
                 "type-sensitive deep JSON comparison; arrays are order-sensitive; "
                 "all measured repeats and warmups compare to baseline measured repeat 1"
             ),
+        },
+        "route_consistency": {
+            "applicable": ocr_mode == "hybrid-recipient",
+            "accepted": route_counts_accepted,
+            "fields": list(ROUTE_FIELDS) if ocr_mode == "hybrid-recipient" else [],
+            "by_run": route_counts_by_run,
+            "failures": route_count_failures,
         },
         "performance": {
             "accepted": performance_acceptance["accepted"],

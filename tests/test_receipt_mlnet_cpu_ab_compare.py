@@ -52,7 +52,65 @@ def _app_variant(tmp_path: Path, variant: str) -> dict[str, object]:
     }
 
 
-def _result(source: Path, artifact_hashes: dict[str, str]) -> dict[str, object]:
+def _paddle_bundle(tmp_path: Path) -> tuple[dict[str, object], str]:
+    root = tmp_path / "paddle-bundle"
+    models: dict[str, dict[str, object]] = {}
+    for role in ("det", "cls", "rec"):
+        path = root / "models" / f"{role}.onnx"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(f"paddle-{role}".encode())
+        models[role] = {
+            "path": path.relative_to(root).as_posix(),
+            "sha256": _sha256(path),
+            "size_bytes": path.stat().st_size,
+        }
+    dictionary = root / "charset" / "ppocr_keys_v1.txt"
+    dictionary.parent.mkdir(parents=True, exist_ok=True)
+    dictionary.write_text("收\n款\n方\n", encoding="utf-8")
+    contract = root / compare.PADDLE_BUNDLE_CONTRACT
+    _write_json(
+        contract,
+        {
+            "schema_version": 1,
+            "kind": "paddle_ocr_v2_delivery",
+            "models": models,
+            "dictionary": {
+                "path": dictionary.relative_to(root).as_posix(),
+                "sha256": _sha256(dictionary),
+                "size_bytes": dictionary.stat().st_size,
+            },
+            "package_size_bytes": sum(
+                int(model["size_bytes"]) for model in models.values()
+            )
+            + dictionary.stat().st_size,
+        },
+    )
+    rows = [
+        {
+            "path": path.relative_to(root).as_posix(),
+            "sha256": _sha256(path),
+            "bytes": path.stat().st_size,
+        }
+        for path in sorted(item for item in root.rglob("*") if item.is_file())
+    ]
+    payload = tmp_path / "paddle-ocr-bundle-payload.json"
+    _write_json(payload, rows)
+    return (
+        {
+            "bundle_root": str(root),
+            "bundle_payload": _evidence(payload),
+            "contract_relative_path": compare.PADDLE_BUNDLE_CONTRACT,
+        },
+        _sha256(contract),
+    )
+
+
+def _result(
+    source: Path,
+    artifact_hashes: dict[str, str],
+    *,
+    paddle_contract_sha256: str | None,
+) -> dict[str, object]:
     fields = {
         "time": {"state": "review", "candidate": "12:34", "delivery_policy": "review_only", "delivery_value": "review"},
         "amount": {"state": "review", "candidate": "88.00", "delivery_policy": "review_only", "delivery_value": "review"},
@@ -60,8 +118,23 @@ def _result(source: Path, artifact_hashes: dict[str, str]) -> dict[str, object]:
         "recipient": {"state": "review", "candidate": "测试商户", "delivery_policy": "review_only", "delivery_value": "review"},
         "payment_method": {"state": "review", "candidate": "余额", "delivery_policy": "review_only", "delivery_value": "review"},
     }
+    if paddle_contract_sha256 is not None:
+        fields["recipient"].update(
+            {
+                "hybrid_ocr_route": "primary",
+                "hybrid_ocr_failure_reason": None,
+                "hybrid_ocr_first_raw": "收款方测试商户",
+                "hybrid_ocr_first_line_count": 1,
+                "hybrid_ocr_first_crop_width": 320,
+                "hybrid_ocr_first_crop_height": 64,
+                "hybrid_ocr_retry_raw": "测试商户",
+                "hybrid_ocr_retry_line_count": 1,
+                "hybrid_ocr_third_route": "right_value",
+                "hybrid_ocr_right_value_line_confidences": [0.91, 0.87],
+            }
+        )
     labels = ["time", "amount", "transfer_status", "recipient_field", "payment_method_field"]
-    return {
+    result: dict[str, object] = {
         "source": str(source),
         "inference_engine": "mlnet",
         "geometry": {
@@ -94,6 +167,14 @@ def _result(source: Path, artifact_hashes: dict[str, str]) -> dict[str, object]:
         },
         "limitations": ["fixed contract fixture"],
     }
+    if paddle_contract_sha256 is not None:
+        result["model_contracts"].update(  # type: ignore[union-attr]
+            {
+                "ocr_bundle": compare.PADDLE_BUNDLE_CONTRACT,
+                compare.PADDLE_RESULT_HASH_FIELD: paddle_contract_sha256,
+            }
+        )
+    return result
 
 
 def _write_run(
@@ -104,6 +185,8 @@ def _write_run(
     inference_ms: float,
     total_seconds: float,
     detector_intra_op_threads: int | None,
+    ocr_mode: str,
+    paddle_contract_sha256: str | None,
 ) -> None:
     manifest: list[dict[str, object]] = []
     stage_template = {
@@ -117,9 +200,18 @@ def _write_run(
         "unified_ocr_postprocess": 0.3,
         "result_assembly": 0.2,
     }
+    if ocr_mode == "hybrid-recipient":
+        stage_template["paddle_ocr"] = 0.6
     for index, source in enumerate(sources):
         result_path = output / "input-list" / f"result-{index}.json"
-        _write_json(result_path, _result(source, artifact_hashes))
+        _write_json(
+            result_path,
+            _result(
+                source,
+                artifact_hashes,
+                paddle_contract_sha256=paddle_contract_sha256,
+            ),
+        )
         manifest.append(
             {
                 "source": str(source),
@@ -137,9 +229,12 @@ def _write_run(
         )
         for stage in compare.REQUIRED_STAGES
     }
-    stage_summary["paddle_ocr"] = compare._summarize([])
+    stage_summary["paddle_ocr"] = compare._summarize(
+        [0.6 for _ in manifest] if ocr_mode == "hybrid-recipient" else []
+    )
     summary = {
         "requested_device": "cpu",
+        "paddle_ocr_provider": "cpu" if ocr_mode == "hybrid-recipient" else None,
         "unified_provider": "cpu",
         "detector_intra_op_threads": detector_intra_op_threads,
         "input": len(sources),
@@ -155,7 +250,7 @@ def _write_run(
     (output / "inference_errors.jsonl").write_text("", encoding="utf-8")
 
 
-def _fixture_plan(tmp_path: Path) -> Path:
+def _fixture_plan(tmp_path: Path, *, ocr_mode: str = "unified") -> Path:
     sources = [tmp_path / "input-1.jpg", tmp_path / "input-2.jpg"]
     for index, source in enumerate(sources):
         source.write_bytes(f"image-{index}".encode())
@@ -177,6 +272,10 @@ def _fixture_plan(tmp_path: Path) -> Path:
         path.write_bytes(f"artifact-{name}".encode())
         artifacts[name] = _evidence(path)
         artifact_hashes[name] = _sha256(path)
+    paddle_contract_sha256: str | None = None
+    if ocr_mode == "hybrid-recipient":
+        paddle_bundle, paddle_contract_sha256 = _paddle_bundle(tmp_path)
+        artifacts["paddle_ocr_bundle"] = paddle_bundle
     variants = {variant: _app_variant(tmp_path, variant) for variant in compare.VARIANTS}
 
     runs: list[dict[str, object]] = []
@@ -199,6 +298,25 @@ def _fixture_plan(tmp_path: Path) -> Path:
                     inference_ms=speed,
                     total_seconds=seconds,
                     detector_intra_op_threads=16 if variant == "candidate" else None,
+                    ocr_mode=ocr_mode,
+                    paddle_contract_sha256=paddle_contract_sha256,
+                )
+                wall_clock = output.parent / "wall-clock.json"
+                _write_json(
+                    wall_clock,
+                    {
+                        "schema_version": 1,
+                        "kind": compare.WALL_CLOCK_KIND,
+                        "run_id": f"{phase}-{iteration:02d}-{variant}",
+                        "phase": phase,
+                        "variant": variant,
+                        "iteration": iteration,
+                        "expected_count": len(expected_sources),
+                        "exit_code": 0,
+                        "started_utc": "2026-08-07T00:00:00+00:00",
+                        "finished_utc": "2026-08-07T00:00:01+00:00",
+                        "elapsed_seconds": seconds + 0.1,
+                    },
                 )
                 runs.append(
                     {
@@ -213,10 +331,11 @@ def _fixture_plan(tmp_path: Path) -> Path:
                         ),
                         "output_directory": str(output),
                         "console_log": str(output.parent / "console.log"),
+                        "wall_clock_evidence": str(wall_clock),
                     }
                 )
     plan = {
-        "schema_version": 1,
+        "schema_version": 2,
         "kind": compare.PLAN_KIND,
         "created_utc": "2026-08-07T00:00:00+00:00",
         "output_root": str(tmp_path),
@@ -227,6 +346,7 @@ def _fixture_plan(tmp_path: Path) -> Path:
             "input_limit_requested": 0,
             "available_count": len(sources),
             "selected_count": len(sources),
+            "expected_input_count": None,
         },
         "fixed_input_list": _evidence(fixed_list),
         "input_evidence": _evidence(input_evidence),
@@ -236,7 +356,8 @@ def _fixture_plan(tmp_path: Path) -> Path:
         "cli_contract": {
             "device": "cpu",
             "unified_provider": "cpu",
-            "ocr": "unified",
+            "paddle_ocr_provider": "cpu" if ocr_mode == "hybrid-recipient" else None,
+            "ocr": ocr_mode,
             "score_threshold": 0.5,
             "rectification": "max-side-1600",
             "annotate": "none",
@@ -244,6 +365,7 @@ def _fixture_plan(tmp_path: Path) -> Path:
             "continue_on_error": False,
             "skip_existing": False,
             "includes_device_model": True,
+            "includes_paddle_ocr_bundle": ocr_mode == "hybrid-recipient",
             "detector_intra_op_threads": {
                 "baseline": None,
                 "candidate": 16,
@@ -291,6 +413,242 @@ def test_cpu_ab_accepts_exact_predictions_and_reports_pooled_performance(tmp_pat
     )
 
 
+def test_cpu_ab_analyzer_keeps_legacy_unified_v1_evidence_readable(
+    tmp_path: Path,
+) -> None:
+    plan_path = _fixture_plan(tmp_path)
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    plan["schema_version"] = 1
+    plan["kind"] = compare.LEGACY_PLAN_KIND
+    del plan["cli_contract"]["paddle_ocr_provider"]
+    del plan["cli_contract"]["includes_paddle_ocr_bundle"]
+    for run in plan["runs"]:
+        del run["wall_clock_evidence"]
+    _write_json(plan_path, plan)
+
+    report, differences = compare.analyze_plan(plan_path)
+
+    assert report["accepted"] is True
+    assert differences == []
+    assert (
+        report["performance"]["baseline"]["throughput_images_per_second"][
+            "measurement"
+        ]
+        == "legacy_inference_summary_total_seconds"
+    )
+
+
+def test_cpu_ab_v2_accepts_exact_hybrid_outputs_and_reports_routes_and_wall_time(
+    tmp_path: Path,
+) -> None:
+    plan_path = _fixture_plan(tmp_path, ocr_mode="hybrid-recipient")
+
+    report, differences = compare.analyze_plan(plan_path)
+
+    assert report["accepted"] is True
+    assert differences == []
+    assert report["cli_contract"]["ocr"] == "hybrid-recipient"
+    assert report["cli_contract"]["paddle_ocr_provider"] == "cpu"
+    assert report["fixed_paddle_ocr_bundle"]["payload_file_count"] == 5
+    assert report["route_consistency"]["accepted"] is True
+    measured_routes = report["route_consistency"]["by_run"][
+        "measured-01-baseline"
+    ]
+    assert measured_routes["hybrid_ocr_route"] == {"primary": 2}
+    assert measured_routes["hybrid_ocr_third_route"] == {"right_value": 2}
+    assert (
+        report["performance"]["baseline"]["stage_latency_ms"]["paddle_ocr"][
+            "count"
+        ]
+        == 6
+    )
+    assert (
+        report["performance"]["baseline"]["outer_wall_seconds_per_run"]["count"]
+        == 3
+    )
+    assert (
+        report["performance"]["baseline"]["throughput_images_per_second"][
+            "measurement"
+        ]
+        == "external_process_wall_clock"
+    )
+
+
+def test_cpu_ab_v2_hybrid_comparison_is_type_sensitive_for_recipient_diagnostics(
+    tmp_path: Path,
+) -> None:
+    plan_path = _fixture_plan(tmp_path, ocr_mode="hybrid-recipient")
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    run = next(
+        row
+        for row in plan["runs"]
+        if row["phase"] == "measured"
+        and row["variant"] == "candidate"
+        and row["iteration"] == 2
+    )
+    manifest = json.loads(
+        (Path(run["output_directory"]) / "inference_manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    result_path = Path(manifest[0]["result"])
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    result["fields"]["recipient"]["hybrid_ocr_first_line_count"] = 1.0
+    _write_json(result_path, result)
+
+    report, differences = compare.analyze_plan(plan_path)
+
+    assert report["accepted"] is False
+    difference = next(
+        row
+        for row in differences
+        if row["json_pointer"]
+        == "/fields/recipient/hybrid_ocr_first_line_count"
+    )
+    assert difference["reason"] == "type"
+    assert difference["reference"] == "int"
+    assert difference["compared"] == "float"
+
+
+def test_cpu_ab_v2_hybrid_rejects_changed_route_counts(tmp_path: Path) -> None:
+    plan_path = _fixture_plan(tmp_path, ocr_mode="hybrid-recipient")
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    run = next(
+        row
+        for row in plan["runs"]
+        if row["phase"] == "measured"
+        and row["variant"] == "candidate"
+        and row["iteration"] == 3
+    )
+    manifest = json.loads(
+        (Path(run["output_directory"]) / "inference_manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    result_path = Path(manifest[0]["result"])
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    result["fields"]["recipient"]["hybrid_ocr_route"] = "none"
+    _write_json(result_path, result)
+
+    report, differences = compare.analyze_plan(plan_path)
+
+    assert any(
+        row["json_pointer"] == "/fields/recipient/hybrid_ocr_route"
+        for row in differences
+    )
+    assert report["route_consistency"]["accepted"] is False
+    assert report["prediction_consistency"]["accepted"] is False
+
+
+def test_cpu_ab_v2_hybrid_rejects_non_cpu_paddle_provider(tmp_path: Path) -> None:
+    plan_path = _fixture_plan(tmp_path, ocr_mode="hybrid-recipient")
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    run = next(row for row in plan["runs"] if row["variant"] == "candidate")
+    summary_path = Path(run["output_directory"]) / "inference_summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["paddle_ocr_provider"] = "cuda"
+    _write_json(summary_path, summary)
+
+    with pytest.raises(compare.ValidationError, match="provider evidence"):
+        compare.analyze_plan(plan_path)
+
+
+def test_cpu_ab_v2_hybrid_rejects_missing_paddle_stage(tmp_path: Path) -> None:
+    plan_path = _fixture_plan(tmp_path, ocr_mode="hybrid-recipient")
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    run = next(row for row in plan["runs"] if row["variant"] == "baseline")
+    manifest_path = Path(run["output_directory"]) / "inference_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    del manifest[0]["stage_latency_ms"]["paddle_ocr"]
+    _write_json(manifest_path, manifest)
+
+    with pytest.raises(compare.ValidationError, match="paddle OCR latency"):
+        compare.analyze_plan(plan_path)
+
+
+def test_cpu_ab_v2_rejects_changed_frozen_paddle_bundle(tmp_path: Path) -> None:
+    plan_path = _fixture_plan(tmp_path, ocr_mode="hybrid-recipient")
+    (tmp_path / "paddle-bundle" / "models" / "rec.onnx").write_bytes(
+        b"changed-recognizer"
+    )
+
+    with pytest.raises(compare.ValidationError, match="bundle payload changed"):
+        compare.analyze_plan(plan_path)
+
+
+def test_cpu_ab_v2_rejects_invalid_outer_wall_evidence(tmp_path: Path) -> None:
+    plan_path = _fixture_plan(tmp_path)
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    wall_path = Path(plan["runs"][0]["wall_clock_evidence"])
+    wall = json.loads(wall_path.read_text(encoding="utf-8"))
+    wall["elapsed_seconds"] = 0
+    _write_json(wall_path, wall)
+
+    with pytest.raises(compare.ValidationError, match="positive finite"):
+        compare.analyze_plan(plan_path)
+
+
+def test_cpu_ab_v2_rejects_outer_wall_shorter_than_cli_total(tmp_path: Path) -> None:
+    plan_path = _fixture_plan(tmp_path)
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    wall_path = Path(plan["runs"][0]["wall_clock_evidence"])
+    wall = json.loads(wall_path.read_text(encoding="utf-8"))
+    wall["elapsed_seconds"] = 0.5
+    _write_json(wall_path, wall)
+
+    with pytest.raises(compare.ValidationError, match="shorter than CLI total_seconds"):
+        compare.analyze_plan(plan_path)
+
+
+def test_cpu_ab_v2_unified_requires_explicit_null_paddle_provider(
+    tmp_path: Path,
+) -> None:
+    plan_path = _fixture_plan(tmp_path)
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    summary_path = Path(plan["runs"][0]["output_directory"]) / "inference_summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    del summary["paddle_ocr_provider"]
+    _write_json(summary_path, summary)
+
+    with pytest.raises(compare.ValidationError, match="provider evidence"):
+        compare.analyze_plan(plan_path)
+
+
+def test_cpu_ab_v2_unified_rejects_unexpected_paddle_result_identity(
+    tmp_path: Path,
+) -> None:
+    plan_path = _fixture_plan(tmp_path)
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    manifest = json.loads(
+        (
+            Path(plan["runs"][0]["output_directory"])
+            / "inference_manifest.json"
+        ).read_text(encoding="utf-8")
+    )
+    result_path = Path(manifest[0]["result"])
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    result["model_contracts"]["ocr_bundle"] = compare.PADDLE_BUNDLE_CONTRACT
+    result["model_contracts"][compare.PADDLE_RESULT_HASH_FIELD] = "a" * 64
+    _write_json(result_path, result)
+
+    with pytest.raises(compare.ValidationError, match="unexpectedly binds"):
+        compare.analyze_plan(plan_path)
+
+
+def test_cpu_ab_rejects_non_alternating_execution_order(tmp_path: Path) -> None:
+    plan_path = _fixture_plan(tmp_path)
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    first, second = plan["runs"][0], plan["runs"][1]
+    first["execution_order"], second["execution_order"] = (
+        second["execution_order"],
+        first["execution_order"],
+    )
+    _write_json(plan_path, plan)
+
+    with pytest.raises(compare.ValidationError, match="alternating AB/BA"):
+        compare.analyze_plan(plan_path)
+
+
 def test_cpu_ab_rejects_any_candidate_business_output_difference(tmp_path: Path) -> None:
     plan_path = _fixture_plan(tmp_path)
     plan = json.loads(plan_path.read_text(encoding="utf-8"))
@@ -333,6 +691,10 @@ def test_cpu_ab_rejects_an_exact_but_slower_candidate(tmp_path: Path) -> None:
             [float(record["inference_ms"]) for record in manifest]
         )
         _write_json(summary_path, summary)
+        wall_path = Path(run["wall_clock_evidence"])
+        wall = json.loads(wall_path.read_text(encoding="utf-8"))
+        wall["elapsed_seconds"] = 1.3
+        _write_json(wall_path, wall)
 
     report, differences = compare.analyze_plan(plan_path)
 
@@ -535,6 +897,16 @@ def test_input_limit_is_verified_as_first_n_of_the_canonical_list(tmp_path: Path
     assert selection["input_limit_requested"] == 1
 
 
+def test_cpu_ab_v2_binds_the_declared_formal_input_count(tmp_path: Path) -> None:
+    plan_path = _fixture_plan(tmp_path)
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    plan["input_selection"]["expected_input_count"] = 10016
+    _write_json(plan_path, plan)
+
+    with pytest.raises(compare.ValidationError, match="expected_input_count"):
+        compare.analyze_plan(plan_path)
+
+
 def test_cpu_ab_powershell_wrapper_parses_when_powershell_is_available() -> None:
     executable = shutil.which("pwsh") or shutil.which("powershell")
     if executable is None:
@@ -582,3 +954,32 @@ def test_cpu_ab_powershell_applies_detector_threads_only_to_candidate() -> None:
     assert '"--detector-intra-op-threads"' in script
     assert "baseline = $null" in script
     assert "candidate = if ($CandidateDetectorIntraOpThreads -gt 0)" in script
+
+
+def test_cpu_ab_powershell_v2_freezes_and_runs_the_complete_hybrid_cpu_route() -> None:
+    script = (
+        Path(__file__).resolve().parents[1]
+        / "scripts"
+        / "receipt-mlnet-cpu-ab-validate.ps1"
+    ).read_text(encoding="utf-8")
+
+    assert '[ValidateSet("unified", "hybrid-recipient")]' in script
+    assert '[string]$OcrMode = "unified"' in script
+    assert "[string]$PaddleOcrBundle" in script
+    assert "[int]$ExpectedInputCount = 0" in script
+    assert "$inputs.Count -ne $ExpectedInputCount" in script
+    assert "expected_input_count = if ($ExpectedInputCount -gt 0)" in script
+    assert '"--ocr", $SelectedOcrMode' in script
+    assert '"--ocr-bundle", $PaddleBundle' in script
+    assert '"--device-model", $Device' in script
+    assert '"--device", "cpu"' in script
+    assert '"--rectification", "max-side-1600"' in script
+    assert '"--annotate", "none"' in script
+    assert '"--require-complete"' in script
+    assert 'paddle_ocr_provider = if ($OcrMode -eq "hybrid-recipient")' in script
+    assert 'kind = "receipt_mlnet_cpu_ab_plan_v2"' in script
+    assert "Freeze-DirectoryPayload" in script
+    assert '"paddle-ocr-bundle-payload.json"' in script
+    assert 'kind = "receipt_mlnet_cpu_ab_wall_clock_v1"' in script
+    assert "[Diagnostics.Stopwatch]::StartNew()" in script
+    assert 'wall_clock_evidence = Join-Path $runContainer "wall-clock.json"' in script
