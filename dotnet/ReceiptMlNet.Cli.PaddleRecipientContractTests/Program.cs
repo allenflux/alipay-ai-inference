@@ -655,6 +655,181 @@ internal static class Program
                     0.99f),
                 "discount arithmetic route cannot use 45-percent overlap exception");
 
+            AssertAlternative(
+                "\u53f8\u6e90(**\u6e90)",
+                "independent_crop_exact_consensus",
+                null,
+                ParseConsensus(
+                    ["  \u53f8\u6e90(**\u6e90)  ", "\u4ed8\u6b3e\u65b9\u5f0f"],
+                    [0.80f, 0.99f],
+                    ["\u53f8\u6e90(**\u6e90)"],
+                    [0.91f],
+                    null,
+                    null),
+                "independent-crop exact consensus at inclusive line floor",
+                0.80f);
+            AssertAlternative(
+                "Merchant-123",
+                "independent_crop_exact_consensus",
+                null,
+                ParseConsensus(
+                    ["Merchant-123"],
+                    [0.93f],
+                    ["different"],
+                    [0.99f],
+                    ["Merchant-123"],
+                    [0.88f]),
+                "first and right-value crops can form exact consensus",
+                0.88f);
+            AssertAlternativeNull(
+                ParseConsensus(
+                    ["\u53f8\u6e90(**\u6e90)"],
+                    [0.799f],
+                    ["\u53f8\u6e90(**\u6e90)"],
+                    [0.99f],
+                    null,
+                    null),
+                "consensus participating line below 0.80");
+            AssertAlternativeNull(
+                ParseConsensus(
+                    ["\u53f8\u6e90(**\u6e90)"],
+                    [0.99f],
+                    ["\u53f8\u6e90(**\u6e90)"],
+                    [0.99f],
+                    null,
+                    null,
+                    detectorScore: 0.679f),
+                "consensus recipient detector below 0.68");
+            AssertAlternativeNull(
+                ParseConsensus(
+                    ["\u53f8\u6e90(**\u6e90)"],
+                    [0.99f],
+                    ["\u53f8\u6e90(**\u6e90)"],
+                    [0.99f],
+                    null,
+                    null,
+                    detectorScore: float.NaN),
+                "consensus non-finite recipient detector");
+            AssertAlternativeNull(
+                ParseConsensus(
+                    ["\u53f8\u6e90(**\u6e90)"],
+                    [0.99f],
+                    ["\u53f8\u6e90(**\u6e90)"],
+                    [0.99f],
+                    null,
+                    null,
+                    detectorScore: 1.001f),
+                "consensus recipient detector above one");
+            AssertAlternativeNull(
+                ParseConsensus(
+                    ["\u53f8\u6e90(**\u6e90)"],
+                    [1.001f],
+                    ["\u53f8\u6e90(**\u6e90)"],
+                    [0.99f],
+                    null,
+                    null),
+                "consensus participating line above one");
+            AssertAlternativeNull(
+                ParseConsensus(
+                    ["\u53f8\u6e90(**\u6e90)"],
+                    [0.99f],
+                    ["\u53f8\u6e90(**\u6e90)"],
+                    [0.99f],
+                    null,
+                    null,
+                    ordinaryGeometryVerified: false),
+                "consensus ordinary 25-percent geometry must be verified");
+            AssertAlternativeNull(
+                ParseConsensus(
+                    ["\u53f8\u6e90(**\u6e90)"],
+                    [0.99f],
+                    ["\u53f8\u6e90(**\u6e90)"],
+                    [0.99f],
+                    null,
+                    null,
+                    alternativeEnvelopeVerified: false),
+                "consensus alternative envelope must be verified");
+            AssertAlternativeNull(
+                ParseConsensus(
+                    ["\u53f8\u6e90(**\u6e90)", "\u5c0f\u738b(**\u6d77)"],
+                    [0.99f, 0.99f],
+                    ["\u53f8\u6e90(**\u6e90)", "\u5c0f\u738b(**\u6d77)"],
+                    [0.99f, 0.99f],
+                    null,
+                    null),
+                "multiple exact consensus candidates are ambiguous");
+            foreach (var forbiddenConsensusLine in new[]
+            {
+                "\u00a5200.00",
+                "$200.00",
+                "200.00\u5143",
+                "CNY 200.00",
+                "05:49",
+                "\u90ae\u50a8\u94f6\u884c\u50a8\u84c4\u5361(8885)",
+                "\u8f6c\u8d26\u6210\u529f",
+                "\u6d3b\u52a8\u5956\u52b1",
+                "shoukuanfang",
+                "shou kuan ting",
+                "shoukudnfang",
+                "Payment Method",
+                "Transfer Success",
+                "Recipient",
+                "Payee",
+                "Amount",
+                "Time",
+                "Status",
+                "Transfer Failed",
+                "Processing",
+                "Bank Card",
+                "\u53f8\u6e90\ud83d\ude42",
+            })
+            {
+                AssertAlternativeNull(
+                    ParseConsensus(
+                        [forbiddenConsensusLine],
+                        [0.99f],
+                        [forbiddenConsensusLine],
+                        [0.99f],
+                        null,
+                        null),
+                    $"forbidden consensus line '{forbiddenConsensusLine}'");
+            }
+            AssertAlternative(
+                "jia",
+                "independent_crop_exact_consensus",
+                null,
+                ParseConsensus(
+                    ["jia"],
+                    [0.91f],
+                    ["jia"],
+                    [0.90f],
+                    null,
+                    null),
+                "short opaque ASCII payee is not rejected as a pinyin label",
+                0.90f);
+            AssertAlternative(
+                "Success Store",
+                "independent_crop_exact_consensus",
+                null,
+                ParseConsensus(
+                    ["Success Store"],
+                    [0.91f],
+                    ["Success Store"],
+                    [0.90f],
+                    null,
+                    null),
+                "ASCII UI keys are exact whole-line matches, not substrings",
+                0.90f);
+            AssertAlternativeNull(
+                ParseConsensus(
+                    ["\u53f8\u6e90(**\u6e90)", "\u53f8\u6e90(**\u6e90)"],
+                    [0.99f, 0.99f],
+                    null,
+                    null,
+                    null,
+                    null),
+                "duplicate lines within one crop are not independent evidence");
+
             var amountBox = new[] { 200.0f, 300.0f, 550.0f, 420.0f };
             var recipientBox = new[] { 20.0f, 460.0f, 730.0f, 520.0f };
             var paymentBox = new[] { 180.0f, 550.0f, 720.0f, 610.0f };
@@ -905,6 +1080,29 @@ internal static class Program
             lineConfidences ?? [0.99f, 0.99f, 0.99f, 0.99f],
             expectedAmount,
             detectorScore);
+    }
+
+    private static PaddleRecipientAlternativeParseResult? ParseConsensus(
+        IReadOnlyList<string>? firstLines,
+        IReadOnlyList<float>? firstConfidences,
+        IReadOnlyList<string>? retryLines,
+        IReadOnlyList<float>? retryConfidences,
+        IReadOnlyList<string>? rightValueLines,
+        IReadOnlyList<float>? rightValueConfidences,
+        float detectorScore = 0.95f,
+        bool ordinaryGeometryVerified = true,
+        bool alternativeEnvelopeVerified = true)
+    {
+        return PaddleRecipientValueParser.ParseIndependentCropExactConsensus(
+            firstLines,
+            firstConfidences,
+            retryLines,
+            retryConfidences,
+            rightValueLines,
+            rightValueConfidences,
+            detectorScore,
+            ordinaryGeometryVerified,
+            alternativeEnvelopeVerified);
     }
 
     private static void AssertAlternative(

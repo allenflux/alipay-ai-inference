@@ -18,9 +18,10 @@ internal static class PaddleRecipientHybrid
     /// An absent or ambiguous row removes the recipient candidate.  A failed
     /// standard crop gets one deterministic left-context retry through the
     /// same full PP-OCR pipeline and fail-closed parsers.  If both reads fail,
-    /// a narrower right-value crop may recover only the two independently
-    /// calibrated full/right agreement layouts; otherwise it remains
-    /// diagnostic evidence and cannot create a candidate.
+    /// a narrower right-value crop first tries the independently calibrated
+    /// layout routes.  Only after every existing route fails, the same three
+    /// reads may recover one value under the strict independent-crop exact
+    /// consensus contract; no additional OCR call is made.
     /// </summary>
     public static UnifiedOcrReadResult OverrideRecipient(
         Image<Rgb24> source,
@@ -223,6 +224,30 @@ internal static class PaddleRecipientHybrid
                         candidateConfidenceOverride = rightAgreementAlternative.CandidateConfidence;
                     }
                 }
+            }
+        }
+
+        // This is deliberately last: no existing anchored or calibrated route
+        // is weakened.  It reuses the three OCR reads already collected above
+        // and accepts only the strict analysis-probe consensus contract.
+        if (value is null)
+        {
+            var consensusAlternative =
+                PaddleRecipientValueParser.ParseIndependentCropExactConsensus(
+                    firstRead.Lines.Select(line => line.Text).ToArray(),
+                    firstRead.Lines.Select(line => line.Confidence).ToArray(),
+                    retryReadEvidence?.Lines.Select(line => line.Text).ToArray(),
+                    retryReadEvidence?.Lines.Select(line => line.Confidence).ToArray(),
+                    rightValueReadEvidence?.Lines.Select(line => line.Text).ToArray(),
+                    rightValueReadEvidence?.Lines.Select(line => line.Confidence).ToArray(),
+                    detection.Score,
+                    ordinaryGeometryVerified: verifiedDefaultAlternativeEnvelope,
+                    alternativeEnvelopeVerified: verifiedAlternativeEnvelope);
+            if (consensusAlternative is not null)
+            {
+                value = consensusAlternative.Value;
+                route = consensusAlternative.Route;
+                candidateConfidenceOverride = consensusAlternative.CandidateConfidence;
             }
         }
 

@@ -238,6 +238,12 @@ def test_atomic_probe_separates_raw_consensus_strict_shadow_and_external_truth(
     assert summary["paddle_teacher_consensus"]["interpretation"] == (
         "self_consistency_coverage_not_human_accuracy"
     )
+    assert summary["paddle_teacher_consensus"]["contract"][
+        "recipient_label_pinyin_keys"
+    ] == ["shoukuanfang", "shoukuanting", "shoukudnfang"]
+    assert summary["paddle_teacher_consensus"]["contract"][
+        "ascii_ui_line_keys"
+    ] == sorted(MODULE.ASCII_UI_LINE_KEYS)
     assert summary["first_alternative_route_by_geometry"] == [
         {"name": "alternative_route=none|geometry=not_evaluated", "records": 203},
         {"name": "alternative_route=unreported|geometry=unreported", "records": 1},
@@ -248,6 +254,15 @@ def test_atomic_probe_separates_raw_consensus_strict_shadow_and_external_truth(
     ]
     assert summary["groups"]["geometry"]
     assert all(len(group["examples"]) <= 3 for group in summary["groups"]["geometry"])
+    remaining = summary["remaining_failure_analysis"]
+    assert remaining["records"] == 6
+    assert remaining["strict_candidate_records"] == 198
+    assert remaining["unreported_failure_reason_records"] == 1
+    assert all(
+        len(group["examples"]) <= 3
+        for groups in remaining["groups"].values()
+        for group in groups
+    )
 
     first = findings[0]
     assert first["attempts"]["first"]["lines"][0]["text"] == "商户甲"
@@ -256,14 +271,22 @@ def test_atomic_probe_separates_raw_consensus_strict_shadow_and_external_truth(
     assert first["reference_exact_positions"] == ["first:0", "retry:0", "right_value:0"]
     assert first["strict_runtime_shadow"]["candidate"] == "商户甲"
     assert first["strict_runtime_shadow"]["truth_outcome"] == "exact"
+    assert first["remaining_failure_cluster"] is None
     assert "truth_outcome" not in first["shadow_candidate_truth_free"]
     assert "truth_outcome" not in first["paddle_teacher_consensus"]
     assert first["formal_delivery_gate"] is False
     assert first["runtime_truth_lookup"] is False
     assert findings[2]["raw_consensus"]["state"] == "one"
     assert findings[2]["strict_runtime_shadow"]["state"] == "unresolved"
+    assert findings[2]["remaining_failure_cluster"]["unresolved_primary_blocker"] == (
+        "raw_consensus_filtered:insufficient_high_confidence_crop_agreement"
+    )
     assert findings[3]["strict_runtime_shadow"]["state"] == "rejected_by_global_gate"
+    assert findings[3]["remaining_failure_cluster"][
+        "global_gate_failures_combination"
+    ] == "ordinary_25pct_geometry_not_verified"
     assert findings[4]["strict_runtime_shadow"]["state"] == "ambiguous"
+    assert findings[4]["remaining_failure_cluster"]["ambiguous_candidate_count"] == 2
     assert findings[5]["strict_runtime_shadow"]["global_gate_failures"] == [
         "alternative_envelope_not_verified"
     ]
@@ -279,6 +302,9 @@ def test_atomic_probe_separates_raw_consensus_strict_shadow_and_external_truth(
         "ordinary_25pct_geometry_not_verified",
         "alternative_envelope_not_verified",
     ]
+    assert findings[7]["remaining_failure_cluster"]["unresolved_primary_blocker"] == (
+        "failure_evidence_unreported"
+    )
     assert all(path.read_bytes() == contents for path, contents in before.items())
     assert not list(tmp_path.glob(".truth-probe.*.tmp"))
 
@@ -386,16 +412,214 @@ def test_real_shape_all_external_references_missing_and_one_route_unreported(
         "candidate": 203,
         "unresolved": 1,
     }
+    remaining = summary["remaining_failure_analysis"]
+    assert remaining["records"] == 1
+    assert remaining["strict_candidate_records"] == 203
+    assert remaining["unreported_failure_reason_records"] == 1
+
+
+def test_real_204_shape_clusters_136_remaining_after_pinyin_label_filter(
+    tmp_path: Path,
+) -> None:
+    replacements: dict[int, dict[str, object]] = {}
+
+    # Seven real-shape raw consensus rows are the pinyin recipient-row label,
+    # not a payee. Five share the canonical spelling; the other two are the
+    # exact OCR confusions observed in the frozen formal evidence.
+    for index, label in enumerate(
+        ["shoukuanfang"] * 5 + ["shou kuan ting", "shoukudnfang"]
+    ):
+        replacements[index] = _finding(
+            index,
+            first=[(0.96, label)],
+            retry=[(0.95, label)],
+        )
+
+    # The other 24 raw-unique rows remain strict candidates. Add
+    # 44 raw-multiple rows whose amount line is removed by the strict contract,
+    # leaving exactly one eligible merchant candidate.
+    for index in range(31, 75):
+        replacements[index] = _finding(
+            index,
+            first=[(0.96, f"商户{index}"), (0.99, "¥1,234.00")],
+            retry=[(0.95, f"商户{index}"), (0.98, "¥1,234.00")],
+        )
+
+    # Twenty records retain two independently repeated, strictly eligible
+    # strings and therefore remain ambiguous.
+    for index in range(75, 95):
+        replacements[index] = _finding(
+            index,
+            first=[(0.96, f"商户甲{index}"), (0.95, f"商户乙{index}")],
+            retry=[(0.94, f"商户甲{index}"), (0.93, f"商户乙{index}")],
+        )
+
+    # Thirty-two records have one strict candidate but fail the frozen global
+    # envelope gate.  The extra raw amount candidate proves raw-vs-strict
+    # grouping without changing candidate derivation.
+    for index in range(95, 127):
+        replacements[index] = _finding(
+            index,
+            first=[(0.96, f"商户{index}"), (0.99, "¥1,234.00")],
+            retry=[(0.95, f"商户{index}"), (0.98, "¥1,234.00")],
+            envelope=False,
+        )
+
+    # Seventy-six records have multiple raw consensus strings, but every one
+    # is rejected by an explicit strict line contract.
+    for index in range(127, 203):
+        replacements[index] = _finding(
+            index,
+            first=[(0.99, "¥1,234.00"), (0.98, "付款方式")],
+            retry=[(0.97, "¥1,234.00"), (0.96, "付款方式")],
+        )
+
+    unreported = _finding(203)
+    unreported.update(
+        {
+            "ppocr_route": None,
+            "ppocr_failure_reason": None,
+            "third_route": None,
+            "first_raw": None,
+            "first_line_count": None,
+            "retry_raw": None,
+            "retry_line_count": None,
+            "right_value_raw": None,
+            "right_value_line_count": None,
+            "right_value_line_confidences": None,
+            "recipient_score": None,
+            "geometry_reasons": ["recipient_score_missing", "recipient_box_invalid"],
+        }
+    )
+    replacements[203] = unreported
+
+    source = _write_input(tmp_path / "diagnostic", replacements=replacements)
+    findings, evidence = MODULE._load_input(source)
+    summary = MODULE.summarize(findings, evidence=evidence)
+
+    assert summary["paddle_teacher_consensus"]["records"] == 68
+    assert summary["paddle_teacher_consensus"]["by_state"] == [
+        {"name": "ambiguous", "records": 20},
+        {"name": "candidate", "records": 68},
+        {"name": "rejected_by_global_gate", "records": 32},
+        {"name": "unresolved", "records": 84},
+    ]
+    assert summary["raw_consensus"]["by_state"] == [
+        {"name": "multiple", "records": 172},
+        {"name": "none", "records": 1},
+        {"name": "one", "records": 31},
+    ]
+
+    remaining = summary["remaining_failure_analysis"]
+    assert remaining["records"] == 136
+    assert remaining["strict_candidate_records"] == 68
+    assert remaining["unreported_failure_reason_records"] == 1
+    assert remaining["by_failure_reason_type_all_records"] == [
+        {"name": "anchored_or_alternative_parse_failed", "records": 203},
+        {"name": "unreported", "records": 1},
+    ]
+
+    groups = remaining["groups"]
+    assert {
+        group["name"]: group["records"]
+        for group in groups["eligible_candidate_count"]
+    } == {"0": 84, "1": 32, "2": 20}
+    assert groups["ambiguous_candidate_count"][0]["name"] == "2"
+    assert groups["ambiguous_candidate_count"][0]["records"] == 20
+    blocker_counts = {
+        group["name"]: group["records"]
+        for group in groups["unresolved_primary_blocker"]
+    }
+    assert blocker_counts == {
+        "failure_evidence_unreported": 1,
+        "raw_consensus_filtered:line_contract:negative_token": 7,
+        "raw_consensus_filtered:line_contract:amount+line_contract:negative_token": 76,
+    }
+    assert all(
+        len(group["examples"]) <= 3
+        for grouped_rows in groups.values()
+        for group in grouped_rows
+    )
+
+    assert findings[0]["remaining_failure_cluster"][
+        "unresolved_primary_blocker"
+    ] == "raw_consensus_filtered:line_contract:negative_token"
+    assert findings[7]["remaining_failure_cluster"] is None
+    assert findings[75]["remaining_failure_cluster"]["ambiguous_candidate_count"] == 2
+    assert findings[95]["remaining_failure_cluster"][
+        "global_gate_failures_combination"
+    ] == "alternative_envelope_not_verified"
+    assert findings[127]["remaining_failure_cluster"]["raw_vs_strict"] == (
+        "raw=multiple|strict=unresolved|raw_candidates=2|eligible=0"
+    )
+    assert findings[203]["remaining_failure_cluster"][
+        "alternative_envelope_geometry_score"
+    ] == (
+        "envelope=unreported|"
+        "geometry=failed:recipient_box_invalid+recipient_score_missing|"
+        "score=unreported"
+    )
 
 
 @pytest.mark.parametrize(
     "value",
-    ["CNY 200.00", "200.00 RMB", "招商银行储蓄卡(8885)", "合计200元"],
+    [
+        "CNY 200.00",
+        "200.00 RMB",
+        "招商银行储蓄卡(8885)",
+        "合计200元",
+        "shoukuanfang",
+        "shou kuan ting",
+        "shoukudnfang",
+    ],
 )
 def test_strict_shadow_rejects_currency_and_payment_lines(value: str) -> None:
     allowed, reason = MODULE._shadow_line_allowed(value)
     assert allowed is False
     assert reason in {"amount", "negative_token"}
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "jia",
+        "you",
+        "V1SC",
+        "D2-SAM ROSS",
+        "Success Store",
+        "Payment Labs",
+        "TransferWise",
+    ],
+)
+def test_strict_shadow_preserves_opaque_ascii_payee_candidates(value: str) -> None:
+    assert MODULE._shadow_line_allowed(value) == (True, "accepted")
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "Payment Method",
+        "Transfer Success",
+        "Recipient",
+        "Payee",
+        "Amount",
+        "Time",
+        "Status",
+        "Transfer Failed",
+        "Processing",
+        "Bank Card",
+    ],
+)
+def test_strict_shadow_rejects_exact_ascii_ui_lines(value: str) -> None:
+    assert MODULE._shadow_line_allowed(value) == (False, "negative_token")
+
+
+def test_every_canonical_ascii_ui_key_is_rejected() -> None:
+    assert MODULE.ASCII_UI_LINE_KEYS
+    assert all(
+        MODULE._shadow_line_allowed(value) == (False, "negative_token")
+        for value in MODULE.ASCII_UI_LINE_KEYS
+    )
 
 
 def test_probe_rejects_nonformal_summary_and_output_inside_input(tmp_path: Path) -> None:

@@ -92,6 +92,62 @@ NEGATIVE_TOKENS = (
     "应付",
     "人民币",
 )
+# Exact keys observed for the pinyin recipient-row label in frozen formal
+# evidence. Do not broaden this into a generic ASCII-name filter.
+RECIPIENT_LABEL_PINYIN_KEYS = frozenset(
+    ("shoukuanfang", "shoukuanting", "shoukudnfang")
+)
+# Exact, whole-line normalized UI labels. Deliberately no substring matching
+# or edit distance: unrelated opaque ASCII payee names stay eligible.
+ASCII_UI_LINE_KEYS = frozenset(
+    (
+        "amount",
+        "amountdue",
+        "balance",
+        "bankcard",
+        "creditcard",
+        "debitcard",
+        "discount",
+        "failed",
+        "failure",
+        "order",
+        "orderid",
+        "ordernumber",
+        "payee",
+        "payment",
+        "paymentfailed",
+        "paymentfailure",
+        "paymentmethod",
+        "paymentprocessing",
+        "paymentstatus",
+        "paymentsuccess",
+        "paymentsuccessful",
+        "pending",
+        "processing",
+        "recipient",
+        "recipientaccount",
+        "recipientnumber",
+        "status",
+        "success",
+        "successful",
+        "time",
+        "transactionfailed",
+        "transactionfailure",
+        "transactionid",
+        "transactionnumber",
+        "transactionprocessing",
+        "transactionstatus",
+        "transactionsuccess",
+        "transactionsuccessful",
+        "transfer",
+        "transferfailed",
+        "transferfailure",
+        "transferprocessing",
+        "transferstatus",
+        "transfersuccess",
+        "transfersuccessful",
+    )
+)
 CURRENCY_CODE_PATTERN = re.compile(r"(?i)(?:^|[^a-z])(?:cny|rmb|usd|hkd|eur|gbp|jpy)(?:$|[^a-z])")
 ALLOWED_PUNCTUATION = frozenset("*＊()（）·•&＆_-—.．/")
 MINIMUM_STRICT_LINE_CONFIDENCE = 0.80
@@ -387,6 +443,8 @@ def _shadow_line_allowed(value: str) -> tuple[bool, str]:
     folded = visible.casefold()
     if any(token.casefold() in folded for token in NEGATIVE_TOKENS):
         return False, "negative_token"
+    if folded in RECIPIENT_LABEL_PINYIN_KEYS or folded in ASCII_UI_LINE_KEYS:
+        return False, "negative_token"
     if "¥" in visible or "￥" in visible or PURE_AMOUNT_PATTERN.fullmatch(value):
         return False, "amount"
     if CURRENCY_CODE_PATTERN.search(value):
@@ -554,6 +612,136 @@ def _crop_combo(crops: Iterable[str], *, empty: str = "none") -> str:
     return "+".join(selected) if selected else empty
 
 
+def _global_gate_failure_key(failures: Sequence[str]) -> str:
+    return "+".join(failures) if failures else "none"
+
+
+def _geometry_reason_key(reasons: Sequence[str]) -> str:
+    if not reasons:
+        return "verified"
+    return "failed:" + "+".join(sorted(set(reasons)))
+
+
+def _score_gate_key(score: float | None) -> str:
+    if score is None:
+        return "unreported"
+    if score < MINIMUM_RECIPIENT_DETECTOR_SCORE:
+        return "below_0.68"
+    return "verified_0.68_plus"
+
+
+def _raw_cardinality_key(state: str) -> str:
+    return "unique" if state == "one" else state
+
+
+def _raw_candidate_blockers(raw_consensus: Mapping[str, Any]) -> list[str]:
+    blockers: set[str] = set()
+    for candidate in raw_consensus["candidates"]:
+        value = str(candidate["candidate"])
+        allowed, reason = _shadow_line_allowed(value)
+        if not allowed:
+            blockers.add(f"line_contract:{reason}")
+            continue
+        confident_crops = sum(
+            float(confidence) >= MINIMUM_STRICT_LINE_CONFIDENCE
+            for confidence in candidate["crop_confidences"].values()
+        )
+        if confident_crops < 2:
+            blockers.add("insufficient_high_confidence_crop_agreement")
+            continue
+        # This is an executable consistency assertion rather than a fallback:
+        # a raw candidate satisfying both strict line gates must have appeared
+        # in strict_runtime_shadow.eligible_candidates.
+        blockers.add("unexpected_strict_eligibility_gap")
+    return sorted(blockers)
+
+
+def _unresolved_primary_blocker(
+    *,
+    failure_reason_type: str,
+    attempts: Mapping[str, Mapping[str, Any]],
+    raw_consensus: Mapping[str, Any],
+    strict_state: str,
+) -> str | None:
+    if strict_state != "unresolved":
+        return None
+    if failure_reason_type == "unreported":
+        return "failure_evidence_unreported"
+    if failure_reason_type == "ocr_empty":
+        return "ocr_empty"
+    if raw_consensus["state"] == "none":
+        nonempty_lines = sum(
+            bool(line["normalized_text"])
+            for attempt in attempts.values()
+            for line in attempt["lines"]
+        )
+        return (
+            "no_nonempty_ocr_line"
+            if nonempty_lines == 0
+            else "no_exact_cross_crop_line_consensus"
+        )
+    blockers = _raw_candidate_blockers(raw_consensus)
+    if "unexpected_strict_eligibility_gap" in blockers:
+        raise ProbeError(
+            "raw consensus passed strict line gates but strict shadow reported unresolved"
+        )
+    return "raw_consensus_filtered:" + "+".join(blockers)
+
+
+def _remaining_failure_cluster(
+    *,
+    failure_reason_type: str,
+    alternative_envelope: bool | None,
+    attempts: Mapping[str, Mapping[str, Any]],
+    geometry_reasons: Sequence[str],
+    recipient_score: float | None,
+    raw_consensus: Mapping[str, Any],
+    strict_shadow: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    strict_state = str(strict_shadow["state"])
+    if strict_state == "candidate":
+        return None
+    raw_candidates = raw_consensus["candidates"]
+    eligible_candidates = strict_shadow["eligible_candidates"]
+    raw_state = str(raw_consensus["state"])
+    global_gate_failures = list(strict_shadow["global_gate_failures"])
+    eligible_count = len(eligible_candidates)
+    ambiguous_count = eligible_count if strict_state == "ambiguous" else 0
+    envelope_key = (
+        "unreported"
+        if alternative_envelope is None
+        else str(alternative_envelope).lower()
+    )
+    geometry_key = _geometry_reason_key(geometry_reasons)
+    score_key = _score_gate_key(recipient_score)
+    unresolved_blocker = _unresolved_primary_blocker(
+        failure_reason_type=failure_reason_type,
+        attempts=attempts,
+        raw_consensus=raw_consensus,
+        strict_state=strict_state,
+    )
+    return {
+        "strict_state": strict_state,
+        "global_gate_failures": global_gate_failures,
+        "global_gate_failures_combination": _global_gate_failure_key(
+            global_gate_failures
+        ),
+        "eligible_candidate_count": eligible_count,
+        "ambiguous_candidate_count": ambiguous_count,
+        "unresolved_primary_blocker": unresolved_blocker,
+        "raw_consensus_state": raw_state,
+        "raw_candidate_count": len(raw_candidates),
+        "strict_filtered_candidate_count": len(raw_candidates) - eligible_count,
+        "raw_vs_strict": (
+            f"raw={_raw_cardinality_key(raw_state)}|strict={strict_state}|"
+            f"raw_candidates={len(raw_candidates)}|eligible={eligible_count}"
+        ),
+        "alternative_envelope_geometry_score": (
+            f"envelope={envelope_key}|geometry={geometry_key}|score={score_key}"
+        ),
+    }
+
+
 def _analyze_finding(payload: Mapping[str, Any], *, index: int) -> dict[str, Any]:
     if payload.get("schema_version") != 1 or payload.get("kind") != INPUT_FINDING_KIND:
         raise ProbeError(f"finding[{index}] has an unsupported schema/kind")
@@ -616,6 +804,15 @@ def _analyze_finding(payload: Mapping[str, Any], *, index: int) -> dict[str, Any
     truth_free_shadow = {
         key: value for key, value in shadow.items() if key != "truth_outcome"
     }
+    remaining_cluster = _remaining_failure_cluster(
+        failure_reason_type=reason_type,
+        alternative_envelope=envelope,
+        attempts=attempts,
+        geometry_reasons=geometry_reasons,
+        recipient_score=recipient_score,
+        raw_consensus=raw_consensus,
+        strict_shadow=truth_free_shadow,
+    )
     return {
         "schema_version": 1,
         "kind": OUTPUT_FINDING_KIND,
@@ -641,6 +838,7 @@ def _analyze_finding(payload: Mapping[str, Any], *, index: int) -> dict[str, Any
         "strict_runtime_shadow": shadow,
         "shadow_candidate_truth_free": truth_free_shadow,
         "paddle_teacher_consensus": dict(truth_free_shadow),
+        "remaining_failure_cluster": remaining_cluster,
         "group_keys": {
             "alternative_envelope": "unreported" if envelope is None else str(envelope).lower(),
             "geometry": _geometry_key(attempts),
@@ -760,6 +958,17 @@ def summarize(
         "line_count_tuple": defaultdict(list),
         "consensus_crop_combination": defaultdict(list),
     }
+    remaining_groups: dict[str, dict[str, list[str]]] = {
+        "global_gate_failures_combination": defaultdict(list),
+        "eligible_candidate_count": defaultdict(list),
+        "ambiguous_candidate_count": defaultdict(list),
+        "unresolved_primary_blocker": defaultdict(list),
+        "raw_vs_strict": defaultdict(list),
+        "alternative_envelope_geometry_score": defaultdict(list),
+    }
+    all_strict_states = Counter()
+    all_failure_reason_types = Counter()
+    remaining_records = 0
     external_reference_present = 0
     for finding in findings:
         source = str(finding["source"])
@@ -781,6 +990,8 @@ def summarize(
                 ]
             )
         shadow = finding["shadow_candidate_truth_free"]
+        all_strict_states.update([shadow["state"]])
+        all_failure_reason_types.update([finding["failure_reason_type"]])
         raw_consensus_state.update([finding["raw_consensus"]["state"]])
         shadow_truth.update([finding["strict_runtime_shadow"]["truth_outcome"]])
         shadow_state.update([shadow["state"]])
@@ -795,6 +1006,29 @@ def summarize(
         retry_alt_geometry.update([_group_key_attempt(finding["attempts"]["retry"])])
         for group_name, key in finding["group_keys"].items():
             groups[group_name][str(key)].append(source)
+        remaining_cluster = finding["remaining_failure_cluster"]
+        if remaining_cluster is not None:
+            remaining_records += 1
+            remaining_groups["global_gate_failures_combination"][
+                str(remaining_cluster["global_gate_failures_combination"])
+            ].append(source)
+            remaining_groups["eligible_candidate_count"][
+                str(remaining_cluster["eligible_candidate_count"])
+            ].append(source)
+            if remaining_cluster["strict_state"] == "ambiguous":
+                remaining_groups["ambiguous_candidate_count"][
+                    str(remaining_cluster["ambiguous_candidate_count"])
+                ].append(source)
+            if remaining_cluster["unresolved_primary_blocker"] is not None:
+                remaining_groups["unresolved_primary_blocker"][
+                    str(remaining_cluster["unresolved_primary_blocker"])
+                ].append(source)
+            remaining_groups["raw_vs_strict"][
+                str(remaining_cluster["raw_vs_strict"])
+            ].append(source)
+            remaining_groups["alternative_envelope_geometry_score"][
+                str(remaining_cluster["alternative_envelope_geometry_score"])
+            ].append(source)
     consensus_coverage = sum(
         finding["reference_exact_line_crop_consensus"]
         for finding in findings
@@ -866,6 +1100,10 @@ def summarize(
                 "requires_verified_alternative_envelope": True,
                 "requires_same_exact_line_in_independent_crops": 2,
                 "negative_tokens": list(NEGATIVE_TOKENS),
+                "recipient_label_pinyin_keys": sorted(
+                    RECIPIENT_LABEL_PINYIN_KEYS
+                ),
+                "ascii_ui_line_keys": sorted(ASCII_UI_LINE_KEYS),
                 "amount_time_and_character_filters": True,
                 "ambiguous_consensus_is_absent": True,
             },
@@ -878,6 +1116,22 @@ def summarize(
             "descriptive_only": True,
             "not_runtime_eligible_without_strict_gates": True,
             "by_state": _count_rows(raw_consensus_state),
+        },
+        "remaining_failure_analysis": {
+            "scope": "strict_runtime_shadow.state != candidate",
+            "records": remaining_records,
+            "strict_candidate_records": len(findings) - remaining_records,
+            "unreported_failure_reason_records": all_failure_reason_types[
+                "unreported"
+            ],
+            "by_strict_state_all_records": _count_rows(all_strict_states),
+            "by_failure_reason_type_all_records": _count_rows(
+                all_failure_reason_types
+            ),
+            "groups": {
+                name: _group_rows(values)
+                for name, values in remaining_groups.items()
+            },
         },
         "groups": {
             name: _group_rows(values) for name, values in groups.items()

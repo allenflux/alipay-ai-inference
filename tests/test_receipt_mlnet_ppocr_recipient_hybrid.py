@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 
@@ -280,6 +281,95 @@ def test_gap_recovery_routes_have_strict_executable_source_contracts() -> None:
         "extra line",
     ):
         assert boundary_token in executable_tests
+
+
+def test_final_independent_crop_consensus_exactly_mirrors_strict_probe_contract() -> None:
+    parser = _source("PaddleRecipientValueParser.cs")
+    router = _source("PaddleRecipientHybrid.cs")
+    executable_tests = (
+        ROOT
+        / "dotnet"
+        / "ReceiptMlNet.Cli.PaddleRecipientContractTests"
+        / "Program.cs"
+    ).read_text(encoding="utf-8")
+
+    existing_right_route = router.index("ParseTruncatedRecipientLabelEmptyMaskThreeCropAgreement")
+    consensus_call = router.index("ParseIndependentCropExactConsensus")
+    diagnostic_build = router.index("var diagnostic = new PaddleRecipientDiagnostic")
+    assert existing_right_route < consensus_call < diagnostic_build
+    assert router.count("paddleOcr.Recognize(") == 3
+    assert "firstRead.Lines.Select(line => line.Text)" in router
+    assert "retryReadEvidence?.Lines.Select(line => line.Text)" in router
+    assert "rightValueReadEvidence?.Lines.Select(line => line.Text)" in router
+    assert "detection.Score" in router[consensus_call:diagnostic_build]
+    assert "ordinaryGeometryVerified: verifiedDefaultAlternativeEnvelope" in router
+    assert "alternativeEnvelopeVerified: verifiedAlternativeEnvelope" in router
+    assert "candidateConfidenceOverride = consensusAlternative.CandidateConfidence" in router
+
+    assert '"independent_crop_exact_consensus"' in parser
+    consensus = parser.split("ParseIndependentCropExactConsensus", 1)[1].split(
+        "AllowsExactCjkPaymentOverlapException", 1
+    )[0]
+    assert "recipientDetectorScore < 0.68f" in consensus
+    assert "recipientDetectorScore > 1.0f" in consensus
+    assert "!ordinaryGeometryVerified" in consensus
+    assert "!alternativeEnvelopeVerified" in consensus
+    assert "confidence < 0.80f" in consensus
+    assert "confidence > 1.0f" in consensus
+    assert "item.Value.Count >= 2" in consensus
+    assert "eligible.Length != 1" in consensus
+    assert "ReceiptFieldNormalizer.CleanText" in consensus
+    assert "IsIndependentCropConsensusLineAllowed(text)" in consensus
+    assert "ConsensusPureAmountPattern" in parser
+    assert "ConsensusCurrencyCodePattern" in parser
+    assert "ConsensusTimePattern" in parser
+    assert "ConsensusNegativeTokens" in parser
+    assert (
+        '["shoukuanfang", "shoukuanting", "shoukudnfang"]'
+        in parser
+    )
+    probe = (
+        ROOT / "scripts" / "receipt-mlnet-hybrid-failure-truth-probe.py"
+    ).read_text(encoding="utf-8")
+    csharp_ascii_block = parser.split(
+        "private static readonly string[] ConsensusAsciiUiLineKeys =", 1
+    )[1].split("];", 1)[0]
+    probe_ascii_block = probe.split("ASCII_UI_LINE_KEYS = frozenset(", 1)[1].split(
+        "CURRENCY_CODE_PATTERN", 1
+    )[0]
+    assert set(re.findall(r'"([a-z]+)"', csharp_ascii_block)) == set(
+        re.findall(r'"([a-z]+)"', probe_ascii_block)
+    )
+    for exact_ui_case in (
+        "Payment Method",
+        "Transfer Success",
+        "Recipient",
+        "Payee",
+        "Amount",
+        "Time",
+        "Status",
+        "Transfer Failed",
+        "Processing",
+        "Bank Card",
+        "ASCII UI keys are exact whole-line matches, not substrings",
+    ):
+        assert exact_ui_case in executable_tests
+    assert "visibleRunes.Length is < 2 or > 48" in parser
+    assert "UnicodeCategory.OtherLetter" in parser
+    assert "UnicodeCategory.OtherNumber" in parser
+    assert "ConsensusAllowedPunctuation" in parser
+
+    for executable_case in (
+        "independent-crop exact consensus at inclusive line floor",
+        "consensus participating line below 0.80",
+        "consensus recipient detector below 0.68",
+        "consensus ordinary 25-percent geometry must be verified",
+        "consensus alternative envelope must be verified",
+        "multiple exact consensus candidates are ambiguous",
+        "forbidden consensus line",
+        "duplicate lines within one crop are not independent evidence",
+    ):
+        assert executable_case in executable_tests
 
 
 def test_failed_source_replay_emits_right_value_probe_evidence() -> None:

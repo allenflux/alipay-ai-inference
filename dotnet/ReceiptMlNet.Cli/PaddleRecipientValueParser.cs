@@ -1,3 +1,5 @@
+using System.Text;
+
 /// <summary>
 /// Strict extraction contract shared by the PP-OCR recipient route and its
 /// package-free .NET contract test.
@@ -20,6 +22,8 @@ internal static class PaddleRecipientValueParser
         "truncated_recipient_label_empty_mask_three_crop_agreement";
     internal const string UnlabelledCjkDiscountArithmeticExactRoute =
         "unlabelled_cjk_discount_arithmetic_exact";
+    internal const string IndependentCropExactConsensusRoute =
+        "independent_crop_exact_consensus";
 
     private static readonly string[] RecipientLabels =
         ["\u6536\u6b3e\u65b9", "\u6536\u6b3e\u4eba", "\u6536\u6b3e\u8d26\u6237", "\u6536\u6b3e\u8d26\u53f7"];
@@ -71,6 +75,114 @@ internal static class PaddleRecipientValueParser
     private static readonly System.Text.RegularExpressions.Regex DiscountFenPattern = new(
         @"^(?:0[1-9]|[1-9][0-9])$",
         System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+    private static readonly System.Text.RegularExpressions.Regex ConsensusPureAmountPattern = new(
+        @"^[\u00a5\uffe5$]?\s*(?:\d+|\d{1,3}(?:,\d{3})+)(?:\.\d{1,2})?\s*(?:\u5143)?$",
+        System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+    private static readonly System.Text.RegularExpressions.Regex ConsensusTimePattern = new(
+        @"(?<!\d)\d{1,2}[:\uff1a]\d{2}(?::\d{2})?(?!\d)",
+        System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+    private static readonly System.Text.RegularExpressions.Regex ConsensusCurrencyCodePattern = new(
+        @"(?:^|[^a-z])(?:cny|rmb|usd|hkd|eur|gbp|jpy)(?:$|[^a-z])",
+        System.Text.RegularExpressions.RegexOptions.IgnoreCase
+            | System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+    private const string ConsensusAllowedPunctuation = "*\uff0a()\uff08\uff09\u00b7\u2022&\uff06_-\u2014.\uff0e/";
+    private static readonly string[] ConsensusNegativeTokens =
+        [
+            "\u91d1\u989d",
+            "\u4ed8\u6b3e",
+            "\u6536\u6b3e",
+            "\u652f\u4ed8",
+            "\u8f6c\u8d26",
+            "\u8f6c\u5e10",
+            "\u6210\u529f",
+            "\u5931\u8d25",
+            "\u5904\u7406\u4e2d",
+            "\u5f85\u5904\u7406",
+            "\u65f6\u95f4",
+            "\u8ba2\u5355",
+            "\u6d3b\u52a8",
+            "\u4f18\u60e0",
+            "\u5956\u52b1",
+            "\u7ea2\u5305",
+            "\u79ef\u5206",
+            "\u5145\u503c",
+            "\u5546\u54c1",
+            "\u4ea4\u6613\u72b6\u6001",
+            "\u4ea4\u6613\u5355\u53f7",
+            "\u6d41\u6c34\u53f7",
+            "\u94f6\u884c",
+            "\u94f6\u884c\u5361",
+            "\u50a8\u84c4\u5361",
+            "\u4fe1\u7528\u5361",
+            "\u501f\u8bb0\u5361",
+            "\u94f6\u8054",
+            "\u652f\u4ed8\u5b9d",
+            "\u5fae\u4fe1",
+            "\u4f59\u989d",
+            "\u82b1\u5457",
+            "\u5c3e\u53f7",
+            "\u5408\u8ba1",
+            "\u603b\u8ba1",
+            "\u5b9e\u4ed8",
+            "\u5e94\u4ed8",
+            "\u4eba\u6c11\u5e01",
+        ];
+    // Frozen formal evidence exposed three OCR spellings of the pinyin row
+    // label itself. Keep this deliberately exact: short/opaque ASCII payee
+    // names remain eligible for independent-crop consensus.
+    private static readonly string[] ConsensusRecipientLabelPinyinKeys =
+        ["shoukuanfang", "shoukuanting", "shoukudnfang"];
+    // Exact, whole-line normalized UI labels only. This is intentionally not
+    // a substring or edit-distance filter, so opaque ASCII payee names remain
+    // eligible unless the complete cleaned line is one of these controls.
+    private static readonly string[] ConsensusAsciiUiLineKeys =
+        [
+            "amount",
+            "amountdue",
+            "balance",
+            "bankcard",
+            "creditcard",
+            "debitcard",
+            "discount",
+            "failed",
+            "failure",
+            "order",
+            "orderid",
+            "ordernumber",
+            "payee",
+            "payment",
+            "paymentfailed",
+            "paymentfailure",
+            "paymentmethod",
+            "paymentprocessing",
+            "paymentstatus",
+            "paymentsuccess",
+            "paymentsuccessful",
+            "pending",
+            "processing",
+            "recipient",
+            "recipientaccount",
+            "recipientnumber",
+            "status",
+            "success",
+            "successful",
+            "time",
+            "transactionfailed",
+            "transactionfailure",
+            "transactionid",
+            "transactionnumber",
+            "transactionprocessing",
+            "transactionstatus",
+            "transactionsuccess",
+            "transactionsuccessful",
+            "transfer",
+            "transferfailed",
+            "transferfailure",
+            "transferprocessing",
+            "transferstatus",
+            "transfersuccess",
+            "transfersuccessful",
+        ];
     private static readonly string[] StrongAnchorNonRecipientFragments =
         [
             "\u6536\u6b3e",
@@ -395,6 +507,100 @@ internal static class PaddleRecipientValueParser
     }
 
     /// <summary>
+    /// Final fail-closed recovery after every anchored and calibrated route
+    /// has failed.  It mirrors the frozen failure probe's strict runtime
+    /// shadow: exactly one cleaned, line-level value must occur in at least
+    /// two distinct deterministic crops, every participating occurrence must
+    /// meet the 0.80 line floor, and both the ordinary 25-percent geometry and
+    /// alternative envelope must already be verified.  The candidate is
+    /// derived only from OCR evidence; truth, source paths and file names are
+    /// not inputs.
+    /// </summary>
+    public static PaddleRecipientAlternativeParseResult? ParseIndependentCropExactConsensus(
+        IReadOnlyList<string>? firstRawLines,
+        IReadOnlyList<float>? firstRawLineConfidences,
+        IReadOnlyList<string>? retryRawLines,
+        IReadOnlyList<float>? retryRawLineConfidences,
+        IReadOnlyList<string>? rightValueRawLines,
+        IReadOnlyList<float>? rightValueRawLineConfidences,
+        float recipientDetectorScore,
+        bool ordinaryGeometryVerified,
+        bool alternativeEnvelopeVerified)
+    {
+        if (!float.IsFinite(recipientDetectorScore)
+            || recipientDetectorScore < 0.68f
+            || recipientDetectorScore > 1.0f
+            || !ordinaryGeometryVerified
+            || !alternativeEnvelopeVerified)
+        {
+            return null;
+        }
+
+        var crops = new[]
+        {
+            (Lines: firstRawLines, Confidences: firstRawLineConfidences),
+            (Lines: retryRawLines, Confidences: retryRawLineConfidences),
+            (Lines: rightValueRawLines, Confidences: rightValueRawLineConfidences),
+        };
+        var cropsByCandidate = new Dictionary<string, Dictionary<int, float>>(
+            StringComparer.Ordinal);
+        for (var cropIndex = 0; cropIndex < crops.Length; cropIndex++)
+        {
+            var (rawLines, rawConfidences) = crops[cropIndex];
+            if (rawLines is null && rawConfidences is null)
+            {
+                continue;
+            }
+            if (rawLines is null
+                || rawConfidences is null
+                || rawLines.Count != rawConfidences.Count)
+            {
+                return null;
+            }
+
+            var bestByText = new Dictionary<string, float>(StringComparer.Ordinal);
+            for (var lineIndex = 0; lineIndex < rawLines.Count; lineIndex++)
+            {
+                var confidence = rawConfidences[lineIndex];
+                var text = ReceiptFieldNormalizer.CleanText(rawLines[lineIndex]);
+                if (!float.IsFinite(confidence)
+                    || confidence < 0.80f
+                    || confidence > 1.0f
+                    || !IsIndependentCropConsensusLineAllowed(text))
+                {
+                    continue;
+                }
+                if (!bestByText.TryGetValue(text, out var previous)
+                    || confidence > previous)
+                {
+                    bestByText[text] = confidence;
+                }
+            }
+            foreach (var (text, confidence) in bestByText)
+            {
+                if (!cropsByCandidate.TryGetValue(text, out var cropConfidences))
+                {
+                    cropConfidences = [];
+                    cropsByCandidate[text] = cropConfidences;
+                }
+                cropConfidences[cropIndex] = confidence;
+            }
+        }
+
+        var eligible = cropsByCandidate
+            .Where(item => item.Value.Count >= 2)
+            .ToArray();
+        if (eligible.Length != 1)
+        {
+            return null;
+        }
+        return new PaddleRecipientAlternativeParseResult(
+            eligible[0].Key,
+            IndependentCropExactConsensusRoute,
+            CandidateConfidence: eligible[0].Value.Values.Min());
+    }
+
+    /// <summary>
     /// A detector overlap exception is eligible only for the strongest
     /// alternative route: a CJK merchant plus an explicit CNY amount exactly
     /// equal to the unified amount.  Ordinary geometry remains authoritative
@@ -513,6 +719,60 @@ internal static class PaddleRecipientValueParser
     {
         return StrongAnchorNonRecipientFragments.Any(fragment =>
             value.Contains(fragment, StringComparison.Ordinal));
+    }
+
+    private static bool IsIndependentCropConsensusLineAllowed(string value)
+    {
+        if (value.Length == 0)
+        {
+            return false;
+        }
+        var visible = value.Replace(" ", string.Empty, StringComparison.Ordinal);
+        var visibleRunes = visible.EnumerateRunes().ToArray();
+        var normalizedAsciiLine = visible.ToLowerInvariant();
+        if (visibleRunes.Length is < 2 or > 48
+            || ConsensusNegativeTokens.Any(token =>
+                visible.Contains(token, StringComparison.OrdinalIgnoreCase))
+            || ConsensusRecipientLabelPinyinKeys.Contains(
+                normalizedAsciiLine,
+                StringComparer.Ordinal)
+            || ConsensusAsciiUiLineKeys.Contains(
+                normalizedAsciiLine,
+                StringComparer.Ordinal)
+            || visible.Contains('\u00a5')
+            || visible.Contains('\uffe5')
+            || ConsensusPureAmountPattern.IsMatch(value)
+            || ConsensusCurrencyCodePattern.IsMatch(value)
+            || ConsensusTimePattern.IsMatch(value))
+        {
+            return false;
+        }
+
+        var hasLetter = false;
+        foreach (var rune in visibleRunes)
+        {
+            var category = System.Text.Rune.GetUnicodeCategory(rune);
+            if (category is System.Globalization.UnicodeCategory.UppercaseLetter
+                or System.Globalization.UnicodeCategory.LowercaseLetter
+                or System.Globalization.UnicodeCategory.TitlecaseLetter
+                or System.Globalization.UnicodeCategory.ModifierLetter
+                or System.Globalization.UnicodeCategory.OtherLetter)
+            {
+                hasLetter = true;
+                continue;
+            }
+            if (category is System.Globalization.UnicodeCategory.DecimalDigitNumber
+                or System.Globalization.UnicodeCategory.LetterNumber
+                or System.Globalization.UnicodeCategory.OtherNumber
+                || ConsensusAllowedPunctuation.Contains(
+                    rune.ToString(),
+                    StringComparison.Ordinal))
+            {
+                continue;
+            }
+            return false;
+        }
+        return hasLetter;
     }
 
     private static bool IsStrictCjkMiddleDotMerchant(string value)
