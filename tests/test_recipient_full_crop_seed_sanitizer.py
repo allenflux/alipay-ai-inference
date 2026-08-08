@@ -31,6 +31,7 @@ from transfer_receipt_ai.recipient_full_crop_seed_sanitizer import (
     ATTESTATION_KIND,
     _build_sanitized_payload,
     _canonical_sha256,
+    _metadata_partitions,
     _partition_descriptor,
     sanitize_recipient_full_crop_seed,
     validate_recipient_full_crop_seed_attestation,
@@ -309,6 +310,13 @@ def _reseal_attestation(output: dict[str, object]) -> None:
         _canonical_sha256(
             attestation["train_only_recipient_lineage"],
             description="test resealed initialization lineage",
+        )
+    )
+    _, non_recipient_metadata = _metadata_partitions(output)
+    attestation["metadata_proof"]["output_non_recipient_sha256"] = (
+        _canonical_sha256(
+            non_recipient_metadata,
+            description="test resealed non-recipient metadata",
         )
     )
     attestation["metadata_proof"]["operative_metadata_sha256"] = (
