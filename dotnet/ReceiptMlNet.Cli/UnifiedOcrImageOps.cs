@@ -58,6 +58,43 @@ internal static class UnifiedOcrImageOps
     }
 
     /// <summary>
+    /// Diagnostic-only value-side view of a recipient detector row.  Match
+    /// the standard crop's vertical extent and right edge, but remove the
+    /// label/left context: the left edge is the later of one ordinary
+    /// horizontal margin inside the detector box and 45% of the source
+    /// width.  A layout whose recipient row ends before that boundary is not
+    /// guessed; it produces no crop and therefore remains fail closed.
+    /// </summary>
+    public static Image<Rgb24>? CropRecipientRowRightValue(Image<Rgb24> source, float[] box)
+    {
+        if (box.Length < 4
+            || !float.IsFinite(box[0])
+            || !float.IsFinite(box[1])
+            || !float.IsFinite(box[2])
+            || !float.IsFinite(box[3])
+            || box[2] <= box[0]
+            || box[3] <= box[1])
+        {
+            return null;
+        }
+
+        var marginX = Math.Max(2.0f, (box[2] - box[0]) * 0.08f);
+        var marginY = Math.Max(2.0f, (box[3] - box[1]) * 0.08f);
+        var boxValueLeft = (int)MathF.Floor(box[0] + marginX);
+        var sourceValueLeft = (int)MathF.Floor(source.Width * 0.45f);
+        var left = Math.Clamp(Math.Max(boxValueLeft, sourceValueLeft), 0, source.Width);
+        var top = Math.Clamp((int)MathF.Floor(box[1] - marginY), 0, source.Height);
+        var right = Math.Clamp((int)MathF.Ceiling(box[2] + marginX), 0, source.Width);
+        var bottom = Math.Clamp((int)MathF.Ceiling(box[3] + marginY), 0, source.Height);
+        if (right <= left || bottom <= top)
+        {
+            return null;
+        }
+
+        return source.Clone(context => context.Crop(new Rectangle(left, top, right - left, bottom - top)));
+    }
+
+    /// <summary>
     /// Build one [1,H,W] grayscale tensor. A right-aligned canvas is used by
     /// amount/time/payment slots; transfer-status and the v12 recipient view
     /// use a centered canvas. Missing slots are represented by an all-white

@@ -17,7 +17,9 @@ internal static class PaddleRecipientHybrid
     /// It never falls back to the lower-accuracy v13 recipient branch.
     /// An absent or ambiguous row removes the recipient candidate.  A failed
     /// standard crop gets one deterministic left-context retry through the
-    /// same full PP-OCR pipeline and fail-closed parsers.
+    /// same full PP-OCR pipeline and fail-closed parsers.  If both reads fail,
+    /// a right-value crop is read for diagnostics only; that third read is
+    /// never parsed and can never create a candidate.
     /// </summary>
     public static UnifiedOcrReadResult OverrideRecipient(
         Image<Rgb24> source,
@@ -152,10 +154,42 @@ internal static class PaddleRecipientHybrid
             }
         }
 
+        string? thirdRoute = null;
+        string? rightValueRaw = null;
+        int? rightValueLineCount = null;
+        int? rightValueCropWidth = null;
+        int? rightValueCropHeight = null;
+        IReadOnlyList<float>? rightValueLineConfidences = null;
+        PaddleOcrReadResult? rightValueReadEvidence = null;
+        if (value is null)
+        {
+            using var rightValueCrop = UnifiedOcrImageOps.CropRecipientRowRightValue(
+                source,
+                detection.BboxImage);
+            if (rightValueCrop is not null)
+            {
+                // Observability only: do not call any recipient parser and do
+                // not assign selectedRead/value from this third read.
+                rightValueReadEvidence = paddleOcr.Recognize(rightValueCrop);
+                thirdRoute = "right_value";
+                rightValueRaw = rightValueReadEvidence.Text;
+                rightValueLineCount = rightValueReadEvidence.Lines.Count;
+                rightValueCropWidth = rightValueCrop.Width;
+                rightValueCropHeight = rightValueCrop.Height;
+                rightValueLineConfidences = rightValueReadEvidence.Lines
+                    .Select(line => float.IsFinite(line.Confidence)
+                        ? MathF.Round(Math.Clamp(line.Confidence, 0.0f, 1.0f), 6)
+                        : 0.0f)
+                    .ToArray();
+            }
+        }
+
         var diagnostic = new PaddleRecipientDiagnostic(
             value is null ? "none" : route,
             value is null
-                ? string.IsNullOrWhiteSpace(firstRead.Text) && string.IsNullOrWhiteSpace(retryRaw)
+                ? string.IsNullOrWhiteSpace(firstRead.Text)
+                    && string.IsNullOrWhiteSpace(retryRaw)
+                    && string.IsNullOrWhiteSpace(rightValueRaw)
                     ? "ocr_empty"
                     : BuildFailureReason(
                         verifiedAlternativeEnvelope,
@@ -164,7 +198,8 @@ internal static class PaddleRecipientHybrid
                         firstAlternativeGeometryAccepted,
                         retryReadEvidence,
                         retryAlternative,
-                        retryAlternativeGeometryAccepted)
+                        retryAlternativeGeometryAccepted,
+                        rightValueReadEvidence)
                 : null,
             firstRead.Text,
             firstRead.Lines.Count,
@@ -173,7 +208,13 @@ internal static class PaddleRecipientHybrid
             retryRaw,
             retryLineCount,
             retryCropWidth,
-            retryCropHeight);
+            retryCropHeight,
+            thirdRoute,
+            rightValueRaw,
+            rightValueLineCount,
+            rightValueCropWidth,
+            rightValueCropHeight,
+            rightValueLineConfidences);
         if (value is null)
         {
             return unified with { Candidates = candidates, RecipientDiagnostic = diagnostic };
@@ -200,14 +241,16 @@ internal static class PaddleRecipientHybrid
         bool? firstAlternativeGeometryAccepted,
         PaddleOcrReadResult? retryRead,
         PaddleRecipientAlternativeParseResult? retryAlternative,
-        bool? retryAlternativeGeometryAccepted)
+        bool? retryAlternativeGeometryAccepted,
+        PaddleOcrReadResult? rightValueRead)
     {
         return string.Join(
             ";",
             "anchored_or_alternative_parse_failed",
             $"alternative_envelope={verifiedAlternativeEnvelope}",
             $"first={DescribeReadEvidence(firstRead, firstAlternative, firstAlternativeGeometryAccepted)}",
-            $"retry={DescribeReadEvidence(retryRead, retryAlternative, retryAlternativeGeometryAccepted)}");
+            $"retry={DescribeReadEvidence(retryRead, retryAlternative, retryAlternativeGeometryAccepted)}",
+            $"right_value={DescribeReadEvidence(rightValueRead, null, null)}");
     }
 
     private static string DescribeReadEvidence(

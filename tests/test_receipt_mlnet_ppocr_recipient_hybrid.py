@@ -140,13 +140,27 @@ def test_payment_parenthesis_calibration_is_narrow_and_preserves_raw_ctc() -> No
     assert 'return raw[..^1] + "）"' in normalizer
 
 
-def test_hybrid_retry_is_left_context_only_and_remains_fail_closed() -> None:
+def test_hybrid_retry_and_diagnostic_probe_remain_fail_closed() -> None:
     image_ops = _source("UnifiedOcrImageOps.cs")
     router = _source("PaddleRecipientHybrid.cs")
 
     retry = image_ops.split("CropRecipientRowLeftContext", 1)[1]
     assert "new Rectangle(0, top, right, bottom - top)" in retry
-    assert router.count("paddleOcr.Recognize(") == 2
+    right_crop = image_ops.split("CropRecipientRowRightValue", 1)[1].split(
+        "PrepareFieldTensor", 1
+    )[0]
+    assert "source.Width * 0.45f" in right_crop
+    assert "Math.Max(boxValueLeft, sourceValueLeft)" in right_crop
+    assert "box[2] <= box[0]" in right_crop
+    assert "box[3] <= box[1]" in right_crop
+    assert "!float.IsFinite(box[0])" in right_crop
+    assert "right <= left || bottom <= top" in right_crop
+
+    retry_call = router.index("CropRecipientRowLeftContext")
+    right_probe_call = router.index("CropRecipientRowRightValue")
+    diagnostic_build = router.index("var diagnostic = new PaddleRecipientDiagnostic")
+    assert retry_call < right_probe_call < diagnostic_build
+    assert router.count("paddleOcr.Recognize(") == 3
     assert router.count("PaddleRecipientValueParser.Parse(") == 2
     assert router.count("ParseCalibratedAlternative(") == 3
     assert router.count("PaddleRecipientValueParser.ParsePinyinAnnotatedRecipient(") == 1
@@ -155,6 +169,33 @@ def test_hybrid_retry_is_left_context_only_and_remains_fail_closed() -> None:
     assert "DescribeReadEvidence" in router
     assert '"ocr_empty"' in router
     assert "candidates.Remove(\"recipient_field\")" in router
+
+    diagnostic_probe = router.split("using var rightValueCrop", 1)[1].split(
+        "var diagnostic = new PaddleRecipientDiagnostic", 1
+    )[0]
+    assert "paddleOcr.Recognize(rightValueCrop)" in diagnostic_probe
+    assert 'thirdRoute = "right_value"' in diagnostic_probe
+    assert "PaddleRecipientValueParser" not in diagnostic_probe
+    assert "ParseCalibratedAlternative" not in diagnostic_probe
+    assert "selectedRead =" not in diagnostic_probe
+    assert "candidates[" not in diagnostic_probe
+    assert "rightValueReadEvidence.Lines" in diagnostic_probe
+    assert "float.IsFinite(line.Confidence)" in diagnostic_probe
+    assert "Math.Clamp(line.Confidence, 0.0f, 1.0f)" in diagnostic_probe
+
+    unified_engine = _source("UnifiedOcrEngine.cs")
+    program = _source("Program.cs")
+    for field in (
+        "ThirdRoute",
+        "RightValueRaw",
+        "RightValueLineCount",
+        "RightValueCropWidth",
+        "RightValueCropHeight",
+        "RightValueLineConfidences",
+    ):
+        assert field in unified_engine
+        assert f"HybridOcr{field}" in program
+    assert '$"right_value={DescribeReadEvidence(rightValueRead, null, null)}"' in router
 
 
 def test_hybrid_is_pure_onnx_cpu_and_binds_all_artifact_hashes() -> None:

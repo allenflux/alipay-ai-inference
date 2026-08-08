@@ -605,7 +605,13 @@ internal static class ReceiptMlNetProgram
                 HybridOcrRetryRaw: recipientDiagnostic?.RetryRaw,
                 HybridOcrRetryLineCount: recipientDiagnostic?.RetryLineCount,
                 HybridOcrRetryCropWidth: recipientDiagnostic?.RetryCropWidth,
-                HybridOcrRetryCropHeight: recipientDiagnostic?.RetryCropHeight);
+                HybridOcrRetryCropHeight: recipientDiagnostic?.RetryCropHeight,
+                HybridOcrThirdRoute: recipientDiagnostic?.ThirdRoute,
+                HybridOcrRightValueRaw: recipientDiagnostic?.RightValueRaw,
+                HybridOcrRightValueLineCount: recipientDiagnostic?.RightValueLineCount,
+                HybridOcrRightValueCropWidth: recipientDiagnostic?.RightValueCropWidth,
+                HybridOcrRightValueCropHeight: recipientDiagnostic?.RightValueCropHeight,
+                HybridOcrRightValueLineConfidences: recipientDiagnostic?.RightValueLineConfidences);
         }
         return new ReceiptFieldResult(
             deliveryValue == "review" ? "review" : "read",
@@ -633,7 +639,13 @@ internal static class ReceiptMlNetProgram
             HybridOcrRetryRaw: recipientDiagnostic?.RetryRaw,
             HybridOcrRetryLineCount: recipientDiagnostic?.RetryLineCount,
             HybridOcrRetryCropWidth: recipientDiagnostic?.RetryCropWidth,
-            HybridOcrRetryCropHeight: recipientDiagnostic?.RetryCropHeight);
+            HybridOcrRetryCropHeight: recipientDiagnostic?.RetryCropHeight,
+            HybridOcrThirdRoute: recipientDiagnostic?.ThirdRoute,
+            HybridOcrRightValueRaw: recipientDiagnostic?.RightValueRaw,
+            HybridOcrRightValueLineCount: recipientDiagnostic?.RightValueLineCount,
+            HybridOcrRightValueCropWidth: recipientDiagnostic?.RightValueCropWidth,
+            HybridOcrRightValueCropHeight: recipientDiagnostic?.RightValueCropHeight,
+            HybridOcrRightValueLineConfidences: recipientDiagnostic?.RightValueLineConfidences);
     }
 
     private static ReceiptFieldResult UnifiedStatusField(DetectionResult? detection, UnifiedOcrReadResult unifiedOcr)
@@ -1907,7 +1919,13 @@ internal sealed record ReceiptFieldResult(
     string? HybridOcrRetryRaw = null,
     int? HybridOcrRetryLineCount = null,
     int? HybridOcrRetryCropWidth = null,
-    int? HybridOcrRetryCropHeight = null);
+    int? HybridOcrRetryCropHeight = null,
+    string? HybridOcrThirdRoute = null,
+    string? HybridOcrRightValueRaw = null,
+    int? HybridOcrRightValueLineCount = null,
+    int? HybridOcrRightValueCropWidth = null,
+    int? HybridOcrRightValueCropHeight = null,
+    IReadOnlyList<float>? HybridOcrRightValueLineConfidences = null);
 internal sealed record DeviceResult(
     string Platform,
     string PlatformCn,

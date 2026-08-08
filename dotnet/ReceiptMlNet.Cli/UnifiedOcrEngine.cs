@@ -38,7 +38,13 @@ internal sealed record PaddleRecipientDiagnostic(
     string? RetryRaw = null,
     int? RetryLineCount = null,
     int? RetryCropWidth = null,
-    int? RetryCropHeight = null);
+    int? RetryCropHeight = null,
+    string? ThirdRoute = null,
+    string? RightValueRaw = null,
+    int? RightValueLineCount = null,
+    int? RightValueCropWidth = null,
+    int? RightValueCropHeight = null,
+    IReadOnlyList<float>? RightValueLineConfidences = null);
 
 /// <summary>
 /// Observability-only timing for the unified reader.  The three measurements

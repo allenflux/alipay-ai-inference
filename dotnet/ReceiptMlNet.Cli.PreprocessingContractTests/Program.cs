@@ -20,6 +20,7 @@ internal static class Program
             VerifyDetectorDestinationLengthContract();
             VerifyStatusbarDestinationLengthContract();
             VerifyRecipientTrimUsesPythonDoubleToEven();
+            VerifyRecipientRightValueDiagnosticCrop();
             VerifyUnifiedFieldTensorReuse();
             Console.WriteLine("PASS: detector/statusbar/unified OCR preprocessing and reusable buffers are bit-exact against the legacy implementation.");
             return 0;
@@ -38,6 +39,51 @@ internal static class Program
         // produces 16.500000655... and incorrectly trims 17 pixels.
         AssertEqual(16, UnifiedOcrImageOps.LeftTrimPixels(55, 0.30), "recipient trim 16.5 to even");
         AssertEqual(20, UnifiedOcrImageOps.LeftTrimPixels(65, 0.30), "recipient trim 19.5 to even");
+    }
+
+    private static void VerifyRecipientRightValueDiagnosticCrop()
+    {
+        using var source = CreatePattern(1000, 1000);
+        using var crop = UnifiedOcrImageOps.CropRecipientRowRightValue(
+            source,
+            [100.0f, 200.0f, 800.0f, 400.0f]);
+        Assert(crop is not null, "valid recipient right-value crop was rejected");
+        AssertEqual(406, crop!.Width, "right-value crop width");
+        AssertEqual(232, crop.Height, "right-value crop height");
+        Assert(
+            source[450, 184].Equals(crop[0, 0]),
+            "right-value crop must begin at 45 percent of the source width");
+        Assert(
+            source[855, 415].Equals(crop[crop.Width - 1, crop.Height - 1]),
+            "right-value crop must preserve the standard crop's right/bottom edge");
+
+        using var boxBoundCrop = UnifiedOcrImageOps.CropRecipientRowRightValue(
+            source,
+            [600.0f, 200.0f, 900.0f, 400.0f]);
+        Assert(boxBoundCrop is not null, "box-bound recipient right-value crop was rejected");
+        AssertEqual(300, boxBoundCrop!.Width, "box-bound right-value crop width");
+        Assert(
+            source[624, 184].Equals(boxBoundCrop[0, 0]),
+            "right-value crop must use detector left plus margin when it is later");
+
+        Assert(
+            UnifiedOcrImageOps.CropRecipientRowRightValue(
+                source,
+                [100.0f, 200.0f, 400.0f, 400.0f]) is null,
+            "right-value crop ending before the 45 percent boundary must fail closed");
+        Assert(
+            UnifiedOcrImageOps.CropRecipientRowRightValue(
+                source,
+                [float.NaN, 200.0f, 800.0f, 400.0f]) is null,
+            "non-finite right-value crop geometry must fail closed");
+        Assert(
+            UnifiedOcrImageOps.CropRecipientRowRightValue(
+                source,
+                [800.0f, 200.0f, 100.0f, 400.0f]) is null,
+            "inverted right-value crop geometry must fail closed");
+        Assert(
+            UnifiedOcrImageOps.CropRecipientRowRightValue(source, [1.0f, 2.0f, 3.0f]) is null,
+            "short right-value crop geometry must fail closed");
     }
 
     private static void VerifyCase(
