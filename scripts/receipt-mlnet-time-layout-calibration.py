@@ -385,8 +385,14 @@ def _load_formal(formal_root: Path) -> dict[str, Any]:
         if key not in hybrid["results"] or not isinstance(row.get("failures"), list) \
                 or type(row.get("invariant")) is not bool:
             raise CalibrationError(f"formal A/B row {index} is not bound to the hybrid run")
-    if row_keys != [_path_key(source) for source in input_sources]:
-        raise CalibrationError("formal A/B source order differs from fixed inputs")
+    # The formal input list (and both inference manifests) is the authority for
+    # calibration order.  The A/B comparator deliberately writes its rows in
+    # sorted normalized-source-key order (`for source in sorted(results)`).
+    # Validate that exact producer order rather than incorrectly requiring the
+    # fixed input order; the source set remains hash-bound and exact.
+    expected_comparison_order = sorted(_path_key(source) for source in input_sources)
+    if row_keys != expected_comparison_order:
+        raise CalibrationError("formal A/B source order differs from comparator canonical source-key order")
     return {
         "root": root,
         "input_sources": input_sources,

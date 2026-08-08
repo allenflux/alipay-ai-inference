@@ -140,7 +140,10 @@ def formal_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str,
     monkeypatch.setattr(MODULE, "TARGET_RECORDS", 6)
     monkeypatch.setattr(MODULE.TARGETED, "FORMAL_RECORDS", 8)
     formal = tmp_path / "formal"
-    sources = [tmp_path / "images" / f"receipt-{index}.jpg" for index in range(8)]
+    # Formal inputs/manifests preserve records-manifest order, while the real
+    # A/B comparator writes comparisons in sorted normalized-source-key order.
+    source_order = [4, 1, 7, 0, 6, 2, 5, 3]
+    sources = [tmp_path / "images" / f"receipt-{index}.jpg" for index in source_order]
     for index, source in enumerate(sources):
         source.parent.mkdir(parents=True, exist_ok=True)
         source.write_bytes(f"image-{index}".encode())
@@ -155,7 +158,10 @@ def formal_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str,
     baseline_ids = _write_run(formal / "baseline-v13", sources, candidates, devices, statuses, hybrid=False)
     hybrid_ids = _write_run(formal / "hybrid-recipient", sources, candidates, devices, statuses, hybrid=True)
     comparison = formal / "comparison"
-    rows = [{"source": source, "invariant": True, "failures": []} for source in rendered]
+    rows = [
+        {"source": source, "invariant": True, "failures": []}
+        for source in sorted(rendered, key=MODULE.TARGETED._source_key)
+    ]
     _write_jsonl(comparison / "comparisons.jsonl", rows)
     input_identity = _identity(input_path, records=8, sources=rendered)
     _write_json(comparison / "summary.json", {
@@ -381,6 +387,19 @@ def test_prepare_rejects_duplicate_nonstrict_score_row(formal_fixture: dict[str,
     _write_jsonl(comparisons, rows)
     with pytest.raises(MODULE.CalibrationError, match="duplicate"):
         _prepare(formal_fixture, formal_fixture["root"] / "bad-prepare")
+
+
+def test_prepare_requires_real_comparator_canonical_order(formal_fixture: dict[str, Any]) -> None:
+    comparison = formal_fixture["formal"] / "comparison" / "comparisons.jsonl"
+    fixed_sources = (formal_fixture["formal"] / "fixed-selected-inputs.txt").read_text(
+        encoding="utf-8"
+    ).splitlines()
+    _write_jsonl(
+        comparison,
+        [{"source": source, "invariant": True, "failures": []} for source in fixed_sources],
+    )
+    with pytest.raises(MODULE.CalibrationError, match="comparator canonical"):
+        _prepare(formal_fixture, formal_fixture["root"] / "wrong-comparison-order")
 
 
 def test_evaluate_rejects_rehashed_truth_semantic_tamper(formal_fixture: dict[str, Any]) -> None:
