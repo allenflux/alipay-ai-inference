@@ -440,6 +440,56 @@ def test_status_and_payment_rules_are_fail_closed() -> None:
     assert ambiguous["unique_diagnostic_coverage"] is False
 
 
+def test_homography_validation_accepts_realistic_cancellation_residual() -> None:
+    source_width, source_height = 1080, 2400
+    rectified_width, rectified_height = 720, 1600
+    scale_x = (rectified_width - 1) / (source_width - 1)
+    scale_y = (rectified_height - 1) / (source_height - 1)
+    forward = [[scale_x, 0.0, 0.0], [0.0, scale_y, 0.0], [0.0, 0.0, 1.0]]
+    # A five-micro-pixel translation residual makes a literal A^-1*A
+    # comparison fail at abs_tol=1e-6, while remaining far below any observable
+    # pixel displacement. This models cancellation around scaled coordinates.
+    inverse = [[1.0 / scale_x, 0.0, 5e-6], [0.0, 1.0 / scale_y, 0.0], [0.0, 0.0, 1.0]]
+    MODULE._require_homography_pair(
+        forward,
+        inverse,
+        source_width=source_width,
+        source_height=source_height,
+        rectified_width=rectified_width,
+        rectified_height=rectified_height,
+        rotation_degrees=0,
+        description="realistic homography",
+    )
+
+
+@pytest.mark.parametrize("failure", ["wrong_inverse", "wrong_forward", "singular"])
+def test_homography_validation_rejects_observably_wrong_or_singular_pairs(failure: str) -> None:
+    source_width, source_height = 1080, 2400
+    rectified_width, rectified_height = 720, 1600
+    scale_x = (rectified_width - 1) / (source_width - 1)
+    scale_y = (rectified_height - 1) / (source_height - 1)
+    forward = [[scale_x, 0.0, 0.0], [0.0, scale_y, 0.0], [0.0, 0.0, 1.0]]
+    inverse = [[1.0 / scale_x, 0.0, 0.0], [0.0, 1.0 / scale_y, 0.0], [0.0, 0.0, 1.0]]
+    if failure == "wrong_inverse":
+        inverse[0][2] = 1.0
+    elif failure == "wrong_forward":
+        forward[0][0] *= 1.01
+        inverse[0][0] = 1.0 / forward[0][0]
+    else:
+        forward[1] = [0.0, 0.0, 0.0]
+    with pytest.raises(MODULE.EvidenceError, match="homography|matrix|projection|round-trip"):
+        MODULE._require_homography_pair(
+            forward,
+            inverse,
+            source_width=source_width,
+            source_height=source_height,
+            rectified_width=rectified_width,
+            rectified_height=rectified_height,
+            rotation_degrees=0,
+            description="bad homography",
+        )
+
+
 def test_atomic_publish_refuses_overwrite_and_detects_toctou(tmp_path: Path) -> None:
     fixture = _fixture(tmp_path)
     summary, evidence_bytes, bindings = _prepare(fixture)

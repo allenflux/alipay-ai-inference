@@ -479,16 +479,112 @@ def _project(point: tuple[float, float], matrix: Sequence[Sequence[float]], *,
     return projected
 
 
-def _require_inverse_matrices(
-    left: Sequence[Sequence[float]], right: Sequence[Sequence[float]], *, description: str
+def _determinant3(matrix: Sequence[Sequence[float]]) -> float:
+    return (
+        matrix[0][0] * (matrix[1][1] * matrix[2][2] - matrix[1][2] * matrix[2][1])
+        - matrix[0][1] * (matrix[1][0] * matrix[2][2] - matrix[1][2] * matrix[2][0])
+        + matrix[0][2] * (matrix[1][0] * matrix[2][1] - matrix[1][1] * matrix[2][0])
+    )
+
+
+def _matrix_infinity_norm(matrix: Sequence[Sequence[float]]) -> float:
+    return max(sum(abs(value) for value in row) for row in matrix)
+
+
+def _require_homography_pair(
+    source_to_rectified: Sequence[Sequence[float]],
+    rectified_to_source: Sequence[Sequence[float]],
+    *,
+    source_width: int,
+    source_height: int,
+    rectified_width: int,
+    rectified_height: int,
+    rotation_degrees: int,
+    description: str,
 ) -> None:
-    for first, second in ((left, right), (right, left)):
-        for row in range(3):
-            for column in range(3):
-                value = sum(first[row][inner] * second[inner][column] for inner in range(3))
-                expected = 1.0 if row == column else 0.0
-                if not math.isclose(value, expected, rel_tol=0, abs_tol=1e-6):
-                    raise EvidenceError(f"{description} matrices are not mutual inverses")
+    # A literal A*A^-1 elementwise comparison is unnecessarily brittle for
+    # homographies with a large translation: subtracting two ~image-size
+    # values can leave a harmless residual above a fixed 1e-6. Validate the
+    # observable geometry instead, while retaining explicit singularity and
+    # conditioning guards.
+    for name, matrix, inverse in (
+        ("original_to_rectified", source_to_rectified, rectified_to_source),
+        ("rectified_to_original", rectified_to_source, source_to_rectified),
+    ):
+        determinant = _determinant3(matrix)
+        norm = _matrix_infinity_norm(matrix)
+        inverse_norm = _matrix_infinity_norm(inverse)
+        if not math.isfinite(determinant) or abs(determinant) <= 1e-15:
+            raise EvidenceError(f"{description} {name} matrix is singular")
+        reciprocal_condition_bound = 1.0 / (norm * inverse_norm)
+        if not math.isfinite(reciprocal_condition_bound) or reciprocal_condition_bound < 1e-12:
+            raise EvidenceError(f"{description} {name} matrix is ill-conditioned")
+
+    source_corners = [
+        (0.0, 0.0),
+        (float(source_width - 1), 0.0),
+        (float(source_width - 1), float(source_height - 1)),
+        (0.0, float(source_height - 1)),
+    ]
+    rectified_corners = [
+        (0.0, 0.0),
+        (float(rectified_width - 1), 0.0),
+        (float(rectified_width - 1), float(rectified_height - 1)),
+        (0.0, float(rectified_height - 1)),
+    ]
+    expected_forward = rectified_corners if rotation_degrees == 0 else [
+        rectified_corners[1],
+        rectified_corners[2],
+        rectified_corners[3],
+        rectified_corners[0],
+    ]
+    tolerance = max(
+        0.02,
+        max(source_width, source_height, rectified_width, rectified_height) * 1e-6,
+    )
+
+    def require_close(observed: tuple[float, float], expected: tuple[float, float], label: str) -> None:
+        if any(
+            not math.isclose(observed[axis], expected[axis], rel_tol=0, abs_tol=tolerance)
+            for axis in range(2)
+        ):
+            raise EvidenceError(
+                f"{description} {label} differs by more than {tolerance:.6g} pixel(s)"
+            )
+
+    for index, (source, expected) in enumerate(zip(source_corners, expected_forward, strict=True)):
+        require_close(
+            _project(source, source_to_rectified, description=description),
+            expected,
+            f"source corner[{index}] projection",
+        )
+
+    source_probes = [
+        *source_corners,
+        ((source_width - 1) / 2.0, (source_height - 1) / 2.0),
+        ((source_width - 1) / 4.0, (source_height - 1) / 4.0),
+        ((source_width - 1) * 0.75, (source_height - 1) * 0.75),
+    ]
+    rectified_probes = [
+        *rectified_corners,
+        ((rectified_width - 1) / 2.0, (rectified_height - 1) / 2.0),
+        ((rectified_width - 1) / 4.0, (rectified_height - 1) / 4.0),
+        ((rectified_width - 1) * 0.75, (rectified_height - 1) * 0.75),
+    ]
+    for index, source in enumerate(source_probes):
+        rectified = _project(source, source_to_rectified, description=description)
+        require_close(
+            _project(rectified, rectified_to_source, description=description),
+            source,
+            f"source round-trip[{index}]",
+        )
+    for index, rectified in enumerate(rectified_probes):
+        source = _project(rectified, rectified_to_source, description=description)
+        require_close(
+            _project(source, source_to_rectified, description=description),
+            rectified,
+            f"rectified round-trip[{index}]",
+        )
 
 
 def _status_bar_limit(size: int) -> int:
@@ -1029,9 +1125,14 @@ def _validate_layout(
             geometry.get("H_original_to_rectified"),
             description="H_original_to_rectified",
         )
-        _require_inverse_matrices(
+        _require_homography_pair(
             source_to_rectified,
             rectified_to_source,
+            source_width=source_width,
+            source_height=source_height,
+            rectified_width=width,
+            rectified_height=height,
+            rotation_degrees=rotation,
             description=f"layout record[{index}] homography",
         )
         screen_quad = geometry.get("screen_quad_original")
