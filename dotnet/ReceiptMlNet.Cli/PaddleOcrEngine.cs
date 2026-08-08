@@ -10,6 +10,30 @@ internal sealed record PaddleOcrLine(string Text, float Confidence);
 /// <summary>Aggregate matching the Python reader's text/confidence semantics.</summary>
 internal sealed record PaddleOcrReadResult(string Text, float? Confidence, IReadOnlyList<PaddleOcrLine> Lines);
 
+/// <summary>One immutable point from a diagnostic PaddleOCR text quadrilateral.</summary>
+internal sealed record PaddleOcrLayoutPoint(float X, float Y);
+
+/// <summary>
+/// One decoded DB text box for diagnostic layout inspection. The quadrilateral
+/// remains in the coordinate system of the image passed to the engine and is
+/// ordered top-left, top-right, bottom-right, bottom-left.
+/// </summary>
+internal sealed record PaddleOcrLayoutLine(
+    string Text,
+    float Confidence,
+    IReadOnlyList<PaddleOcrLayoutPoint> Quad,
+    bool PassesDropScore);
+
+/// <summary>
+/// Raw diagnostic layout plus the exact accepted-line projection used by the
+/// legacy aggregate reader. This type is not consumed by production fields.
+/// </summary>
+internal sealed record PaddleOcrLayoutReadResult(
+    string Text,
+    float? Confidence,
+    IReadOnlyList<PaddleOcrLine> AcceptedLines,
+    IReadOnlyList<PaddleOcrLayoutLine> Lines);
+
 /// <summary>
 /// Direct ONNX Runtime implementation of the frozen PaddleOCR v2 pipeline:
 /// DB text detection, perspective crop, angle classification and CTC text
@@ -109,6 +133,131 @@ internal sealed class PaddleOcrEngine : IDisposable
                 crop.Dispose();
             }
         }
+    }
+
+    /// <summary>
+    /// Run the same frozen DB/CLS/REC pipeline while retaining every DB text
+    /// quadrilateral. This additive diagnostic API deliberately does not
+    /// replace or feed <see cref="Recognize(Mat)"/>.
+    /// </summary>
+    public PaddleOcrLayoutReadResult RecognizeLayoutDiagnostic(Image<Rgb24> image)
+    {
+        using var rgb = PaddleOcrImageOps.ToRgbMat(image);
+        return RecognizeLayoutDiagnostic(rgb);
+    }
+
+    /// <summary>
+    /// Mat overload for diagnostic tools that already own an RGB OpenCV image.
+    /// </summary>
+    public PaddleOcrLayoutReadResult RecognizeLayoutDiagnostic(Mat rgb)
+    {
+        if (rgb.Empty())
+        {
+            return AssembleLayoutDiagnostic(
+                Array.Empty<Point2f[]>(),
+                Array.Empty<PaddleOcrLine?>(),
+                _bundle.Settings.DropScore);
+        }
+
+        var boxes = DetectTextBoxes(rgb);
+        if (boxes.Count == 0)
+        {
+            return AssembleLayoutDiagnostic(
+                boxes,
+                Array.Empty<PaddleOcrLine?>(),
+                _bundle.Settings.DropScore);
+        }
+
+        var orientedCrops = new List<Mat>(boxes.Count);
+        try
+        {
+            foreach (var box in boxes)
+            {
+                using var textCrop = PaddleOcrImageOps.RotateCrop(rgb, box);
+                orientedCrops.Add(ClassifyAngle(textCrop));
+            }
+            return AssembleLayoutDiagnostic(
+                boxes,
+                RecognizeLines(orientedCrops),
+                _bundle.Settings.DropScore);
+        }
+        finally
+        {
+            foreach (var crop in orientedCrops)
+            {
+                crop.Dispose();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Pure layout/read assembly kept internal for deterministic contract
+    /// tests. Recognition results are already restored to DB-box order by
+    /// <see cref="RecognizeLines(IReadOnlyList{Mat})"/>.
+    /// </summary>
+    internal static PaddleOcrLayoutReadResult AssembleLayoutDiagnostic(
+        IReadOnlyList<Point2f[]> boxes,
+        IReadOnlyList<PaddleOcrLine?> recognizedLines,
+        float dropScore)
+    {
+        ArgumentNullException.ThrowIfNull(boxes);
+        ArgumentNullException.ThrowIfNull(recognizedLines);
+        if (!float.IsFinite(dropScore))
+        {
+            throw new ArgumentOutOfRangeException(nameof(dropScore), "Paddle OCR drop score must be finite");
+        }
+        if (boxes.Count != recognizedLines.Count)
+        {
+            throw new InvalidOperationException(
+                $"Paddle OCR diagnostic box/line count differs: boxes={boxes.Count} lines={recognizedLines.Count}");
+        }
+
+        var layoutLines = new List<PaddleOcrLayoutLine>(boxes.Count);
+        var acceptedLines = new List<PaddleOcrLine>(boxes.Count);
+        for (var index = 0; index < boxes.Count; index++)
+        {
+            var box = boxes[index];
+            if (box is null || box.Length != 4 || box.Any(point => !float.IsFinite(point.X) || !float.IsFinite(point.Y)))
+            {
+                throw new InvalidOperationException($"Paddle OCR diagnostic box {index} is not a finite quadrilateral");
+            }
+            var line = recognizedLines[index]
+                ?? throw new InvalidOperationException($"Paddle OCR diagnostic line {index} was not decoded");
+            if (!float.IsFinite(line.Confidence))
+            {
+                throw new InvalidOperationException($"Paddle OCR diagnostic line {index} has non-finite confidence");
+            }
+
+            var passesDropScore = line.Confidence >= dropScore;
+            var quad = Array.AsReadOnly(box
+                .Select(point => new PaddleOcrLayoutPoint(point.X, point.Y))
+                .ToArray());
+            layoutLines.Add(new PaddleOcrLayoutLine(
+                line.Text,
+                line.Confidence,
+                quad,
+                passesDropScore));
+            if (passesDropScore)
+            {
+                acceptedLines.Add(line);
+            }
+        }
+
+        if (acceptedLines.Count == 0)
+        {
+            return new PaddleOcrLayoutReadResult(
+                string.Empty,
+                null,
+                Array.Empty<PaddleOcrLine>(),
+                layoutLines.AsReadOnly());
+        }
+        return new PaddleOcrLayoutReadResult(
+            string.Join(" ", acceptedLines
+                .Select(line => ReceiptFieldNormalizer.CleanText(line.Text))
+                .Where(text => text.Length > 0)),
+            acceptedLines.Average(line => line.Confidence),
+            acceptedLines.AsReadOnly(),
+            layoutLines.AsReadOnly());
     }
 
     public void Dispose()
