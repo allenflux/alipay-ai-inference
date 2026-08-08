@@ -22,7 +22,6 @@ import json
 import math
 from pathlib import Path
 import shutil
-import struct
 from typing import Any
 from uuid import uuid4
 
@@ -454,11 +453,21 @@ def _effective_detector_score(field: Mapping[str, Any], *, description: str) -> 
     return _finite_confidence(present[0], description=f"{description} detector score")
 
 
-def _round_runtime_confidence(value: float) -> float:
-    """Mirror the CLI's MathF.Round(value, 6) JSON field projection."""
+def _matches_runtime_confidence_projection(projected: float, raw: float) -> bool:
+    """Validate the CLI's six-decimal MathF projection without widening it.
 
-    value32 = struct.unpack("<f", struct.pack("<f", value))[0]
-    return round(value32, 6)
+    ``MathF.Round`` operates in float32 and can select the opposite side of a
+    decimal half-step from Python's binary64 ``round``.  The serialized field
+    must itself be a six-decimal value and remain within one six-decimal
+    half-step plus one float32 ULP at confidence magnitudes below one.
+    """
+
+    return projected == round(projected, 6) and math.isclose(
+        projected,
+        raw,
+        rel_tol=0.0,
+        abs_tol=5.6e-7,
+    )
 
 
 def _assert_nonrecipient_identical(
@@ -531,15 +540,22 @@ def _assert_recipient_contract(
     detector_score = _finite_confidence(
         new_detection.get("score"), description=f"fresh result {source!r} detection score"
     )
-    rounded_detector_score = _round_runtime_confidence(detector_score)
     if (
-        _effective_detector_score(old_field, description=f"old recipient {source!r}")
-        != rounded_detector_score
+        not _matches_runtime_confidence_projection(
+            _effective_detector_score(
+                old_field, description=f"old recipient {source!r}"
+            ),
+            detector_score,
+        )
     ):
         _fail(f"old result {source!r} recipient detector score disagrees with detection")
     if (
-        _effective_detector_score(new_field, description=f"fresh recipient {source!r}")
-        != rounded_detector_score
+        not _matches_runtime_confidence_projection(
+            _effective_detector_score(
+                new_field, description=f"fresh recipient {source!r}"
+            ),
+            detector_score,
+        )
     ):
         _fail(f"fresh result {source!r} recipient detector score disagrees with detection")
 
@@ -576,7 +592,9 @@ def _assert_recipient_contract(
         ocr.get("confidence"),
         description=f"fresh recipient {source!r} detection OCR confidence",
     )
-    if _round_runtime_confidence(detection_ocr_confidence) != ocr_confidence:
+    if not _matches_runtime_confidence_projection(
+        ocr_confidence, detection_ocr_confidence
+    ):
         _fail(f"fresh replay {source!r} detection/field OCR confidence mismatch")
     return {"candidate": candidate, "route": route, "ctc_matches": True}
 

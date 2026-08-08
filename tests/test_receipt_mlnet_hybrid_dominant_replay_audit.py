@@ -284,14 +284,17 @@ def test_audit_mirrors_runtime_six_decimal_confidence_projection(
         )
         detection["score"] = 0.9252378
         if result_path == new_path:
-            field["ocr_confidence"] = 0.876543
-            field["ctc_confidence"] = 0.876543
-            detection["ocr"]["confidence"] = 0.8765432
+            field["ocr_confidence"] = 0.966956
+            field["ctc_confidence"] = 0.966956
+            detection["ocr"]["confidence"] = 0.9669555
         _write_json(result_path, result)
 
     summary = _run(fixture, tmp_path / "rounded-confidence-audit")
 
     assert summary["accepted"] is True
+    assert not MODULE._matches_runtime_confidence_projection(
+        0.966957, 0.9669555
+    )
 
 
 def test_audit_rejects_nonrecipient_or_ctc_regression(
