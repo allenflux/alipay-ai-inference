@@ -5894,33 +5894,32 @@ def _validate_recipient_full_crop_warmstart_config(
         )
 
 
-def _validate_recipient_full_crop_seed_policy(payload: Mapping[str, object]) -> None:
-    """Require proof that the warm-start recipient weights are train-only.
+def _validate_recipient_full_crop_seed_policy(
+    payload: Mapping[str, object], *, torch: Any | None = None
+) -> None:
+    """Require the content-bound v13 recipient sanitizer attestation.
 
-    A physically blind train/validation manifest is not sufficient when the
-    starting recipient branch may itself have been optimised on validation or
-    test teacher labels.  Full-crop is an analysis of a preprocessing change,
-    so it must fail closed unless the checkpoint records the standard
-    train-only recipient supervision policy.
+    A top-level ``standard_train_only`` value can be rewritten while leaving
+    transductive recipient tensors untouched.  The sanitizer proof instead
+    binds the complete recipient and non-recipient state partitions plus both
+    metadata partitions.  Its builder has already verified that only the
+    private ``recipient_`` state came from a compatible train-only v12 seed.
     """
 
-    if payload.get("kind") != KIND_V13:
-        raise ValueError("recipient_full_crop_warmstart requires a v13 seed checkpoint")
-    policy = payload.get("recipient_train_split_policy")
-    if not isinstance(policy, Mapping):
-        raise ValueError(
-            "recipient_full_crop_warmstart seed does not prove train-only recipient supervision"
+    try:
+        from .recipient_full_crop_seed_sanitizer import (
+            validate_recipient_full_crop_seed_attestation,
+            verify_recipient_full_crop_seed_source_provenance,
         )
-    splits = policy.get("splits")
-    if (
-        policy.get("mode") != "standard_train_only"
-        or not isinstance(splits, Sequence)
-        or isinstance(splits, (str, bytes))
-        or list(splits) != ["train"]
-    ):
+
+        validate_recipient_full_crop_seed_attestation(payload)
+        if torch is None:
+            raise ValueError("source checkpoint revalidation requires the active torch runtime")
+        verify_recipient_full_crop_seed_source_provenance(payload, torch=torch)
+    except (ImportError, TypeError, ValueError) as error:
         raise ValueError(
-            "recipient_full_crop_warmstart seed does not prove train-only recipient supervision"
-        )
+            "recipient_full_crop_warmstart requires a valid content-bound seed sanitizer attestation"
+        ) from error
 
 
 def _recipient_only_expansion_label_override(
@@ -5963,7 +5962,7 @@ def _recipient_only_expansion_label_override(
         raise FileNotFoundError(checkpoint_path)
     payload = _load_checkpoint(checkpoint_path, torch=torch)
     if init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_WARMSTART:
-        _validate_recipient_full_crop_seed_policy(payload)
+        _validate_recipient_full_crop_seed_policy(payload, torch=torch)
     source_config = _checkpoint_config(payload)
     if init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_INPUT_WIDTH_EXPANSION:
         # Validate even when the two dataclasses compare equal: this mode is a
@@ -6449,7 +6448,7 @@ def _parameter_only_initialization(
         raise FileNotFoundError(checkpoint_path)
     payload = _load_checkpoint(checkpoint_path, torch=torch)
     if init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_WARMSTART:
-        _validate_recipient_full_crop_seed_policy(payload)
+        _validate_recipient_full_crop_seed_policy(payload, torch=torch)
     source_config = _checkpoint_config(payload)
     v12_status_text_expansion = (
         allow_v12_status_text_expansion and _is_v12(source_config) and _is_v13(config)
@@ -6527,7 +6526,10 @@ def _parameter_only_initialization(
             {
                 "source_recipient_train_split_policy": dict(
                     payload["recipient_train_split_policy"]
-                )
+                ),
+                "source_full_crop_seed_sanitizer_attestation": dict(
+                    payload["full_crop_seed_sanitizer_attestation"]
+                ),
             }
             if init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_WARMSTART
             else {}

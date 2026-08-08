@@ -33,6 +33,11 @@ from .ocr_unified import (
     train_unified_reader,
 )
 from .recipient_blind_manifest import KIND as BLIND_MANIFEST_KIND
+from .recipient_full_crop_seed_sanitizer import (
+    ATTESTATION_KIND as SEED_SANITIZER_ATTESTATION_KIND,
+    PUBLICATION_POLICY as SEED_SANITIZER_PUBLICATION_POLICY,
+    TOPOLOGY_POLICY as SEED_SANITIZER_TOPOLOGY_POLICY,
+)
 
 
 KIND = "receipt_recipient_full_crop_pilot_v1"
@@ -211,7 +216,7 @@ def target_config_from_seed(checkpoint: Path, *, torch: Any) -> UnifiedReaderCon
     """Return the seed configuration with only the destructive trim removed."""
 
     payload = _load_checkpoint(Path(checkpoint), torch=torch)
-    _validate_recipient_full_crop_seed_policy(payload)
+    _validate_recipient_full_crop_seed_policy(payload, torch=torch)
     source = _checkpoint_config(payload)
     target = replace(source, recipient_value_left_trim=0.0)
     _validate_recipient_full_crop_warmstart_config(source, target)
@@ -252,6 +257,14 @@ def evaluate_pilot_summary(summary: Mapping[str, object]) -> dict[str, object]:
         initialization.get("source_recipient_train_split_policy"),
         "seed recipient split policy",
     )
+    seed_sanitizer = _mapping(
+        initialization.get("source_full_crop_seed_sanitizer_attestation"),
+        "seed sanitizer attestation",
+    )
+    sanitizer_compatibility = _mapping(
+        seed_sanitizer.get("compatibility"), "seed sanitizer compatibility"
+    )
+    sanitizer_state = _mapping(seed_sanitizer.get("state_proof"), "seed sanitizer state proof")
     row_mapping = _mapping(
         initialization.get("recipient_classifier_row_mapping"),
         "recipient classifier row mapping",
@@ -304,6 +317,19 @@ def evaluate_pilot_summary(summary: Mapping[str, object]) -> dict[str, object]:
         or initialization.get("source_kind") != KIND_V13
         or seed_split_policy.get("mode") != "standard_train_only"
         or seed_split_policy.get("splits") != ["train"]
+        or seed_sanitizer.get("kind") != SEED_SANITIZER_ATTESTATION_KIND
+        or seed_sanitizer.get("analysis_only") is not True
+        or seed_sanitizer.get("production_route_authorized") is not False
+        or seed_sanitizer.get("optimizer_state_loaded") is not False
+        or seed_sanitizer.get("external_test_artifacts_opened") is not False
+        or seed_sanitizer.get("publication_policy") != SEED_SANITIZER_PUBLICATION_POLICY
+        or seed_sanitizer.get("topology_policy") != SEED_SANITIZER_TOPOLOGY_POLICY
+        or sanitizer_compatibility.get("status_architecture_version") != 13
+        or sanitizer_compatibility.get("recipient_architecture_version") != 12
+        or sanitizer_compatibility.get("only_config_difference") != "architecture_version"
+        or int(sanitizer_compatibility.get("recipient_input_width", -1)) != 1536
+        or sanitizer_state.get("non_recipient_source") != "status_checkpoint"
+        or sanitizer_state.get("recipient_source") != "train_only_recipient_checkpoint"
         or row_mapping.get("blank_row_copied") is not True
         or int(row_mapping.get("shared_character_rows_copied", -1))
         != int(row_mapping.get("checkpoint_character_count", -2))

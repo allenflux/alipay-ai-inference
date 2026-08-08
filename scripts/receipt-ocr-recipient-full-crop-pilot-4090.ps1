@@ -94,7 +94,7 @@ Require-File $pythonExe "CUDA virtual-environment Python"
 Require-File $normalizer "JSON normalizer"
 Require-File $FullRecords "full v13 unified manifest"
 Require-Directory $DatasetRoot "recipient crop root"
-Require-File $SeedCheckpoint "accepted 0.30-trim v13 seed checkpoint"
+Require-File $SeedCheckpoint "attested analysis-only sanitized 0.30-trim v13 seed checkpoint"
 if ([IO.Path]::GetExtension($SeedCheckpoint) -ne ".pt") {
     throw "SeedCheckpoint must be a PyTorch .pt file."
 }
@@ -102,6 +102,7 @@ $OutputRoot = [IO.Path]::GetFullPath($OutputRoot)
 Require-FreshNonReparseOutput $OutputRoot
 
 $sourceTests = @(
+    (Join-Path $repoRoot "tests\test_recipient_full_crop_seed_sanitizer.py"),
     (Join-Path $repoRoot "tests\test_recipient_full_crop_pilot.py"),
     (Join-Path $repoRoot "tests\test_ocr_unified_v13.py")
 )
@@ -118,6 +119,8 @@ if ([string]$gpuRows[0] -notmatch "4090") {
 }
 
 Write-Host "receipt_recipient_full_crop_pilot_4090 preflight"
+Write-Host "  seed requires content-bound sanitizer attestation; top-level train-only claims are insufficient"
+Write-Host "  warmstart reopens both sanitizer sources and the complete hash-bound train-only lineage"
 Write-Host "  v13 ABI and checkpoint config preserved; only recipient left trim 0.30 -> 0.0"
 Write-Host "  optimizer=train only; checkpoint selection=val only; test=physically excluded"
 Write-Host ("  fixed pilot: epochs={0}, best recipient>={1:P2}, epoch4-to-8 gain>={2:P2}" -f `

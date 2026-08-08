@@ -19,7 +19,10 @@ from transfer_receipt_ai.ocr_unified import (
     STATUS_TEXT_TARGET,
     V6_TIME_CHARACTERS,
     V8_AMOUNT_CHARACTERS,
+    V12_ONNX_OUTPUT_NAMES,
     UnifiedReaderConfig,
+    _recipient_artifact_metadata,
+    _recipient_train_split_policy,
     _parameter_only_initialization,
     _recipient_only_expansion_label_override,
     _validate_recipient_full_crop_seed_policy,
@@ -36,6 +39,10 @@ from transfer_receipt_ai.recipient_full_crop_pilot import (
     verify_blind_manifest_contract,
 )
 from transfer_receipt_ai.recipient_blind_manifest import build_blind_manifest
+from transfer_receipt_ai.recipient_full_crop_seed_sanitizer import (
+    ATTESTATION_KIND as SEED_SANITIZER_ATTESTATION_KIND,
+    sanitize_recipient_full_crop_seed,
+)
 
 
 def _source_config() -> UnifiedReaderConfig:
@@ -49,7 +56,7 @@ def _source_config() -> UnifiedReaderConfig:
         recipient_hidden_size=16,
         recipient_value_left_trim=0.30,
         recipient_input_height=32,
-        recipient_input_width=128,
+        recipient_input_width=1536,
         recipient_branch_channels=8,
         recipient_open_text_layers=2,
         recipient_open_text_heads=4,
@@ -74,14 +81,46 @@ def _model(config: UnifiedReaderConfig, recipient_vocab_size: int = 3):
     )
 
 
-def _seed_payload(config: UnifiedReaderConfig, state_dict: object) -> dict[str, object]:
+def _seed_source_payloads(
+    config: UnifiedReaderConfig, state_dict: object
+) -> tuple[dict[str, object], dict[str, object]]:
     recipient_characters = ["商", "户"]
     status_characters = sorted(set("转账成功"))
-    return {
+    policies = {
+        "recipient_sampling_policy": {
+            "mode": "uniform",
+            "recipient_sampling_weight": 1.0,
+            "recipient_train_records": 2,
+            "train_records": 2,
+        },
+        "recipient_confidence_policy": {
+            "mode": "none",
+            "low_confidence_threshold": None,
+            "low_confidence_loss_weight": 1.0,
+            "curriculum_epochs": 0,
+        },
+        "recipient_tail_loss_policy": {
+            "mode": "none",
+            "rare_character_max_support": 0,
+            "rare_character_loss_weight": 1.0,
+            "long_text_min_length": 0,
+            "long_text_loss_weight": 1.0,
+            "recipient_train_records": 2,
+            "rare_character_train_records": 0,
+            "long_text_train_records": 0,
+            "combined_boost_train_records": 0,
+        },
+        "recipient_train_augmentation_policy": {"mode": "none"},
+    }
+    state = dict(state_dict)
+    status_keys = [key for key in state if key.startswith("status_text_")]
+    source_config = asdict(config)
+    source_config["architecture_version"] = 12
+    status_payload: dict[str, object] = {
         "schema_version": 1,
         "kind": KIND_V13,
         "config": asdict(config),
-        "state_dict": state_dict,
+        "state_dict": state,
         "amount_characters": list(V8_AMOUNT_CHARACTERS),
         "time_characters": list(V6_TIME_CHARACTERS),
         "payment_characters": ["卡", "行", "银", "储"],
@@ -92,11 +131,8 @@ def _seed_payload(config: UnifiedReaderConfig, state_dict: object) -> dict[str, 
         ).hexdigest(),
         "recipient_charset_source": "train_only_anchored_recipient_value",
         "recipient_target": "anchored_recipient_value_with_dedicated_high_resolution_value_view",
-        "recipient_train_split_policy": {
-            "mode": "standard_train_only",
-            "splits": ["train"],
-            "warning": None,
-        },
+        "recipient_train_split_policy": _recipient_train_split_policy(["train", "val"]),
+        "recipient_loss_weight": 1.0,
         "recipient_oov_by_split": {
             split: {"records": 1, "oov_records": 0}
             for split in ("train", "val", "test")
@@ -121,7 +157,70 @@ def _seed_payload(config: UnifiedReaderConfig, state_dict: object) -> dict[str, 
         },
         "payment_bank_prefix_classes": ["__other__", "银行"],
         "epoch": 9,
+        "initialization": {
+            "mode": "parameter_only_v12_to_v13_status_text_expansion",
+            "source_kind": "receipt_unified_field_reader_v12",
+            "source_config": source_config,
+            "checkpoint_sha256": "a" * 64,
+            "optimizer_restored": False,
+            "epoch_reset": True,
+            "new_parameter_prefix": "status_text_",
+            "copied_legacy_tensor_count": len(state) - len(status_keys),
+            "new_status_text_tensor_count": len(status_keys),
+            "frozen_legacy_output_count": len(V12_ONNX_OUTPUT_NAMES),
+            "financial_label_policy": {
+                "mode": "checkpoint_legacy_label_maps_status_text_only_v1"
+            },
+        },
+        "fine_tune_policy": {
+            "mode": "status_text_only_v13",
+            "trainable_parameter_prefix": "status_text_",
+            "frozen_legacy_output_count": len(V12_ONNX_OUTPUT_NAMES),
+            "full_validation_schedule": "epoch_1_every_n_and_final_epoch",
+            "validation_every": 1,
+        },
+        "training_runtime": {
+            "status_text_only_training": True,
+            "recipient_only_private_branch_training": False,
+            "full_validation_schedule": "epoch_1_every_n_and_final_epoch",
+            "validation_every": 1,
+            "recipient_train_split_policy": _recipient_train_split_policy(["train", "val"]),
+        },
     }
+    status_payload.update(policies)
+    status_payload.update(
+        _recipient_artifact_metadata(
+            config,
+            recipient_sampling_policy=policies["recipient_sampling_policy"],
+            recipient_confidence_policy=policies["recipient_confidence_policy"],
+            recipient_tail_loss_policy=policies["recipient_tail_loss_policy"],
+            recipient_train_augmentation_policy=policies[
+                "recipient_train_augmentation_policy"
+            ],
+        )
+    )
+    train_payload = {
+        **status_payload,
+        "kind": "receipt_unified_field_reader_v12",
+        "config": source_config,
+        "state_dict": {
+            key: value for key, value in state.items() if not key.startswith("status_text_")
+        },
+        "recipient_train_split_policy": _recipient_train_split_policy(["train"]),
+        "training_runtime": {
+            "recipient_train_split_policy": _recipient_train_split_policy(["train"])
+        },
+        "initialization": {
+            "mode": "random",
+            "optimizer_restored": False,
+            "epoch_reset": True,
+        },
+    }
+    for key in [key for key in train_payload if key.startswith("status_text_")]:
+        del train_payload[key]
+    for key in ("fine_tune_policy",):
+        del train_payload[key]
+    return status_payload, train_payload
 
 
 def _write_seed(tmp_path: Path):
@@ -131,8 +230,18 @@ def _write_seed(tmp_path: Path):
     state = {name: value.detach().clone() for name, value in model.state_dict().items()}
     for index, value in enumerate(state.values(), start=1):
         value.fill_(float(index) / 100.0)
+    status_payload, train_payload = _seed_source_payloads(source, state)
+    status_checkpoint = tmp_path / "v13-status-source.pt"
+    train_checkpoint = tmp_path / "v12-train-only-source.pt"
     checkpoint = tmp_path / "v13-trim30.pt"
-    torch.save(_seed_payload(source, state), checkpoint)
+    torch.save(status_payload, status_checkpoint)
+    torch.save(train_payload, train_checkpoint)
+    sanitize_recipient_full_crop_seed(
+        status_checkpoint=status_checkpoint,
+        train_only_recipient_checkpoint=train_checkpoint,
+        output_checkpoint=checkpoint,
+        torch=torch,
+    )
     return torch, checkpoint, state
 
 
@@ -163,18 +272,13 @@ def test_full_crop_config_allows_only_v13_trim_30_to_zero() -> None:
         )
 
 
-def test_full_crop_seed_must_prove_train_only_recipient_supervision() -> None:
-    payload = _seed_payload(_source_config(), {})
-    _validate_recipient_full_crop_seed_policy(payload)
-    for unsafe in (
-        None,
-        {"mode": "paddle_fit_transductive_v1", "splits": ["train", "val"]},
-        {"mode": "standard_train_only", "splits": ["train", "test"]},
-    ):
-        changed = dict(payload)
-        changed["recipient_train_split_policy"] = unsafe
-        with pytest.raises(ValueError, match="train-only recipient supervision"):
-            _validate_recipient_full_crop_seed_policy(changed)
+def test_full_crop_seed_requires_content_bound_sanitizer_not_top_level_policy() -> None:
+    payload = {
+        "kind": KIND_V13,
+        "recipient_train_split_policy": _recipient_train_split_policy(["train"]),
+    }
+    with pytest.raises(ValueError, match="content-bound seed sanitizer attestation"):
+        _validate_recipient_full_crop_seed_policy(payload)
 
 
 def test_blind_contract_is_hash_bound_and_physically_excludes_test(tmp_path: Path) -> None:
@@ -346,6 +450,25 @@ def _summary(*, best: float = 0.80, epoch4: float = 0.76, epoch8: float = 0.79):
                 "mode": "standard_train_only",
                 "splits": ["train"],
             },
+            "source_full_crop_seed_sanitizer_attestation": {
+                "kind": SEED_SANITIZER_ATTESTATION_KIND,
+                "analysis_only": True,
+                "production_route_authorized": False,
+                "optimizer_state_loaded": False,
+                "external_test_artifacts_opened": False,
+                "publication_policy": "same_directory_hard_link_no_clobber_v1",
+                "topology_policy": "v12_v13_private_recipient_prefix_partition_v1",
+                "compatibility": {
+                    "status_architecture_version": 13,
+                    "recipient_architecture_version": 12,
+                    "only_config_difference": "architecture_version",
+                    "recipient_input_width": 1536,
+                },
+                "state_proof": {
+                    "non_recipient_source": "status_checkpoint",
+                    "recipient_source": "train_only_recipient_checkpoint",
+                },
+            },
             "recipient_classifier_row_mapping": {
                 "blank_row_copied": True,
                 "shared_character_rows_copied": 2,
@@ -504,6 +627,9 @@ def test_cli_and_powershell_runner_are_hard_locked_to_blind_eight_epoch_pilot() 
     assert "$epoch4To8GainFloor = 0.02" in runner
     assert '$gpuRows[0] -notmatch "4090"' in runner
     assert "recipient_full_crop_warmstart" in runner
+    assert "test_recipient_full_crop_seed_sanitizer.py" in runner
+    assert "content-bound sanitizer attestation" in runner
+    assert "complete hash-bound train-only lineage" in runner
     assert "transfer_receipt_ai.recipient_blind_manifest" in runner
     assert "transfer_receipt_ai.recipient_full_crop_pilot" in runner
     assert '"--blind-contract", $blindContractPath' in runner
