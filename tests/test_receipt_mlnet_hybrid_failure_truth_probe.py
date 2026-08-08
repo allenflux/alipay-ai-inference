@@ -463,15 +463,17 @@ def test_real_204_shape_matches_frozen_v2_state_transitions(
             retry=[(0.94, f"商户{index}"), (0.93, label)],
         )
 
-    # Thirty-two records have one strict candidate but fail the frozen global
-    # envelope gate.  The extra raw amount candidate proves raw-vs-strict
-    # grouping without changing candidate derivation.
+    # Thirty-two records were in the old global-gate rejection bucket. Thirty
+    # have a real envelope failure; two (96 and 97) only had the diagnostic's
+    # source-vs-rectified geometry-space bug and are now verified candidates.
+    # The extra raw amount candidate proves raw-vs-strict grouping without
+    # changing candidate derivation.
     for index in range(95, 127):
         replacements[index] = _finding(
             index,
             first=[(0.96, f"商户{index}"), (0.99, "¥1,234.00")],
             retry=[(0.95, f"商户{index}"), (0.98, "¥1,234.00")],
-            envelope=False,
+            envelope=index in (96, 97),
         )
     # One old rejected-by-envelope row has only the label as its eligible
     # string (the amount remains descriptive raw consensus), so it moves
@@ -482,7 +484,6 @@ def test_real_204_shape_matches_frozen_v2_state_transitions(
         retry=[(0.95, "shoukudnfang"), (0.98, "¥1,234.00")],
         envelope=False,
     )
-
     # Seventy-six records have multiple raw consensus strings, but every one
     # is rejected by an explicit strict line contract.
     for index in range(127, 203):
@@ -515,11 +516,11 @@ def test_real_204_shape_matches_frozen_v2_state_transitions(
     findings, evidence = MODULE._load_input(source)
     summary = MODULE.summarize(findings, evidence=evidence)
 
-    assert summary["paddle_teacher_consensus"]["records"] == 71
+    assert summary["paddle_teacher_consensus"]["records"] == 73
     assert summary["paddle_teacher_consensus"]["by_state"] == [
         {"name": "ambiguous", "records": 18},
-        {"name": "candidate", "records": 71},
-        {"name": "rejected_by_global_gate", "records": 31},
+        {"name": "candidate", "records": 73},
+        {"name": "rejected_by_global_gate", "records": 29},
         {"name": "unresolved", "records": 84},
     ]
     assert summary["raw_consensus"]["by_state"] == [
@@ -529,8 +530,8 @@ def test_real_204_shape_matches_frozen_v2_state_transitions(
     ]
 
     remaining = summary["remaining_failure_analysis"]
-    assert remaining["records"] == 133
-    assert remaining["strict_candidate_records"] == 71
+    assert remaining["records"] == 131
+    assert remaining["strict_candidate_records"] == 73
     assert remaining["unreported_failure_reason_records"] == 1
     assert remaining["by_failure_reason_type_all_records"] == [
         {"name": "anchored_or_alternative_parse_failed", "records": 203},
@@ -541,7 +542,7 @@ def test_real_204_shape_matches_frozen_v2_state_transitions(
     assert {
         group["name"]: group["records"]
         for group in groups["eligible_candidate_count"]
-    } == {"0": 84, "1": 31, "2": 18}
+    } == {"0": 84, "1": 29, "2": 18}
     assert groups["ambiguous_candidate_count"][0]["name"] == "2"
     assert groups["ambiguous_candidate_count"][0]["records"] == 18
     blocker_counts = {
@@ -577,6 +578,11 @@ def test_real_204_shape_matches_frozen_v2_state_transitions(
     assert findings[95]["remaining_failure_cluster"][
         "global_gate_failures_combination"
     ] == "alternative_envelope_not_verified"
+    assert all(
+        findings[index]["strict_runtime_shadow"]["state"] == "candidate"
+        for index in (96, 97)
+    )
+    assert all(findings[index]["remaining_failure_cluster"] is None for index in (96, 97))
     assert findings[127]["remaining_failure_cluster"]["raw_vs_strict"] == (
         "raw=multiple|strict=unresolved|raw_candidates=2|eligible=0"
     )

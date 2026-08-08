@@ -35,7 +35,15 @@ def _result(
 ) -> dict[str, object]:
     return {
         "source": str(source),
-        "geometry": {"rectified_size": {"width": 1000, "height": 2000}},
+        "geometry": {
+            "source_size": {"width": 1000, "height": 2000},
+            "rectified_size": {"width": 1000, "height": 2000},
+            "H_original_to_rectified": [
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+        },
         "fields": {
             "amount": {"candidate": "100.00"},
             "recipient": {
@@ -66,6 +74,106 @@ def _result(
             },
         ],
     }
+
+
+def test_geometry_checks_project_public_source_boxes_back_to_rectified_space() -> None:
+    # Public bbox_image is emitted after Program.ProjectBoxToSource.  This
+    # fixture is a landscape 4000x2000 source rotated to portrait and scaled
+    # to 800x1600.  Comparing these source boxes directly to rectified_size
+    # fails several old checks even though their rectified boxes are valid.
+    result = {
+        "geometry": {
+            "source_size": {"width": 4000, "height": 2000},
+            "rectified_size": {"width": 800, "height": 1600},
+            "H_original_to_rectified": [
+                [0.0, 0.4, 0.0],
+                [-0.4, 0.0, 1600.0],
+                [0.0, 0.0, 1.0],
+            ],
+        }
+    }
+    detections = {
+        "amount": {
+            "label": "amount",
+            "score": 0.95,
+            "bbox_image": [3400, 0, 3600, 2000],
+        },
+        "recipient_field": {
+            "label": "recipient_field",
+            "score": 0.93,
+            "bbox_image": [3000, 0, 3200, 2000],
+        },
+        "payment_method_field": {
+            "label": "payment_method_field",
+            "score": 0.96,
+            "bbox_image": [2600, 0, 2800, 2000],
+        },
+    }
+
+    assert MODULE._geometry_reasons(result, detections) == []
+    evidence = MODULE._geometry_evidence(result, detections)
+    assert evidence is not None
+    assert evidence["bbox_input_coordinate_space"] == "exif_upright_source"
+    assert evidence["bbox_check_coordinate_space"] == "rectified"
+    assert evidence["source_recipient_box"] == [3000.0, 0.0, 3200.0, 2000.0]
+    assert evidence["amount_box"] == pytest.approx([0.0, 160.0, 800.0, 240.0])
+    assert evidence["recipient_box"] == pytest.approx([0.0, 320.0, 800.0, 400.0])
+    assert evidence["payment_box"] == pytest.approx([0.0, 480.0, 800.0, 560.0])
+
+
+@pytest.mark.parametrize(
+    ("mutation", "reason"),
+    [
+        ({"source_size": None}, "source_size_missing_or_invalid"),
+        ({"rectified_size": {"width": 1, "height": 2000}}, "rectified_size_missing_or_invalid"),
+        ({"H_original_to_rectified": None}, "H_original_to_rectified_missing_or_invalid"),
+        (
+            {
+                "H_original_to_rectified": [
+                    [1.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0],
+                    [0.0, 0.0, 0.0],
+                ]
+            },
+            "H_original_to_rectified_missing_or_invalid",
+        ),
+    ],
+)
+def test_geometry_checks_fail_closed_on_missing_or_invalid_projection_contract(
+    mutation: dict[str, object], reason: str
+) -> None:
+    result = _result(
+        Path("receipt.jpg"), candidate=None, route="none", failure_reason="failed"
+    )
+    result["geometry"].update(mutation)
+    detections = {
+        record["label"]: record
+        for record in result["detections"]
+        if isinstance(record, dict)
+    }
+
+    assert MODULE._geometry_reasons(result, detections) == [reason]
+    assert MODULE._geometry_evidence(result, detections) is None
+
+
+def test_geometry_checks_fail_closed_when_a_corner_projects_to_infinity() -> None:
+    result = _result(
+        Path("receipt.jpg"), candidate=None, route="none", failure_reason="failed"
+    )
+    result["geometry"]["H_original_to_rectified"] = [
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.01, 0.0, -10.0],
+    ]
+    detections = {
+        record["label"]: record
+        for record in result["detections"]
+        if isinstance(record, dict)
+    }
+
+    reasons = MODULE._geometry_reasons(result, detections)
+    assert "recipient_box_projection_invalid" in reasons
+    assert MODULE._geometry_evidence(result, detections) is None
 
 
 def _write_comparison_summary(

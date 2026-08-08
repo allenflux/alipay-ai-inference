@@ -490,16 +490,179 @@ def _score(record: Mapping[str, Any] | None) -> float | None:
     return value if math.isfinite(value) else None
 
 
+def _image_size(geometry: Mapping[str, Any], key: str) -> tuple[int, int] | None:
+    value = geometry.get(key)
+    if not isinstance(value, Mapping):
+        return None
+    width = value.get("width")
+    height = value.get("height")
+    if (
+        isinstance(width, bool)
+        or not isinstance(width, int)
+        or width < 2
+        or isinstance(height, bool)
+        or not isinstance(height, int)
+        or height < 2
+    ):
+        return None
+    return width, height
+
+
+def _homography(value: object) -> list[list[float]] | None:
+    """Parse the exact 3x3 matrix emitted by ``RectificationGeometry``."""
+
+    if (
+        not isinstance(value, Sequence)
+        or isinstance(value, (str, bytes))
+        or len(value) != 3
+    ):
+        return None
+    matrix: list[list[float]] = []
+    for raw_row in value:
+        if (
+            not isinstance(raw_row, Sequence)
+            or isinstance(raw_row, (str, bytes))
+            or len(raw_row) != 3
+        ):
+            return None
+        row: list[float] = []
+        for component in raw_row:
+            if isinstance(component, bool) or not isinstance(component, (int, float)):
+                return None
+            number = float(component)
+            if not math.isfinite(number):
+                return None
+            row.append(number)
+        matrix.append(row)
+    determinant = (
+        matrix[0][0]
+        * (matrix[1][1] * matrix[2][2] - matrix[1][2] * matrix[2][1])
+        - matrix[0][1]
+        * (matrix[1][0] * matrix[2][2] - matrix[1][2] * matrix[2][0])
+        + matrix[0][2]
+        * (matrix[1][0] * matrix[2][1] - matrix[1][1] * matrix[2][0])
+    )
+    if not math.isfinite(determinant) or abs(determinant) < 1e-12:
+        return None
+    return matrix
+
+
+def _project_box_to_rectified(
+    source_box: Sequence[float], homography: Sequence[Sequence[float]]
+) -> list[float] | None:
+    """Project all source-box corners and return their rectified envelope."""
+
+    corners = (
+        (float(source_box[0]), float(source_box[1])),
+        (float(source_box[2]), float(source_box[1])),
+        (float(source_box[2]), float(source_box[3])),
+        (float(source_box[0]), float(source_box[3])),
+    )
+    projected: list[tuple[float, float]] = []
+    for source_x, source_y in corners:
+        denominator = (
+            homography[2][0] * source_x
+            + homography[2][1] * source_y
+            + homography[2][2]
+        )
+        if not math.isfinite(denominator) or abs(denominator) < 1e-12:
+            return None
+        rectified_x = (
+            homography[0][0] * source_x
+            + homography[0][1] * source_y
+            + homography[0][2]
+        ) / denominator
+        rectified_y = (
+            homography[1][0] * source_x
+            + homography[1][1] * source_y
+            + homography[1][2]
+        ) / denominator
+        if not math.isfinite(rectified_x) or not math.isfinite(rectified_y):
+            return None
+        projected.append((rectified_x, rectified_y))
+    x_coordinates = [point[0] for point in projected]
+    y_coordinates = [point[1] for point in projected]
+    envelope = [
+        min(x_coordinates),
+        min(y_coordinates),
+        max(x_coordinates),
+        max(y_coordinates),
+    ]
+    if envelope[2] <= envelope[0] or envelope[3] <= envelope[1]:
+        return None
+    return envelope
+
+
+def _geometry_context(
+    result: Mapping[str, Any],
+) -> tuple[tuple[int, int], tuple[int, int], list[list[float]]] | str:
+    geometry = result.get("geometry")
+    if not isinstance(geometry, Mapping):
+        return "geometry_missing"
+    source_size = _image_size(geometry, "source_size")
+    if source_size is None:
+        return "source_size_missing_or_invalid"
+    rectified_size = _image_size(geometry, "rectified_size")
+    if rectified_size is None:
+        return "rectified_size_missing_or_invalid"
+    # The capital H is part of the public JSON contract.  Do not silently
+    # accept a differently-cased or flattened substitute.
+    homography = _homography(geometry.get("H_original_to_rectified"))
+    if homography is None:
+        return "H_original_to_rectified_missing_or_invalid"
+    return source_size, rectified_size, homography
+
+
+def _project_detection_boxes(
+    detections: Mapping[str, Mapping[str, Any]],
+    *,
+    source_size: tuple[int, int],
+    rectified_size: tuple[int, int],
+    homography: Sequence[Sequence[float]],
+) -> tuple[dict[str, list[float]], dict[str, list[float]], list[str]]:
+    source_width, source_height = source_size
+    rectified_width, rectified_height = rectified_size
+    rectified_boundary_tolerance = 1.0
+    source_boxes: dict[str, list[float]] = {}
+    rectified_boxes: dict[str, list[float]] = {}
+    reasons: list[str] = []
+    for name, label in (
+        ("recipient", "recipient_field"),
+        ("amount", "amount"),
+        ("payment", "payment_method_field"),
+    ):
+        source_box = _box(detections.get(label))
+        if source_box is None:
+            reasons.append(f"{name}_box_invalid")
+            continue
+        source_boxes[name] = source_box
+        if (
+            source_box[0] < 0.0
+            or source_box[1] < 0.0
+            or source_box[2] > source_width
+            or source_box[3] > source_height
+        ):
+            reasons.append(f"{name}_box_outside_source")
+            continue
+        rectified_box = _project_box_to_rectified(source_box, homography)
+        if rectified_box is None:
+            reasons.append(f"{name}_box_projection_invalid")
+            continue
+        if (
+            rectified_box[0] < -rectified_boundary_tolerance
+            or rectified_box[1] < -rectified_boundary_tolerance
+            or rectified_box[2] > rectified_width + rectified_boundary_tolerance
+            or rectified_box[3] > rectified_height + rectified_boundary_tolerance
+        ):
+            reasons.append(f"{name}_box_outside_rectified")
+            continue
+        rectified_boxes[name] = rectified_box
+    return source_boxes, rectified_boxes, reasons
+
+
 def _geometry_reasons(
     result: Mapping[str, Any], detections: Mapping[str, Mapping[str, Any]]
 ) -> list[str]:
-    geometry = result.get("geometry")
-    size = geometry.get("rectified_size") if isinstance(geometry, Mapping) else None
-    try:
-        width = int(size.get("width"))
-        height = int(size.get("height"))
-    except (AttributeError, TypeError, ValueError):
-        return ["rectified_size_missing"]
     recipient = detections.get("recipient_field")
     amount = detections.get("amount")
     payment = detections.get("payment_method_field")
@@ -514,13 +677,23 @@ def _geometry_reasons(
             reasons.append(f"{name}_score_missing")
         elif score < floor:
             reasons.append(f"{name}_score_below_{floor:.2f}")
-        if _box(record) is None:
-            reasons.append(f"{name}_box_invalid")
-    recipient_box = _box(recipient)
-    amount_box = _box(amount)
-    payment_box = _box(payment)
-    if recipient_box is None or amount_box is None or payment_box is None:
+    context = _geometry_context(result)
+    if isinstance(context, str):
+        reasons.append(context)
         return reasons
+    source_size, (width, height), homography = context
+    _, rectified_boxes, projection_reasons = _project_detection_boxes(
+        detections,
+        source_size=source_size,
+        rectified_size=(width, height),
+        homography=homography,
+    )
+    reasons.extend(projection_reasons)
+    if projection_reasons:
+        return reasons
+    recipient_box = rectified_boxes["recipient"]
+    amount_box = rectified_boxes["amount"]
+    payment_box = rectified_boxes["payment"]
     recipient_width = recipient_box[2] - recipient_box[0]
     recipient_height = recipient_box[3] - recipient_box[1]
     recipient_center = (recipient_box[1] + recipient_box[3]) * 0.5
@@ -544,25 +717,35 @@ def _geometry_reasons(
 def _geometry_evidence(
     result: Mapping[str, Any], detections: Mapping[str, Mapping[str, Any]]
 ) -> dict[str, Any] | None:
-    geometry = result.get("geometry")
-    size = geometry.get("rectified_size") if isinstance(geometry, Mapping) else None
-    recipient = _box(detections.get("recipient_field"))
-    amount = _box(detections.get("amount"))
-    payment = _box(detections.get("payment_method_field"))
-    try:
-        width = int(size.get("width"))
-        height = int(size.get("height"))
-    except (AttributeError, TypeError, ValueError):
+    context = _geometry_context(result)
+    if isinstance(context, str):
         return None
-    if recipient is None or amount is None or payment is None:
+    source_size, (width, height), homography = context
+    source_boxes, rectified_boxes, projection_reasons = _project_detection_boxes(
+        detections,
+        source_size=source_size,
+        rectified_size=(width, height),
+        homography=homography,
+    )
+    if projection_reasons:
         return None
+    recipient = rectified_boxes["recipient"]
+    amount = rectified_boxes["amount"]
+    payment = rectified_boxes["payment"]
     recipient_height = recipient[3] - recipient[1]
     tolerance = max(4.0, recipient_height * 0.25)
     payment_overlap = max(0.0, recipient[3] - payment[1])
     exact_cjk_tolerance = max(4.0, recipient_height * 0.45)
     return {
+        "bbox_input_coordinate_space": "exif_upright_source",
+        "bbox_check_coordinate_space": "rectified",
+        "source_width": source_size[0],
+        "source_height": source_size[1],
         "rectified_width": width,
         "rectified_height": height,
+        "source_amount_box": source_boxes["amount"],
+        "source_recipient_box": source_boxes["recipient"],
+        "source_payment_box": source_boxes["payment"],
         "amount_box": amount,
         "recipient_box": recipient,
         "payment_box": payment,
