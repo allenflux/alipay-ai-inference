@@ -95,8 +95,8 @@ def _write_fixture(root: Path) -> tuple[list[Path], dict[str, Path], dict[str, P
             "split": "val",
             "source": str(source),
             "field": "recipient_field",
-            "reference_text": f"真实商户{index}",
-            "candidate_text": None if index > 0 else "真实商户0",
+            "reference_text": "商户甲" if index == 0 else f"真实商户{index}",
+            "candidate_text": None if index > 0 else "商户甲",
             "candidate_present": index == 0,
             "missing_reason": "candidate_missing" if index > 0 else None,
             "raw_exact": index == 0,
@@ -123,6 +123,26 @@ def _write_fixture(root: Path) -> tuple[list[Path], dict[str, Path], dict[str, P
             (hybrid_paths if hybrid else baseline_paths)[str(source)] = result_path
         _write_json(run / "inference_manifest.json", manifest)
     return sources, baseline_paths, hybrid_paths
+
+
+def _write_records(path: Path, sources: list[Path]) -> None:
+    rows = [
+        {
+            "id": source.stem,
+            "split": "val",
+            "source": str(source),
+            "slots": {
+                "recipient_field": {
+                    "text": "商户甲" if index == 0 else f"真实商户{index}"
+                }
+            },
+        }
+        for index, source in enumerate(sources)
+    ]
+    path.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+        encoding="utf-8",
+    )
 
 
 def test_audit_outputs_only_failed_or_missing_rows_with_ppocr_evidence(
@@ -159,12 +179,13 @@ def test_audit_outputs_only_failed_or_missing_rows_with_ppocr_evidence(
         "score": 0.95,
         "bbox_image": [9, 10, 11, 12],
     }
-    assert failure["hybrid_recipient_reference_evidence"] == {
-        "field": "recipient_field",
-        "reference_text": "真实商户1",
-        "candidate_text": None,
-        "raw_exact": False,
-    }
+    reference = failure["hybrid_recipient_reference_evidence"]
+    assert reference["field"] == "recipient_field"
+    assert reference["reference_text"] == "真实商户1"
+    assert reference["candidate_text"] is None
+    assert reference["raw_exact"] is False
+    assert reference["reference_present"] is True
+    assert reference["provenance"] == "hybrid_val_score"
     assert failure["hybrid_model_contracts"]["ocr_bundle_contract_sha256"] == "b" * 64
     assert failure["hybrid_ppocr_evidence"] == {
         "failure_reason": "anchored_or_alternative_parse_failed;first=lines=[0:0.61:商户]",
@@ -297,6 +318,129 @@ def test_audit_strictly_binds_hybrid_recipient_reference_evidence(
         MODULE.audit(root)
 
 
+def test_audit_streams_records_fallback_when_score_was_not_created(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "ab"
+    sources, _, _ = _write_fixture(root)
+    (root / "hybrid-val-score" / "comparisons.jsonl").unlink()
+    records = tmp_path / "unified_fields.jsonl"
+    _write_records(records, sources)
+
+    payload = MODULE.audit(root, records_path=records)
+
+    evidence = payload["findings"][0]["hybrid_recipient_reference_evidence"]
+    assert evidence == {
+        "field": "recipient_field",
+        "reference_text": "真实商户1",
+        "candidate_text": None,
+        "raw_exact": False,
+        "reference_present": True,
+        "missing_reason": None,
+        "provenance": "records_fallback",
+        "provenance_path": records.resolve().as_posix(),
+        "records_val_rows": 1,
+        "records_reference_rows": 1,
+    }
+
+
+def test_audit_records_fallback_marks_missing_recipient_reference(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "ab"
+    sources, _, _ = _write_fixture(root)
+    (root / "hybrid-val-score" / "comparisons.jsonl").unlink()
+    records = tmp_path / "unified_fields.jsonl"
+    _write_records(records, sources)
+    rows = [json.loads(line) for line in records.read_text(encoding="utf-8").splitlines()]
+    rows[1]["slots"] = {}
+    records.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+    payload = MODULE.audit(root, records_path=records)
+
+    evidence = payload["findings"][0]["hybrid_recipient_reference_evidence"]
+    assert evidence["reference_text"] is None
+    assert evidence["reference_present"] is False
+    assert evidence["missing_reason"] == "val slots.recipient_field.text missing"
+    assert evidence["records_val_rows"] == 1
+    assert evidence["records_reference_rows"] == 0
+
+
+def test_audit_records_fallback_rejects_conflicting_truth(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "ab"
+    sources, _, _ = _write_fixture(root)
+    (root / "hybrid-val-score" / "comparisons.jsonl").unlink()
+    records = tmp_path / "unified_fields.jsonl"
+    _write_records(records, sources)
+    rows = records.read_text(encoding="utf-8").splitlines()
+    conflict = {
+        "id": "bad-conflict",
+        "split": "val",
+        "source": str(sources[1]),
+        "slots": {"recipient_field": {"text": "冲突真值"}},
+    }
+    records.write_text(
+        "\n".join([*rows, json.dumps(conflict, ensure_ascii=False)]) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(MODULE.AuditError, match="conflicting recipient_field references"):
+        MODULE.audit(root, records_path=records)
+
+
+def test_audit_records_fallback_rejects_non_val_source(tmp_path: Path) -> None:
+    root = tmp_path / "ab"
+    sources, _, _ = _write_fixture(root)
+    (root / "hybrid-val-score" / "comparisons.jsonl").unlink()
+    records = tmp_path / "unified_fields.jsonl"
+    _write_records(records, sources)
+    rows = [json.loads(line) for line in records.read_text(encoding="utf-8").splitlines()]
+    rows[1]["split"] = "train"
+    records.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(MODULE.AuditError, match="has no split='val' unified record"):
+        MODULE.audit(root, records_path=records)
+
+
+def test_audit_missing_score_requires_existing_records_fallback(tmp_path: Path) -> None:
+    root = tmp_path / "ab"
+    _write_fixture(root)
+    (root / "hybrid-val-score" / "comparisons.jsonl").unlink()
+
+    with pytest.raises(MODULE.AuditError, match="provide --records"):
+        MODULE.audit(root)
+    with pytest.raises(MODULE.AuditError, match="missing unified records fallback"):
+        MODULE.audit(root, records_path=tmp_path / "missing.jsonl")
+
+
+def test_audit_cross_checks_records_when_score_exists(tmp_path: Path) -> None:
+    root = tmp_path / "ab"
+    sources, _, _ = _write_fixture(root)
+    records = tmp_path / "unified_fields.jsonl"
+    _write_records(records, sources)
+
+    payload = MODULE.audit(root, records_path=records)
+
+    evidence = payload["findings"][0]["hybrid_recipient_reference_evidence"]
+    assert evidence["provenance"] == "hybrid_val_score_cross_checked_records"
+    rows = [json.loads(line) for line in records.read_text(encoding="utf-8").splitlines()]
+    rows[1]["slots"]["recipient_field"]["text"] = "冲突真值"
+    records.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    with pytest.raises(MODULE.AuditError, match="recipient reference mismatch"):
+        MODULE.audit(root, records_path=records)
+
+
 def test_main_emits_exactly_one_json_line(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     root = tmp_path / "ab"
     _write_fixture(root)
@@ -349,6 +493,8 @@ def test_main_text_format_is_complete_and_terminal_width_bounded(
     assert '    reference_text: "真实商户1"' in lines
     assert "    candidate_text: null" in lines
     assert "    raw_exact: false" in lines
+    assert "    reference_present: true" in lines
+    assert '    provenance: "hybrid_val_score"' in lines
     assert "  hybrid PP-OCR evidence:" in lines
     assert '    route: "none"' in lines
     assert "anchored_or_alternative_parse_failed" in output

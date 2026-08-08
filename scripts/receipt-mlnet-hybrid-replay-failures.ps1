@@ -119,6 +119,12 @@ $evidence = foreach ($row in @($manifest)) {
         failure_reason = Get-OptionalProperty $recipient "hybrid_ocr_failure_reason"
         first_raw = Get-OptionalProperty $recipient "hybrid_ocr_first_raw"
         retry_raw = Get-OptionalProperty $recipient "hybrid_ocr_retry_raw"
+        third_route = Get-OptionalProperty $recipient "hybrid_ocr_third_route"
+        right_value_raw = Get-OptionalProperty $recipient "hybrid_ocr_right_value_raw"
+        right_value_line_count = Get-OptionalProperty $recipient "hybrid_ocr_right_value_line_count"
+        right_value_crop_width = Get-OptionalProperty $recipient "hybrid_ocr_right_value_crop_width"
+        right_value_crop_height = Get-OptionalProperty $recipient "hybrid_ocr_right_value_crop_height"
+        right_value_line_confidences = Get-OptionalProperty $recipient "hybrid_ocr_right_value_line_confidences"
     }
 }
 

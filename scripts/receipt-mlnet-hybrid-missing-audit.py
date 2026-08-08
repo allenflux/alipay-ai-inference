@@ -114,7 +114,7 @@ def _comparison_rows(path: Path) -> tuple[list[dict[str, Any]], dict[str, dict[s
     return rows, indexed
 
 
-def _recipient_reference_evidence(
+def _score_recipient_reference_evidence(
     path: Path, *, comparison_keys: set[str]
 ) -> dict[str, dict[str, Any]]:
     rows = _load_jsonl(path, description="hybrid val score comparisons")
@@ -163,6 +163,10 @@ def _recipient_reference_evidence(
             raise AuditError(
                 f"hybrid score comparison[{index}].raw_exact must be a boolean"
             )
+        if raw_exact != (candidate is not None and candidate == reference):
+            raise AuditError(
+                f"hybrid score comparison[{index}].raw_exact disagrees with its text"
+            )
         recipients[source_key] = {
             "field": field,
             "reference_text": reference,
@@ -178,6 +182,206 @@ def _recipient_reference_evidence(
             f"missing={len(missing)} extra={len(extra)}"
         )
     return recipients
+
+
+def _records_recipient_references(
+    path: Path, *, comparison_keys: set[str]
+) -> dict[str, dict[str, Any]]:
+    """Stream the large unified manifest and retain only requested val references."""
+
+    if not path.is_file():
+        raise AuditError(f"missing unified records fallback: {path}")
+    states: dict[str, dict[str, Any]] = {
+        key: {
+            "val_rows": 0,
+            "reference_rows": 0,
+            "reference_present": False,
+            "reference_text": None,
+            "observed_splits": set(),
+        }
+        for key in comparison_keys
+    }
+    with path.open("r", encoding="utf-8-sig") as stream:
+        for line_number, line in enumerate(stream, start=1):
+            if not line.strip():
+                raise AuditError(f"invalid unified records {path}:{line_number}: blank line")
+            record = _loads(line, location=f"{path}:{line_number}")
+            if not isinstance(record, dict):
+                raise AuditError(
+                    f"invalid unified records {path}:{line_number}: expected one object"
+                )
+            source = _nonempty_string(
+                record.get("source"),
+                description=f"unified records {path}:{line_number}.source",
+            )
+            key = _source_key(source)
+            if key not in states:
+                continue
+            state = states[key]
+            split = record.get("split")
+            state["observed_splits"].add(split if isinstance(split, str) else repr(split))
+            if split != "val":
+                continue
+            state["val_rows"] += 1
+            slots = record.get("slots")
+            if not isinstance(slots, Mapping):
+                raise AuditError(
+                    f"unified records {path}:{line_number} source {source!r} "
+                    "has no slots object"
+                )
+            recipient = slots.get("recipient_field")
+            if not isinstance(recipient, Mapping) or recipient.get("text") is None:
+                continue
+            reference = recipient.get("text")
+            if not isinstance(reference, str):
+                raise AuditError(
+                    f"unified records {path}:{line_number} source {source!r} "
+                    "slots.recipient_field.text must be a string or null"
+                )
+            if state["reference_present"] and state["reference_text"] != reference:
+                raise AuditError(
+                    f"unified records source {source!r} has conflicting recipient_field "
+                    f"references {state['reference_text']!r} and {reference!r}"
+                )
+            state["reference_present"] = True
+            state["reference_text"] = reference
+            state["reference_rows"] += 1
+
+    references: dict[str, dict[str, Any]] = {}
+    for key, state in states.items():
+        if state["val_rows"] == 0:
+            observed = sorted(map(str, state["observed_splits"]))
+            raise AuditError(
+                f"A/B source {key!r} has no split='val' unified record; "
+                f"observed_splits={observed}"
+            )
+        references[key] = {
+            "reference_text": state["reference_text"],
+            "reference_present": state["reference_present"],
+            "missing_reason": (
+                None
+                if state["reference_present"]
+                else "val slots.recipient_field.text missing"
+            ),
+            "records_val_rows": state["val_rows"],
+            "records_reference_rows": state["reference_rows"],
+        }
+    return references
+
+
+def _bound_recipient_reference_evidence(
+    *,
+    root: Path,
+    comparisons: Mapping[str, Mapping[str, Any]],
+    records_path: Path | None,
+) -> dict[str, dict[str, Any]]:
+    comparison_keys = set(comparisons)
+    score_path = root / "hybrid-val-score" / "comparisons.jsonl"
+    if score_path.exists() and not score_path.is_file():
+        raise AuditError(f"hybrid val score comparisons is not a file: {score_path}")
+    score = (
+        _score_recipient_reference_evidence(
+            score_path, comparison_keys=comparison_keys
+        )
+        if score_path.is_file()
+        else None
+    )
+    records = (
+        _records_recipient_references(
+            records_path, comparison_keys=comparison_keys
+        )
+        if records_path is not None
+        else None
+    )
+    if score is None and records is None:
+        raise AuditError(
+            f"missing hybrid val score comparisons: {score_path}; "
+            "provide --records for strict val reference fallback"
+        )
+
+    if score is not None and records is not None:
+        for key in comparison_keys:
+            score_row = score.get(key)
+            record_row = records[key]
+            if (score_row is not None) != bool(record_row["reference_present"]):
+                raise AuditError(
+                    f"recipient reference presence mismatch for source {key!r} "
+                    "between hybrid score and unified records"
+                )
+            if score_row is not None and (
+                score_row["reference_text"] != record_row["reference_text"]
+            ):
+                raise AuditError(
+                    f"recipient reference mismatch for source {key!r} between "
+                    "hybrid score and unified records"
+                )
+
+    evidence: dict[str, dict[str, Any]] = {}
+    for key, comparison in comparisons.items():
+        comparison_candidate = comparison.get("recipient_candidate")
+        score_row = score.get(key) if score is not None else None
+        if score_row is not None:
+            if score_row["candidate_text"] != comparison_candidate:
+                raise AuditError(
+                    f"recipient candidate mismatch for source {key!r} between "
+                    "hybrid score and A/B comparison"
+                )
+            row = dict(score_row)
+            row.update(
+                {
+                    "reference_present": True,
+                    "missing_reason": None,
+                    "provenance": (
+                        "hybrid_val_score_cross_checked_records"
+                        if records is not None
+                        else "hybrid_val_score"
+                    ),
+                    "provenance_path": score_path.resolve().as_posix(),
+                }
+            )
+            evidence[key] = row
+            continue
+
+        record_row = records[key] if records is not None else None
+        reference = record_row["reference_text"] if record_row is not None else None
+        reference_present = (
+            bool(record_row["reference_present"]) if record_row is not None else False
+        )
+        row = {
+            "field": "recipient_field",
+            "reference_text": reference,
+            "candidate_text": comparison_candidate,
+            "raw_exact": (
+                reference_present
+                and isinstance(comparison_candidate, str)
+                and comparison_candidate == reference
+            ),
+            "reference_present": reference_present,
+            "missing_reason": (
+                record_row["missing_reason"]
+                if record_row is not None
+                else "recipient_field score comparison absent"
+            ),
+            "provenance": (
+                "records_fallback"
+                if score is None
+                else (
+                    "hybrid_val_score_cross_checked_records"
+                    if records is not None
+                    else "hybrid_val_score"
+                )
+            ),
+            "provenance_path": (
+                records_path.resolve().as_posix()
+                if score is None and records_path is not None
+                else score_path.resolve().as_posix()
+            ),
+        }
+        if record_row is not None:
+            row["records_val_rows"] = record_row["records_val_rows"]
+            row["records_reference_rows"] = record_row["records_reference_rows"]
+        evidence[key] = row
+    return evidence
 
 
 def _contained_result_path(raw: str, *, run_root: Path, manifest_path: Path) -> Path:
@@ -284,7 +488,7 @@ def _ppocr_evidence(recipient: Mapping[str, Any] | None) -> dict[str, Any] | Non
     return evidence or None
 
 
-def audit(root: Path) -> dict[str, Any]:
+def audit(root: Path, *, records_path: Path | None = None) -> dict[str, Any]:
     try:
         root = root.resolve(strict=True)
     except FileNotFoundError as exception:
@@ -294,9 +498,10 @@ def audit(root: Path) -> dict[str, Any]:
     comparison_rows, comparisons = _comparison_rows(
         root / "comparison" / "comparisons.jsonl"
     )
-    recipient_references = _recipient_reference_evidence(
-        root / "hybrid-val-score" / "comparisons.jsonl",
-        comparison_keys=set(comparisons),
+    recipient_references = _bound_recipient_reference_evidence(
+        root=root,
+        comparisons=comparisons,
+        records_path=records_path,
     )
     baseline = _manifest_results(root / "baseline-v13", label="baseline")
     hybrid = _manifest_results(root / "hybrid-recipient", label="hybrid")
@@ -498,7 +703,18 @@ def _append_ppocr_summary(lines: list[str], evidence: object, *, width: int) -> 
 def _append_reference_summary(lines: list[str], evidence: object, *, width: int) -> None:
     lines.append("  hybrid recipient reference evidence:")
     mapping = evidence if isinstance(evidence, Mapping) else {}
-    for key in ("field", "reference_text", "candidate_text", "raw_exact"):
+    for key in (
+        "field",
+        "reference_text",
+        "candidate_text",
+        "raw_exact",
+        "reference_present",
+        "missing_reason",
+        "provenance",
+        "provenance_path",
+        "records_val_rows",
+        "records_reference_rows",
+    ):
         _append_text_value(
             lines,
             key,
@@ -613,6 +829,11 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", required=True, type=Path, help="hybrid CPU A/B output root")
     parser.add_argument(
+        "--records",
+        type=Path,
+        help="unified_fields.jsonl fallback/cross-check for recipient references",
+    )
+    parser.add_argument(
         "--format",
         dest="output_format",
         choices=("json", "text"),
@@ -625,7 +846,7 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
-        payload = audit(args.root)
+        payload = audit(args.root, records_path=args.records)
         if args.output_format == "text":
             print(format_text(payload))
         else:

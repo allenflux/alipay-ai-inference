@@ -198,6 +198,22 @@ def test_hybrid_retry_and_diagnostic_probe_remain_fail_closed() -> None:
     assert '$"right_value={DescribeReadEvidence(rightValueRead, null, null)}"' in router
 
 
+def test_failed_source_replay_emits_right_value_probe_evidence() -> None:
+    replay = (
+        ROOT / "scripts" / "receipt-mlnet-hybrid-replay-failures.ps1"
+    ).read_text(encoding="utf-8")
+
+    for field in (
+        "hybrid_ocr_third_route",
+        "hybrid_ocr_right_value_raw",
+        "hybrid_ocr_right_value_line_count",
+        "hybrid_ocr_right_value_crop_width",
+        "hybrid_ocr_right_value_crop_height",
+        "hybrid_ocr_right_value_line_confidences",
+    ):
+        assert f'Get-OptionalProperty $recipient "{field}"' in replay
+
+
 def test_hybrid_is_pure_onnx_cpu_and_binds_all_artifact_hashes() -> None:
     program = _source("Program.cs")
     engine = _source("PaddleOcrEngine.cs")
