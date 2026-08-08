@@ -3,6 +3,7 @@ using Microsoft.ML.OnnxRuntime.Tensors;
 using OpenCvSharp;
 using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.PixelFormats;
+using System.Security.Cryptography;
 
 /// <summary>One recognised PaddleOCR text line, after CTC decoding.</summary>
 internal sealed record PaddleOcrLine(string Text, float Confidence);
@@ -35,6 +36,58 @@ internal sealed record PaddleOcrLayoutReadResult(
     IReadOnlyList<PaddleOcrLayoutLine> Lines);
 
 /// <summary>
+/// Immutable, hash-verified CPU model bytes for diagnostic callers that must
+/// close the path reopen window between delivery verification and ORT session
+/// construction. Existing production constructors continue to load paths.
+/// </summary>
+internal sealed class PaddleOcrCpuModelSnapshot
+{
+    private PaddleOcrCpuModelSnapshot(
+        byte[] detector,
+        byte[] classifier,
+        byte[] recognizer)
+    {
+        Detector = detector;
+        Classifier = classifier;
+        Recognizer = recognizer;
+    }
+
+    internal byte[] Detector { get; }
+    internal byte[] Classifier { get; }
+    internal byte[] Recognizer { get; }
+
+    public static PaddleOcrCpuModelSnapshot Create(
+        PaddleOcrDeliveryBundle bundle,
+        byte[] detector,
+        byte[] classifier,
+        byte[] recognizer)
+    {
+        ArgumentNullException.ThrowIfNull(bundle);
+        return new PaddleOcrCpuModelSnapshot(
+            VerifyAndClone(detector, bundle.DetModel.File, "detector"),
+            VerifyAndClone(classifier, bundle.ClsModel.File, "classifier"),
+            VerifyAndClone(recognizer, bundle.RecModel.File, "recognizer"));
+    }
+
+    internal static byte[] VerifyAndClone(
+        byte[] bytes,
+        PaddleOcrFileRecord expected,
+        string role)
+    {
+        ArgumentNullException.ThrowIfNull(bytes);
+        ArgumentNullException.ThrowIfNull(expected);
+        var sha256 = Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();
+        if (bytes.LongLength != expected.SizeBytes
+            || !string.Equals(sha256, expected.Sha256, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                $"Paddle OCR {role} byte snapshot differs from the verified delivery contract");
+        }
+        return bytes.ToArray();
+    }
+}
+
+/// <summary>
 /// Direct ONNX Runtime implementation of the frozen PaddleOCR v2 pipeline:
 /// DB text detection, perspective crop, angle classification and CTC text
 /// recognition.  It owns exactly three sessions for the lifetime of a batch.
@@ -59,6 +112,36 @@ internal sealed class PaddleOcrEngine : IDisposable
         _classifier = sessions.Classifier;
         _recognizer = sessions.Recognizer;
         ExecutionProvider = provider;
+        try
+        {
+            VerifySessionContract(_detector, bundle.DetModel);
+            VerifySessionContract(_classifier, bundle.ClsModel);
+            VerifySessionContract(_recognizer, bundle.RecModel);
+        }
+        catch
+        {
+            Dispose();
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// CPU-only diagnostic constructor whose ORT sessions are created directly
+    /// from already hash-verified immutable model bytes. It is additive and
+    /// does not change the existing path/device constructor.
+    /// </summary>
+    internal PaddleOcrEngine(
+        PaddleOcrDeliveryBundle bundle,
+        PaddleOcrCpuModelSnapshot cpuModelSnapshot)
+    {
+        ArgumentNullException.ThrowIfNull(bundle);
+        ArgumentNullException.ThrowIfNull(cpuModelSnapshot);
+        _bundle = bundle;
+        var sessions = CreateCpuSessions(cpuModelSnapshot);
+        _detector = sessions.Detector;
+        _classifier = sessions.Classifier;
+        _recognizer = sessions.Recognizer;
+        ExecutionProvider = "cpu";
         try
         {
             VerifySessionContract(_detector, bundle.DetModel);
@@ -547,6 +630,26 @@ internal sealed class PaddleOcrEngine : IDisposable
             detector = new InferenceSession(bundle.DetModel.FullPath);
             classifier = new InferenceSession(bundle.ClsModel.FullPath);
             var recognizer = new InferenceSession(bundle.RecModel.FullPath);
+            return (detector, classifier, recognizer);
+        }
+        catch
+        {
+            classifier?.Dispose();
+            detector?.Dispose();
+            throw;
+        }
+    }
+
+    private static (InferenceSession Detector, InferenceSession Classifier, InferenceSession Recognizer) CreateCpuSessions(
+        PaddleOcrCpuModelSnapshot snapshot)
+    {
+        InferenceSession? detector = null;
+        InferenceSession? classifier = null;
+        try
+        {
+            detector = new InferenceSession(snapshot.Detector);
+            classifier = new InferenceSession(snapshot.Classifier);
+            var recognizer = new InferenceSession(snapshot.Recognizer);
             return (detector, classifier, recognizer);
         }
         catch
