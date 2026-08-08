@@ -343,6 +343,318 @@ internal static class Program
                     ParsePinyin(["shou kuan fang", "\u53f8\u6e90(**\u6e90)", "\u6536\u6b3e\u65b9"], [0.90f, 0.90f, 0.90f], 0.99f),
                     0.99f),
                 "pinyin route has no overlap exception");
+
+            AssertAlternative(
+                "\u53f8\u6e90(**\u6e90)",
+                "unlabelled_masked_cjk_right_full_agreement",
+                null,
+                ParseMaskedAgreement(
+                    "\u53f8\u6e90(**\u6e90)",
+                    "\u53f8\u6e90(**\u6e90)",
+                    fullConfidence: 0.91f,
+                    rightConfidence: 0.83f),
+                "masked ASCII-parenthesis full/right agreement",
+                0.83f);
+            AssertAlternative(
+                "\u5c0f\u8363\uff08**\u9f99\uff09",
+                "unlabelled_masked_cjk_right_full_agreement",
+                null,
+                ParseMaskedAgreement(
+                    "\u5c0f\u8363\uff08**\u9f99\uff09",
+                    "\u5c0f\u8363\uff08**\u9f99\uff09",
+                    fullConfidence: 0.80f,
+                    rightConfidence: 0.80f,
+                    fullWidth: 675,
+                    rightWidth: 438,
+                    detectorScore: 0.95f),
+                "masked route inclusive confidence/crop/detector thresholds",
+                0.80f);
+            AssertAlternativeNull(
+                ParseMaskedAgreement("\u53f8\u6e90(**\u6e90)", "\u53f8\u6e90(**\u6d77)"),
+                "masked full/right string difference");
+            AssertAlternativeNull(
+                ParseMaskedAgreement("\u53f8\u6e90(**\u6e90)", "\u53f8\u6e90(**\u6e90)", fullConfidence: 0.799f),
+                "masked full confidence below 0.80");
+            AssertAlternativeNull(
+                ParseMaskedAgreement("\u53f8\u6e90(**\u6e90)", "\u53f8\u6e90(**\u6e90)", rightConfidence: 0.799f),
+                "masked right confidence below 0.80");
+            AssertAlternativeNull(
+                ParseMaskedAgreement("\u53f8\u6e90(**\u6e90)", "\u53f8\u6e90(**\u6e90)", fullConfidence: float.NaN),
+                "masked non-finite full confidence");
+            AssertAlternativeNull(
+                ParseMaskedAgreement("\u53f8\u6e90(**\u6e90)", "\u53f8\u6e90(**\u6e90)", rightConfidence: float.PositiveInfinity),
+                "masked infinite right confidence");
+            AssertAlternativeNull(
+                ParseMaskedAgreement("\u53f8\u6e90(**\u6e90)", "\u53f8\u6e90(**\u6e90)", detectorScore: 0.949f),
+                "masked detector below 0.95");
+            AssertAlternativeNull(
+                ParseMaskedAgreement("\u53f8\u6e90(**\u6e90)", "\u53f8\u6e90(**\u6e90)", detectorScore: float.NaN),
+                "masked non-finite detector");
+            AssertAlternativeNull(
+                ParseMaskedAgreement("\u53f8\u6e90(**\u6e90)", "\u53f8\u6e90(**\u6e90)", detectorScore: float.PositiveInfinity),
+                "masked infinite detector");
+            AssertAlternativeNull(
+                ParseMaskedAgreement("\u53f8\u6e90(**\u6e90)", "\u53f8\u6e90(**\u6e90)", fullWidth: 674),
+                "masked full crop below 90 percent source width");
+            AssertAlternativeNull(
+                ParseMaskedAgreement("\u53f8\u6e90(**\u6e90)", "\u53f8\u6e90(**\u6e90)", fullWidth: 675, rightWidth: 439),
+                "masked right crop above 65 percent of full crop");
+            AssertAlternativeNull(
+                PaddleRecipientValueParser.ParseUnlabelledMaskedCjkRightFullAgreement(
+                    ["\u53f8\u6e90(**\u6e90)", "\u5907\u6ce8"],
+                    [0.90f, 0.90f],
+                    720,
+                    ["\u53f8\u6e90(**\u6e90)"],
+                    [0.90f],
+                    396,
+                    750,
+                    0.95f),
+                "masked full crop has an extra non-empty line");
+            foreach (var invalidMasked in new[]
+            {
+                "\u53f8\u6e90()",
+                "\u53f8\u6e90\uff08\uff09",
+                "\u53f8\u6e90(\u6e90\u6d77)",
+                "\u53f8\u6e90(**\u6e90\uff09",
+                "\u53f8\u6e90\uff08**\u6e90)",
+                "\u53f8(*\u6e90)",
+                "\u53f8\u6e90ABCDEFGHIJK(**)",
+                "Merchant(**)",
+                "\u53f8\u6e90(*1)",
+                "\u53f8\u6e90(*******)",
+                "\u4e00\u4e8c\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d\u5341\u7532\u4e59\u4e19(**)",
+                "\u5904\u7406(**)",
+                "\u8be6\u60c5(**)",
+                "\u8d26\u53f7(**)",
+                "\u8d26\u6237(**)",
+            })
+            {
+                AssertAlternativeNull(
+                    ParseMaskedAgreement(invalidMasked, invalidMasked),
+                    $"invalid masked merchant '{invalidMasked}'");
+            }
+
+            AssertAlternative(
+                "\u8d8a\u91ce\u5154\uff08\uff09",
+                "truncated_recipient_label_empty_mask_three_crop_agreement",
+                null,
+                ParseEmptyMaskAgreement(
+                    "\u6536\u6b3e",
+                    "\u8d8a\u91ce\u5154\uff08\uff09",
+                    "\u8d8a\u91ce\u5154\uff08\uff09",
+                    "\u8d8a\u91ce\u5154\uff08\uff09",
+                    labelConfidence: 0.50f,
+                    standardCandidateConfidence: 0.82f,
+                    fullConfidence: 0.76f,
+                    rightConfidence: 0.75f),
+                "empty-mask three-crop agreement at inclusive thresholds",
+                0.75f);
+            AssertAlternative(
+                "\u8d8a\u91ce\u5154()",
+                "truncated_recipient_label_empty_mask_three_crop_agreement",
+                null,
+                ParseEmptyMaskAgreement(
+                    "\u6536\u6b3e",
+                    "\u8d8a\u91ce\u5154()",
+                    "\u8d8a\u91ce\u5154()",
+                    "\u8d8a\u91ce\u5154()"),
+                "empty-mask ASCII parentheses",
+                0.90f);
+            AssertAlternativeNull(
+                ParseEmptyMaskAgreement("\u6536\u6b3e\u65b9", "\u8d8a\u91ce\u5154\uff08\uff09", "\u8d8a\u91ce\u5154\uff08\uff09", "\u8d8a\u91ce\u5154\uff08\uff09"),
+                "empty-mask standard label must be exactly truncated shoukuan");
+            AssertAlternativeNull(
+                ParseEmptyMaskAgreement("\u6536\u6b3e", "\u8d8a\u91ce\u5154\uff08\uff09", "\u8d8a\u91ce\u72d0\uff08\uff09", "\u8d8a\u91ce\u5154\uff08\uff09"),
+                "empty-mask full crop differs");
+            AssertAlternativeNull(
+                ParseEmptyMaskAgreement("\u6536\u6b3e", "\u8d8a\u91ce\u5154\uff08\uff09", "\u8d8a\u91ce\u5154\uff08\uff09", "\u8d8a\u91ce\u72d0\uff08\uff09"),
+                "empty-mask right crop differs");
+            AssertAlternativeNull(
+                ParseEmptyMaskAgreement("\u6536\u6b3e", "\u8d8a\u91ce\u5154\uff08\uff09", "\u8d8a\u91ce\u5154\uff08\uff09", "\u8d8a\u91ce\u5154\uff08\uff09", labelConfidence: 0.499f),
+                "empty-mask label confidence below 0.50");
+            AssertAlternativeNull(
+                ParseEmptyMaskAgreement("\u6536\u6b3e", "\u8d8a\u91ce\u5154\uff08\uff09", "\u8d8a\u91ce\u5154\uff08\uff09", "\u8d8a\u91ce\u5154\uff08\uff09", standardCandidateConfidence: 0.799f),
+                "empty-mask standard candidate below 0.80");
+            AssertAlternativeNull(
+                ParseEmptyMaskAgreement("\u6536\u6b3e", "\u8d8a\u91ce\u5154\uff08\uff09", "\u8d8a\u91ce\u5154\uff08\uff09", "\u8d8a\u91ce\u5154\uff08\uff09", fullConfidence: 0.749f),
+                "empty-mask full confidence below 0.75");
+            AssertAlternativeNull(
+                ParseEmptyMaskAgreement("\u6536\u6b3e", "\u8d8a\u91ce\u5154\uff08\uff09", "\u8d8a\u91ce\u5154\uff08\uff09", "\u8d8a\u91ce\u5154\uff08\uff09", rightConfidence: 0.749f),
+                "empty-mask right confidence below 0.75");
+            AssertAlternativeNull(
+                ParseEmptyMaskAgreement("\u6536\u6b3e", "\u8d8a\u91ce\u5154\uff08\uff09", "\u8d8a\u91ce\u5154\uff08\uff09", "\u8d8a\u91ce\u5154\uff08\uff09", labelConfidence: float.NaN),
+                "empty-mask non-finite label confidence");
+            AssertAlternativeNull(
+                ParseEmptyMaskAgreement("\u6536\u6b3e", "\u8d8a\u91ce\u5154\uff08\uff09", "\u8d8a\u91ce\u5154\uff08\uff09", "\u8d8a\u91ce\u5154\uff08\uff09", detectorScore: float.PositiveInfinity),
+                "empty-mask infinite detector");
+            AssertAlternativeNull(
+                ParseEmptyMaskAgreement("\u6536\u6b3e", "\u8d8a\u91ce\u5154\uff08\uff09", "\u8d8a\u91ce\u5154\uff08\uff09", "\u8d8a\u91ce\u5154\uff08\uff09", fullWidth: 674),
+                "empty-mask full crop below 90 percent source width");
+            AssertAlternativeNull(
+                ParseEmptyMaskAgreement("\u6536\u6b3e", "\u8d8a\u91ce\u5154\uff08\uff09", "\u8d8a\u91ce\u5154\uff08\uff09", "\u8d8a\u91ce\u5154\uff08\uff09", fullWidth: 675, rightWidth: 439),
+                "empty-mask right crop above 65 percent of full crop");
+            AssertAlternativeNull(
+                PaddleRecipientValueParser.ParseTruncatedRecipientLabelEmptyMaskThreeCropAgreement(
+                    ["\u6536\u6b3e", "\u8d8a\u91ce\u5154\uff08\uff09", "\u5907\u6ce8"],
+                    [0.90f, 0.90f, 0.90f],
+                    ["\u8d8a\u91ce\u5154\uff08\uff09"],
+                    [0.90f],
+                    720,
+                    ["\u8d8a\u91ce\u5154\uff08\uff09"],
+                    [0.90f],
+                    396,
+                    750,
+                    0.95f),
+                "empty-mask standard crop has extra line");
+            foreach (var invalidEmptyMask in new[]
+            {
+                "\u8d8a\u91ce\u5154(**)",
+                "\u8d8a\u91ce\u5154(\uff09",
+                "\u8d8a\u91ce\u5154\uff08)",
+                "\u8d8a()",
+                "\u8d8a\u91ce\u5154\u5546\u6237\u540d\u79f0\u8d85\u957f()",
+                "A\u8d8a\u91ce\u5154()",
+                "\u5904\u7406()",
+                "\u8be6\u60c5()",
+                "\u8d26\u53f7()",
+                "\u8d26\u6237()",
+            })
+            {
+                AssertAlternativeNull(
+                    ParseEmptyMaskAgreement(
+                        "\u6536\u6b3e",
+                        invalidEmptyMask,
+                        invalidEmptyMask,
+                        invalidEmptyMask),
+                    $"invalid empty-mask merchant '{invalidEmptyMask}'");
+            }
+
+            AssertAlternative(
+                "\u5f20\u5976\u6c38",
+                "unlabelled_cjk_discount_arithmetic_exact",
+                8,
+                ParseDiscountArithmetic(
+                    "\u5f20\u5976\u6c38",
+                    "\u00a5 500.00",
+                    "\u767e\u6b21\u7acb\u51cf",
+                    "08",
+                    "499.92",
+                    [0.99f, 0.90f, 0.99f, 0.99f],
+                    0.95f),
+                "exact four-line discount arithmetic evidence",
+                0.90f);
+            AssertAlternative(
+                "\u5f20\u00b7\u5976\u6c38",
+                "unlabelled_cjk_discount_arithmetic_exact",
+                1,
+                ParseDiscountArithmetic("\u5f20\u00b7\u5976\u6c38", "\uffe5500.00", "\u767e\u6b21\u7acb\u51cf", "01", "499.99"),
+                "discount route permits internal middle dot",
+                0.99f);
+            AssertAlternative(
+                "\u5f20\u5976\u6c38",
+                "unlabelled_cjk_discount_arithmetic_exact",
+                99,
+                ParseDiscountArithmetic("\u5f20\u5976\u6c38", "\u00a5500.00", "\u767e\u6b21\u7acb\u51cf", "99", "499.01"),
+                "discount 99-fen upper boundary",
+                0.99f);
+            AssertAlternativeNull(
+                ParseDiscountArithmetic("\u5f20\u5976\u6c38", "\u00a5500.00", "\u767e\u6b21\u7acb\u51cf", "08", "499.91"),
+                "discount arithmetic mismatch");
+            AssertAlternativeNull(
+                ParseDiscountArithmetic("\u5f20\u5976\u6c38", "\u00a5500.00", "\u767e\u6b21\u7acb\u51cf", "08", "500.08"),
+                "gross must exceed expected amount");
+            foreach (var invalidGross in new[]
+            {
+                "500.00",
+                "\u00a5500.0",
+                "\u00a5500.000",
+                "\u00a51,500.00",
+                "\u00a5\uff15\uff10\uff10.\uff10\uff10",
+                "\u00a5OOO.00",
+            })
+            {
+                AssertAlternativeNull(
+                    ParseDiscountArithmetic("\u5f20\u5976\u6c38", invalidGross, "\u767e\u6b21\u7acb\u51cf", "08", "499.92"),
+                    $"invalid strict discount gross '{invalidGross}'");
+            }
+            foreach (var invalidDiscount in new[] { "00", "1", "100", "\uff10\uff18", "0A" })
+            {
+                AssertAlternativeNull(
+                    ParseDiscountArithmetic("\u5f20\u5976\u6c38", "\u00a5500.00", "\u767e\u6b21\u7acb\u51cf", invalidDiscount, "499.92"),
+                    $"invalid exact two-digit discount '{invalidDiscount}'");
+            }
+            AssertAlternativeNull(
+                ParseDiscountArithmetic("\u5f20\u5976\u6c38", "\u00a5500.00", "\u6bcf\u6b21\u7acb\u51cf", "08", "499.92"),
+                "discount marker must be exact");
+            foreach (var invalidMerchant in new[]
+            {
+                "A\u5f20\u5976\u6c38",
+                "\u00b7\u5f20\u5976\u6c38",
+                "\u5f20\u5976\u6c38\u00b7",
+                "\u5f20\u00b7\u00b7\u5976\u6c38",
+                "\u5f20\u5976\u6c38500",
+                "\u5904\u7406\u8be6\u60c5",
+                "\u8d26\u53f7\u4fe1\u606f",
+                "\u8d26\u6237\u4fe1\u606f",
+            })
+            {
+                AssertAlternativeNull(
+                    ParseDiscountArithmetic(invalidMerchant, "\u00a5500.00", "\u767e\u6b21\u7acb\u51cf", "08", "499.92"),
+                    $"invalid discount merchant '{invalidMerchant}'");
+            }
+            AssertAlternativeNull(
+                ParseDiscountArithmetic("\u5f20\u5976\u6c38", "\u00a5500.00", "\u767e\u6b21\u7acb\u51cf", "08", "499.92", [0.989f, 0.99f, 0.99f, 0.99f]),
+                "discount merchant confidence below 0.99");
+            AssertAlternativeNull(
+                ParseDiscountArithmetic("\u5f20\u5976\u6c38", "\u00a5500.00", "\u767e\u6b21\u7acb\u51cf", "08", "499.92", [0.99f, 0.899f, 0.99f, 0.99f]),
+                "discount gross confidence below 0.90");
+            AssertAlternativeNull(
+                ParseDiscountArithmetic("\u5f20\u5976\u6c38", "\u00a5500.00", "\u767e\u6b21\u7acb\u51cf", "08", "499.92", [0.99f, 0.99f, 0.989f, 0.99f]),
+                "discount marker confidence below 0.99");
+            AssertAlternativeNull(
+                ParseDiscountArithmetic("\u5f20\u5976\u6c38", "\u00a5500.00", "\u767e\u6b21\u7acb\u51cf", "08", "499.92", [0.99f, 0.99f, 0.99f, 0.989f]),
+                "discount fen confidence below 0.99");
+            AssertAlternativeNull(
+                ParseDiscountArithmetic("\u5f20\u5976\u6c38", "\u00a5500.00", "\u767e\u6b21\u7acb\u51cf", "08", "499.92", [0.99f, float.NaN, 0.99f, 0.99f]),
+                "discount non-finite line confidence");
+            AssertAlternativeNull(
+                ParseDiscountArithmetic("\u5f20\u5976\u6c38", "\u00a5500.00", "\u767e\u6b21\u7acb\u51cf", "08", "499.92", detectorScore: 0.949f),
+                "discount detector below 0.95");
+            AssertAlternativeNull(
+                ParseDiscountArithmetic("\u5f20\u5976\u6c38", "\u00a5500.00", "\u767e\u6b21\u7acb\u51cf", "08", "499.92", detectorScore: float.NaN),
+                "discount non-finite detector");
+            AssertAlternativeNull(
+                PaddleRecipientValueParser.ParseUnlabelledCjkDiscountArithmeticExact(
+                    ["\u5f20\u5976\u6c38", "\u00a5500.00", "\u767e\u6b21\u7acb\u51cf", "08", "\u5907\u6ce8"],
+                    [0.99f, 0.99f, 0.99f, 0.99f, 0.99f],
+                    "499.92",
+                    0.95f),
+                "discount route extra line");
+            AssertFalse(
+                PaddleRecipientValueParser.AllowsExactCjkPaymentOverlapException(
+                    ParseMaskedAgreement("\u53f8\u6e90(**\u6e90)", "\u53f8\u6e90(**\u6e90)"),
+                    0.99f),
+                "masked full/right route cannot use 45-percent overlap exception");
+            AssertFalse(
+                PaddleRecipientValueParser.AllowsExactCjkPaymentOverlapException(
+                    ParseEmptyMaskAgreement(
+                        "\u6536\u6b3e",
+                        "\u8d8a\u91ce\u5154\uff08\uff09",
+                        "\u8d8a\u91ce\u5154\uff08\uff09",
+                        "\u8d8a\u91ce\u5154\uff08\uff09"),
+                    0.99f),
+                "empty-mask route cannot use 45-percent overlap exception");
+            AssertFalse(
+                PaddleRecipientValueParser.AllowsExactCjkPaymentOverlapException(
+                    ParseDiscountArithmetic(
+                        "\u5f20\u5976\u6c38",
+                        "\u00a5 500.00",
+                        "\u767e\u6b21\u7acb\u51cf",
+                        "08",
+                        "499.92"),
+                    0.99f),
+                "discount arithmetic route cannot use 45-percent overlap exception");
+
             var amountBox = new[] { 200.0f, 300.0f, 550.0f, 420.0f };
             var recipientBox = new[] { 20.0f, 460.0f, 730.0f, 520.0f };
             var paymentBox = new[] { 180.0f, 550.0f, 720.0f, 610.0f };
@@ -531,23 +843,93 @@ internal static class Program
             score);
     }
 
+    private static PaddleRecipientAlternativeParseResult? ParseMaskedAgreement(
+        string full,
+        string right,
+        float fullConfidence = 0.90f,
+        float rightConfidence = 0.90f,
+        int fullWidth = 720,
+        int rightWidth = 396,
+        int sourceWidth = 750,
+        float detectorScore = 0.95f)
+    {
+        return PaddleRecipientValueParser.ParseUnlabelledMaskedCjkRightFullAgreement(
+            [full],
+            [fullConfidence],
+            fullWidth,
+            [right],
+            [rightConfidence],
+            rightWidth,
+            sourceWidth,
+            detectorScore);
+    }
+
+    private static PaddleRecipientAlternativeParseResult? ParseEmptyMaskAgreement(
+        string label,
+        string standardCandidate,
+        string fullCandidate,
+        string rightCandidate,
+        float labelConfidence = 0.90f,
+        float standardCandidateConfidence = 0.90f,
+        float fullConfidence = 0.90f,
+        float rightConfidence = 0.90f,
+        int fullWidth = 720,
+        int rightWidth = 396,
+        int sourceWidth = 750,
+        float detectorScore = 0.95f)
+    {
+        return PaddleRecipientValueParser.ParseTruncatedRecipientLabelEmptyMaskThreeCropAgreement(
+            [label, standardCandidate],
+            [labelConfidence, standardCandidateConfidence],
+            [fullCandidate],
+            [fullConfidence],
+            fullWidth,
+            [rightCandidate],
+            [rightConfidence],
+            rightWidth,
+            sourceWidth,
+            detectorScore);
+    }
+
+    private static PaddleRecipientAlternativeParseResult? ParseDiscountArithmetic(
+        string merchant,
+        string gross,
+        string marker,
+        string discountFen,
+        string expectedAmount,
+        IReadOnlyList<float>? lineConfidences = null,
+        float detectorScore = 0.95f)
+    {
+        return PaddleRecipientValueParser.ParseUnlabelledCjkDiscountArithmeticExact(
+            [merchant, gross, marker, discountFen],
+            lineConfidences ?? [0.99f, 0.99f, 0.99f, 0.99f],
+            expectedAmount,
+            detectorScore);
+    }
+
     private static void AssertAlternative(
         string expectedValue,
         string expectedRoute,
         long? expectedAmountDeltaFen,
         PaddleRecipientAlternativeParseResult? actual,
-        string label)
+        string label,
+        float? expectedCandidateConfidence = null)
     {
         if (actual is null
             || !string.Equals(expectedValue, actual.Value, StringComparison.Ordinal)
             || !string.Equals(expectedRoute, actual.Route, StringComparison.Ordinal)
-            || expectedAmountDeltaFen != actual.AmountDeltaFen)
+            || expectedAmountDeltaFen != actual.AmountDeltaFen
+            || (expectedCandidateConfidence is { } expectedConfidence
+                && (actual.CandidateConfidence is not { } actualConfidence
+                    || Math.Abs(actualConfidence - expectedConfidence) > 0.000001f)))
         {
             throw new InvalidOperationException(
                 $"{label}: expected '{expectedValue}' via '{expectedRoute}' with delta "
-                + $"'{expectedAmountDeltaFen?.ToString() ?? "<null>"}', got "
+                + $"'{expectedAmountDeltaFen?.ToString() ?? "<null>"}' and confidence "
+                + $"'{expectedCandidateConfidence?.ToString() ?? "<unasserted>"}', got "
                 + $"'{actual?.Value ?? "<null>"}' via '{actual?.Route ?? "<null>"}' with delta "
-                + $"'{actual?.AmountDeltaFen.ToString() ?? "<null>"}'");
+                + $"'{actual?.AmountDeltaFen.ToString() ?? "<null>"}' and confidence "
+                + $"'{actual?.CandidateConfidence.ToString() ?? "<null>"}'");
         }
     }
 

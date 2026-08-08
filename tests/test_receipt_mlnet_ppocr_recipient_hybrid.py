@@ -92,6 +92,12 @@ def test_hybrid_routes_only_recipient_after_v13_and_keeps_review_policy() -> Non
     assert "PaddleRecipientValueParser.HasRequiredDualCropAgreement" in router
     assert "first!.Value, retry!.Value, StringComparison.Ordinal" in parser
     assert 'dual_crop_{PaddleRecipientValueParser.PinyinAnnotatedThreeLineStrongAnchorsRoute}' in router
+    assert "ParseUnlabelledMaskedCjkRightFullAgreement" in router
+    assert "ParseTruncatedRecipientLabelEmptyMaskThreeCropAgreement" in router
+    assert "ParseUnlabelledCjkDiscountArithmeticExact" in router
+    assert "verifiedDefaultAlternativeEnvelope" in router
+    assert "candidateConfidenceOverride" in router
+    assert "rightAgreementAlternative.CandidateConfidence" in router
     assert '0 => 0.75f' in parser
     assert '<= 1 => 0.68f' in parser
     assert '<= 100 => 0.90f' in parser
@@ -140,7 +146,7 @@ def test_payment_parenthesis_calibration_is_narrow_and_preserves_raw_ctc() -> No
     assert 'return raw[..^1] + "）"' in normalizer
 
 
-def test_hybrid_retry_and_diagnostic_probe_remain_fail_closed() -> None:
+def test_hybrid_retry_and_conditional_right_probe_remain_fail_closed() -> None:
     image_ops = _source("UnifiedOcrImageOps.cs")
     router = _source("PaddleRecipientHybrid.cs")
 
@@ -165,6 +171,7 @@ def test_hybrid_retry_and_diagnostic_probe_remain_fail_closed() -> None:
     assert router.count("ParseCalibratedAlternative(") == 3
     assert router.count("PaddleRecipientValueParser.ParsePinyinAnnotatedRecipient(") == 1
     assert router.count("PaddleRecipientValueParser.ParseUnlabelledMerchantAmountPair(") == 1
+    assert router.count("PaddleRecipientValueParser.ParseUnlabelledCjkDiscountArithmeticExact(") == 1
     assert '"anchored_or_alternative_parse_failed"' in router
     assert "DescribeReadEvidence" in router
     assert '"ocr_empty"' in router
@@ -175,9 +182,16 @@ def test_hybrid_retry_and_diagnostic_probe_remain_fail_closed() -> None:
     )[0]
     assert "paddleOcr.Recognize(rightValueCrop)" in diagnostic_probe
     assert 'thirdRoute = "right_value"' in diagnostic_probe
-    assert "PaddleRecipientValueParser" not in diagnostic_probe
+    assert "verifiedDefaultAlternativeEnvelope" in diagnostic_probe
+    assert "ParseUnlabelledMaskedCjkRightFullAgreement" in diagnostic_probe
+    assert "ParseTruncatedRecipientLabelEmptyMaskThreeCropAgreement" in diagnostic_probe
     assert "ParseCalibratedAlternative" not in diagnostic_probe
-    assert "selectedRead =" not in diagnostic_probe
+    assert "paymentOverlapFraction: 0.45f" not in diagnostic_probe
+    assert "if (rightAgreementAlternative is not null)" in diagnostic_probe
+    assert "selectedRead = retryReadEvidence" in diagnostic_probe
+    assert "value = rightAgreementAlternative.Value" in diagnostic_probe
+    assert "route = rightAgreementAlternative.Route" in diagnostic_probe
+    assert "candidateConfidenceOverride = rightAgreementAlternative.CandidateConfidence" in diagnostic_probe
     assert "candidates[" not in diagnostic_probe
     assert "rightValueReadEvidence.Lines" in diagnostic_probe
     assert "float.IsFinite(line.Confidence)" in diagnostic_probe
@@ -196,6 +210,76 @@ def test_hybrid_retry_and_diagnostic_probe_remain_fail_closed() -> None:
         assert field in unified_engine
         assert f"HybridOcr{field}" in program
     assert '$"right_value={DescribeReadEvidence(rightValueRead, null, null)}"' in router
+
+
+def test_gap_recovery_routes_have_strict_executable_source_contracts() -> None:
+    parser = _source("PaddleRecipientValueParser.cs")
+    router = _source("PaddleRecipientHybrid.cs")
+    executable_tests = (
+        ROOT
+        / "dotnet"
+        / "ReceiptMlNet.Cli.PaddleRecipientContractTests"
+        / "Program.cs"
+    ).read_text(encoding="utf-8")
+
+    for route in (
+        "unlabelled_masked_cjk_right_full_agreement",
+        "truncated_recipient_label_empty_mask_three_crop_agreement",
+        "unlabelled_cjk_discount_arithmetic_exact",
+    ):
+        assert route in parser
+        assert route in executable_tests
+
+    assert "fullCropWidth >= sourceWidth * 0.90f" in parser
+    assert "rightCropWidth <= fullCropWidth * 0.65f" in parser
+    assert parser.count("fullRawLines.Count != 1") == 2
+    assert parser.count("rightRawLines.Count != 1") == 2
+    assert "standardRawLines.Count != 2" in parser
+    assert "recipientDetectorScore < 0.95f" in parser
+    assert 'fullLines[0].Confidence < 0.80f' in parser
+    assert 'rightLines[0].Confidence < 0.80f' in parser
+    assert 'masked.Contains(\'*\')' in parser
+    assert '@"^(?<base>[\\u3400-\\u9fff]{2,12}' in parser
+    assert 'standardLines[0].Confidence < 0.50f' in parser
+    assert 'standardLines[1].Confidence < 0.80f' in parser
+    assert 'fullLines[0].Confidence < 0.75f' in parser
+    assert 'rightLines[0].Confidence < 0.75f' in parser
+    assert 'standardLines[0].Text, "\\u6536\\u6b3e"' in parser
+    assert '@"^[\\u3400-\\u9fff]{2,8}(?:\\(\\)|（）)$"' in parser
+    assert 'standardLines[1].Confidence,' in parser
+    assert 'standardLines[0].Confidence,' not in parser.split(
+        "TruncatedRecipientLabelEmptyMaskThreeCropAgreementRoute", 1
+    )[1].split("}.Min()", 1)[0]
+
+    assert 'lines[0].Confidence < 0.99f' in parser
+    assert 'lines[1].Confidence < 0.90f' in parser
+    assert 'lines[2].Confidence < 0.99f' in parser
+    assert 'lines[3].Confidence < 0.99f' in parser
+    assert '@"^[\\u00a5\\uffe5]\\s*(?<amount>[0-9]+\\.[0-9]{2})$"' in parser
+    assert '@"^(?:0[1-9]|[1-9][0-9])$"' in parser
+    assert '"\\u767e\\u6b21\\u7acb\\u51cf"' in parser
+    assert "originalFen <= expectedFen" in parser
+    assert "originalFen - expectedFen != discountFen" in parser
+    assert "lines.Min(line => line.Confidence)" in parser
+    for negative_fragment in ("\\u5904\\u7406", "\\u8be6\\u60c5", "\\u8d26\\u53f7", "\\u8d26\\u6237"):
+        assert negative_fragment in parser
+
+    right_probe = router.split("using var rightValueCrop", 1)[1].split(
+        "var diagnostic = new PaddleRecipientDiagnostic", 1
+    )[0]
+    assert "verifiedDefaultAlternativeEnvelope" in right_probe
+    assert "paymentOverlapFraction: 0.45f" not in right_probe
+    assert "candidateConfidenceOverride ?? selectedRead.Confidence" in router
+    for boundary_token in (
+        "float.NaN",
+        "float.PositiveInfinity",
+        "below 90 percent source width",
+        "above 65 percent of full crop",
+        "full/right string difference",
+        "discount arithmetic mismatch",
+        "extra line",
+    ):
+        assert boundary_token in executable_tests
 
 
 def test_failed_source_replay_emits_right_value_probe_evidence() -> None:

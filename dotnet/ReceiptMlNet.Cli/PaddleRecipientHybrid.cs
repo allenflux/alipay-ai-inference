@@ -18,8 +18,9 @@ internal static class PaddleRecipientHybrid
     /// An absent or ambiguous row removes the recipient candidate.  A failed
     /// standard crop gets one deterministic left-context retry through the
     /// same full PP-OCR pipeline and fail-closed parsers.  If both reads fail,
-    /// a right-value crop is read for diagnostics only; that third read is
-    /// never parsed and can never create a candidate.
+    /// a narrower right-value crop may recover only the two independently
+    /// calibrated full/right agreement layouts; otherwise it remains
+    /// diagnostic evidence and cannot create a candidate.
     /// </summary>
     public static UnifiedOcrReadResult OverrideRecipient(
         Image<Rgb24> source,
@@ -58,13 +59,17 @@ internal static class PaddleRecipientHybrid
 
         var firstRead = paddleOcr.Recognize(crop);
         var selectedRead = firstRead;
+        float? candidateConfidenceOverride = null;
         var value = PaddleRecipientValueParser.Parse(firstRead.Text);
         string route = "primary";
         var amountCandidate = unified.Candidates.TryGetValue("amount", out var amount)
             ? amount.Candidate
             : null;
-        var verifiedAlternativeEnvelope = HasVerifiedUnlabelledMerchantRowLayout(
-            source, detections, detection, paymentOverlapFraction: 0.45f);
+        var verifiedDefaultAlternativeEnvelope = HasVerifiedUnlabelledMerchantRowLayout(
+            source, detections, detection);
+        var verifiedAlternativeEnvelope = verifiedDefaultAlternativeEnvelope
+            || HasVerifiedUnlabelledMerchantRowLayout(
+                source, detections, detection, paymentOverlapFraction: 0.45f);
         PaddleRecipientAlternativeParseResult? firstAlternative = null;
         bool? firstAlternativeGeometryAccepted = null;
         if (value is null
@@ -88,6 +93,7 @@ internal static class PaddleRecipientHybrid
             {
                 value = firstAlternative.Value;
                 route = $"primary_{firstAlternative.Route}";
+                candidateConfidenceOverride = firstAlternative.CandidateConfidence;
             }
         }
         string? retryRaw = null;
@@ -142,6 +148,7 @@ internal static class PaddleRecipientHybrid
                             retryRoute = dualCropAgreement
                                 ? $"dual_crop_{PaddleRecipientValueParser.PinyinAnnotatedThreeLineStrongAnchorsRoute}"
                                 : $"left_context_retry_{retryAlternative.Route}";
+                            candidateConfidenceOverride = retryAlternative.CandidateConfidence;
                         }
                     }
                 }
@@ -161,6 +168,7 @@ internal static class PaddleRecipientHybrid
         int? rightValueCropHeight = null;
         IReadOnlyList<float>? rightValueLineConfidences = null;
         PaddleOcrReadResult? rightValueReadEvidence = null;
+        PaddleRecipientAlternativeParseResult? rightAgreementAlternative = null;
         if (value is null)
         {
             using var rightValueCrop = UnifiedOcrImageOps.CropRecipientRowRightValue(
@@ -168,8 +176,6 @@ internal static class PaddleRecipientHybrid
                 detection.BboxImage);
             if (rightValueCrop is not null)
             {
-                // Observability only: do not call any recipient parser and do
-                // not assign selectedRead/value from this third read.
                 rightValueReadEvidence = paddleOcr.Recognize(rightValueCrop);
                 thirdRoute = "right_value";
                 rightValueRaw = rightValueReadEvidence.Text;
@@ -181,6 +187,42 @@ internal static class PaddleRecipientHybrid
                         ? MathF.Round(Math.Clamp(line.Confidence, 0.0f, 1.0f), 6)
                         : 0.0f)
                     .ToArray();
+
+                // Both recovery routes require the ordinary 25% geometry;
+                // the exact-amount 45% overlap exception is never eligible.
+                if (verifiedDefaultAlternativeEnvelope
+                    && retryReadEvidence is not null
+                    && retryCropWidth is { } fullWidth)
+                {
+                    rightAgreementAlternative =
+                        PaddleRecipientValueParser.ParseUnlabelledMaskedCjkRightFullAgreement(
+                            retryReadEvidence.Lines.Select(line => line.Text).ToArray(),
+                            retryReadEvidence.Lines.Select(line => line.Confidence).ToArray(),
+                            fullWidth,
+                            rightValueReadEvidence.Lines.Select(line => line.Text).ToArray(),
+                            rightValueReadEvidence.Lines.Select(line => line.Confidence).ToArray(),
+                            rightValueCrop.Width,
+                            source.Width,
+                            detection.Score)
+                        ?? PaddleRecipientValueParser.ParseTruncatedRecipientLabelEmptyMaskThreeCropAgreement(
+                            firstRead.Lines.Select(line => line.Text).ToArray(),
+                            firstRead.Lines.Select(line => line.Confidence).ToArray(),
+                            retryReadEvidence.Lines.Select(line => line.Text).ToArray(),
+                            retryReadEvidence.Lines.Select(line => line.Confidence).ToArray(),
+                            fullWidth,
+                            rightValueReadEvidence.Lines.Select(line => line.Text).ToArray(),
+                            rightValueReadEvidence.Lines.Select(line => line.Confidence).ToArray(),
+                            rightValueCrop.Width,
+                            source.Width,
+                            detection.Score);
+                    if (rightAgreementAlternative is not null)
+                    {
+                        selectedRead = retryReadEvidence;
+                        value = rightAgreementAlternative.Value;
+                        route = rightAgreementAlternative.Route;
+                        candidateConfidenceOverride = rightAgreementAlternative.CandidateConfidence;
+                    }
+                }
             }
         }
 
@@ -220,7 +262,8 @@ internal static class PaddleRecipientHybrid
             return unified with { Candidates = candidates, RecipientDiagnostic = diagnostic };
         }
 
-        var confidence = selectedRead.Confidence is { } score && float.IsFinite(score)
+        var confidenceSource = candidateConfidenceOverride ?? selectedRead.Confidence;
+        var confidence = confidenceSource is { } score && float.IsFinite(score)
             ? Math.Clamp(score, 0.0f, 1.0f)
             : 0.0f;
         candidates["recipient_field"] = new UnifiedOcrCandidate(
@@ -286,6 +329,11 @@ internal static class PaddleRecipientHybrid
                 confidences,
                 recipientDetectorScore)
             ?? PaddleRecipientValueParser.ParseUnlabelledMerchantAmountPair(
+                texts,
+                confidences,
+                expectedReceiptAmount,
+                recipientDetectorScore)
+            ?? PaddleRecipientValueParser.ParseUnlabelledCjkDiscountArithmeticExact(
                 texts,
                 confidences,
                 expectedReceiptAmount,
