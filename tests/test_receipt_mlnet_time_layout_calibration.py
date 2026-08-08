@@ -4,6 +4,8 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
+import shutil
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -269,6 +271,109 @@ def _prepare(fixture: dict[str, Any], output: Path) -> dict[str, Any]:
         formal_root=fixture["formal"], records_path=fixture["records"],
         score_directory=fixture["score"], output_directory=output,
     )
+
+
+def test_prepare_cli_records_from_score_is_mutually_exclusive_and_uses_bound_path(
+    formal_fixture: dict[str, Any]
+) -> None:
+    output = formal_fixture["root"] / "prepared-from-score"
+    exit_code = MODULE.main([
+        "prepare",
+        "--formal-root", str(formal_fixture["formal"]),
+        "--records-from-score",
+        "--score-directory", str(formal_fixture["score"]),
+        "--output-directory", str(output),
+    ])
+    assert exit_code == 0
+    assert output.is_dir()
+    with pytest.raises(SystemExit):
+        MODULE._parser().parse_args([
+            "prepare", "--formal-root", str(formal_fixture["formal"]),
+            "--records", str(formal_fixture["records"]), "--records-from-score",
+            "--score-directory", str(formal_fixture["score"]),
+            "--output-directory", str(formal_fixture["root"] / "both"),
+        ])
+    with pytest.raises(SystemExit):
+        MODULE._parser().parse_args([
+            "prepare", "--formal-root", str(formal_fixture["formal"]),
+            "--score-directory", str(formal_fixture["score"]),
+            "--output-directory", str(formal_fixture["root"] / "neither"),
+        ])
+
+
+def test_records_from_score_rejects_relative_missing_and_symlink_paths(
+    formal_fixture: dict[str, Any]
+) -> None:
+    summary_path = formal_fixture["score"] / "summary.json"
+    original = json.loads(summary_path.read_text(encoding="utf-8"))
+    relative = dict(original)
+    relative["records"] = "unified-fields.jsonl"
+    _write_json(summary_path, relative)
+    with pytest.raises(MODULE.CalibrationError, match="absolute"):
+        MODULE._records_path_from_score(formal_fixture["score"])
+
+    missing = dict(original)
+    missing["records"] = (formal_fixture["root"] / "missing-records.jsonl").resolve().as_posix()
+    _write_json(summary_path, missing)
+    with pytest.raises(MODULE.CalibrationError, match="missing"):
+        MODULE._records_path_from_score(formal_fixture["score"])
+
+    link = formal_fixture["root"] / "records-link.jsonl"
+    try:
+        link.symlink_to(formal_fixture["records"])
+    except OSError:
+        pytest.skip("symlink creation is unavailable")
+    linked = dict(original)
+    linked["records"] = link.resolve(strict=False).as_posix()
+    # Keep the symlink path rather than Path.resolve()'s target.
+    linked["records"] = link.absolute().as_posix()
+    _write_json(summary_path, linked)
+    with pytest.raises(MODULE.CalibrationError, match="symlink|reparse|junction"):
+        MODULE._records_path_from_score(formal_fixture["score"])
+
+
+def test_records_from_score_preserves_path_and_hash_binding(formal_fixture: dict[str, Any]) -> None:
+    copy = formal_fixture["root"] / "records-copy.jsonl"
+    shutil.copyfile(formal_fixture["records"], copy)
+    with pytest.raises(MODULE.CalibrationError, match="records binding"):
+        MODULE.prepare(
+            formal_root=formal_fixture["formal"], records_path=copy,
+            score_directory=formal_fixture["score"],
+            output_directory=formal_fixture["root"] / "copy-output",
+        )
+
+    rows = [json.loads(line) for line in formal_fixture["records"].read_text(encoding="utf-8").splitlines()]
+    rows[0]["id"] = "tampered-but-valid-json"
+    _write_jsonl(formal_fixture["records"], rows)
+    exit_code = MODULE.main([
+        "prepare", "--formal-root", str(formal_fixture["formal"]),
+        "--records-from-score", "--score-directory", str(formal_fixture["score"]),
+        "--output-directory", str(formal_fixture["root"] / "tampered-output"),
+    ])
+    assert exit_code == 2
+    assert not (formal_fixture["root"] / "tampered-output").exists()
+
+
+def test_records_from_score_rejects_windows_reparse_attribute(
+    formal_fixture: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    records = formal_fixture["records"].resolve()
+    original_lstat = Path.lstat
+    original_metadata = original_lstat(records)
+
+    def fake_lstat(path: Path):
+        if path == records:
+            return SimpleNamespace(
+                st_file_attributes=0x400,
+                st_mode=original_metadata.st_mode,
+            )
+        return original_lstat(path)
+
+    monkeypatch.setattr(Path, "lstat", fake_lstat)
+    with pytest.raises(MODULE.CalibrationError, match="reparse"):
+        MODULE._require_regular_non_reparse_file(
+            records, description="Windows records fixture"
+        )
 
 
 def _line(index: int, text: str, confidence: float, box: tuple[float, float, float, float]) -> dict[str, Any]:

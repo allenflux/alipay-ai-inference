@@ -22,6 +22,7 @@ import math
 import os
 from pathlib import Path
 import shutil
+import stat
 import statistics
 import sys
 from typing import Any
@@ -112,6 +113,41 @@ def _identity(path: Path, payload: bytes | None = None) -> dict[str, Any]:
         "sha256": _sha(data),
         "size_bytes": len(data),
     }
+
+
+def _require_regular_non_reparse_file(path: Path, *, description: str) -> Path:
+    try:
+        if path.is_symlink() or (hasattr(path, "is_junction") and path.is_junction()):
+            raise CalibrationError(f"{description} must not be a symlink/junction: {path}")
+        metadata = path.lstat()
+        reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+        if getattr(metadata, "st_file_attributes", 0) & reparse_flag:
+            raise CalibrationError(f"{description} must not be a reparse point: {path}")
+        resolved = path.resolve(strict=True)
+    except FileNotFoundError as error:
+        raise CalibrationError(f"missing {description}: {path}") from error
+    except OSError as error:
+        raise CalibrationError(f"cannot inspect {description}: {path}: {error}") from error
+    if not resolved.is_file() or resolved.is_symlink():
+        raise CalibrationError(f"{description} must be a regular file: {resolved}")
+    return resolved
+
+
+def _records_path_from_score(score_directory: Path) -> Path:
+    summary, _identity_unused = _load_json(
+        score_directory / "summary.json", description="records-from-score summary"
+    )
+    if summary.get("schema_version") != 1 or summary.get("kind") != SCORE_KIND:
+        raise CalibrationError("records-from-score summary schema/kind is unsupported")
+    raw = summary.get("records")
+    if not isinstance(raw, str) or not raw:
+        raise CalibrationError("records-from-score summary has no records path")
+    path = Path(raw)
+    if not path.is_absolute():
+        raise CalibrationError("records-from-score requires an absolute scorer records path")
+    return _require_regular_non_reparse_file(
+        path, description="records-from-score bound records file"
+    )
 
 
 def _load_json(path: Path, *, description: str) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -1825,7 +1861,13 @@ def _parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     prepare_parser = subparsers.add_parser("prepare")
     prepare_parser.add_argument("--formal-root", required=True, type=Path)
-    prepare_parser.add_argument("--records", required=True, type=Path)
+    records_group = prepare_parser.add_mutually_exclusive_group(required=True)
+    records_group.add_argument("--records", type=Path)
+    records_group.add_argument(
+        "--records-from-score",
+        action="store_true",
+        help="use the absolute records path hash-bound by --score-directory/summary.json",
+    )
     prepare_parser.add_argument("--score-directory", required=True, type=Path)
     prepare_parser.add_argument("--output-directory", required=True, type=Path)
     evaluate_parser = subparsers.add_parser("evaluate")
@@ -1840,9 +1882,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         if args.command == "prepare":
+            records_path = (
+                _records_path_from_score(args.score_directory)
+                if args.records_from_score else args.records
+            )
+            assert records_path is not None
             result = prepare(
                 formal_root=args.formal_root,
-                records_path=args.records,
+                records_path=records_path,
                 score_directory=args.score_directory,
                 output_directory=args.output_directory,
             )
