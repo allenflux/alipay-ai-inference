@@ -501,6 +501,9 @@ Require-File $pythonExe "CUDA virtual-environment Python used for provenance too
 $checkpointAttestor = Join-Path $PSScriptRoot "receipt_ocr_v13_recovery_attest.py"
 Require-File $checkpointAttestor "v13 recovery checkpoint attestor"
 $checkpointAttestorSha256 = Get-Sha256 $checkpointAttestor
+$sidecarAttestor = Join-Path $PSScriptRoot "receipt_ocr_v13_sidecar_attest.py"
+Require-File $sidecarAttestor "v13 recovery sidecar attestor"
+$sidecarAttestorSha256 = Get-Sha256 $sidecarAttestor
 $RunDirectory = [IO.Path]::GetFullPath($RunDirectory)
 Require-Directory $RunDirectory "existing v13 run directory"
 
@@ -776,13 +779,15 @@ if ($null -ne $seedContract.outputs.PSObject.Properties["status_text_logits"] `
 
 # Restore the causal proof that the original one-process producer obtained by
 # training and immediately exporting. The helper directly compares every
-# frozen seed/best tensor with torch.equal. Fresh, temporary exports must then
-# be byte-identical to the already evaluated ONNX models and both sidecars.
+# frozen seed/best tensor with torch.equal. Fresh ONNX graphs must then be
+# byte-identical. Sidecars must be identical except for the strictly attested
+# 17bc8af legacy-default metadata additions and their derived labels hash.
 $artifactAttestationRoot = Join-Path `
     $RunDirectory `
     (".v13-artifact-attestation-" + [Guid]::NewGuid().ToString("N"))
 Require-NewPath $artifactAttestationRoot "temporary artifact attestation directory"
 $checkpointAttestation = $null
+$sidecarAttestation = $null
 try {
     New-Item -ItemType Directory -Path $artifactAttestationRoot | Out-Null
     $checkpointAttestationPath = Join-Path $artifactAttestationRoot "checkpoint-attestation.json"
@@ -840,13 +845,52 @@ try {
         "--output", $attestedCandidateModel
     ) "deterministic v13 candidate attestation re-export"
 
+    # The original run predates 17bc8af, which added two defaulted legacy
+    # recipient config fields plus one repeated legacy-backbone metadata key.
+    # ONNX bytes must still match exactly. Sidecars may differ only at those
+    # fixed paths/values and at the contract hash derived from the changed
+    # labels bytes. Every other path or value is rejected by the helper.
+    $sidecarAttestationPath = Join-Path $artifactAttestationRoot "sidecar-attestation.json"
+    Assert-FileHash $sidecarAttestor $sidecarAttestorSha256 "sidecar attestor"
+    Invoke-Python @(
+        $sidecarAttestor,
+        "--existing-seed-model", $seedModel,
+        "--fresh-seed-model", $attestedSeedModel,
+        "--existing-candidate-model", $candidateModel,
+        "--fresh-candidate-model", $attestedCandidateModel,
+        "--output", $sidecarAttestationPath
+    ) "strict v12/v13 sidecar compatibility attestation"
+    $sidecarAttestation = Read-GuardedJson `
+        $sidecarAttestationPath `
+        "strict v12/v13 sidecar compatibility attestation"
+    if ([string]$sidecarAttestation.kind -ne `
+            "receipt_unified_v13_recovery_sidecar_attestation_v1" `
+        -or $sidecarAttestation.passed -isnot [bool] `
+        -or $sidecarAttestation.passed -ne $true `
+        -or [string]$sidecarAttestation.policy -ne `
+            "legacy_recipient_sidecar_defaults_added_by_17bc8af_v1" `
+        -or [string]$sidecarAttestation.compatibility_commit -ne `
+            "17bc8afca6f0a1a95b0f3a45d603d016638fbbdb" `
+        -or $sidecarAttestation.all_onnx_byte_identical -isnot [bool] `
+        -or $sidecarAttestation.all_onnx_byte_identical -ne $true `
+        -or $sidecarAttestation.all_sidecars_semantically_equivalent -isnot [bool] `
+        -or $sidecarAttestation.all_sidecars_semantically_equivalent -ne $true `
+        -or $sidecarAttestation.all_sidecars_byte_identical -isnot [bool] `
+        -or $sidecarAttestation.comparisons.seed.passed -isnot [bool] `
+        -or $sidecarAttestation.comparisons.seed.passed -ne $true `
+        -or $sidecarAttestation.comparisons.seed.onnx_byte_identical -ne $true `
+        -or $sidecarAttestation.comparisons.candidate.passed -isnot [bool] `
+        -or $sidecarAttestation.comparisons.candidate.passed -ne $true `
+        -or $sidecarAttestation.comparisons.candidate.onnx_byte_identical -ne $true) {
+        throw "Strict v12/v13 sidecar compatibility attestation did not pass."
+    }
+
+    # Retain an independent PowerShell byte-hash assertion for the two ONNX
+    # graphs. JSON sidecars are validated semantically under the fixed helper
+    # allowlist above; they are deliberately not claimed byte-identical.
     foreach ($reexportBinding in @(
             @{ Actual = $attestedSeedModel; Expected = $seedModelSha256; Description = "seed ONNX" },
-            @{ Actual = [IO.Path]::ChangeExtension($attestedSeedModel, ".contract.json"); Expected = $seedContractSha256; Description = "seed ONNX contract" },
-            @{ Actual = [IO.Path]::ChangeExtension($attestedSeedModel, ".labels.json"); Expected = $seedLabelsSha256; Description = "seed ONNX labels" },
-            @{ Actual = $attestedCandidateModel; Expected = $candidateModelSha256; Description = "candidate ONNX" },
-            @{ Actual = [IO.Path]::ChangeExtension($attestedCandidateModel, ".contract.json"); Expected = $candidateContractSha256; Description = "candidate contract" },
-            @{ Actual = [IO.Path]::ChangeExtension($attestedCandidateModel, ".labels.json"); Expected = $candidateLabelsSha256; Description = "candidate labels" }
+            @{ Actual = $attestedCandidateModel; Expected = $candidateModelSha256; Description = "candidate ONNX" }
         )) {
         Require-File ([string]$reexportBinding.Actual) "re-exported $($reexportBinding.Description)"
         if ((Get-Sha256 ([string]$reexportBinding.Actual)) -cne `
@@ -858,7 +902,8 @@ try {
             @{ Path = $seedCheckpoint; Sha256 = $seedCheckpointSha256; Description = "seed checkpoint" },
             @{ Path = $candidateCheckpoint; Sha256 = $candidateCheckpointSha256; Description = "candidate checkpoint" },
             @{ Path = $trainingSummaryPath; Sha256 = $trainingSummarySha256; Description = "training summary" },
-            @{ Path = $checkpointAttestor; Sha256 = $checkpointAttestorSha256; Description = "checkpoint attestor" }
+            @{ Path = $checkpointAttestor; Sha256 = $checkpointAttestorSha256; Description = "checkpoint attestor" },
+            @{ Path = $sidecarAttestor; Sha256 = $sidecarAttestorSha256; Description = "sidecar attestor" }
         )) {
         Assert-FileHash `
             ([string]$sourceBinding.Path) `
@@ -871,7 +916,7 @@ finally {
         Remove-Item -LiteralPath $artifactAttestationRoot -Recurse -Force
     }
 }
-if ($null -eq $checkpointAttestation) {
+if ($null -eq $checkpointAttestation -or $null -eq $sidecarAttestation) {
     throw "Checkpoint and artifact attestation produced no evidence."
 }
 
@@ -933,15 +978,25 @@ $validationEvidence = [ordered]@{
         legacy_tensor_count = [long]$checkpointAttestation.legacy_tensor_count
         new_status_text_tensor_count = [long]$checkpointAttestation.new_status_text_tensor_count
         comparison = [string]$checkpointAttestation.comparison
-        deterministic_reexport_byte_identical = $true
+        deterministic_reexport_onnx_byte_identical = $true
+        deterministic_reexport_sidecars_byte_identical = `
+            [bool]$sidecarAttestation.all_sidecars_byte_identical
+        deterministic_reexport_sidecars_semantically_equivalent = $true
+        sidecar_compatibility_policy = [string]$sidecarAttestation.policy
+        sidecar_compatibility_commit = [string]$sidecarAttestation.compatibility_commit
+        sidecar_allowed_fresh_only_defaults = $sidecarAttestation.allowed_fresh_only_defaults
+        sidecar_allowed_derived_differences = $sidecarAttestation.allowed_derived_differences
+        sidecar_comparisons = $sidecarAttestation.comparisons
         attestor = $checkpointAttestor
         attestor_sha256 = $checkpointAttestorSha256
+        sidecar_attestor = $sidecarAttestor
+        sidecar_attestor_sha256 = $sidecarAttestorSha256
     }
     legacy_output_parity = [ordered]@{
         passed = $true
         frozen_output_count = 15
         output_names = $legacyOutputNames
-        proof = "direct seed/best torch.equal legacy-tensor audit + byte-identical deterministic checkpoint re-export + exported name/shape ABI comparison"
+        proof = "direct seed/best torch.equal legacy-tensor audit + byte-identical ONNX re-export + strict allowlisted sidecar semantic attestation + exported name/shape ABI comparison"
     }
     acceptance_floors = [ordered]@{
         amount = $amountFloor
@@ -995,8 +1050,9 @@ $sourceBindings = @(
         @{ Path = $candidateLabelsPath; Sha256 = $candidateLabelsSha256; Description = "candidate labels" },
         @{ Path = $trainingSummaryPath; Sha256 = $trainingSummarySha256; Description = "training summary" },
         @{ Path = $valSummaryPath; Sha256 = $valSummarySha256; Description = "val GPU summary" },
-        @{ Path = $testSummaryPath; Sha256 = $testSummarySha256; Description = "test GPU summary" }
-        @{ Path = $checkpointAttestor; Sha256 = $checkpointAttestorSha256; Description = "checkpoint attestor" }
+        @{ Path = $testSummaryPath; Sha256 = $testSummarySha256; Description = "test GPU summary" },
+        @{ Path = $checkpointAttestor; Sha256 = $checkpointAttestorSha256; Description = "checkpoint attestor" },
+        @{ Path = $sidecarAttestor; Sha256 = $sidecarAttestorSha256; Description = "sidecar attestor" }
     )
 foreach ($binding in $sourceBindings) {
     Assert-FileHash `
@@ -1051,4 +1107,8 @@ Write-Host "  evidence=$evidencePath"
 Write-Host ("  recipient-delegated-to-hybrid-formal={0}" -f `
     [bool]$validationEvidence.recipient_delivery_policy.delegated_in_any_held_out_split)
 Write-Host "  temporary-attestation-reexport-performed=true"
+Write-Host "  deterministic-reexport-onnx-byte-identical=true"
+Write-Host ("  deterministic-reexport-sidecars-byte-identical={0}" -f `
+    [bool]$sidecarAttestation.all_sidecars_byte_identical)
+Write-Host "  deterministic-reexport-sidecars-semantically-equivalent=true"
 Write-Host "  training-or-evaluation-performed=false"
