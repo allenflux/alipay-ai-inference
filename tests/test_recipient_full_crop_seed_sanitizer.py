@@ -301,6 +301,25 @@ def _sanitized_payload() -> tuple[dict[str, object], dict[str, object], dict[str
 
 def _reseal_attestation(output: dict[str, object]) -> None:
     attestation = output[ATTESTATION_KEY]
+    # Tests that intentionally mutate the embedded lineage need to keep every
+    # public derivative hash coherent; otherwise validation correctly stops at
+    # the outer dual-source metadata binding before exercising the narrower
+    # lineage invariant under test.
+    output["initialization"]["train_only_recipient_lineage_sha256"] = (
+        _canonical_sha256(
+            attestation["train_only_recipient_lineage"],
+            description="test resealed initialization lineage",
+        )
+    )
+    attestation["metadata_proof"]["operative_metadata_sha256"] = (
+        _canonical_sha256(
+            {
+                key: output[key]
+                for key in ("initialization", "training_runtime", "metrics")
+            },
+            description="test resealed operative metadata",
+        )
+    )
     unsigned = {
         key: value for key, value in attestation.items() if key != "integrity_sha256"
     }
@@ -509,12 +528,18 @@ def test_status_transductive_provenance_is_history_not_an_operative_recipient_cl
     )
 
 
-@pytest.mark.parametrize("name", ["recipient_classifier.bias", "status_text_classifier.bias"])
-def test_attestation_detects_state_tampering(name: str) -> None:
+@pytest.mark.parametrize(
+    ("name", "message"),
+    [
+        ("recipient_classifier.bias", "recipient lineage leaf state does not match"),
+        ("status_text_classifier.bias", "state no longer matches"),
+    ],
+)
+def test_attestation_detects_state_tampering(name: str, message: str) -> None:
     _, _, output = _sanitized_payload()
     output["state_dict"][name] = output["state_dict"][name].clone()
     output["state_dict"][name][0] += 1.0
-    with pytest.raises(ValueError, match="state no longer matches"):
+    with pytest.raises(ValueError, match=message):
         validate_recipient_full_crop_seed_attestation(output)
 
 
