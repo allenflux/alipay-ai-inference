@@ -389,7 +389,17 @@ def _source_key(value: object) -> str:
 
 
 def _normalized_source_set_sha256(keys: Sequence[str]) -> str:
-    payload = "".join(f"{key}\n" for key in sorted(keys)).encode("utf-8")
+    # The producer comparator hashes normalized absolute paths without the
+    # platform discriminator used by this cross-platform consumer's maps.
+    producer_keys: list[str] = []
+    for key in keys:
+        if key.startswith("windows:"):
+            producer_keys.append(key[len("windows:") :])
+        elif key.startswith("posix:"):
+            producer_keys.append(key[len("posix:") :])
+        else:
+            raise ReplayError("normalized source key has no internal platform prefix")
+    payload = "".join(f"{key}\n" for key in sorted(producer_keys)).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
 
 

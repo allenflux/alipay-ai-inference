@@ -24,6 +24,18 @@ MODEL_BYTES = b"fixture-v13-unified-model"
 MODEL_SHA256 = hashlib.sha256(MODEL_BYTES).hexdigest()
 
 
+def test_normalized_source_set_hash_matches_comparator_without_internal_prefixes() -> None:
+    keys = [
+        MODULE._source_key(r"D:\receipts\B.JPG"),
+        MODULE._source_key(r"D:\receipts\a.jpg"),
+    ]
+    expected_payload = "d:/receipts/a.jpg\nd:/receipts/b.jpg\n".encode("utf-8")
+
+    assert MODULE._normalized_source_set_sha256(keys) == hashlib.sha256(
+        expected_payload
+    ).hexdigest()
+
+
 def _write_json(path: Path, payload: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
