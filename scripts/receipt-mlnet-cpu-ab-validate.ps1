@@ -31,6 +31,7 @@ param(
     [ValidateRange(0, 1000000)]
     [int]$ExpectedInputCount = 0,
     [switch]$AllowIncompleteRecipientEquivalence,
+    [switch]$AllowPreexistingIncompleteEquivalence,
     [switch]$EquivalenceOnlyOnce,
     [string]$PerformanceEvidenceReport
 )
@@ -435,6 +436,11 @@ $DeviceModel = Get-ProviderFullPath $DeviceModel
 $UnifiedModel = Get-ProviderFullPath $UnifiedModel
 $InputList = Get-ProviderFullPath $InputList
 $OutputRoot = Get-ProviderFullPath $OutputRoot
+if ($AllowIncompleteRecipientEquivalence -and $AllowPreexistingIncompleteEquivalence) {
+    throw "Choose exactly one incomplete-equivalence policy; recipient-only and preexisting-all-fields are mutually exclusive."
+}
+$allowIncompleteEquivalence = [bool](
+    $AllowIncompleteRecipientEquivalence -or $AllowPreexistingIncompleteEquivalence)
 $performanceEvidence = $null
 if ($EquivalenceOnlyOnce) {
     if ([string]::IsNullOrWhiteSpace($PerformanceEvidenceReport)) {
@@ -449,8 +455,10 @@ if ($EquivalenceOnlyOnce) {
     if ($InputLimit -ne 0 -or $ExpectedInputCount -ne 10016) {
         throw "-EquivalenceOnlyOnce requires the complete formal set: -InputLimit 0 -ExpectedInputCount 10016."
     }
-    if ($OcrMode -ne "hybrid-recipient" -or -not $AllowIncompleteRecipientEquivalence) {
-        throw "-EquivalenceOnlyOnce requires hybrid-recipient OCR with -AllowIncompleteRecipientEquivalence."
+    if ($OcrMode -ne "hybrid-recipient" `
+        -or -not $AllowPreexistingIncompleteEquivalence `
+        -or $AllowIncompleteRecipientEquivalence) {
+        throw "-EquivalenceOnlyOnce requires hybrid-recipient OCR with -AllowPreexistingIncompleteEquivalence."
     }
 
     $PerformanceEvidenceReport = Get-ProviderFullPath $PerformanceEvidenceReport
@@ -499,6 +507,17 @@ if ($EquivalenceOnlyOnce) {
         -or $null -ne $performancePlanPayload.PSObject.Properties["execution_mode"]) {
         throw "The external performance plan must be one standard 332-image, three-repetition v2 plan."
     }
+    $performanceCliContract = $performancePlanPayload.cli_contract
+    $performanceAllowedIncompleteFields = @(
+        $performanceCliContract.allowed_incomplete_fields | ForEach-Object { [string]$_ })
+    if ($performanceCliContract.require_complete -ne $false `
+        -or $performanceCliContract.equivalence_only -ne $true `
+        -or $null -ne $performanceCliContract.allowed_incomplete_field `
+        -or $performanceCliContract.preexisting_incomplete_equivalence -ne $true `
+        -or ($performanceAllowedIncompleteFields -join "|") -ne "time|amount|transfer_status|recipient|payment_method" `
+        -or [string]$performanceCliContract.missing_set_rule -ne "baseline_and_candidate_exact_per_field") {
+        throw "The external 332-image plan must use the same explicit preexisting-incomplete equivalence contract."
+    }
     $performanceEvidence = [ordered]@{
         expected_input_count = 332
         expected_repetitions_per_variant = 3
@@ -540,6 +559,9 @@ elseif (-not [string]::IsNullOrWhiteSpace($PaddleOcrBundle)) {
 }
 if ($AllowIncompleteRecipientEquivalence -and $OcrMode -ne "hybrid-recipient") {
     throw "-AllowIncompleteRecipientEquivalence is valid only when -OcrMode hybrid-recipient."
+}
+if ($AllowPreexistingIncompleteEquivalence -and $OcrMode -ne "hybrid-recipient") {
+    throw "-AllowPreexistingIncompleteEquivalence is valid only when -OcrMode hybrid-recipient."
 }
 $baselineAppRoot = Get-ProviderFullPath (Split-Path -Parent $BaselineExecutable)
 $candidateAppRoot = Get-ProviderFullPath (Split-Path -Parent $CandidateExecutable)
@@ -718,8 +740,8 @@ $plan = [ordered]@{
         score_threshold = [double]0.50
         rectification = "max-side-1600"
         annotate = "none"
-        require_complete = -not [bool]$AllowIncompleteRecipientEquivalence
-        equivalence_only = [bool]$AllowIncompleteRecipientEquivalence
+        require_complete = -not $allowIncompleteEquivalence
+        equivalence_only = $allowIncompleteEquivalence
         allowed_incomplete_field = if ($AllowIncompleteRecipientEquivalence) {
             "recipient"
         }
@@ -749,6 +771,16 @@ $plan = [ordered]@{
     variants = $variants
     runs = $runPlan
 }
+if ($AllowPreexistingIncompleteEquivalence) {
+    $plan["cli_contract"]["preexisting_incomplete_equivalence"] = $true
+    $plan["cli_contract"]["allowed_incomplete_fields"] = @(
+        "time",
+        "amount",
+        "transfer_status",
+        "recipient",
+        "payment_method")
+    $plan["cli_contract"]["missing_set_rule"] = "baseline_and_candidate_exact_per_field"
+}
 if ($EquivalenceOnlyOnce) {
     $plan["execution_mode"] = "equivalence_only_once"
     $plan["performance_evidence"] = $performanceEvidence
@@ -771,7 +803,16 @@ if ($EquivalenceOnlyOnce) {
     Write-Host "Evidence    : accepted external 332-image x3 performance report"
 }
 Write-Host "OCR mode    : $OcrMode"
-Write-Host "Completeness: $(if ($AllowIncompleteRecipientEquivalence) { 'recipient-only incomplete equivalence' } else { 'require-complete' })"
+$completenessDescription = if ($AllowPreexistingIncompleteEquivalence) {
+    "preexisting baseline missing sets must remain exactly equal"
+}
+elseif ($AllowIncompleteRecipientEquivalence) {
+    "recipient-only incomplete equivalence"
+}
+else {
+    "require-complete"
+}
+Write-Host "Completeness: $completenessDescription"
 Write-Host "Throughput  : external process wall clock"
 $candidateThreadDescription = if ($CandidateDetectorIntraOpThreads -gt 0) {
     [string]$CandidateDetectorIntraOpThreads
@@ -788,7 +829,7 @@ foreach ($descriptor in @($runPlan | Sort-Object execution_order)) {
         $descriptor $variants $fixedInputListPath `
         $DetectorModel $DeviceModel $UnifiedModel `
         $CandidateDetectorIntraOpThreads $OcrMode $PaddleOcrBundle `
-        ([bool]$AllowIncompleteRecipientEquivalence)
+        $allowIncompleteEquivalence
 }
 if ((Get-Sha256 $planPath) -ne $frozenPlanSha256) {
     throw "CPU A/B plan changed while the runs were executing."
@@ -814,6 +855,11 @@ if ($report.accepted -ne $true `
     -or $report.route_consistency.accepted -ne $true `
     -or $report.performance.accepted -ne $true) {
     throw "CPU A/B prediction consistency or performance improvement was not accepted."
+}
+if ($AllowPreexistingIncompleteEquivalence `
+    -and ($report.preexisting_incomplete_consistency.accepted -ne $true `
+        -or [string]$report.preexisting_incomplete_consistency.policy -ne "baseline_and_candidate_exact_per_field")) {
+    throw "CPU A/B preexisting missing-source sets were not exactly preserved."
 }
 if ($EquivalenceOnlyOnce `
     -and ([string]$report.execution_mode -ne "equivalence_only_once" `

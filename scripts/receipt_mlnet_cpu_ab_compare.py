@@ -48,6 +48,9 @@ REQUIRED_COMPLETE_FIELDS = (
     "payment_method",
 )
 ALLOWED_INCOMPLETE_RECIPIENT_FIELD = "recipient"
+PREEXISTING_INCOMPLETE_POLICY = "__preexisting_baseline_missing_sets_exact__"
+PREEXISTING_INCOMPLETE_FIELDS = REQUIRED_COMPLETE_FIELDS
+PREEXISTING_MISSING_SET_RULE = "baseline_and_candidate_exact_per_field"
 EXPECTED_DETECTIONS = frozenset(
     {"time", "amount", "transfer_status", "recipient_field", "payment_method_field"}
 )
@@ -635,6 +638,14 @@ def _validate_cli_contract(
         )
     equivalence_only = contract.get("equivalence_only", False)
     allowed_incomplete_field = contract.get("allowed_incomplete_field")
+    preexisting_property_names = {
+        "preexisting_incomplete_equivalence",
+        "allowed_incomplete_fields",
+        "missing_set_rule",
+    }
+    preexisting_incomplete = contract.get(
+        "preexisting_incomplete_equivalence", False
+    )
     if require_complete:
         if type(equivalence_only) is not bool or equivalence_only:
             raise ValidationError(
@@ -643,6 +654,10 @@ def _validate_cli_contract(
         if allowed_incomplete_field is not None:
             raise ValidationError(
                 "complete CPU A/B runs cannot allow an incomplete field"
+            )
+        if preexisting_property_names.intersection(contract):
+            raise ValidationError(
+                "complete CPU A/B runs cannot bind a preexisting-incomplete policy"
             )
         allowed_incomplete_field = None
     else:
@@ -654,14 +669,39 @@ def _validate_cli_contract(
             raise ValidationError(
                 "incomplete CPU A/B runs must explicitly bind equivalence_only=true"
             )
-        if allowed_incomplete_field != ALLOWED_INCOMPLETE_RECIPIENT_FIELD:
-            raise ValidationError(
-                "incomplete CPU A/B runs may allow only recipient"
-            )
-        if ocr_mode != "hybrid-recipient":
-            raise ValidationError(
-                "recipient-only incomplete equivalence requires hybrid-recipient OCR"
-            )
+        if preexisting_incomplete is True:
+            if allowed_incomplete_field is not None:
+                raise ValidationError(
+                    "preexisting-incomplete equivalence cannot name one allowed_incomplete_field"
+                )
+            if contract.get("allowed_incomplete_fields") != list(
+                PREEXISTING_INCOMPLETE_FIELDS
+            ):
+                raise ValidationError(
+                    "preexisting-incomplete equivalence must explicitly bind all five fields"
+                )
+            if contract.get("missing_set_rule") != PREEXISTING_MISSING_SET_RULE:
+                raise ValidationError(
+                    "preexisting-incomplete equivalence changed its exact missing-set rule"
+                )
+            if ocr_mode != "hybrid-recipient":
+                raise ValidationError(
+                    "preexisting-incomplete equivalence requires hybrid-recipient OCR"
+                )
+            allowed_incomplete_field = PREEXISTING_INCOMPLETE_POLICY
+        else:
+            if preexisting_property_names.intersection(contract):
+                raise ValidationError(
+                    "recipient-only equivalence cannot carry preexisting-incomplete properties"
+                )
+            if allowed_incomplete_field != ALLOWED_INCOMPLETE_RECIPIENT_FIELD:
+                raise ValidationError(
+                    "incomplete CPU A/B runs may allow only recipient unless the explicit preexisting policy is bound"
+                )
+            if ocr_mode != "hybrid-recipient":
+                raise ValidationError(
+                    "recipient-only incomplete equivalence requires hybrid-recipient OCR"
+                )
     if schema_version >= 2:
         expected_paddle_provider = "cpu" if ocr_mode == "hybrid-recipient" else None
         if "paddle_ocr_provider" not in contract:
@@ -781,10 +821,10 @@ def _validate_plan(
     ) = _validate_cli_contract(plan, schema_version)
     if execution_mode == EQUIVALENCE_ONLY_ONCE_MODE and (
         ocr_mode != "hybrid-recipient"
-        or allowed_incomplete_field != ALLOWED_INCOMPLETE_RECIPIENT_FIELD
+        or allowed_incomplete_field != PREEXISTING_INCOMPLETE_POLICY
     ):
         raise ValidationError(
-            "equivalence-only-once requires hybrid-recipient OCR with only recipient allowed incomplete"
+            "equivalence-only-once requires hybrid-recipient OCR with the explicit preexisting-incomplete policy"
         )
     _validate_performance_gate(plan)
     return (
@@ -929,13 +969,16 @@ def _validate_result_contract(
         ):
             raise ValidationError(f"{description} omitted {field_name} delivery policy")
         candidate = field.get("candidate")
-        may_be_incomplete = field_name == allowed_incomplete_field
+        may_be_incomplete = (
+            field_name == allowed_incomplete_field
+            or allowed_incomplete_field == PREEXISTING_INCOMPLETE_POLICY
+        )
         if candidate is None and may_be_incomplete:
             continue
         if not isinstance(candidate, str) or not candidate.strip():
             qualifier = (
-                " except the explicitly allowed recipient"
-                if allowed_incomplete_field
+                " except fields allowed by the explicit equivalence-only policy"
+                if allowed_incomplete_field is not None
                 else ""
             )
             raise ValidationError(
@@ -972,7 +1015,10 @@ def _validate_result_contract(
         failure_reason = recipient.get("hybrid_ocr_failure_reason")
         recipient_detected = "recipient_field" in labels
         if recipient_candidate is None:
-            if allowed_incomplete_field != ALLOWED_INCOMPLETE_RECIPIENT_FIELD:
+            if allowed_incomplete_field not in (
+                ALLOWED_INCOMPLETE_RECIPIENT_FIELD,
+                PREEXISTING_INCOMPLETE_POLICY,
+            ):
                 raise ValidationError(
                     f"{description} unexpectedly omitted the recipient candidate"
                 )
@@ -1108,7 +1154,11 @@ def _recipient_route_counts(
         if (
             primary is None
             and recipient.get("candidate") is None
-            and allowed_incomplete_field == ALLOWED_INCOMPLETE_RECIPIENT_FIELD
+            and allowed_incomplete_field
+            in (
+                ALLOWED_INCOMPLETE_RECIPIENT_FIELD,
+                PREEXISTING_INCOMPLETE_POLICY,
+            )
         ):
             detections = result.get("detections")
             detection_labels = {
@@ -1280,6 +1330,20 @@ def _load_run(
         allowed_incomplete_field,
         f"run {run_id}",
     )
+    missing_candidate_sources = {
+        field_name: frozenset(
+            source_key
+            for source_key, result in results.items()
+            if _require_mapping(
+                _require_mapping(result.get("fields"), f"run {run_id} fields").get(
+                    field_name
+                ),
+                f"run {run_id} field {field_name}",
+            ).get("candidate")
+            is None
+        )
+        for field_name in REQUIRED_COMPLETE_FIELDS
+    }
     return {
         "descriptor": dict(descriptor),
         "summary": dict(summary),
@@ -1287,6 +1351,7 @@ def _load_run(
         "inference_values": inference_values,
         "stage_values": dict(stage_values),
         "route_counts": route_counts,
+        "missing_candidate_sources": missing_candidate_sources,
         "metrics": {
             "input": expected_count,
             "total_seconds": total_seconds,
@@ -2059,6 +2124,35 @@ def analyze_plan(
 
     reference_key = ("measured", "baseline", 1)
     reference = loaded_runs[reference_key]
+    preexisting_missing_failures: list[str] = []
+    reference_missing_sources: dict[str, list[str]] = {}
+    if allowed_incomplete_field == PREEXISTING_INCOMPLETE_POLICY:
+        reference_missing = reference["missing_candidate_sources"]
+        for field_name in PREEXISTING_INCOMPLETE_FIELDS:
+            reference_keys = reference_missing[field_name]
+            reference_missing_sources[field_name] = sorted(
+                str(reference["results"][source_key]["source"])
+                for source_key in reference_keys
+            )
+        for phase, count in (("warmup", warmup_runs), ("measured", repetitions)):
+            phase_reference = loaded_runs[(phase, "baseline", 1)][
+                "missing_candidate_sources"
+            ]
+            for iteration in range(1, count + 1):
+                for variant in VARIANTS:
+                    run = loaded_runs[(phase, variant, iteration)]
+                    for field_name in PREEXISTING_INCOMPLETE_FIELDS:
+                        observed = run["missing_candidate_sources"][field_name]
+                        expected = phase_reference[field_name]
+                        if observed != expected:
+                            present_to_missing = len(observed - expected)
+                            missing_to_present = len(expected - observed)
+                            preexisting_missing_failures.append(
+                                f"{run['descriptor']['id']} {field_name} "
+                                "missing-source set changed: "
+                                f"present_to_missing={present_to_missing} "
+                                f"missing_to_present={missing_to_present}"
+                            )
     differences: list[dict[str, Any]] = []
     difference_count = 0
 
@@ -2120,7 +2214,10 @@ def analyze_plan(
         variant: _aggregate_variant(measured_by_variant[variant]) for variant in VARIANTS
     }
     route_counts_accepted = not route_count_failures
-    prediction_accepted = difference_count == 0 and route_counts_accepted
+    missing_sets_accepted = not preexisting_missing_failures
+    prediction_accepted = (
+        difference_count == 0 and route_counts_accepted and missing_sets_accepted
+    )
     performance_delta = _performance_delta(
         aggregate["baseline"], aggregate["candidate"]
     )
@@ -2194,6 +2291,17 @@ def analyze_plan(
             "failures": route_count_failures,
         },
     }
+    if allowed_incomplete_field == PREEXISTING_INCOMPLETE_POLICY:
+        report["preexisting_incomplete_consistency"] = {
+            "applicable": True,
+            "accepted": missing_sets_accepted,
+            "policy": PREEXISTING_MISSING_SET_RULE,
+            "comparison_scope": "each_phase_against_its_baseline_iteration_1",
+            "reference_run": reference["descriptor"]["id"],
+            "allowed_fields": list(PREEXISTING_INCOMPLETE_FIELDS),
+            "reference_missing_sources_by_field": reference_missing_sources,
+            "failures": preexisting_missing_failures,
+        }
     if execution_mode == EQUIVALENCE_ONLY_ONCE_MODE:
         if external_performance is None:
             raise ValidationError("external performance evidence was not resolved")

@@ -255,14 +255,19 @@ def _fixture_plan(
     *,
     ocr_mode: str = "unified",
     allow_incomplete_recipient: bool = False,
+    allow_preexisting_incomplete: bool = False,
     repetitions: int = 3,
     warmup_runs: int = 1,
     expected_input_count: int | None = None,
     sources: list[Path] | None = None,
     identity_plan: Path | None = None,
 ) -> Path:
+    if allow_incomplete_recipient and allow_preexisting_incomplete:
+        raise ValueError("incomplete fixture policies are mutually exclusive")
     if allow_incomplete_recipient and ocr_mode != "hybrid-recipient":
         raise ValueError("recipient-only incomplete fixtures require hybrid-recipient OCR")
+    if allow_preexisting_incomplete and ocr_mode != "hybrid-recipient":
+        raise ValueError("preexisting-incomplete fixtures require hybrid-recipient OCR")
     tmp_path.mkdir(parents=True, exist_ok=True)
     if sources is None:
         sources = [tmp_path / "input-1.jpg", tmp_path / "input-2.jpg"]
@@ -371,6 +376,39 @@ def _fixture_plan(
                         "wall_clock_evidence": str(wall_clock),
                     }
                 )
+    allow_incomplete = allow_incomplete_recipient or allow_preexisting_incomplete
+    cli_contract = {
+        "device": "cpu",
+        "unified_provider": "cpu",
+        "paddle_ocr_provider": "cpu" if ocr_mode == "hybrid-recipient" else None,
+        "ocr": ocr_mode,
+        "score_threshold": 0.5,
+        "rectification": "max-side-1600",
+        "annotate": "none",
+        "require_complete": not allow_incomplete,
+        "equivalence_only": allow_incomplete,
+        "allowed_incomplete_field": (
+            "recipient" if allow_incomplete_recipient else None
+        ),
+        "continue_on_error": False,
+        "skip_existing": False,
+        "includes_device_model": True,
+        "includes_paddle_ocr_bundle": ocr_mode == "hybrid-recipient",
+        "detector_intra_op_threads": {
+            "baseline": None,
+            "candidate": 16,
+        },
+    }
+    if allow_preexisting_incomplete:
+        cli_contract.update(
+            {
+                "preexisting_incomplete_equivalence": True,
+                "allowed_incomplete_fields": list(
+                    compare.PREEXISTING_INCOMPLETE_FIELDS
+                ),
+                "missing_set_rule": compare.PREEXISTING_MISSING_SET_RULE,
+            }
+        )
     plan = {
         "schema_version": 2,
         "kind": compare.PLAN_KIND,
@@ -390,28 +428,7 @@ def _fixture_plan(
         "warmup_runs": warmup_runs,
         "warmup_limit": 1,
         "repetitions": repetitions,
-        "cli_contract": {
-            "device": "cpu",
-            "unified_provider": "cpu",
-            "paddle_ocr_provider": "cpu" if ocr_mode == "hybrid-recipient" else None,
-            "ocr": ocr_mode,
-            "score_threshold": 0.5,
-            "rectification": "max-side-1600",
-            "annotate": "none",
-            "require_complete": not allow_incomplete_recipient,
-            "equivalence_only": allow_incomplete_recipient,
-            "allowed_incomplete_field": (
-                "recipient" if allow_incomplete_recipient else None
-            ),
-            "continue_on_error": False,
-            "skip_existing": False,
-            "includes_device_model": True,
-            "includes_paddle_ocr_bundle": ocr_mode == "hybrid-recipient",
-            "detector_intra_op_threads": {
-                "baseline": None,
-                "candidate": 16,
-            },
-        },
+        "cli_contract": cli_contract,
         "performance_gate": {
             # Windows PowerShell 5.1 ConvertTo-Json emits whole-valued doubles
             # as JSON integers. The analyzer must preserve the numeric guard
@@ -443,7 +460,7 @@ def _equivalence_only_once_fixture(
     full_plan_path = _fixture_plan(
         tmp_path / "full",
         ocr_mode="hybrid-recipient",
-        allow_incomplete_recipient=True,
+        allow_preexisting_incomplete=True,
         repetitions=1,
         expected_input_count=3,
         sources=sources,
@@ -451,7 +468,7 @@ def _equivalence_only_once_fixture(
     performance_plan_path = _fixture_plan(
         tmp_path / "performance",
         ocr_mode="hybrid-recipient",
-        allow_incomplete_recipient=True,
+        allow_preexisting_incomplete=True,
         repetitions=3,
         expected_input_count=2,
         # A route-diverse targeted subset need not be the canonical first-N.
@@ -508,6 +525,23 @@ def _make_all_recipient_candidates_incomplete(plan_path: Path) -> None:
         _write_json(result_path, result)
 
 
+def _make_preexisting_candidate_incomplete(
+    plan_path: Path,
+    *,
+    field_name: str,
+    source_suffix: str,
+) -> None:
+    for result_path in _result_paths(plan_path):
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+        if not str(result["source"]).endswith(source_suffix):
+            continue
+        field = result["fields"][field_name]
+        field["candidate"] = None
+        field["state"] = "absent"
+        field["ctc_diagnostic"] = {"preexisting": True}
+        _write_json(result_path, result)
+
+
 def _make_first_source_recipient_detection_absent(plan_path: Path) -> None:
     for result_path in _result_paths(plan_path):
         result = json.loads(result_path.read_text(encoding="utf-8"))
@@ -546,6 +580,7 @@ def test_cpu_ab_accepts_exact_predictions_and_reports_pooled_performance(tmp_pat
     assert report["performance"]["baseline"]["stage_latency_ms"]["device"]["count"] == 6
     assert "execution_mode" not in report
     assert "external_performance_evidence" not in report
+    assert "preexisting_incomplete_consistency" not in report
     assert "full_once_observation" not in report["performance"]
     assert (
         report["variant_identities"]["baseline"]["managed_entrypoint_sha256"]
@@ -581,6 +616,11 @@ def test_cpu_ab_equivalence_only_once_uses_revalidated_external_performance(
     assert observation["acceptance_applicable"] is False
     assert observation["baseline"]["repetitions"] == 1
     assert report["prediction_consistency"]["compared_runs"] == 3
+    assert report["preexisting_incomplete_consistency"]["accepted"] is True
+    assert (
+        report["preexisting_incomplete_consistency"]["policy"]
+        == compare.PREEXISTING_MISSING_SET_RULE
+    )
 
 
 def test_cpu_ab_standard_mode_does_not_allow_one_repetition(tmp_path: Path) -> None:
@@ -605,7 +645,7 @@ def test_cpu_ab_standard_mode_does_not_allow_one_repetition(tmp_path: Path) -> N
                 equivalence_only=False,
                 allowed_incomplete_field=None,
             ),
-            "only recipient allowed incomplete",
+            "preexisting-incomplete policy",
         ),
         (lambda plan: plan.pop("performance_evidence"), "requires hash-bound"),
     ],
@@ -700,7 +740,7 @@ def test_cpu_ab_equivalence_only_once_rejects_nonformal_performance_inputs(
     rogue_plan_path = _fixture_plan(
         tmp_path / "rogue-performance",
         ocr_mode="hybrid-recipient",
-        allow_incomplete_recipient=True,
+        allow_preexisting_incomplete=True,
         repetitions=3,
         expected_input_count=2,
         sources=rogue_sources,
@@ -1041,6 +1081,167 @@ def test_cpu_ab_hybrid_equivalence_rejects_any_other_missing_candidate(
     _write_json(result_path, result)
 
     with pytest.raises(compare.ValidationError, match=field_name):
+        compare.analyze_plan(plan_path)
+
+
+def test_cpu_ab_preexisting_incomplete_equivalence_accepts_exact_baseline_missing_sets(
+    tmp_path: Path,
+) -> None:
+    plan_path = _fixture_plan(
+        tmp_path,
+        ocr_mode="hybrid-recipient",
+        allow_preexisting_incomplete=True,
+    )
+    for field_name, source_suffix in (
+        ("time", "input-1.jpg"),
+        ("amount", "input-2.jpg"),
+        ("payment_method", "input-2.jpg"),
+        ("transfer_status", "input-2.jpg"),
+    ):
+        _make_preexisting_candidate_incomplete(
+            plan_path,
+            field_name=field_name,
+            source_suffix=source_suffix,
+        )
+    _make_all_recipient_candidates_incomplete(plan_path)
+
+    report, differences = compare.analyze_plan(plan_path)
+
+    assert differences == []
+    assert report["accepted"] is True
+    contract = report["cli_contract"]
+    assert contract["require_complete"] is False
+    assert contract["preexisting_incomplete_equivalence"] is True
+    assert contract["allowed_incomplete_fields"] == list(
+        compare.PREEXISTING_INCOMPLETE_FIELDS
+    )
+    consistency = report["preexisting_incomplete_consistency"]
+    assert consistency["accepted"] is True
+    assert len(consistency["reference_missing_sources_by_field"]["time"]) == 1
+    assert len(consistency["reference_missing_sources_by_field"]["amount"]) == 1
+    assert len(consistency["reference_missing_sources_by_field"]["recipient"]) == 2
+
+
+def test_cpu_ab_preexisting_incomplete_equivalence_rejects_present_to_missing(
+    tmp_path: Path,
+) -> None:
+    plan_path = _fixture_plan(
+        tmp_path,
+        ocr_mode="hybrid-recipient",
+        allow_preexisting_incomplete=True,
+    )
+    _make_preexisting_candidate_incomplete(
+        plan_path, field_name="time", source_suffix="input-1.jpg"
+    )
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    candidate_run = next(
+        run
+        for run in plan["runs"]
+        if run["phase"] == "measured"
+        and run["variant"] == "candidate"
+        and run["iteration"] == 1
+    )
+    manifest = json.loads(
+        (Path(candidate_run["output_directory"]) / "inference_manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    result_path = next(
+        Path(row["result"])
+        for row in manifest
+        if str(row["source"]).endswith("input-2.jpg")
+    )
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    result["fields"]["time"]["candidate"] = None
+    result["fields"]["time"]["state"] = "absent"
+    _write_json(result_path, result)
+
+    report, differences = compare.analyze_plan(plan_path)
+
+    consistency = report["preexisting_incomplete_consistency"]
+    assert consistency["accepted"] is False
+    assert "present_to_missing=1" in consistency["failures"][0]
+    assert report["prediction_consistency"]["accepted"] is False
+    assert report["accepted"] is False
+    assert any(row["json_pointer"] == "/fields/time/candidate" for row in differences)
+
+
+def test_cpu_ab_preexisting_incomplete_equivalence_keeps_deep_field_json_exact(
+    tmp_path: Path,
+) -> None:
+    plan_path = _fixture_plan(
+        tmp_path,
+        ocr_mode="hybrid-recipient",
+        allow_preexisting_incomplete=True,
+    )
+    _make_preexisting_candidate_incomplete(
+        plan_path, field_name="time", source_suffix="input-1.jpg"
+    )
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    candidate_run = next(
+        run
+        for run in plan["runs"]
+        if run["phase"] == "measured"
+        and run["variant"] == "candidate"
+        and run["iteration"] == 1
+    )
+    manifest = json.loads(
+        (Path(candidate_run["output_directory"]) / "inference_manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    result_path = next(
+        Path(row["result"])
+        for row in manifest
+        if str(row["source"]).endswith("input-1.jpg")
+    )
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    result["fields"]["time"]["ctc_diagnostic"]["preexisting"] = 1
+    _write_json(result_path, result)
+
+    report, differences = compare.analyze_plan(plan_path)
+
+    assert report["preexisting_incomplete_consistency"]["accepted"] is True
+    assert report["accepted"] is False
+    assert any(
+        row["json_pointer"] == "/fields/time/ctc_diagnostic/preexisting"
+        and row["reason"] == "type"
+        for row in differences
+    )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (
+            lambda contract: contract.update(allowed_incomplete_fields=["recipient"]),
+            "all five fields",
+        ),
+        (
+            lambda contract: contract.update(missing_set_rule="any_missing_allowed"),
+            "missing-set rule",
+        ),
+        (
+            lambda contract: contract.update(allowed_incomplete_field="recipient"),
+            "cannot name one",
+        ),
+    ],
+)
+def test_cpu_ab_rejects_ambiguous_preexisting_incomplete_contract(
+    tmp_path: Path,
+    mutation: object,
+    message: str,
+) -> None:
+    plan_path = _fixture_plan(
+        tmp_path,
+        ocr_mode="hybrid-recipient",
+        allow_preexisting_incomplete=True,
+    )
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    mutation(plan["cli_contract"])  # type: ignore[operator]
+    _write_json(plan_path, plan)
+
+    with pytest.raises(compare.ValidationError, match=message):
         compare.analyze_plan(plan_path)
 
 
@@ -1597,6 +1798,7 @@ def test_cpu_ab_powershell_v2_freezes_and_runs_the_complete_hybrid_cpu_route() -
     assert "[string]$PaddleOcrBundle" in script
     assert "[int]$ExpectedInputCount = 0" in script
     assert "[switch]$AllowIncompleteRecipientEquivalence" in script
+    assert "[switch]$AllowPreexistingIncompleteEquivalence" in script
     assert "[switch]$EquivalenceOnlyOnce" in script
     assert "[string]$PerformanceEvidenceReport" in script
     assert '[ValidateRange(1, 20)]\n    [int]$Repetitions = 3' in script
@@ -1604,7 +1806,7 @@ def test_cpu_ab_powershell_v2_freezes_and_runs_the_complete_hybrid_cpu_route() -
     assert '$Repetitions -ne 1' in script
     assert '$WarmupRuns -ne 1' in script
     assert '$InputLimit -ne 0 -or $ExpectedInputCount -ne 10016' in script
-    assert '$OcrMode -ne "hybrid-recipient" -or -not $AllowIncompleteRecipientEquivalence' in script
+    assert '-or -not $AllowPreexistingIncompleteEquivalence' in script
     assert '[int]$performanceReportPayload.input_count -ne 332' in script
     assert '[int]$performanceReportPayload.measured_repetitions_per_variant -ne 3' in script
     assert '$plan["execution_mode"] = "equivalence_only_once"' in script
@@ -1620,8 +1822,12 @@ def test_cpu_ab_powershell_v2_freezes_and_runs_the_complete_hybrid_cpu_route() -
     assert '"--require-complete"' in script
     assert "if (-not $AllowIncompleteRecipient)" in script
     assert "$AllowIncompleteRecipientEquivalence -and $OcrMode -ne \"hybrid-recipient\"" in script
-    assert "require_complete = -not [bool]$AllowIncompleteRecipientEquivalence" in script
-    assert "equivalence_only = [bool]$AllowIncompleteRecipientEquivalence" in script
+    assert "$AllowPreexistingIncompleteEquivalence -and $OcrMode -ne \"hybrid-recipient\"" in script
+    assert "require_complete = -not $allowIncompleteEquivalence" in script
+    assert "equivalence_only = $allowIncompleteEquivalence" in script
+    assert '$plan["cli_contract"]["preexisting_incomplete_equivalence"] = $true' in script
+    assert '$plan["cli_contract"]["allowed_incomplete_fields"]' in script
+    assert '"baseline_and_candidate_exact_per_field"' in script
     assert '"recipient"' in script
     assert 'paddle_ocr_provider = if ($OcrMode -eq "hybrid-recipient")' in script
     assert 'kind = "receipt_mlnet_cpu_ab_plan_v2"' in script
