@@ -23,7 +23,9 @@ internal static class Program
             VerifyRecipientRightValueDiagnosticCrop();
             VerifyUnifiedGrayscaleRowSpanBitExactness();
             VerifyUnifiedFieldTensorReuse();
-            Console.WriteLine("PASS: detector/statusbar/unified OCR preprocessing and reusable buffers are bit-exact against the legacy implementation.");
+            VerifyPaddleResizeOwnershipAndPixels();
+            VerifyPaddleAngleOwnershipAndPixels();
+            Console.WriteLine("PASS: detector/statusbar/unified/Paddle OCR preprocessing, ownership and reusable buffers are bit-exact against the legacy implementation.");
             return 0;
         }
         catch (Exception error)
@@ -337,6 +339,227 @@ internal static class Program
                 $"legacy grayscale rounding boundary {index}");
         }
         AssertArrayBitsEqual(boundaryExpected, boundaryActual, "row-span grayscale rounding boundaries");
+    }
+
+    private static void VerifyPaddleResizeOwnershipAndPixels()
+    {
+        VerifyPaddleResizeCase(7, 5, 9, 32, padRight: false, "unpadded ownership transfer");
+        VerifyPaddleResizeCase(7, 5, 9, 32, padRight: true, "right padding");
+        VerifyPaddleResizeCase(16, 8, 8, 16, padRight: true, "full-width ownership transfer");
+
+        var source = CreateCvPattern(3, 2);
+        try
+        {
+            try
+            {
+                using var unexpected = PaddleOcrImageOps.ResizeKeepRatio(
+                    source,
+                    targetHeight: 0,
+                    targetWidth: 8,
+                    padRight: false);
+            }
+            catch (ArgumentOutOfRangeException error) when (error.ParamName == "targetHeight")
+            {
+                Assert(!source.IsDisposed, "invalid Paddle resize must not dispose the caller-owned source");
+                return;
+            }
+            catch (Exception error)
+            {
+                throw new InvalidOperationException(
+                    $"invalid Paddle resize raised {error.GetType().Name} instead of ArgumentOutOfRangeException",
+                    error);
+            }
+            throw new InvalidOperationException("invalid Paddle resize dimensions were accepted");
+        }
+        finally
+        {
+            source.Dispose();
+        }
+    }
+
+    private static void VerifyPaddleResizeCase(
+        int width,
+        int height,
+        int targetHeight,
+        int targetWidth,
+        bool padRight,
+        string label)
+    {
+        var source = CreateCvPattern(width, height);
+        try
+        {
+            using var expected = LegacyPaddleResizeKeepRatio(
+                source,
+                targetHeight,
+                targetWidth,
+                padRight);
+            var actual = PaddleOcrImageOps.ResizeKeepRatio(
+                source,
+                targetHeight,
+                targetWidth,
+                padRight);
+            try
+            {
+                Assert(!actual.IsDisposed, $"{label} returned a disposed Mat");
+                Assert(!source.IsDisposed, $"{label} disposed the caller-owned source");
+                AssertCvMatBytesEqual(expected, actual, label);
+            }
+            finally
+            {
+                actual.Dispose();
+            }
+            Assert(actual.IsDisposed, $"{label} result did not release its transferred ownership");
+            Assert(!source.IsDisposed, $"{label} result disposal affected the caller-owned source");
+        }
+        finally
+        {
+            source.Dispose();
+        }
+    }
+
+    private static void VerifyPaddleAngleOwnershipAndPixels()
+    {
+        var unchangedInput = CreateCvPattern(7, 5);
+        using var unchangedExpected = unchangedInput.Clone();
+        var unchangedResult = PaddleOcrEngine.ApplyAngleDecisionAndTakeOwnership(
+            unchangedInput,
+            rotate180: false);
+        try
+        {
+            Assert(
+                ReferenceEquals(unchangedInput, unchangedResult),
+                "non-180 Paddle angle branch must transfer the original Mat without cloning");
+            Assert(!unchangedInput.IsDisposed, "non-180 Paddle angle branch returned a disposed Mat");
+            AssertCvMatBytesEqual(unchangedExpected, unchangedResult, "non-180 Paddle angle pixels");
+        }
+        finally
+        {
+            unchangedResult.Dispose();
+        }
+        Assert(
+            unchangedInput.IsDisposed,
+            "disposing the non-180 result must release the transferred input ownership");
+
+        var rotatedInput = CreateCvPattern(7, 5);
+        using var rotatedExpected = new OpenCvSharp.Mat();
+        OpenCvSharp.Cv2.Rotate(
+            rotatedInput,
+            rotatedExpected,
+            OpenCvSharp.RotateFlags.Rotate180);
+        var rotatedResult = PaddleOcrEngine.ApplyAngleDecisionAndTakeOwnership(
+            rotatedInput,
+            rotate180: true);
+        try
+        {
+            Assert(
+                !ReferenceEquals(rotatedInput, rotatedResult),
+                "180-degree Paddle angle branch must return the rotated Mat");
+            Assert(rotatedInput.IsDisposed, "180-degree Paddle angle branch did not dispose its input");
+            Assert(!rotatedResult.IsDisposed, "180-degree Paddle angle branch returned a disposed Mat");
+            AssertCvMatBytesEqual(rotatedExpected, rotatedResult, "180-degree Paddle angle pixels");
+        }
+        finally
+        {
+            rotatedResult.Dispose();
+        }
+
+        var emptyInput = new OpenCvSharp.Mat();
+        try
+        {
+            using var unexpected = PaddleOcrEngine.ApplyAngleDecisionAndTakeOwnership(
+                emptyInput,
+                rotate180: true);
+        }
+        catch (InvalidOperationException error)
+            when (error.Message.Contains("empty Paddle OCR text crop", StringComparison.Ordinal))
+        {
+            Assert(emptyInput.IsDisposed, "exceptional Paddle angle branch leaked its owned input");
+            return;
+        }
+        catch (Exception error)
+        {
+            throw new InvalidOperationException(
+                $"empty Paddle angle crop raised {error.GetType().Name} instead of InvalidOperationException",
+                error);
+        }
+        throw new InvalidOperationException("empty Paddle angle crop was accepted");
+    }
+
+    private static OpenCvSharp.Mat LegacyPaddleResizeKeepRatio(
+        OpenCvSharp.Mat rgb,
+        int targetHeight,
+        int targetWidth,
+        bool padRight)
+    {
+        var ratio = rgb.Cols / (float)Math.Max(1, rgb.Rows);
+        var resizedWidth = Math.Min(
+            targetWidth,
+            Math.Max(1, (int)Math.Ceiling(targetHeight * ratio)));
+        using var resized = new OpenCvSharp.Mat();
+        OpenCvSharp.Cv2.Resize(
+            rgb,
+            resized,
+            new OpenCvSharp.Size(resizedWidth, targetHeight),
+            0,
+            0,
+            OpenCvSharp.InterpolationFlags.Linear);
+        if (!padRight || resizedWidth == targetWidth)
+        {
+            return resized.Clone();
+        }
+
+        var padded = new OpenCvSharp.Mat(
+            targetHeight,
+            targetWidth,
+            OpenCvSharp.MatType.CV_8UC3,
+            OpenCvSharp.Scalar.All(0));
+        using var destination = new OpenCvSharp.Mat(
+            padded,
+            new OpenCvSharp.Rect(0, 0, resizedWidth, targetHeight));
+        resized.CopyTo(destination);
+        return padded;
+    }
+
+    private static OpenCvSharp.Mat CreateCvPattern(int width, int height)
+    {
+        var mat = new OpenCvSharp.Mat(height, width, OpenCvSharp.MatType.CV_8UC3);
+        for (var y = 0; y < height; y++)
+        {
+            for (var x = 0; x < width; x++)
+            {
+                mat.Set(
+                    y,
+                    x,
+                    new OpenCvSharp.Vec3b(
+                        (byte)((x * 17 + y * 29 + 3) & 255),
+                        (byte)((x * 31 + y * 11 + 71) & 255),
+                        (byte)((x * 7 + y * 43 + 149) & 255)));
+            }
+        }
+        return mat;
+    }
+
+    private static void AssertCvMatBytesEqual(
+        OpenCvSharp.Mat expected,
+        OpenCvSharp.Mat actual,
+        string label)
+    {
+        AssertEqual(expected.Rows, actual.Rows, label + " rows");
+        AssertEqual(expected.Cols, actual.Cols, label + " columns");
+        Assert(expected.Type() == actual.Type(), label + " type differs");
+        for (var y = 0; y < expected.Rows; y++)
+        {
+            for (var x = 0; x < expected.Cols; x++)
+            {
+                var expectedPixel = expected.At<OpenCvSharp.Vec3b>(y, x);
+                var actualPixel = actual.At<OpenCvSharp.Vec3b>(y, x);
+                if (!expectedPixel.Equals(actualPixel))
+                {
+                    throw new InvalidOperationException(
+                        $"{label} differs at ({x},{y}): expected {expectedPixel}, actual {actualPixel}");
+                }
+            }
+        }
     }
 
     private static void VerifyUnifiedFieldCase(

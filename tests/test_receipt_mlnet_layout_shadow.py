@@ -25,7 +25,7 @@ def _method_block(source: str, signature: str) -> str:
     raise AssertionError(f"unterminated method {signature!r}")
 
 
-def test_layout_api_is_additive_and_legacy_recognize_body_is_frozen() -> None:
+def test_layout_api_is_additive_and_optimized_recognize_body_is_frozen() -> None:
     source = ENGINE.read_text(encoding="utf-8")
     image_overload = _method_block(
         source,
@@ -38,9 +38,13 @@ def test_layout_api_is_additive_and_legacy_recognize_body_is_frozen() -> None:
         source,
         "    public PaddleOcrReadResult Recognize(Mat rgb)\n",
     )
+    # Frozen again after the audited A3 ownership-only revision: the caller
+    # must not dispose a non-180 crop that ClassifyAngle now returns directly.
     assert hashlib.sha256(legacy.encode("utf-8")).hexdigest() == (
-        "fcdfa3f10279fbec78be415e8761344eb7098abe64e1ebef4cbb6fd4d0ddb9f8"
+        "141aa1f6f730448194a6d7b512f4391b24fd6de8dfac8800dd8b00dff3fc90eb"
     )
+    assert "ClassifyAngleAndTakeOwnership(" in legacy
+    assert "using var textCrop" not in legacy
     assert "RecognizeLayoutDiagnostic(Image<Rgb24> image)" in source
     assert "RecognizeLayoutDiagnostic(Mat rgb)" in source
     assert "AssembleLayoutDiagnostic(" in source

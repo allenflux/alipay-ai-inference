@@ -75,7 +75,7 @@ def test_producer_executes_exact_frozen_crop4_crop5_layout_contract() -> None:
     assert "RequireOrderedConvexQuad(line.Quad, lineIndex)" in source
 
 
-def test_existing_production_engine_paths_are_byte_for_byte_unchanged() -> None:
+def test_existing_production_engine_paths_match_audited_ownership_revision() -> None:
     source = (MAIN / "PaddleOcrEngine.cs").read_text(encoding="utf-8")
 
     def section(start: str, end: str) -> str:
@@ -95,7 +95,8 @@ def test_existing_production_engine_paths_are_byte_for_byte_unchanged() -> None:
                 "    public PaddleOcrReadResult Recognize(Image<Rgb24> image)",
                 "    /// <summary>\n    /// Run the same frozen DB/CLS/REC pipeline",
             ),
-            "4791e915358bf557a82316979c49fe74ba8d7585c4e2dac693d4500396c260cf",
+            # Frozen after the audited A3 Mat ownership-only revision.
+            "9660b41dc77ed688fa87d201ef32d8e94fd0c78e21dde98bc5b22bcf2f796c26",
         ),
         "device_session_selection": (
             section(

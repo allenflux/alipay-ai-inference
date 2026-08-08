@@ -182,8 +182,17 @@ internal sealed class PaddleOcrEngine : IDisposable
         {
             foreach (var box in boxes)
             {
-                using var textCrop = PaddleOcrImageOps.RotateCrop(rgb, box);
-                orientedCrops.Add(ClassifyAngle(textCrop));
+                var orientedCrop = ClassifyAngleAndTakeOwnership(
+                    PaddleOcrImageOps.RotateCrop(rgb, box));
+                try
+                {
+                    orientedCrops.Add(orientedCrop);
+                }
+                catch
+                {
+                    orientedCrop.Dispose();
+                    throw;
+                }
             }
 
             // PaddleOCR's CTC decoder can yield an empty text line with a
@@ -256,8 +265,17 @@ internal sealed class PaddleOcrEngine : IDisposable
         {
             foreach (var box in boxes)
             {
-                using var textCrop = PaddleOcrImageOps.RotateCrop(rgb, box);
-                orientedCrops.Add(ClassifyAngle(textCrop));
+                var orientedCrop = ClassifyAngleAndTakeOwnership(
+                    PaddleOcrImageOps.RotateCrop(rgb, box));
+                try
+                {
+                    orientedCrops.Add(orientedCrop);
+                }
+                catch
+                {
+                    orientedCrop.Dispose();
+                    throw;
+                }
             }
             return AssembleLayoutDiagnostic(
                 boxes,
@@ -384,29 +402,92 @@ internal sealed class PaddleOcrEngine : IDisposable
                 _bundle.Settings.DetDbScoreMode));
     }
 
-    private Mat ClassifyAngle(Mat rgb)
+    /// <summary>
+    /// Classify one crop while taking ownership of <paramref name="rgb"/>.
+    /// The input is either returned unchanged, replaced and disposed after a
+    /// 180-degree rotation, or disposed before any exception escapes.
+    /// </summary>
+    private Mat ClassifyAngleAndTakeOwnership(Mat rgb)
     {
-        var shape = _bundle.Settings.ClsImageShape;
-        // Paddle v2 normalizes only the resized pixels into a zero-initialized
-        // float tensor. Padding is therefore normalized-space 0, not a black
-        // uint8 pixel which would normalize to -1.
-        using var prepared = PaddleOcrImageOps.ResizeKeepRatio(rgb, shape.Height, shape.Width, padRight: false);
-        var tensor = PaddleOcrImageOps.ToNormalizedNchw(prepared, CenterMean, CenterStd, shape.Width, shape.Height);
-        var output = Run(_classifier, _bundle.ClsModel, tensor, [1, shape.Channels, shape.Height, shape.Width]);
-        if (output.Shape.Length < 2 || output.Shape[^1] < 2)
+        ArgumentNullException.ThrowIfNull(rgb);
+        Mat? ownedInput = rgb;
+        try
         {
-            throw new InvalidOperationException(
-                $"Paddle OCR classifier output must contain two angle scores, got [{string.Join(',', output.Shape)}]");
+            var shape = _bundle.Settings.ClsImageShape;
+            // Paddle v2 normalizes only the resized pixels into a zero-initialized
+            // float tensor. Padding is therefore normalized-space 0, not a black
+            // uint8 pixel which would normalize to -1.
+            using var prepared = PaddleOcrImageOps.ResizeKeepRatio(
+                ownedInput,
+                shape.Height,
+                shape.Width,
+                padRight: false);
+            var tensor = PaddleOcrImageOps.ToNormalizedNchw(
+                prepared,
+                CenterMean,
+                CenterStd,
+                shape.Width,
+                shape.Height);
+            var output = Run(
+                _classifier,
+                _bundle.ClsModel,
+                tensor,
+                [1, shape.Channels, shape.Height, shape.Width]);
+            if (output.Shape.Length < 2 || output.Shape[^1] < 2)
+            {
+                throw new InvalidOperationException(
+                    $"Paddle OCR classifier output must contain two angle scores, got [{string.Join(',', output.Shape)}]");
+            }
+            var classCount = output.Shape[^1];
+            var (index, score) = ArgMax(output.Values, 0, classCount);
+            var transferredInput = ownedInput;
+            ownedInput = null;
+            return ApplyAngleDecisionAndTakeOwnership(
+                transferredInput,
+                index == 1 && score > _bundle.Settings.ClsThreshold);
         }
-        var classCount = output.Shape[^1];
-        var (index, score) = ArgMax(output.Values, 0, classCount);
-        if (index == 1 && score > _bundle.Settings.ClsThreshold)
+        finally
         {
-            var rotated = new Mat();
-            Cv2.Rotate(rgb, rotated, RotateFlags.Rotate180);
-            return rotated;
+            ownedInput?.Dispose();
         }
-        return rgb.Clone();
+    }
+
+    /// <summary>
+    /// Apply a frozen angle decision while taking ownership of the input. This
+    /// is internal so contract tests can prove the transfer/disposal semantics
+    /// without loading ONNX sessions.
+    /// </summary>
+    internal static Mat ApplyAngleDecisionAndTakeOwnership(Mat rgb, bool rotate180)
+    {
+        ArgumentNullException.ThrowIfNull(rgb);
+        Mat? ownedInput = rgb;
+        Mat? rotated = null;
+        try
+        {
+            if (ownedInput.Empty())
+            {
+                throw new InvalidOperationException("Cannot classify an empty Paddle OCR text crop");
+            }
+            if (!rotate180)
+            {
+                var result = ownedInput;
+                ownedInput = null;
+                return result;
+            }
+
+            rotated = new Mat();
+            Cv2.Rotate(ownedInput, rotated, RotateFlags.Rotate180);
+            ownedInput.Dispose();
+            ownedInput = null;
+            var rotatedResult = rotated;
+            rotated = null;
+            return rotatedResult;
+        }
+        finally
+        {
+            rotated?.Dispose();
+            ownedInput?.Dispose();
+        }
     }
 
     /// <summary>

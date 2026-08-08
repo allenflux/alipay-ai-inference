@@ -169,17 +169,34 @@ internal static class PaddleOcrImageOps
         }
         var ratio = rgb.Cols / (float)Math.Max(1, rgb.Rows);
         var resizedWidth = Math.Min(targetWidth, Math.Max(1, (int)Math.Ceiling(targetHeight * ratio)));
-        using var resized = new Mat();
-        Cv2.Resize(rgb, resized, new OpenCvSharp.Size(resizedWidth, targetHeight), 0, 0, InterpolationFlags.Linear);
-        if (!padRight || resizedWidth == targetWidth)
+        Mat? resized = new Mat();
+        Mat? padded = null;
+        try
         {
-            return resized.Clone();
-        }
+            Cv2.Resize(rgb, resized, new OpenCvSharp.Size(resizedWidth, targetHeight), 0, 0, InterpolationFlags.Linear);
+            if (!padRight)
+            {
+                var result = resized;
+                resized = null;
+                return result;
+            }
+            if (resizedWidth == targetWidth)
+            {
+                return resized.Clone();
+            }
 
-        var padded = new Mat(targetHeight, targetWidth, MatType.CV_8UC3, Scalar.All(0));
-        using var destination = new Mat(padded, new Rect(0, 0, resizedWidth, targetHeight));
-        resized.CopyTo(destination);
-        return padded;
+            padded = new Mat(targetHeight, targetWidth, MatType.CV_8UC3, Scalar.All(0));
+            using var destination = new Mat(padded, new Rect(0, 0, resizedWidth, targetHeight));
+            resized.CopyTo(destination);
+            var paddedResult = padded;
+            padded = null;
+            return paddedResult;
+        }
+        finally
+        {
+            padded?.Dispose();
+            resized?.Dispose();
+        }
     }
 
     private static int AlignDetectionAxis(int value)
