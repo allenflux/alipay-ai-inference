@@ -591,6 +591,42 @@ def _status_bar_limit(size: int) -> int:
     return max(1, round(size * STATUS_BAR_FRACTION)) - 1
 
 
+def _convex_hull_area(points: Sequence[tuple[float, float]]) -> float:
+    unique = sorted(set(points))
+    if len(unique) < 3:
+        return 0.0
+
+    def cross(
+        origin: tuple[float, float],
+        left: tuple[float, float],
+        right: tuple[float, float],
+    ) -> float:
+        return (left[0] - origin[0]) * (right[1] - origin[1]) - (
+            left[1] - origin[1]
+        ) * (right[0] - origin[0])
+
+    lower: list[tuple[float, float]] = []
+    for point in unique:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], point) <= 0:
+            lower.pop()
+        lower.append(point)
+    upper: list[tuple[float, float]] = []
+    for point in reversed(unique):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], point) <= 0:
+            upper.pop()
+        upper.append(point)
+    hull = lower[:-1] + upper[:-1]
+    if len(hull) < 3:
+        return 0.0
+    return abs(
+        sum(
+            hull[index][0] * hull[(index + 1) % len(hull)][1]
+            - hull[(index + 1) % len(hull)][0] * hull[index][1]
+            for index in range(len(hull))
+        )
+    ) / 2.0
+
+
 def _quad_geometry(
     line: Mapping[str, Any],
     *,
@@ -601,6 +637,7 @@ def _quad_geometry(
     source_width: int,
     source_height: int,
     rectified_to_source: Sequence[Sequence[float]],
+    allow_intrinsically_degenerate: bool = False,
 ) -> dict[str, Any]:
     raw = line.get("quad_rectified")
     normalized = line.get("quad_rectified_normalized")
@@ -639,8 +676,46 @@ def _quad_geometry(
         - raw_points[(item + 1) % 4][0] * raw_points[item][1]
         for item in range(4)
     )) / 2.0
+    hull_area = _convex_hull_area(raw_points)
+    degenerate_quad: dict[str, Any] | None = None
     if polygon_area <= 1e-3:
-        raise EvidenceError(f"layout record[{record_index}] line[{line_index}] quad is degenerate")
+        # A zero shoelace area may also be caused by a bow-tie ordering over a
+        # perfectly non-degenerate point set.  That is evidence corruption,
+        # not a low-area DB box, and must remain fatal even in the narrow
+        # diagnostic exclusion mode.
+        if hull_area > 1e-3:
+            raise EvidenceError(
+                f"layout record[{record_index}] line[{line_index}] quad order "
+                "cancels a non-degenerate hull"
+            )
+        if not allow_intrinsically_degenerate:
+            raise EvidenceError(
+                f"layout record[{record_index}] line[{line_index}] quad is degenerate"
+            )
+        unique_points = len(set(raw_points))
+        bounding_width = max(point[0] for point in raw_points) - min(
+            point[0] for point in raw_points
+        )
+        bounding_height = max(point[1] for point in raw_points) - min(
+            point[1] for point in raw_points
+        )
+        if unique_points < 4:
+            classification = "repeated_points"
+        elif bounding_width <= 1e-9 or bounding_height <= 1e-9:
+            classification = "axis_collapsed"
+        elif hull_area <= 1e-9:
+            classification = "collinear_points"
+        else:
+            classification = "sub_millipixel_area"
+        degenerate_quad = {
+            "classification": classification,
+            "polygon_area_pixels2": polygon_area,
+            "convex_hull_area_pixels2": hull_area,
+            "unique_points": unique_points,
+            "bounding_width_pixels": bounding_width,
+            "bounding_height_pixels": bounding_height,
+            "candidate_eligible": False,
+        }
     source_normalized = [
         (
             min(1.0, max(0.0, x / (source_width - 1))),
@@ -662,6 +737,7 @@ def _quad_geometry(
         "source_top8_y_max_normalized": round(
             _status_bar_limit(source_height) / (source_height - 1), 6
         ),
+        "degenerate_quad": degenerate_quad,
     }
 
 
@@ -1030,6 +1106,8 @@ def _validate_layout(
     sources: Sequence[Path],
     source_identities: Sequence[Mapping[str, Any]],
     missing_sets: Mapping[str, set[str]],
+    *,
+    allow_intrinsically_degenerate_lines: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     summary_path = layout_directory / "summary.json"
     records_path = layout_directory / "records.jsonl"
@@ -1076,6 +1154,7 @@ def _validate_layout(
         raise EvidenceError(f"layout records.jsonl must contain {EXPECTED_RECORDS} records")
 
     evidence_rows: list[dict[str, Any]] = []
+    degenerate_lines: list[dict[str, Any]] = []
     for index, (record, source, source_identity) in enumerate(
         zip(records, sources, source_identities, strict=True)
     ):
@@ -1180,11 +1259,29 @@ def _validate_layout(
                 source_width=source_width,
                 source_height=source_height,
                 rectified_to_source=rectified_to_source,
+                allow_intrinsically_degenerate=allow_intrinsically_degenerate_lines,
             )
             prepared = dict(line)
             prepared["_geometry"] = line_geometry
             prepared["_rotation_degrees"] = rotation
             prepared_lines.append(prepared)
+            degenerate_quad = line_geometry.get("degenerate_quad")
+            if isinstance(degenerate_quad, Mapping):
+                degenerate_lines.append(
+                    {
+                        "record_index": index,
+                        "line_index": line_index,
+                        "source": str(source),
+                        "text": line["text"],
+                        "confidence": confidence,
+                        "passes_drop_score": passes,
+                        "quad_rectified": line.get("quad_rectified"),
+                        "quad_rectified_normalized": line.get(
+                            "quad_rectified_normalized"
+                        ),
+                        **dict(degenerate_quad),
+                    }
+                )
         accepted = [line for line in prepared_lines if line["passes_drop_score"]]
         _require_int(record.get("accepted_line_count"), len(accepted), description="accepted_line_count")
         accepted_text = " ".join(
@@ -1209,6 +1306,11 @@ def _validate_layout(
             _require_number(timing.get(stage), description=f"layout timing {stage}", minimum=0)
 
         source_key = _path_key(source)
+        analysis_lines = [
+            line
+            for line in prepared_lines
+            if line["_geometry"].get("degenerate_quad") is None
+        ]
         evidence_rows.append({
             "schema_version": 1,
             "kind": EVIDENCE_RECORD_KIND,
@@ -1220,18 +1322,21 @@ def _validate_layout(
             "source_image_sha256": source_identity["sha256"],
             "audit_missing_fields": [field for field in FIELD_SPECS if source_key in missing_sets[field]],
             "evidence_by_field": {
-                "time": _time_evidence(prepared_lines),
-                "payment_method_field": _payment_evidence(prepared_lines),
-                "transfer_status": _status_evidence(prepared_lines),
+                "time": _time_evidence(analysis_lines),
+                "payment_method_field": _payment_evidence(analysis_lines),
+                "transfer_status": _status_evidence(analysis_lines),
             },
         })
-    return evidence_rows, {
+    bindings = {
         "layout_summary": _identity(summary_path, summary_bytes),
         "layout_records": _identity(records_path, records_bytes),
         "paddle_bundle": summary.get("paddle_bundle"),
         "paddle_drop_score": drop_score,
         "layout_latency_ms": summary.get("latency_ms"),
     }
+    if allow_intrinsically_degenerate_lines:
+        bindings["excluded_intrinsically_degenerate_lines"] = degenerate_lines
+    return evidence_rows, bindings
 
 
 def _percentile(values: Sequence[float], quantile: float) -> float:

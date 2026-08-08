@@ -50,6 +50,7 @@ EVALUATION_SUMMARY_KIND = "receipt_mlnet_recipient_full_layout_shadow_summary_v1
 EVALUATION_RECORD_KIND = "receipt_mlnet_recipient_full_layout_shadow_record_v1"
 
 MINIMUM_LINE_CONFIDENCE = 0.80
+MAX_EXCLUDED_DEGENERATE_QUAD_LINES = 1
 LABELS = ("收款账户", "收款方", "收款人")
 LABEL_ALTERNATION = "|".join(map(re.escape, LABELS))
 LABEL_ONLY = re.compile(rf"^(?P<label>{LABEL_ALTERNATION})\s*[:：]?\s*$")
@@ -983,9 +984,12 @@ def _strict_candidate(value: object, filter_module) -> tuple[str | None, str]:
 
 def _recipient_shadow(lines: Sequence[Mapping[str, Any]], *, drop_score: float, filter_module) -> dict[str, Any]:
     prepared: list[dict[str, Any]] = []
-    for index, line in enumerate(lines):
-        if not isinstance(line, Mapping) or line.get("index") != index:
-            raise FullLayoutShadowError("layout lines must have contiguous indices")
+    previous_index = -1
+    for line in lines:
+        index = line.get("index") if isinstance(line, Mapping) else None
+        if type(index) is not int or index <= previous_index:
+            raise FullLayoutShadowError("eligible layout line indices must be strictly increasing")
+        previous_index = index
         confidence = _require_number(
             line.get("confidence"), description="layout line confidence", minimum=0, maximum=1
         )
@@ -1101,19 +1105,63 @@ def _recipient_shadow(lines: Sequence[Mapping[str, Any]], *, drop_score: float, 
     }
 
 
+def _validate_degenerate_exclusions(
+    excluded: object, records: Sequence[Mapping[str, Any]]
+) -> list[dict[str, Any]]:
+    if not isinstance(excluded, list) or any(not isinstance(item, Mapping) for item in excluded):
+        raise FullLayoutShadowError("layout validator did not report degenerate-line diagnostics")
+    if len(excluded) > MAX_EXCLUDED_DEGENERATE_QUAD_LINES:
+        raise FullLayoutShadowError(
+            "LayoutShadow contains more than one intrinsically degenerate line; "
+            "treating this as evidence damage instead of widening the exclusion"
+        )
+    allowed_classifications = {
+        "repeated_points",
+        "axis_collapsed",
+        "collinear_points",
+        "sub_millipixel_area",
+    }
+    seen_excluded: set[tuple[int, int]] = set()
+    for item in excluded:
+        record_index = item.get("record_index")
+        line_index = item.get("line_index")
+        if (
+            type(record_index) is not int
+            or type(line_index) is not int
+            or not 0 <= record_index < len(records)
+            or not 0 <= line_index < len(records[record_index].get("lines", []))
+            or (record_index, line_index) in seen_excluded
+            or item.get("candidate_eligible") is not False
+            or item.get("classification") not in allowed_classifications
+        ):
+            raise FullLayoutShadowError("degenerate-line exclusion evidence is invalid")
+        seen_excluded.add((record_index, line_index))
+        raw_line = records[record_index]["lines"][line_index]
+        if (
+            raw_line.get("index") != line_index
+            or raw_line.get("text") != item.get("text")
+            or raw_line.get("quad_rectified") != item.get("quad_rectified")
+            or raw_line.get("quad_rectified_normalized")
+            != item.get("quad_rectified_normalized")
+        ):
+            raise FullLayoutShadowError("degenerate-line diagnostic differs from raw OCR record")
+    return [dict(item) for item in excluded]
+
+
 def _validate_layout(
     *, selection: Mapping[str, Any], layout_directory: Path, layout_module
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     layout_directory = _require_directory(layout_directory, description="LayoutShadow output")
     missing_sets = {field: set() for field in layout_module.FIELD_SPECS}
     try:
-        layout_module._validate_layout(
+        _, generic_bindings = layout_module._validate_layout(
             layout_directory,
             selection["directory"],
             selection["summary"],
             selection["sources"],
             selection["source_identities"],
             missing_sets,
+            allow_intrinsically_degenerate_lines=True,
         )
     except (OSError, ValueError) as error:
         raise FullLayoutShadowError(f"LayoutShadow 339 closure is invalid: {error}") from error
@@ -1128,6 +1176,9 @@ def _validate_layout(
         or len(records) != EXPECTED_RECORDS
     ):
         raise FullLayoutShadowError("LayoutShadow output is not the fresh CPU339 contract")
+    excluded = _validate_degenerate_exclusions(
+        generic_bindings.get("excluded_intrinsically_degenerate_lines"), records
+    )
     return records, {
         "layout_summary": _identity(
             layout_directory / "summary.json", summary_bytes, description="LayoutShadow summary"
@@ -1140,6 +1191,7 @@ def _validate_layout(
             summary.get("paddle_drop_score"), description="Paddle drop score", minimum=0, maximum=1
         ),
         "latency_ms": summary.get("latency_ms"),
+        "excluded_degenerate_quad_lines": excluded,
     }
 
 
@@ -1163,10 +1215,23 @@ def evaluate(
         selection=selection, layout_directory=layout_directory, layout_module=layout_module
     )
     drop_score = layout_bindings["paddle_drop_score"]
+    excluded_by_record: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for item in layout_bindings["excluded_degenerate_quad_lines"]:
+        excluded_by_record[int(item["record_index"])].append(dict(item))
 
     findings: list[dict[str, Any]] = []
     for index, (selected, layout) in enumerate(zip(selection["rows"], records, strict=True)):
-        shadow = _recipient_shadow(layout.get("lines", []), drop_score=drop_score, filter_module=filter_module)
+        raw_lines = layout.get("lines", [])
+        excluded_lines = excluded_by_record.get(index, [])
+        excluded_indices = {int(item["line_index"]) for item in excluded_lines}
+        eligible_lines = [
+            line
+            for line in raw_lines
+            if isinstance(line, Mapping) and line.get("index") not in excluded_indices
+        ]
+        shadow = _recipient_shadow(
+            eligible_lines, drop_score=drop_score, filter_module=filter_module
+        )
         base = {
             "schema_version": 1,
             "kind": EVALUATION_RECORD_KIND,
@@ -1177,6 +1242,7 @@ def evaluate(
             "index": index,
             "source": selected["source"],
             "cohort": selected["cohort"],
+            "excluded_degenerate_quad_lines": excluded_lines,
             **shadow,
         }
         if selected["cohort"] == "target_unresolved":
@@ -1243,6 +1309,18 @@ def evaluate(
         "accuracy_claimed_for_targets": False,
         "target_truth_used_for_candidate_selection": False,
         "records": EXPECTED_RECORDS,
+        "layout_geometry_safety": {
+            "intrinsically_degenerate_quad_lines": len(
+                layout_bindings["excluded_degenerate_quad_lines"]
+            ),
+            "records_with_intrinsically_degenerate_quad_lines": len(
+                excluded_by_record
+            ),
+            "maximum_allowed_exclusions": MAX_EXCLUDED_DEGENERATE_QUAD_LINES,
+            "non_degenerate_hull_order_cancellation_allowed": False,
+            "excluded_lines_candidate_eligible": False,
+            "policy": "fail_closed_exclude_from_labels_and_values",
+        },
         "targets": {
             "records": TARGET_RECORDS,
             "truth_reported": False,

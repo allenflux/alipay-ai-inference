@@ -462,6 +462,144 @@ def test_homography_validation_accepts_realistic_cancellation_residual() -> None
     )
 
 
+def test_intrinsically_degenerate_db_quad_is_diagnosed_only_in_explicit_exclusion_mode() -> None:
+    raw = [[10.0, 20.0], [30.0, 20.0], [30.0, 20.0], [10.0, 20.0]]
+    normalized = [[x / 99.0, y / 99.0] for x, y in raw]
+    line = {
+        "quad_rectified": raw,
+        "quad_rectified_normalized": normalized,
+    }
+    with pytest.raises(MODULE.EvidenceError, match="quad is degenerate"):
+        MODULE._quad_geometry(
+            line,
+            record_index=146,
+            line_index=20,
+            rectified_width=100,
+            rectified_height=100,
+            source_width=100,
+            source_height=100,
+            rectified_to_source=[[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+        )
+
+    geometry = MODULE._quad_geometry(
+        line,
+        record_index=146,
+        line_index=20,
+        rectified_width=100,
+        rectified_height=100,
+        source_width=100,
+        source_height=100,
+        rectified_to_source=[[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+        allow_intrinsically_degenerate=True,
+    )
+    assert geometry["degenerate_quad"] == {
+        "classification": "repeated_points",
+        "polygon_area_pixels2": 0.0,
+        "convex_hull_area_pixels2": 0.0,
+        "unique_points": 2,
+        "bounding_width_pixels": 20.0,
+        "bounding_height_pixels": 0.0,
+        "candidate_eligible": False,
+    }
+
+
+def test_layout_closure_can_report_one_degenerate_raw_line_without_using_it_as_field_evidence(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+    records = fixture["records"]
+    raw, normalized = _quad(100, 700, 300, 700)
+    records[0]["lines"].append(
+        {
+            "index": len(records[0]["lines"]),
+            "text": "收款方：不得使用",
+            "confidence": 0.4,
+            "passes_drop_score": False,
+            "quad_rectified": raw,
+            "quad_rectified_normalized": normalized,
+        }
+    )
+    records[0]["raw_line_count"] = len(records[0]["lines"])
+    records_path = Path(fixture["layout"]) / "records.jsonl"
+    records_bytes = _write_jsonl(records_path, records)
+    layout_summary = fixture["layout_summary"]
+    layout_summary["artifacts"]["records_jsonl"]["sha256"] = _sha(records_bytes)
+    layout_summary["artifacts"]["records_jsonl"]["size_bytes"] = len(records_bytes)
+    _write_json(Path(fixture["layout"]) / "summary.json", layout_summary)
+
+    selection, sources, source_ids, _ = MODULE._validate_selection(
+        fixture["selection"], fixture["audit"]
+    )
+    missing_sets, _ = MODULE._validate_audit(
+        fixture["audit"], selection, sources
+    )
+    with pytest.raises(MODULE.EvidenceError, match="quad is degenerate"):
+        MODULE._validate_layout(
+            fixture["layout"],
+            fixture["selection"],
+            selection,
+            sources,
+            source_ids,
+            missing_sets,
+        )
+    evidence, bindings = MODULE._validate_layout(
+        fixture["layout"],
+        fixture["selection"],
+        selection,
+        sources,
+        source_ids,
+        missing_sets,
+        allow_intrinsically_degenerate_lines=True,
+    )
+    excluded = bindings["excluded_intrinsically_degenerate_lines"]
+    assert len(excluded) == 1
+    assert excluded[0]["record_index"] == 0
+    assert excluded[0]["line_index"] == 3
+    assert excluded[0]["classification"] == "repeated_points"
+    assert excluded[0]["candidate_eligible"] is False
+    assert all(
+        anchor.get("text") != "收款方：不得使用"
+        for field in evidence[0]["evidence_by_field"].values()
+        for anchor in field["anchors"]
+    )
+
+
+def test_degenerate_exclusion_mode_still_rejects_bow_tie_and_normalization_damage() -> None:
+    bow_tie = [[10.0, 10.0], [30.0, 30.0], [10.0, 30.0], [30.0, 10.0]]
+    line = {
+        "quad_rectified": bow_tie,
+        "quad_rectified_normalized": [[x / 99.0, y / 99.0] for x, y in bow_tie],
+    }
+    with pytest.raises(MODULE.EvidenceError, match="cancels a non-degenerate hull"):
+        MODULE._quad_geometry(
+            line,
+            record_index=0,
+            line_index=0,
+            rectified_width=100,
+            rectified_height=100,
+            source_width=100,
+            source_height=100,
+            rectified_to_source=[[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+            allow_intrinsically_degenerate=True,
+        )
+
+    damaged = dict(line)
+    damaged["quad_rectified"] = [[10.0, 20.0]] * 4
+    damaged["quad_rectified_normalized"] = [[0.9, 0.9]] * 4
+    with pytest.raises(MODULE.EvidenceError, match="normalized quad disagrees"):
+        MODULE._quad_geometry(
+            damaged,
+            record_index=0,
+            line_index=0,
+            rectified_width=100,
+            rectified_height=100,
+            source_width=100,
+            source_height=100,
+            rectified_to_source=[[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+            allow_intrinsically_degenerate=True,
+        )
+
+
 @pytest.mark.parametrize("failure", ["wrong_inverse", "wrong_forward", "singular"])
 def test_homography_validation_rejects_observably_wrong_or_singular_pairs(failure: str) -> None:
     source_width, source_height = 1080, 2400

@@ -143,6 +143,36 @@ def test_low_confidence_and_multiple_right_values_do_not_emit() -> None:
     assert ambiguous["ambiguous_anchor_indices"] == [0]
 
 
+def test_degenerate_exclusion_is_bounded_and_bound_to_the_raw_line() -> None:
+    raw_line = {
+        "index": 0,
+        "text": "收款方：张三",
+        "quad_rectified": [[10, 10], [20, 10], [20, 10], [10, 10]],
+        "quad_rectified_normalized": _quad(0.1, 0.1, 0.2, 0.1),
+    }
+    diagnostic = {
+        "record_index": 0,
+        "line_index": 0,
+        "text": raw_line["text"],
+        "quad_rectified": raw_line["quad_rectified"],
+        "quad_rectified_normalized": raw_line["quad_rectified_normalized"],
+        "classification": "repeated_points",
+        "candidate_eligible": False,
+    }
+    assert MODULE._validate_degenerate_exclusions(
+        [diagnostic], [{"lines": [raw_line]}]
+    ) == [diagnostic]
+    with pytest.raises(MODULE.FullLayoutShadowError, match="more than one"):
+        MODULE._validate_degenerate_exclusions(
+            [diagnostic, {**diagnostic, "record_index": 1}],
+            [{"lines": [raw_line]}, {"lines": [raw_line]}],
+        )
+    with pytest.raises(MODULE.FullLayoutShadowError, match="differs from raw"):
+        MODULE._validate_degenerate_exclusions(
+            [{**diagnostic, "text": "李四"}], [{"lines": [raw_line]}]
+        )
+
+
 def test_prepare_atomically_freezes_targets_without_truth_and_stratified_controls(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -289,12 +319,37 @@ def test_evaluate_reports_target_shadow_only_and_control_regression_metrics(
         }
         for text in texts
     ]
+    # A producer-authentic zero-area DB line is retained in raw evidence but
+    # must never become a recipient label/value.  The following valid line
+    # keeps its original non-contiguous index after fail-closed exclusion.
+    records[0]["lines"] = [
+        _line(0, "收款方：恶意值"),
+        _line(1, "收款方：张三"),
+    ]
+    excluded = {
+        "record_index": 0,
+        "line_index": 0,
+        "source": selection_rows[0]["source"],
+        "text": "收款方：恶意值",
+        "confidence": 0.95,
+        "passes_drop_score": True,
+        "quad_rectified": [[10, 10], [20, 10], [20, 10], [10, 10]],
+        "quad_rectified_normalized": _quad(0.1, 0.1, 0.2, 0.1),
+        "classification": "repeated_points",
+        "polygon_area_pixels2": 0.0,
+        "convex_hull_area_pixels2": 0.0,
+        "unique_points": 2,
+        "bounding_width_pixels": 10.0,
+        "bounding_height_pixels": 0.0,
+        "candidate_eligible": False,
+    }
     layout_bindings = {
         "layout_summary": frozen["layout-summary.json"],
         "layout_records": frozen["layout.jsonl"],
         "paddle_bundle": {"directory": "bundle"},
         "paddle_drop_score": 0.5,
         "latency_ms": {"total": {"count": 6}},
+        "excluded_degenerate_quad_lines": [excluded],
     }
     monkeypatch.setattr(MODULE, "_load_selection", lambda *_, **__: fake_selection)
     monkeypatch.setattr(MODULE, "_validate_layout", lambda *_, **__: (records, layout_bindings))
@@ -322,6 +377,17 @@ def test_evaluate_reports_target_shadow_only_and_control_regression_metrics(
     assert summary["controls"]["false_positive_records"] == 1
     assert summary["controls"]["correct_to_wrong_records"] == 1
     assert summary["controls"]["wrong_to_correct_records"] == 1
+    assert summary["layout_geometry_safety"] == {
+        "intrinsically_degenerate_quad_lines": 1,
+        "records_with_intrinsically_degenerate_quad_lines": 1,
+        "maximum_allowed_exclusions": 1,
+        "non_degenerate_hull_order_cancellation_allowed": False,
+        "excluded_lines_candidate_eligible": False,
+        "policy": "fail_closed_exclude_from_labels_and_values",
+    }
     findings = [json.loads(line) for line in (output / "findings.jsonl").read_text().splitlines()]
+    assert findings[0]["shadow_candidate"] == "张三"
+    assert "恶意值" not in findings[0]["distinct_eligible_values"]
+    assert findings[0]["excluded_degenerate_quad_lines"][0]["candidate_eligible"] is False
     assert all("control_evaluation" not in row for row in findings[:2])
     assert all("external_reference" not in json.dumps(row) for row in findings[:2])
