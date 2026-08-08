@@ -29,7 +29,8 @@ param(
     [string]$OcrMode = "unified",
     [string]$PaddleOcrBundle,
     [ValidateRange(0, 1000000)]
-    [int]$ExpectedInputCount = 0
+    [int]$ExpectedInputCount = 0,
+    [switch]$AllowIncompleteRecipientEquivalence
 )
 
 Set-StrictMode -Version Latest
@@ -344,7 +345,8 @@ function Invoke-CpuRun(
     [int]$CandidateDetectorThreads,
     [string]$SelectedOcrMode,
     [AllowNull()]
-    [string]$PaddleBundle
+    [string]$PaddleBundle,
+    [bool]$AllowIncompleteRecipient
 ) {
     $variant = [string]$Descriptor.variant
     $executable = [string]$Variants[$variant]["executable"]["path"]
@@ -369,9 +371,11 @@ function Invoke-CpuRun(
         "--device", "cpu",
         "--score-threshold", "0.50",
         "--rectification", "max-side-1600",
-        "--annotate", "none",
-        "--require-complete"
+        "--annotate", "none"
     )
+    if (-not $AllowIncompleteRecipient) {
+        $arguments += "--require-complete"
+    }
     if ($SelectedOcrMode -eq "hybrid-recipient") {
         $arguments += @("--ocr-bundle", $PaddleBundle)
     }
@@ -451,6 +455,9 @@ if ($OcrMode -eq "hybrid-recipient") {
 }
 elseif (-not [string]::IsNullOrWhiteSpace($PaddleOcrBundle)) {
     throw "-PaddleOcrBundle is valid only when -OcrMode hybrid-recipient."
+}
+if ($AllowIncompleteRecipientEquivalence -and $OcrMode -ne "hybrid-recipient") {
+    throw "-AllowIncompleteRecipientEquivalence is valid only when -OcrMode hybrid-recipient."
 }
 $baselineAppRoot = Get-ProviderFullPath (Split-Path -Parent $BaselineExecutable)
 $candidateAppRoot = Get-ProviderFullPath (Split-Path -Parent $CandidateExecutable)
@@ -629,7 +636,14 @@ $plan = [ordered]@{
         score_threshold = [double]0.50
         rectification = "max-side-1600"
         annotate = "none"
-        require_complete = $true
+        require_complete = -not [bool]$AllowIncompleteRecipientEquivalence
+        equivalence_only = [bool]$AllowIncompleteRecipientEquivalence
+        allowed_incomplete_field = if ($AllowIncompleteRecipientEquivalence) {
+            "recipient"
+        }
+        else {
+            $null
+        }
         continue_on_error = $false
         skip_existing = $false
         includes_device_model = $true
@@ -668,6 +682,7 @@ if ($InputLimit -gt 0) {
 Write-Host "Warmup      : $WarmupRuns x $warmupLimit image(s) per variant"
 Write-Host "Measured    : $Repetitions full repeat(s) per variant"
 Write-Host "OCR mode    : $OcrMode"
+Write-Host "Completeness: $(if ($AllowIncompleteRecipientEquivalence) { 'recipient-only incomplete equivalence' } else { 'require-complete' })"
 Write-Host "Throughput  : external process wall clock"
 $candidateThreadDescription = if ($CandidateDetectorIntraOpThreads -gt 0) {
     [string]$CandidateDetectorIntraOpThreads
@@ -683,7 +698,8 @@ foreach ($descriptor in @($runPlan | Sort-Object execution_order)) {
     Invoke-CpuRun `
         $descriptor $variants $fixedInputListPath `
         $DetectorModel $DeviceModel $UnifiedModel `
-        $CandidateDetectorIntraOpThreads $OcrMode $PaddleOcrBundle
+        $CandidateDetectorIntraOpThreads $OcrMode $PaddleOcrBundle `
+        ([bool]$AllowIncompleteRecipientEquivalence)
 }
 if ((Get-Sha256 $planPath) -ne $frozenPlanSha256) {
     throw "CPU A/B plan changed while the runs were executing."

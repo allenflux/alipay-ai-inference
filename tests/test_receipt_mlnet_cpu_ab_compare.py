@@ -250,7 +250,14 @@ def _write_run(
     (output / "inference_errors.jsonl").write_text("", encoding="utf-8")
 
 
-def _fixture_plan(tmp_path: Path, *, ocr_mode: str = "unified") -> Path:
+def _fixture_plan(
+    tmp_path: Path,
+    *,
+    ocr_mode: str = "unified",
+    allow_incomplete_recipient: bool = False,
+) -> Path:
+    if allow_incomplete_recipient and ocr_mode != "hybrid-recipient":
+        raise ValueError("recipient-only incomplete fixtures require hybrid-recipient OCR")
     sources = [tmp_path / "input-1.jpg", tmp_path / "input-2.jpg"]
     for index, source in enumerate(sources):
         source.write_bytes(f"image-{index}".encode())
@@ -361,7 +368,11 @@ def _fixture_plan(tmp_path: Path, *, ocr_mode: str = "unified") -> Path:
             "score_threshold": 0.5,
             "rectification": "max-side-1600",
             "annotate": "none",
-            "require_complete": True,
+            "require_complete": not allow_incomplete_recipient,
+            "equivalence_only": allow_incomplete_recipient,
+            "allowed_incomplete_field": (
+                "recipient" if allow_incomplete_recipient else None
+            ),
             "continue_on_error": False,
             "skip_existing": False,
             "includes_device_model": True,
@@ -399,6 +410,35 @@ def _result_paths(plan_path: Path) -> list[Path]:
         )
         paths.extend(Path(record["result"]) for record in manifest)
     return paths
+
+
+def _make_all_recipient_candidates_incomplete(plan_path: Path) -> None:
+    for result_path in _result_paths(plan_path):
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+        recipient = result["fields"]["recipient"]
+        recipient.pop("candidate", None)
+        recipient["state"] = "unreadable"
+        recipient["hybrid_ocr_route"] = "none"
+        recipient["hybrid_ocr_failure_reason"] = "ocr_empty"
+        recipient["hybrid_ocr_third_route"] = None
+        _write_json(result_path, result)
+
+
+def _make_first_source_recipient_detection_absent(plan_path: Path) -> None:
+    for result_path in _result_paths(plan_path):
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+        if not str(result["source"]).endswith("input-1.jpg"):
+            continue
+        result["detections"] = [
+            row for row in result["detections"] if row["label"] != "recipient_field"
+        ]
+        recipient = result["fields"]["recipient"]
+        recipient.pop("candidate", None)
+        recipient["state"] = "absent"
+        for key in list(recipient):
+            if key.startswith("hybrid_ocr_"):
+                del recipient[key]
+        _write_json(result_path, result)
 
 
 def test_cpu_ab_accepts_exact_predictions_and_reports_pooled_performance(tmp_path: Path) -> None:
@@ -572,6 +612,170 @@ def test_cpu_ab_v2_accepts_exact_hybrid_outputs_and_reports_routes_and_wall_time
     )
 
 
+def test_cpu_ab_hybrid_equivalence_allows_only_missing_recipient_candidates(
+    tmp_path: Path,
+) -> None:
+    plan_path = _fixture_plan(
+        tmp_path,
+        ocr_mode="hybrid-recipient",
+        allow_incomplete_recipient=True,
+    )
+    _make_all_recipient_candidates_incomplete(plan_path)
+
+    report, differences = compare.analyze_plan(plan_path)
+
+    assert report["accepted"] is True
+    assert differences == []
+    assert report["cli_contract"]["require_complete"] is False
+    assert report["cli_contract"]["equivalence_only"] is True
+    assert report["cli_contract"]["allowed_incomplete_field"] == "recipient"
+    assert report["route_consistency"]["by_run"]["measured-01-baseline"][
+        "hybrid_ocr_route"
+    ] == {"none": 2}
+
+
+def test_cpu_ab_hybrid_equivalence_accepts_exact_detector_absent_recipient(
+    tmp_path: Path,
+) -> None:
+    plan_path = _fixture_plan(
+        tmp_path,
+        ocr_mode="hybrid-recipient",
+        allow_incomplete_recipient=True,
+    )
+    _make_first_source_recipient_detection_absent(plan_path)
+
+    report, differences = compare.analyze_plan(plan_path)
+
+    assert report["accepted"] is True
+    assert differences == []
+    assert report["route_consistency"]["by_run"]["measured-01-baseline"][
+        "hybrid_ocr_route"
+    ] == {"detector_absent": 1, "primary": 1}
+
+
+@pytest.mark.parametrize("route_value", [None, "none"])
+def test_cpu_ab_hybrid_equivalence_rejects_detector_absent_recipient_diagnostics(
+    tmp_path: Path,
+    route_value: str | None,
+) -> None:
+    plan_path = _fixture_plan(
+        tmp_path,
+        ocr_mode="hybrid-recipient",
+        allow_incomplete_recipient=True,
+    )
+    _make_first_source_recipient_detection_absent(plan_path)
+    result_path = next(
+        path
+        for path in _result_paths(plan_path)
+        if json.loads(path.read_text(encoding="utf-8"))["source"].endswith(
+            "input-1.jpg"
+        )
+    )
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    result["fields"]["recipient"]["hybrid_ocr_route"] = route_value
+    _write_json(result_path, result)
+
+    with pytest.raises(compare.ValidationError, match="detector-absent"):
+        compare.analyze_plan(plan_path)
+
+
+def test_cpu_ab_complete_mode_still_rejects_missing_recipient_candidate(
+    tmp_path: Path,
+) -> None:
+    plan_path = _fixture_plan(tmp_path, ocr_mode="hybrid-recipient")
+    _make_all_recipient_candidates_incomplete(plan_path)
+
+    with pytest.raises(compare.ValidationError, match="recipient"):
+        compare.analyze_plan(plan_path)
+
+
+@pytest.mark.parametrize(
+    "field_name", ["amount", "time", "payment_method", "transfer_status"]
+)
+def test_cpu_ab_hybrid_equivalence_rejects_any_other_missing_candidate(
+    tmp_path: Path,
+    field_name: str,
+) -> None:
+    plan_path = _fixture_plan(
+        tmp_path,
+        ocr_mode="hybrid-recipient",
+        allow_incomplete_recipient=True,
+    )
+    _make_all_recipient_candidates_incomplete(plan_path)
+    result_path = _result_paths(plan_path)[0]
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    result["fields"][field_name].pop("candidate")
+    _write_json(result_path, result)
+
+    with pytest.raises(compare.ValidationError, match=field_name):
+        compare.analyze_plan(plan_path)
+
+
+@pytest.mark.parametrize(
+    ("route", "failure_reason", "message"),
+    [
+        ("primary", "ocr_empty", "hybrid_ocr_route=none"),
+        ("none", None, "failure diagnostic"),
+        ("none", "", "failure diagnostic"),
+    ],
+)
+def test_cpu_ab_hybrid_equivalence_rejects_inconsistent_missing_recipient_diagnostic(
+    tmp_path: Path,
+    route: str,
+    failure_reason: str | None,
+    message: str,
+) -> None:
+    plan_path = _fixture_plan(
+        tmp_path,
+        ocr_mode="hybrid-recipient",
+        allow_incomplete_recipient=True,
+    )
+    _make_all_recipient_candidates_incomplete(plan_path)
+    result_path = _result_paths(plan_path)[0]
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    recipient = result["fields"]["recipient"]
+    recipient["hybrid_ocr_route"] = route
+    recipient["hybrid_ocr_failure_reason"] = failure_reason
+    _write_json(result_path, result)
+
+    with pytest.raises(compare.ValidationError, match=message):
+        compare.analyze_plan(plan_path)
+
+
+@pytest.mark.parametrize(
+    ("ocr_mode", "require_complete", "equivalence_only", "allowed_field", "message"),
+    [
+        ("unified", False, True, "recipient", "hybrid-recipient"),
+        ("hybrid-recipient", False, False, "recipient", "equivalence_only"),
+        ("hybrid-recipient", False, True, None, "only recipient"),
+        ("hybrid-recipient", False, True, "amount", "only recipient"),
+        ("hybrid-recipient", True, True, None, "cannot be marked equivalence_only"),
+        ("hybrid-recipient", True, False, "recipient", "cannot allow"),
+    ],
+)
+def test_cpu_ab_rejects_invalid_incomplete_equivalence_plan_contract(
+    tmp_path: Path,
+    ocr_mode: str,
+    require_complete: bool,
+    equivalence_only: bool,
+    allowed_field: str | None,
+    message: str,
+) -> None:
+    plan_path = _fixture_plan(tmp_path, ocr_mode=ocr_mode)
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    plan["cli_contract"].update(
+        {
+            "require_complete": require_complete,
+            "equivalence_only": equivalence_only,
+            "allowed_incomplete_field": allowed_field,
+        }
+    )
+    _write_json(plan_path, plan)
+
+    with pytest.raises(compare.ValidationError, match=message):
+        compare.analyze_plan(plan_path)
+
+
 def test_cpu_ab_v2_hybrid_comparison_is_type_sensitive_for_recipient_diagnostics(
     tmp_path: Path,
 ) -> None:
@@ -628,14 +832,8 @@ def test_cpu_ab_v2_hybrid_rejects_changed_route_counts(tmp_path: Path) -> None:
     result["fields"]["recipient"]["hybrid_ocr_route"] = "none"
     _write_json(result_path, result)
 
-    report, differences = compare.analyze_plan(plan_path)
-
-    assert any(
-        row["json_pointer"] == "/fields/recipient/hybrid_ocr_route"
-        for row in differences
-    )
-    assert report["route_consistency"]["accepted"] is False
-    assert report["prediction_consistency"]["accepted"] is False
+    with pytest.raises(compare.ValidationError, match="successful route"):
+        compare.analyze_plan(plan_path)
 
 
 def test_cpu_ab_v2_hybrid_rejects_non_cpu_paddle_provider(tmp_path: Path) -> None:
@@ -1065,6 +1263,7 @@ def test_cpu_ab_powershell_v2_freezes_and_runs_the_complete_hybrid_cpu_route() -
     assert '[string]$OcrMode = "unified"' in script
     assert "[string]$PaddleOcrBundle" in script
     assert "[int]$ExpectedInputCount = 0" in script
+    assert "[switch]$AllowIncompleteRecipientEquivalence" in script
     assert "$inputs.Count -ne $ExpectedInputCount" in script
     assert "expected_input_count = if ($ExpectedInputCount -gt 0)" in script
     assert '"--ocr", $SelectedOcrMode' in script
@@ -1074,6 +1273,11 @@ def test_cpu_ab_powershell_v2_freezes_and_runs_the_complete_hybrid_cpu_route() -
     assert '"--rectification", "max-side-1600"' in script
     assert '"--annotate", "none"' in script
     assert '"--require-complete"' in script
+    assert "if (-not $AllowIncompleteRecipient)" in script
+    assert "$AllowIncompleteRecipientEquivalence -and $OcrMode -ne \"hybrid-recipient\"" in script
+    assert "require_complete = -not [bool]$AllowIncompleteRecipientEquivalence" in script
+    assert "equivalence_only = [bool]$AllowIncompleteRecipientEquivalence" in script
+    assert '"recipient"' in script
     assert 'paddle_ocr_provider = if ($OcrMode -eq "hybrid-recipient")' in script
     assert 'kind = "receipt_mlnet_cpu_ab_plan_v2"' in script
     assert "Freeze-DirectoryPayload" in script

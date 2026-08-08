@@ -40,6 +40,14 @@ RESULT_EXCLUDED_TOP_LEVEL_KEYS = frozenset(
 EXPECTED_FIELDS = frozenset(
     {"time", "amount", "transfer_status", "recipient", "payment_method"}
 )
+REQUIRED_COMPLETE_FIELDS = (
+    "time",
+    "amount",
+    "transfer_status",
+    "recipient",
+    "payment_method",
+)
+ALLOWED_INCOMPLETE_RECIPIENT_FIELD = "recipient"
 EXPECTED_DETECTIONS = frozenset(
     {"time", "amount", "transfer_status", "recipient_field", "payment_method_field"}
 )
@@ -571,7 +579,7 @@ def _validate_input_selection(
 
 def _validate_cli_contract(
     plan: Mapping[str, Any], schema_version: int
-) -> tuple[str, dict[str, int | None]]:
+) -> tuple[str, dict[str, int | None], str | None]:
     contract = _require_mapping(plan.get("cli_contract"), "CLI contract")
     exact = {
         "device": "cpu",
@@ -579,7 +587,6 @@ def _validate_cli_contract(
         "score_threshold": 0.5,
         "rectification": "max-side-1600",
         "annotate": "none",
-        "require_complete": True,
         "continue_on_error": False,
         "skip_existing": False,
         "includes_device_model": True,
@@ -597,6 +604,40 @@ def _validate_cli_contract(
             f"CLI protection setting ocr changed: expected one of {sorted(allowed_modes)!r}, "
             f"found {ocr_mode!r}"
         )
+    require_complete = contract.get("require_complete")
+    if type(require_complete) is not bool:
+        raise ValidationError(
+            "CLI protection setting require_complete must be one boolean"
+        )
+    equivalence_only = contract.get("equivalence_only", False)
+    allowed_incomplete_field = contract.get("allowed_incomplete_field")
+    if require_complete:
+        if type(equivalence_only) is not bool or equivalence_only:
+            raise ValidationError(
+                "complete CPU A/B runs cannot be marked equivalence_only"
+            )
+        if allowed_incomplete_field is not None:
+            raise ValidationError(
+                "complete CPU A/B runs cannot allow an incomplete field"
+            )
+        allowed_incomplete_field = None
+    else:
+        if schema_version < 2:
+            raise ValidationError(
+                "legacy CPU A/B evidence must retain require_complete"
+            )
+        if equivalence_only is not True:
+            raise ValidationError(
+                "incomplete CPU A/B runs must explicitly bind equivalence_only=true"
+            )
+        if allowed_incomplete_field != ALLOWED_INCOMPLETE_RECIPIENT_FIELD:
+            raise ValidationError(
+                "incomplete CPU A/B runs may allow only recipient"
+            )
+        if ocr_mode != "hybrid-recipient":
+            raise ValidationError(
+                "recipient-only incomplete equivalence requires hybrid-recipient OCR"
+            )
     if schema_version >= 2:
         expected_paddle_provider = "cpu" if ocr_mode == "hybrid-recipient" else None
         if "paddle_ocr_provider" not in contract:
@@ -639,7 +680,11 @@ def _validate_cli_contract(
             "candidate detector intra-op threads must be null/default or an integer in "
             f"[1, {MAXIMUM_DETECTOR_INTRA_OP_THREADS}]"
         )
-    return ocr_mode, {"baseline": None, "candidate": candidate_threads}
+    return (
+        ocr_mode,
+        {"baseline": None, "candidate": candidate_threads},
+        allowed_incomplete_field,
+    )
 
 
 def _validate_performance_gate(plan: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -665,7 +710,7 @@ def _validate_performance_gate(plan: Mapping[str, Any]) -> Mapping[str, Any]:
 
 def _validate_plan(
     plan: Mapping[str, Any],
-) -> tuple[int, int, int, int, str, dict[str, int | None]]:
+) -> tuple[int, int, int, int, str, dict[str, int | None], str | None]:
     schema_version = plan.get("schema_version")
     kind = plan.get("kind")
     if type(schema_version) is not int or (schema_version, kind) not in (
@@ -682,7 +727,11 @@ def _validate_plan(
         raise ValidationError("CPU A/B requires at least one warmup run per variant")
     if isinstance(warmup_limit, bool) or not isinstance(warmup_limit, int) or warmup_limit < 1:
         raise ValidationError("CPU A/B warmup_limit must be positive")
-    ocr_mode, detector_thread_contract = _validate_cli_contract(plan, schema_version)
+    (
+        ocr_mode,
+        detector_thread_contract,
+        allowed_incomplete_field,
+    ) = _validate_cli_contract(plan, schema_version)
     _validate_performance_gate(plan)
     return (
         schema_version,
@@ -691,6 +740,7 @@ def _validate_plan(
         warmup_limit,
         ocr_mode,
         detector_thread_contract,
+        allowed_incomplete_field,
     )
 
 
@@ -803,6 +853,7 @@ def _validate_result_contract(
     source: str,
     artifact_hashes: Mapping[str, str],
     ocr_mode: str,
+    allowed_incomplete_field: str | None,
     description: str,
 ) -> None:
     if _path_key(str(result.get("source", ""))) != _path_key(source):
@@ -816,10 +867,29 @@ def _validate_result_contract(
     fields = result.get("fields")
     if not isinstance(fields, Mapping) or not EXPECTED_FIELDS.issubset(fields):
         raise ValidationError(f"{description} omitted unified OCR field outputs")
-    for field_name in EXPECTED_FIELDS:
+    for field_name in REQUIRED_COMPLETE_FIELDS:
         field = fields[field_name]
-        if not isinstance(field, Mapping) or not isinstance(field.get("delivery_policy"), str):
+        if not isinstance(field, Mapping) or not isinstance(
+            field.get("delivery_policy"), str
+        ):
             raise ValidationError(f"{description} omitted {field_name} delivery policy")
+        candidate = field.get("candidate")
+        may_be_incomplete = field_name == allowed_incomplete_field
+        if candidate is None and may_be_incomplete:
+            continue
+        if not isinstance(candidate, str) or not candidate.strip():
+            qualifier = (
+                " except the explicitly allowed recipient"
+                if allowed_incomplete_field
+                else ""
+            )
+            raise ValidationError(
+                f"{description} requires a non-empty candidate for {field_name}{qualifier}"
+            )
+    recipient = _require_mapping(
+        fields.get("recipient"), f"{description} recipient field"
+    )
+    recipient_candidate = recipient.get("candidate")
     detections = result.get("detections")
     if not isinstance(detections, list):
         raise ValidationError(f"{description} omitted detector outputs")
@@ -842,7 +912,52 @@ def _validate_result_contract(
                 f"{description} contains duplicate detector label: {label}"
             )
         labels.add(label)
-    contracts = _require_mapping(result.get("model_contracts"), f"{description} model contracts")
+    if ocr_mode == "hybrid-recipient":
+        route = recipient.get("hybrid_ocr_route")
+        failure_reason = recipient.get("hybrid_ocr_failure_reason")
+        recipient_detected = "recipient_field" in labels
+        if recipient_candidate is None:
+            if allowed_incomplete_field != ALLOWED_INCOMPLETE_RECIPIENT_FIELD:
+                raise ValidationError(
+                    f"{description} unexpectedly omitted the recipient candidate"
+                )
+            if recipient_detected:
+                if route != "none":
+                    raise ValidationError(
+                        f"{description} missing detected recipient candidate must use "
+                        "hybrid_ocr_route=none"
+                    )
+                if not isinstance(failure_reason, str) or not failure_reason.strip():
+                    raise ValidationError(
+                        f"{description} missing detected recipient candidate requires "
+                        "a non-empty hybrid failure diagnostic"
+                    )
+            else:
+                present_diagnostics = sorted(
+                    key
+                    for key in recipient
+                    if key.startswith("hybrid_ocr_")
+                )
+                if present_diagnostics:
+                    raise ValidationError(
+                        f"{description} detector-absent recipient cannot carry hybrid "
+                        "OCR diagnostics: "
+                        + ", ".join(present_diagnostics)
+                    )
+        else:
+            if not isinstance(route, str) or not route or route == "none":
+                raise ValidationError(
+                    f"{description} non-empty hybrid recipient candidate requires "
+                    "a successful route"
+                )
+            if failure_reason is not None:
+                raise ValidationError(
+                    f"{description} successful recipient route cannot carry a hybrid "
+                    "failure diagnostic"
+                )
+    contracts = _require_mapping(
+        result.get("model_contracts"), f"{description} model contracts"
+    )
     for artifact_name, result_name in MODEL_HASH_FIELDS.items():
         if contracts.get(result_name) != artifact_hashes[artifact_name]:
             raise ValidationError(
@@ -919,7 +1034,10 @@ def _load_outer_wall_seconds(
 
 
 def _recipient_route_counts(
-    results: Mapping[str, Mapping[str, Any]], ocr_mode: str, description: str
+    results: Mapping[str, Mapping[str, Any]],
+    ocr_mode: str,
+    allowed_incomplete_field: str | None,
+    description: str,
 ) -> dict[str, dict[str, int]]:
     if ocr_mode != "hybrid-recipient":
         return {}
@@ -932,6 +1050,19 @@ def _recipient_route_counts(
             fields.get("recipient"), f"{description} recipient field"
         )
         primary = recipient.get("hybrid_ocr_route")
+        if (
+            primary is None
+            and recipient.get("candidate") is None
+            and allowed_incomplete_field == ALLOWED_INCOMPLETE_RECIPIENT_FIELD
+        ):
+            detections = result.get("detections")
+            detection_labels = {
+                item.get("label")
+                for item in detections
+                if isinstance(item, Mapping)
+            } if isinstance(detections, list) else set()
+            if "recipient_field" not in detection_labels:
+                primary = "detector_absent"
         if not isinstance(primary, str) or not primary:
             raise ValidationError(
                 f"{description} hybrid recipient has no string hybrid_ocr_route"
@@ -958,6 +1089,7 @@ def _load_run(
     artifact_hashes: Mapping[str, str],
     expected_detector_intra_op_threads: int | None,
     ocr_mode: str,
+    allowed_incomplete_field: str | None,
     schema_version: int,
 ) -> dict[str, Any]:
     run_id = descriptor.get("id")
@@ -1034,6 +1166,7 @@ def _load_run(
             expected_by_key[key],
             artifact_hashes,
             ocr_mode,
+            allowed_incomplete_field,
             f"run {run_id} result {result_path}",
         )
         results[key] = result
@@ -1086,7 +1219,12 @@ def _load_run(
     throughput_seconds = (
         total_seconds if outer_wall_seconds is None else outer_wall_seconds
     )
-    route_counts = _recipient_route_counts(results, ocr_mode, f"run {run_id}")
+    route_counts = _recipient_route_counts(
+        results,
+        ocr_mode,
+        allowed_incomplete_field,
+        f"run {run_id}",
+    )
     return {
         "descriptor": dict(descriptor),
         "summary": dict(summary),
@@ -1318,6 +1456,7 @@ def analyze_plan(plan_path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]
         warmup_limit,
         ocr_mode,
         detector_thread_contract,
+        allowed_incomplete_field,
     ) = _validate_plan(plan)
     fixed_inputs, _ = _read_fixed_inputs(plan)
     input_selection = _validate_input_selection(plan, fixed_inputs, schema_version)
@@ -1456,6 +1595,7 @@ def analyze_plan(plan_path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]
             artifact_hashes,
             expected_detector_threads,
             ocr_mode,
+            allowed_incomplete_field,
             schema_version,
         )
 
