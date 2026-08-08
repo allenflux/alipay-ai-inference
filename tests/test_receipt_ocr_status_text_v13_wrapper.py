@@ -66,7 +66,7 @@ def test_wrapper_is_cuda_only_status_head_training_from_wide_v12() -> None:
     assert "runtime.validation_every -ne $ValidationEvery" in source
 
 
-def test_wrapper_freezes_old_15_outputs_and_preserves_four_field_floors() -> None:
+def test_wrapper_freezes_old_outputs_and_preserves_final_hybrid_recipient_floor() -> None:
     source = _source()
 
     assert source.count('"recipient_logits"') >= 1
@@ -84,6 +84,31 @@ def test_wrapper_freezes_old_15_outputs_and_preserves_four_field_floors() -> Non
     assert "[double]$PaymentFloor" not in source
     assert "[double]$RecipientFloor" not in source
     assert '"--min-recipient-exact-match", "$recipientFloor"' in source
+    assert 'requestedRecipientFloor.Value -lt $recipientFloor' in source
+    assert 'final_floor = $recipientFloor' in source
+    assert 'final_gate_required = $true' in source
+
+
+def test_wrapper_allows_only_recipient_base_failure_and_records_delegation_truthfully() -> None:
+    source = _source()
+
+    assert '& $pythonExe @evaluateArgs' in source
+    assert '$evaluationExitCode = $LASTEXITCODE' in source
+    assert '$passedValue -isnot [bool]' in source
+    assert '$rawFailures -isnot [Array]' in source
+    assert 'return ,$property.Value' in source
+    assert 'StartsWith("recipient_field:", [StringComparison]::Ordinal)' in source
+    assert '$nonRecipientFailures.Count -ne 0' in source
+    assert '$evaluationExitCode -ne $expectedEvaluationExitCode' in source
+    assert source.count(
+        'Get-ExactMetric $evaluationSummary "recipient_field" "$split evaluation"'
+    ) == 1
+    assert 'base_summary_passed = $baseSummaryPassed' in source
+    assert 'base_summary_failures = $failures' in source
+    assert 'recipient_delegated_to_hybrid_formal = $recipientDelegated' in source
+    assert 'core_amount_time_payment_status_accepted = $true' in source
+    assert 'accepted = $baseSummaryPassed' in source
+    assert '\n            accepted = $true' not in source
 
 
 def test_wrapper_fails_closed_on_visible_status_text_and_review_only_delivery() -> None:
@@ -135,6 +160,9 @@ def test_wrapper_exports_and_evaluates_but_delegates_cpu_packaging() -> None:
     assert "onnx_validation_summary_sha256 = Get-Sha256 $packagingValidationSummary" in source
     assert "records_sha256 = Get-Sha256 $records" in source
     assert "evaluationSummary.records_sha256 -ne (Get-Sha256 $records)" in source
+    assert 'evaluationSummary.model_sha256 -ne (Get-Sha256 $candidateModel)' in source
+    assert '[IO.Path]::GetFullPath([string]$evaluationSummary.model)' in source
+    assert '[IO.Path]::GetFullPath($candidateModel)' in source
     assert "candidateLabelsPath" in source
     assert "labels_sha256 = Get-Sha256 $candidateLabelsPath" in source
     assert "$statusCtcRecords -ne [int]$statusAudit.visible_status_records" in source
@@ -142,6 +170,8 @@ def test_wrapper_exports_and_evaluates_but_delegates_cpu_packaging() -> None:
     assert 'Properties["max_non_success_to_success"]' in source
     assert "$statusMetrics.non_success_to_success -ne 0" in source
     assert "include_device_model = $true" in source
+    assert "recipient_delivery_policy" in source
+    assert "recipient_delegated_to_hybrid_formal" in source
     assert 'required_runtime_flavor = "cpu"' in source
     assert 'required_rectification = "max-side-1600"' in source
     assert 'Write-Host "    -UnifiedModelPath $candidateModel"' in source

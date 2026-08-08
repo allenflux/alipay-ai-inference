@@ -94,6 +94,18 @@ function Read-GuardedJson([string]$Path) {
     }
 }
 
+function Get-RequiredProperty([object]$Object, [string]$Name, [string]$Description) {
+    if ($null -eq $Object) {
+        throw "$Description is missing."
+    }
+    $property = $Object.PSObject.Properties[$Name]
+    if ($null -eq $property -or $null -eq $property.Value) {
+        throw "$Description has no $Name."
+    }
+    # Keep acceptance.failures=[] as an empty array on Windows PowerShell 5.1.
+    return ,$property.Value
+}
+
 function Get-Sha256([string]$Path) {
     return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
 }
@@ -395,9 +407,8 @@ $bestMetrics = $bestRecord[0].val_candidate_text_by_field
 if ([double]$bestMetrics.amount.exact_match -lt $amountFloor `
     -or [double]$bestMetrics.time.exact_match -lt $timeFloor `
     -or [double]$bestMetrics.payment_method_field.exact_match -lt $paymentFloor `
-    -or [double]$bestMetrics.recipient_field.exact_match -lt $recipientFloor `
     -or [double]$bestRecord[0].val_ctc_by_field.transfer_status.exact_match -lt $StatusTextFloor) {
-    throw "Best checkpoint does not retain the four protected fields plus visible-status CTC floor."
+    throw "Best checkpoint does not retain amount/time/payment plus visible-status CTC floors."
 }
 
 Invoke-Python @(
@@ -491,15 +502,59 @@ foreach ($statusAudit in @($valStatusAudit, $testStatusAudit)) {
     if ($nonSuccessSafetyCalibrated) {
         $evaluateArgs += @("--max-non-success-to-success", "0")
     }
-    Invoke-Python $evaluateArgs "v13 $split CUDA ONNX evaluation"
+    # The v13 base artifact may miss only the recipient floor. The production
+    # hybrid PP-OCR route owns the final recipient >=90% gate, while every
+    # amount/time/payment/status failure remains fatal here. Python exits 1
+    # after writing a structurally complete summary for an acceptance miss, so
+    # capture that code and validate the exact failure field below.
+    & $pythonExe @evaluateArgs
+    $evaluationExitCode = $LASTEXITCODE
     $evaluationSummaryPath = Join-Path $evaluationOutput "summary.json"
     $evaluationSummary = Read-GuardedJson $evaluationSummaryPath
+    $acceptance = Get-RequiredProperty $evaluationSummary "acceptance" "v13 $split evaluation"
+    $requestedValue = Get-RequiredProperty $acceptance "requested" "v13 $split acceptance"
+    $passedValue = Get-RequiredProperty $acceptance "passed" "v13 $split acceptance"
+    $rawFailures = Get-RequiredProperty $acceptance "failures" "v13 $split acceptance"
+    if ($requestedValue -isnot [bool] `
+        -or $requestedValue -ne $true `
+        -or $passedValue -isnot [bool] `
+        -or $rawFailures -isnot [Array]) {
+        throw "v13 $split evaluation has an invalid aggregate acceptance schema."
+    }
+    $failures = @(
+        $rawFailures |
+            ForEach-Object {
+                if ($_ -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$_)) {
+                    throw "v13 $split acceptance failures must be non-empty strings."
+                }
+                [string]$_
+            }
+    )
+    $nonRecipientFailures = @(
+        $failures |
+            Where-Object {
+                -not $_.StartsWith("recipient_field:", [StringComparison]::Ordinal)
+            }
+    )
+    $baseSummaryPassed = [bool]$passedValue
+    $aggregateStateValid = (
+        ($baseSummaryPassed -and $failures.Count -eq 0) `
+        -or (-not $baseSummaryPassed `
+            -and $failures.Count -gt 0 `
+            -and $nonRecipientFailures.Count -eq 0)
+    )
+    $expectedEvaluationExitCode = if ($baseSummaryPassed) { 0 } else { 1 }
+    $evaluationModel = [IO.Path]::GetFullPath([string]$evaluationSummary.model)
     $evaluationRecords = [IO.Path]::GetFullPath([string]$evaluationSummary.records)
     $statusMetrics = $evaluationSummary.by_field.transfer_status
     $statusCtcRecords = [int]$statusMetrics.ctc_records
     $statusCtcExactMatches = [int]$statusMetrics.ctc_raw_exact_matches
     $statusCtcExactMatch = [double]$statusMetrics.ctc_raw_exact_match
-    if (-not $evaluationRecords.Equals(
+    if (-not $evaluationModel.Equals(
+            [IO.Path]::GetFullPath($candidateModel),
+            [StringComparison]::OrdinalIgnoreCase) `
+        -or [string]$evaluationSummary.model_sha256 -ne (Get-Sha256 $candidateModel) `
+        -or -not $evaluationRecords.Equals(
             [IO.Path]::GetFullPath($records),
             [StringComparison]::OrdinalIgnoreCase) `
         -or [string]$evaluationSummary.records_sha256 -ne (Get-Sha256 $records) `
@@ -512,19 +567,31 @@ foreach ($statusAudit in @($valStatusAudit, $testStatusAudit)) {
             $statusCtcExactMatch - ([double]$statusCtcExactMatches / [double]$statusCtcRecords)
         ) -gt 0.000000000001 `
         -or $evaluationSummary.providers -notcontains "CUDAExecutionProvider" `
-        -or $evaluationSummary.acceptance.requested -ne $true `
-        -or $evaluationSummary.acceptance.passed -ne $true `
+        -or -not $aggregateStateValid `
+        -or $nonRecipientFailures.Count -ne 0 `
+        -or $evaluationExitCode -ne $expectedEvaluationExitCode `
         -or [string]$evaluationSummary.status_text_policy.runtime_policy -ne $requiredStatusTextPolicy `
         -or [string]$evaluationSummary.status_text_policy.review_value -ne $requiredReviewValue `
         -or (Get-ExactMetric $evaluationSummary "amount" "$split evaluation") -lt $amountFloor `
         -or (Get-ExactMetric $evaluationSummary "time" "$split evaluation") -lt $timeFloor `
         -or (Get-ExactMetric $evaluationSummary "payment_method_field" "$split evaluation") -lt $paymentFloor `
-        -or (Get-ExactMetric $evaluationSummary "recipient_field" "$split evaluation") -lt $recipientFloor `
         -or (Get-ExactMetric $evaluationSummary "transfer_status" "$split evaluation" "ctc_raw_exact_match") -lt $StatusTextFloor) {
-        throw "v13 $split evaluation did not satisfy its GPU, policy, or exact-match contract."
+        throw "v13 $split evaluation did not satisfy its GPU core-field, policy, or exact-match contract."
+    }
+    $recipientExactMatch = Get-ExactMetric $evaluationSummary "recipient_field" "$split evaluation"
+    $requestedRecipientFloor = $acceptance.PSObject.Properties["min_recipient_exact_match"]
+    if ($null -eq $requestedRecipientFloor `
+        -or $null -eq $requestedRecipientFloor.Value `
+        -or [double]$requestedRecipientFloor.Value -lt $recipientFloor) {
+        throw "v13 $split evaluation weakens the final hybrid recipient floor."
+    }
+    $recipientDelegated = $recipientExactMatch -lt $recipientFloor
+    if (($recipientDelegated -and ($baseSummaryPassed -or $failures.Count -eq 0)) `
+        -or (-not $recipientDelegated -and (-not $baseSummaryPassed -or $failures.Count -ne 0))) {
+        throw "v13 $split aggregate acceptance is inconsistent with its recipient metric."
     }
     if ($nonSuccessSafetyCalibrated) {
-        $maxSafetyProperty = $evaluationSummary.acceptance.PSObject.Properties["max_non_success_to_success"]
+        $maxSafetyProperty = $acceptance.PSObject.Properties["max_non_success_to_success"]
         if ($null -eq $maxSafetyProperty `
             -or $null -eq $maxSafetyProperty.Value `
             -or [int]$maxSafetyProperty.Value -ne 0 `
@@ -548,10 +615,19 @@ foreach ($statusAudit in @($valStatusAudit, $testStatusAudit)) {
         }
         status_text_exact_match = $statusCtcExactMatch
         status_non_success_to_success = [int]$statusMetrics.non_success_to_success
-        accepted = $true
+        base_summary_passed = $baseSummaryPassed
+        base_summary_failures = $failures
+        recipient_exact_match = $recipientExactMatch
+        recipient_delegated_to_hybrid_formal = $recipientDelegated
+        core_amount_time_payment_status_accepted = $true
+        accepted = $baseSummaryPassed
     }
 }
 
+$recipientDelegationRequired = [bool](@(
+        $evaluationEvidence |
+            Where-Object { $_.recipient_delegated_to_hybrid_formal -eq $true }
+    ).Count -gt 0)
 $packagingValidationSummary = Join-Path $OutputRoot "onnx-val-gpu\summary.json"
 Require-File $packagingValidationSummary "accepted v13 val ONNX summary for CPU packaging"
 
@@ -614,6 +690,14 @@ $validationEvidence = [ordered]@{
         visible_transfer_status_cjk_text = $StatusTextFloor
     }
     evaluations = $evaluationEvidence
+    recipient_delivery_policy = [ordered]@{
+        final_floor = $recipientFloor
+        base_v13_below_floor_may_only_fail_recipient = $true
+        delegated_runtime = "hybrid_ppocr"
+        final_gate = "10016-receipt CPU formal"
+        final_gate_required = $true
+        delegated_in_any_held_out_split = $recipientDelegationRequired
+    }
     cpu_packaging = [ordered]@{
         performed = $false
         next_script = "scripts/receipt-mlnet-unified-package-validate-4090.ps1"
@@ -625,6 +709,7 @@ $validationEvidence = [ordered]@{
         required_runtime_flavor = "cpu"
         required_rectification = "max-side-1600"
         include_device_model = $true
+        recipient_delegated_to_hybrid_formal = $recipientDelegationRequired
     }
 }
 $validationEvidence | ConvertTo-Json -Depth 12 |
@@ -635,6 +720,7 @@ Write-Host "PASS: additive v13 visible-status OCR candidate is ready for existin
 Write-Host "  model=$candidateModel"
 Write-Host "  manifest=$records"
 Write-Host "  evidence=$validationEvidencePath"
+Write-Host "  recipient-delegated-to-hybrid-formal=$recipientDelegationRequired"
 Write-Host "  CPU packaging intentionally not run; use scripts\receipt-mlnet-unified-package-validate-4090.ps1 next with:"
 Write-Host "    -RunDirectory $OutputRoot"
 Write-Host "    -UnifiedModelPath $candidateModel"
