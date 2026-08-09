@@ -1053,19 +1053,132 @@ def validate_embedded_continuation_authority(
 def _publish_checkpoint_no_clobber(
     output: Path, payload: Mapping[str, object], *, torch: Any
 ) -> None:
-    temporary = output.with_name(f".{output.name}.{uuid4().hex}.tmp")
+    class _NonClosingSerializationBuffer(io.BytesIO):
+        # A caller-owned file-like object must remain readable after
+        # ``torch.save``.  PyTorch observes that contract; keeping this shim
+        # non-closing also makes the publication boundary robust to a faulty
+        # or mocked serializer that calls close itself.
+        def close(self) -> None:
+            self.flush()
+
+    buffer = _NonClosingSerializationBuffer()
     try:
-        torch.save(dict(payload), temporary)
-        with temporary.open("rb") as stream:
-            os.fsync(stream.fileno())
-        os.link(temporary, output)
-    except FileExistsError as error:
-        raise ValueError(f"Refusing to overwrite authorized continuation checkpoint: {output}") from error
+        torch.save(dict(payload), buffer)
+        buffer.flush()
+        serialized = buffer.getvalue()
     finally:
+        io.BytesIO.close(buffer)
+    if not serialized:
+        raise ValueError("authorized continuation checkpoint serialization is empty")
+
+    output = _absolute_without_reparse(
+        output, "authorized continuation checkpoint"
+    )
+    _existing(
+        output.parent,
+        directory=True,
+        description="authorized continuation checkpoint parent",
+    )
+    temporary = output.with_name(f".{output.name}.{uuid4().hex}.tmp")
+    temporary = _absolute_without_reparse(
+        temporary, "authorized continuation checkpoint stage"
+    )
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= int(getattr(os, "O_BINARY", 0))
+    flags |= int(getattr(os, "O_CLOEXEC", 0))
+    flags |= int(getattr(os, "O_NOFOLLOW", 0))
+    stage_created = False
+    stage_inode: tuple[int, int] | None = None
+    stage_identity: tuple[int, int, int, str] | None = None
+    output_link_created = False
+    publication_verified = False
+
+    def unlink_if_owned(
+        path: Path,
+        *,
+        inode: tuple[int, int],
+        identity: tuple[int, int, int, str] | None,
+    ) -> None:
         try:
-            temporary.unlink()
+            _, observed = _read_frozen_regular_file(
+                path, description="owned checkpoint publication artifact"
+            )
+        except (FileNotFoundError, ValueError, OSError):
+            return
+        if observed[:2] != inode or (identity is not None and observed != identity):
+            return
+        try:
+            path.unlink()
         except FileNotFoundError:
             pass
+
+    raw_fd: int | None = None
+    try:
+        try:
+            raw_fd = os.open(temporary, flags, 0o600)
+        except FileExistsError as error:
+            raise ValueError(
+                f"Refusing to reuse temporary authorized checkpoint stage: {temporary}"
+            ) from error
+        stage_created = True
+        created = os.fstat(raw_fd)
+        if not stat.S_ISREG(created.st_mode):
+            raise ValueError("authorized checkpoint stage is not a regular file")
+        stage_inode = (created.st_dev, created.st_ino)
+        try:
+            stream = os.fdopen(raw_fd, "wb", closefd=True)
+        except BaseException:
+            os.close(raw_fd)
+            raw_fd = None
+            raise
+        raw_fd = None
+        with stream:
+            written = stream.write(serialized)
+            if written != len(serialized):
+                raise OSError("authorized checkpoint stage write was incomplete")
+            stream.flush()
+            os.fsync(stream.fileno())
+
+        stage_identity = (
+            stage_inode[0],
+            stage_inode[1],
+            len(serialized),
+            hashlib.sha256(serialized).hexdigest(),
+        )
+
+        stage_bytes, frozen_stage_identity = _read_frozen_regular_file(
+            temporary, description="authorized checkpoint stage"
+        )
+        if frozen_stage_identity != stage_identity or stage_bytes != serialized:
+            raise ValueError("authorized checkpoint stage changed before hard-link publication")
+        del stage_bytes
+        try:
+            os.link(temporary, output)
+        except FileExistsError as error:
+            raise ValueError(
+                f"Refusing to overwrite authorized continuation checkpoint: {output}"
+            ) from error
+        output_link_created = True
+        output_bytes, output_identity = _read_frozen_regular_file(
+            output, description="published authorized continuation checkpoint"
+        )
+        if output_identity != stage_identity or output_bytes != serialized:
+            raise ValueError(
+                "published authorized checkpoint does not match its frozen stage"
+            )
+        del output_bytes
+        publication_verified = True
+    finally:
+        if raw_fd is not None:
+            os.close(raw_fd)
+        if (
+            output_link_created
+            and not publication_verified
+            and stage_inode is not None
+        ):
+            unlink_if_owned(output, inode=stage_inode, identity=stage_identity)
+        if stage_created and stage_inode is not None:
+            unlink_if_owned(temporary, inode=stage_inode, identity=stage_identity)
 
 
 def _publish_json_no_clobber(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import inspect
 import json
 import math
@@ -662,6 +663,156 @@ def test_frozen_validation_bytes_and_binding_cannot_diverge(tmp_path: Path) -> N
     # bytes from those consumed by the semantic validator.
     artifact.write_bytes(replacement)
     assert _file_identity(artifact) != identity
+
+
+def test_checkpoint_publisher_uses_writable_fsync_and_survives_serializer_close(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class ClosingSerializer:
+        @staticmethod
+        def save(payload, stream) -> None:
+            assert not isinstance(stream, (str, Path))
+            stream.write(b"checkpoint:" + payload["value"])
+            stream.close()
+
+    real_fsync = continuation.os.fsync
+    fsync_calls: list[int] = []
+
+    def windows_like_fsync(fd: int) -> None:
+        # A zero-byte write proves this is not the read-only descriptor that
+        # raises EBADF through the Windows CRT _commit implementation.
+        assert continuation.os.write(fd, b"") == 0
+        fsync_calls.append(fd)
+        real_fsync(fd)
+
+    monkeypatch.setattr(continuation.os, "fsync", windows_like_fsync)
+    output = tmp_path / "authorized.pt"
+    continuation._publish_checkpoint_no_clobber(
+        output, {"value": b"payload"}, torch=ClosingSerializer
+    )
+    assert output.read_bytes() == b"checkpoint:payload"
+    assert fsync_calls
+    assert list(tmp_path.glob(".authorized.pt.*.tmp")) == []
+
+    with pytest.raises(ValueError, match="Refusing to overwrite"):
+        continuation._publish_checkpoint_no_clobber(
+            output, {"value": b"replacement"}, torch=ClosingSerializer
+        )
+    assert output.read_bytes() == b"checkpoint:payload"
+    assert list(tmp_path.glob(".authorized.pt.*.tmp")) == []
+
+
+def test_checkpoint_publisher_cleans_owned_failures_but_not_foreign_stage(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class Serializer:
+        @staticmethod
+        def save(payload, stream) -> None:
+            stream.write(bytes(payload["value"]))
+
+    output = tmp_path / "authorized.pt"
+
+    class FailingSerializer:
+        @staticmethod
+        def save(payload, stream) -> None:
+            stream.write(b"partial")
+            stream.close()
+            raise RuntimeError("simulated serializer failure")
+
+    with pytest.raises(RuntimeError, match="simulated serializer failure"):
+        continuation._publish_checkpoint_no_clobber(
+            output, {"value": b"owned"}, torch=FailingSerializer
+        )
+    assert not output.exists()
+    assert list(tmp_path.glob(".authorized.pt.*.tmp")) == []
+
+    real_fsync = continuation.os.fsync
+
+    def failing_fsync(fd: int) -> None:
+        raise OSError("simulated fsync failure")
+
+    monkeypatch.setattr(continuation.os, "fsync", failing_fsync)
+    with pytest.raises(OSError, match="simulated fsync failure"):
+        continuation._publish_checkpoint_no_clobber(
+            output, {"value": b"owned"}, torch=Serializer
+        )
+    assert not output.exists()
+    assert list(tmp_path.glob(".authorized.pt.*.tmp")) == []
+
+    monkeypatch.setattr(continuation.os, "fsync", real_fsync)
+    monkeypatch.setattr(
+        continuation, "uuid4", lambda: SimpleNamespace(hex="fixed-stage")
+    )
+    foreign_stage = tmp_path / ".authorized.pt.fixed-stage.tmp"
+    foreign_stage.write_bytes(b"foreign")
+    with pytest.raises(ValueError, match="Refusing to reuse temporary"):
+        continuation._publish_checkpoint_no_clobber(
+            output, {"value": b"owned"}, torch=Serializer
+        )
+    assert foreign_stage.read_bytes() == b"foreign"
+    assert not output.exists()
+
+
+def test_checkpoint_publisher_fails_closed_on_link_races_without_deleting_foreign_bytes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class Serializer:
+        @staticmethod
+        def save(payload, stream) -> None:
+            stream.write(bytes(payload["value"]))
+
+    output = tmp_path / "authorized.pt"
+    real_link = continuation.os.link
+
+    def competing_output(source, destination) -> None:
+        Path(destination).write_bytes(b"competitor")
+        raise FileExistsError("simulated output race")
+
+    monkeypatch.setattr(continuation.os, "link", competing_output)
+    with pytest.raises(ValueError, match="Refusing to overwrite"):
+        continuation._publish_checkpoint_no_clobber(
+            output, {"value": b"owned"}, torch=Serializer
+        )
+    assert output.read_bytes() == b"competitor"
+    assert list(tmp_path.glob(".authorized.pt.*.tmp")) == []
+
+    output.unlink()
+    monkeypatch.setattr(
+        continuation, "uuid4", lambda: SimpleNamespace(hex="replaced-stage")
+    )
+    foreign_stage = tmp_path / ".authorized.pt.replaced-stage.tmp"
+
+    def replace_stage_then_link(source, destination) -> None:
+        stage = Path(source)
+        stage.unlink()
+        stage.write_bytes(b"foreign-stage")
+        real_link(stage, destination)
+
+    monkeypatch.setattr(continuation.os, "link", replace_stage_then_link)
+    with pytest.raises(ValueError, match="does not match its frozen stage"):
+        continuation._publish_checkpoint_no_clobber(
+            output, {"value": b"owned"}, torch=Serializer
+        )
+    assert foreign_stage.read_bytes() == b"foreign-stage"
+    assert output.read_bytes() == b"foreign-stage"
+
+
+def test_checkpoint_publisher_round_trips_with_real_torch(tmp_path: Path) -> None:
+    torch = pytest.importorskip("torch")
+    payload = {"tensor": torch.tensor([1.0, -0.0, 3.5])}
+    probe = io.BytesIO()
+    torch.save(payload, probe)
+    assert probe.closed is False
+    probe.close()
+
+    output = tmp_path / "authorized.pt"
+    continuation._publish_checkpoint_no_clobber(output, payload, torch=torch)
+    try:
+        loaded = torch.load(output, map_location="cpu", weights_only=False)
+    except TypeError:
+        loaded = torch.load(output, map_location="cpu")
+    torch.testing.assert_close(loaded["tensor"], payload["tensor"], rtol=0, atol=0)
+    assert list(tmp_path.glob(".authorized.pt.*.tmp")) == []
 
 
 def test_last_checkpoint_cannot_strip_analysis_only_policy_metadata() -> None:
