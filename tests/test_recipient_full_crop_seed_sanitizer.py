@@ -29,6 +29,8 @@ from transfer_receipt_ai.ocr_unified import (
 from transfer_receipt_ai.recipient_full_crop_seed_sanitizer import (
     ATTESTATION_KEY,
     ATTESTATION_KIND,
+    DISCARDED_TRAIN_PAYMENT_POLICY,
+    DISCARDED_TRAIN_PAYMENT_TENSOR_KEYS,
     _build_sanitized_payload,
     _canonical_sha256,
     _metadata_partitions,
@@ -103,11 +105,12 @@ def _state(
     recipient_fill: float,
     shared_fill: float = 1.0,
     recipient_character_count: int = 2,
+    payment_character_count: int = 4,
 ):
     _torch()
     config = _config(13 if v13 else 12)
     model = build_unified_reader(
-        payment_vocab_size=5,
+        payment_vocab_size=payment_character_count + 1,
         config=config,
         payment_bank_prefix_vocab_size=2,
         recipient_vocab_size=recipient_character_count + 1,
@@ -132,14 +135,19 @@ def _payload(
     train_only: bool,
     recipient_fill: float,
     recipient_characters: list[str] | None = None,
+    payment_characters: list[str] | None = None,
+    shared_fill: float = 1.0,
 ) -> dict[str, object]:
     config = _config(architecture)
     policies = _recipient_policies()
     recipient_characters = recipient_characters or ["商", "户"]
+    payment_characters = payment_characters or ["卡", "行", "银", "储"]
     state = _state(
         v13=architecture == 13,
         recipient_fill=recipient_fill,
+        shared_fill=shared_fill,
         recipient_character_count=len(recipient_characters),
+        payment_character_count=len(payment_characters),
     )
     split_policy = _recipient_train_split_policy(["train"] if train_only else ["train", "val"])
     payload: dict[str, object] = {
@@ -149,7 +157,7 @@ def _payload(
         "state_dict": state,
         "amount_characters": list(V8_AMOUNT_CHARACTERS),
         "time_characters": list(V6_TIME_CHARACTERS),
-        "payment_characters": ["卡", "行", "银", "储"],
+        "payment_characters": payment_characters,
         "status_classes": list(STATUS_CLASSES),
         "payment_bank_prefix_classes": ["__other__", "银行"],
         "recipient_characters": recipient_characters,
@@ -408,6 +416,119 @@ def test_sanitizer_preserves_status_side_and_replaces_only_recipient_side() -> N
     }
     assert output["recipient_train_split_policy"] == _recipient_train_split_policy(["train"])
     assert output["recipient_sampling_policy"] == recipient["recipient_sampling_policy"]
+
+
+def test_sanitizer_discards_train_payment_mismatch_and_attests_exact_four_heads() -> None:
+    torch = _torch()
+    status_payment = ["卡", "行", "银", "储", "蓄"]
+    train_payment = ["卡", "行", "银", "储"]
+    status = _payload(
+        architecture=13,
+        train_only=False,
+        recipient_fill=8.0,
+        payment_characters=status_payment,
+    )
+    recipient = _payload(
+        architecture=12,
+        train_only=True,
+        recipient_fill=3.0,
+        payment_characters=train_payment,
+    )
+    status_source = _source("/status.pt", KIND_V13)
+    train_source = _source("/recipient.pt", KIND_V12)
+    output = _build_sanitized_payload(
+        status_payload=status,
+        train_payload=recipient,
+        status_source=status_source,
+        train_source=train_source,
+        train_lineage=_lineage(recipient, train_source),
+    )
+    validate_recipient_full_crop_seed_attestation(output)
+    assert output["payment_characters"] == status_payment
+    for name in DISCARDED_TRAIN_PAYMENT_TENSOR_KEYS:
+        assert torch.equal(output["state_dict"][name], status["state_dict"][name])
+    proof = output[ATTESTATION_KEY]["compatibility"]["discarded_train_payment"]
+    assert proof == {
+        "policy": DISCARDED_TRAIN_PAYMENT_POLICY,
+        "status_character_count": len(status_payment),
+        "train_character_count": len(train_payment),
+        "status_charset_sha256": hashlib.sha256(
+            "".join(status_payment).encode("utf-8")
+        ).hexdigest(),
+        "train_charset_sha256": hashlib.sha256(
+            "".join(train_payment).encode("utf-8")
+        ).hexdigest(),
+        "label_maps_equal": False,
+        "allowed_shape_difference_keys": sorted(DISCARDED_TRAIN_PAYMENT_TENSOR_KEYS),
+        "observed_shape_difference_keys": sorted(DISCARDED_TRAIN_PAYMENT_TENSOR_KEYS),
+    }
+
+
+def test_sanitizer_rejects_nonpayment_label_mismatch_despite_discarded_payment() -> None:
+    status = _payload(architecture=13, train_only=False, recipient_fill=8.0)
+    recipient = _payload(architecture=12, train_only=True, recipient_fill=3.0)
+    recipient["payment_bank_prefix_classes"] = ["__other__", "另一银行"]
+    status_source = _source("/status.pt", KIND_V13)
+    train_source = _source("/recipient.pt", KIND_V12)
+    with pytest.raises(ValueError, match="bank label maps do not match"):
+        _build_sanitized_payload(
+            status_payload=status,
+            train_payload=recipient,
+            status_source=status_source,
+            train_source=train_source,
+            train_lineage=_lineage(recipient, train_source),
+        )
+
+
+def test_sanitizer_rejects_shape_drift_outside_discarded_payment_heads() -> None:
+    torch = _torch()
+    status = _payload(architecture=13, train_only=False, recipient_fill=8.0)
+    recipient = _payload(architecture=12, train_only=True, recipient_fill=3.0)
+    name = "payment_ctc_sequence.weight_ih_l0"
+    recipient["state_dict"][name] = torch.cat(
+        (recipient["state_dict"][name], recipient["state_dict"][name][:1]), dim=0
+    )
+    status_source = _source("/status.pt", KIND_V13)
+    train_source = _source("/recipient.pt", KIND_V12)
+    with pytest.raises(ValueError, match="shape/dtype does not match its declared model"):
+        _build_sanitized_payload(
+            status_payload=status,
+            train_payload=recipient,
+            status_source=status_source,
+            train_source=train_source,
+            train_lineage=_lineage(recipient, train_source),
+        )
+
+
+def test_attestation_rejects_discarded_payment_proof_substitution() -> None:
+    status = _payload(
+        architecture=13,
+        train_only=False,
+        recipient_fill=8.0,
+        payment_characters=["卡", "行", "银", "储", "蓄"],
+    )
+    recipient = _payload(
+        architecture=12,
+        train_only=True,
+        recipient_fill=3.0,
+        payment_characters=["卡", "行", "银", "储"],
+    )
+    status_source = _source("/status.pt", KIND_V13)
+    train_source = _source("/recipient.pt", KIND_V12)
+    output = _build_sanitized_payload(
+        status_payload=status,
+        train_payload=recipient,
+        status_source=status_source,
+        train_source=train_source,
+        train_lineage=_lineage(recipient, train_source),
+    )
+    proof = output[ATTESTATION_KEY]["compatibility"]["discarded_train_payment"]
+    proof["observed_shape_difference_keys"] = sorted(
+        DISCARDED_TRAIN_PAYMENT_TENSOR_KEYS
+    )[:-1]
+    _reseal_attestation(output)
+    with pytest.raises(ValueError, match="discarded train payment proof"):
+        validate_recipient_full_crop_seed_attestation(output)
 
 
 @pytest.mark.parametrize("representation", ["missing", "null"])
@@ -896,8 +1017,18 @@ def test_warmstart_reopens_sources_and_rejects_coherently_resealed_lineage_splic
 
 def test_atomic_file_publication_is_fresh_and_reloads(tmp_path: Path) -> None:
     torch = _torch()
-    status = _payload(architecture=13, train_only=False, recipient_fill=8.0)
-    recipient = _payload(architecture=12, train_only=True, recipient_fill=3.0)
+    status = _payload(
+        architecture=13,
+        train_only=False,
+        recipient_fill=8.0,
+        payment_characters=["卡", "行", "银", "储", "蓄"],
+    )
+    recipient = _payload(
+        architecture=12,
+        train_only=True,
+        recipient_fill=3.0,
+        payment_characters=["卡", "行", "银", "储"],
+    )
     status_path = tmp_path / "status.pt"
     recipient_path = tmp_path / "recipient.pt"
     output_path = tmp_path / "sanitized.pt"
@@ -925,3 +1056,49 @@ def test_atomic_file_publication_is_fresh_and_reloads(tmp_path: Path) -> None:
             output_checkpoint=output_path,
             torch=torch,
         )
+
+
+def test_reopened_policy_rejects_resealed_train_payment_tensor_substitution(
+    tmp_path: Path,
+) -> None:
+    torch = _torch()
+    status = _payload(
+        architecture=13,
+        train_only=False,
+        recipient_fill=8.0,
+        payment_characters=["卡", "行", "银", "储"],
+        shared_fill=1.0,
+    )
+    recipient = _payload(
+        architecture=12,
+        train_only=True,
+        recipient_fill=3.0,
+        payment_characters=["卡", "行", "银", "蓄"],
+        shared_fill=2.0,
+    )
+    status_path = tmp_path / "status.pt"
+    recipient_path = tmp_path / "recipient.pt"
+    output_path = tmp_path / "sanitized.pt"
+    torch.save(status, status_path)
+    torch.save(recipient, recipient_path)
+    sanitize_recipient_full_crop_seed(
+        status_checkpoint=status_path,
+        train_only_recipient_checkpoint=recipient_path,
+        output_checkpoint=output_path,
+        torch=torch,
+    )
+    try:
+        tampered = torch.load(output_path, map_location="cpu", weights_only=True)
+    except TypeError:
+        tampered = torch.load(output_path, map_location="cpu")
+    name = "payment_ctc_classifier.weight"
+    assert tampered["state_dict"][name].shape == recipient["state_dict"][name].shape
+    assert not torch.equal(tampered["state_dict"][name], recipient["state_dict"][name])
+    tampered["state_dict"][name] = recipient["state_dict"][name].clone()
+    tampered[ATTESTATION_KEY]["state_proof"]["output_non_recipient"] = (
+        _partition_descriptor(tampered["state_dict"], recipient=False)
+    )
+    _reseal_attestation(tampered)
+    validate_recipient_full_crop_seed_attestation(tampered)
+    with pytest.raises(ValueError, match="content-bound seed sanitizer attestation"):
+        _validate_recipient_full_crop_seed_policy(tampered, torch=torch)

@@ -75,6 +75,17 @@ SANITIZED_INITIALIZATION_MODE = "analysis_only_full_crop_seed_sanitizer_dual_sou
 RECIPIENT_CLASSIFIER_KEYS = frozenset(
     {"recipient_classifier.weight", "recipient_classifier.bias"}
 )
+DISCARDED_TRAIN_PAYMENT_TENSOR_KEYS = frozenset(
+    {
+        "payment_ctc_classifier.weight",
+        "payment_ctc_classifier.bias",
+        "payment_prefix_classifier.weight",
+        "payment_prefix_classifier.bias",
+    }
+)
+DISCARDED_TRAIN_PAYMENT_POLICY = (
+    "status_payment_labels_and_tensors_authoritative_train_payment_discarded_v1"
+)
 
 _HEX = frozenset("0123456789abcdef")
 _FORBIDDEN_STATEFUL_KEYS = frozenset(
@@ -379,6 +390,99 @@ def _validate_classifier_row_transition(
             or (not allow_hidden_change and source_shape[1:] != target_shape[1:])
         ):
             raise ValueError(f"{description} has an invalid recipient classifier row transition")
+
+
+def _charset_sha256(characters: Sequence[str]) -> str:
+    return hashlib.sha256("".join(characters).encode("utf-8")).hexdigest()
+
+
+def _discarded_train_payment_proof(
+    *,
+    status_characters: Sequence[str],
+    train_characters: Sequence[str],
+    observed_shape_difference_keys: Sequence[str],
+) -> dict[str, object]:
+    """Describe the payment branch that is discarded from the train source."""
+
+    observed = sorted(observed_shape_difference_keys)
+    expected_shape_differences = (
+        sorted(DISCARDED_TRAIN_PAYMENT_TENSOR_KEYS)
+        if len(status_characters) != len(train_characters)
+        else []
+    )
+    if observed != expected_shape_differences:
+        raise ValueError(
+            "discarded train payment tensor differences do not match the two payment output heads"
+        )
+    return {
+        "policy": DISCARDED_TRAIN_PAYMENT_POLICY,
+        "status_character_count": len(status_characters),
+        "train_character_count": len(train_characters),
+        "status_charset_sha256": _charset_sha256(status_characters),
+        "train_charset_sha256": _charset_sha256(train_characters),
+        "label_maps_equal": list(status_characters) == list(train_characters),
+        "allowed_shape_difference_keys": sorted(DISCARDED_TRAIN_PAYMENT_TENSOR_KEYS),
+        "observed_shape_difference_keys": observed,
+    }
+
+
+def _validate_discarded_train_payment_proof(
+    value: object, *, output_payment_characters: Sequence[str]
+) -> Mapping[str, object]:
+    proof = _require_exact_keys(
+        value,
+        {
+            "policy",
+            "status_character_count",
+            "train_character_count",
+            "status_charset_sha256",
+            "train_charset_sha256",
+            "label_maps_equal",
+            "allowed_shape_difference_keys",
+            "observed_shape_difference_keys",
+        },
+        description="discarded train payment proof",
+    )
+    status_count = proof.get("status_character_count")
+    train_count = proof.get("train_character_count")
+    if (
+        proof.get("policy") != DISCARDED_TRAIN_PAYMENT_POLICY
+        or isinstance(status_count, bool)
+        or not isinstance(status_count, int)
+        or status_count <= 0
+        or isinstance(train_count, bool)
+        or not isinstance(train_count, int)
+        or train_count <= 0
+        or not isinstance(proof.get("label_maps_equal"), bool)
+        or proof.get("allowed_shape_difference_keys")
+        != sorted(DISCARDED_TRAIN_PAYMENT_TENSOR_KEYS)
+    ):
+        raise ValueError("discarded train payment policy/count is invalid")
+    status_hash = _require_sha256(
+        proof.get("status_charset_sha256"),
+        description="discarded train payment status charset hash",
+    )
+    train_hash = _require_sha256(
+        proof.get("train_charset_sha256"),
+        description="discarded train payment train charset hash",
+    )
+    observed = proof.get("observed_shape_difference_keys")
+    expected_observed = (
+        sorted(DISCARDED_TRAIN_PAYMENT_TENSOR_KEYS)
+        if status_count != train_count
+        else []
+    )
+    if (
+        status_count != len(output_payment_characters)
+        or status_hash != _charset_sha256(output_payment_characters)
+        or observed != expected_observed
+        or (
+            bool(proof.get("label_maps_equal"))
+            != (status_count == train_count and status_hash == train_hash)
+        )
+    ):
+        raise ValueError("discarded train payment proof does not match the output payment contract")
+    return proof
 
 
 def _validate_recipient_lineage_transition(
@@ -1121,9 +1225,14 @@ def _validate_compatible_sources(
         )
     status_labels = _checkpoint_labels(status_payload, config=status_config)
     train_labels = _checkpoint_labels(train_payload, config=train_config)
-    for index, description in ((0, "amount"), (1, "time"), (2, "payment"), (4, "status class"), (5, "bank")):
+    # Payment belongs entirely to the non-recipient/status source partition.
+    # The train-only checkpoint's payment labels and two payment output heads
+    # are discarded, so only the remaining non-recipient label maps must agree.
+    for index, description in ((0, "amount"), (1, "time"), (4, "status class"), (5, "bank")):
         if status_labels[index] != train_labels[index]:
             raise ValueError(f"v13 status and train-only v12 {description} label maps do not match")
+    status_payment_characters = status_labels[2]
+    train_payment_characters = train_labels[2]
     status_characters, status_recipient_metadata = _validate_recipient_metadata(
         status_payload,
         config=status_config,
@@ -1157,11 +1266,24 @@ def _validate_compatible_sources(
             f"missing={sorted(status_shared_keys - train_shared_keys)}, "
             f"unexpected={sorted(train_shared_keys - status_shared_keys)}"
         )
+    payment_shape_differences: list[str] = []
     for name in sorted(status_shared_keys):
-        if _tensor_signature(status_state[name], name=name) != _tensor_signature(
-            train_state[name], name=name
-        ):
+        status_dtype, status_shape = _tensor_signature(status_state[name], name=name)
+        train_dtype, train_shape = _tensor_signature(train_state[name], name=name)
+        if (status_dtype, status_shape) == (train_dtype, train_shape):
+            continue
+        if name not in DISCARDED_TRAIN_PAYMENT_TENSOR_KEYS:
             raise ValueError(f"checkpoint tensor shape/dtype mismatch for {name}")
+        if (
+            status_dtype != train_dtype
+            or not status_shape
+            or not train_shape
+            or status_shape[0] != len(status_payment_characters) + 1
+            or train_shape[0] != len(train_payment_characters) + 1
+            or status_shape[1:] != train_shape[1:]
+        ):
+            raise ValueError(f"discarded train payment tensor mismatch is invalid for {name}")
+        payment_shape_differences.append(name)
     for name in sorted(status_recipient_keys - RECIPIENT_CLASSIFIER_KEYS):
         if _tensor_signature(status_state[name], name=name) != _tensor_signature(
             train_state[name], name=name
@@ -1177,6 +1299,11 @@ def _validate_compatible_sources(
     )
     if set(status_recipient_metadata) != set(train_recipient_metadata):
         raise ValueError("v13 status and train-only v12 recipient metadata key sets do not match")
+    discarded_train_payment = _discarded_train_payment_proof(
+        status_characters=status_payment_characters,
+        train_characters=train_payment_characters,
+        observed_shape_difference_keys=payment_shape_differences,
+    )
     return {
         "status_config": status_config,
         "train_config": train_config,
@@ -1188,6 +1315,7 @@ def _validate_compatible_sources(
         "status_recipient_characters": status_characters,
         "status_text_key_count": len(status_status_keys),
         "shared_key_count": len(status_shared_keys),
+        "discarded_train_payment": discarded_train_payment,
     }
 
 
@@ -1237,6 +1365,15 @@ def _build_sanitized_payload(
         for name, value in status_state.items()
     }
     output["state_dict"] = output_state
+    if output.get("payment_characters") != status_payload.get("payment_characters"):
+        raise AssertionError("sanitized output did not preserve status-source payment labels")
+    for name in sorted(DISCARDED_TRAIN_PAYMENT_TENSOR_KEYS):
+        _, _, output_bytes = _tensor_bytes(output_state[name], name=name)
+        _, _, status_bytes = _tensor_bytes(status_state[name], name=name)
+        if output_bytes != status_bytes:
+            raise AssertionError(
+                f"sanitized output did not preserve status-source payment tensor {name}"
+            )
     recipient_metadata, non_recipient_metadata = _metadata_partitions(output)
     status_recipient_metadata = compatible["status_recipient_metadata"]
     assert isinstance(status_recipient_metadata, Mapping)
@@ -1263,6 +1400,7 @@ def _build_sanitized_payload(
                 "recipient_charset_sha256"
             ],
             "recipient_charset_sha256": train_payload["recipient_charset_sha256"],
+            "discarded_train_payment": compatible["discarded_train_payment"],
             "output_abi": list(V13_ONNX_OUTPUT_NAMES),
             "output_config_sha256": _canonical_sha256(
                 output["config"], description="sanitized output config"
@@ -1635,6 +1773,7 @@ def validate_recipient_full_crop_seed_attestation(
             "recipient_charset_relation",
             "status_recipient_charset_sha256",
             "recipient_charset_sha256",
+            "discarded_train_payment",
             "output_abi",
             "output_config_sha256",
         },
@@ -1662,6 +1801,11 @@ def validate_recipient_full_crop_seed_attestation(
     )
     _require_sha256(
         compatibility.get("output_config_sha256"), description="sanitized config hash"
+    )
+    output_labels = _checkpoint_labels(payload, config=config)
+    _validate_discarded_train_payment_proof(
+        compatibility.get("discarded_train_payment"),
+        output_payment_characters=output_labels[2],
     )
     state_proof = _require_exact_keys(
         attestation.get("state_proof"),
@@ -1796,6 +1940,8 @@ def verify_recipient_full_crop_seed_source_provenance(
         != status_payload.get("recipient_charset_sha256")
         or compatibility_proof.get("recipient_charset_sha256")
         != train_payload.get("recipient_charset_sha256")
+        or compatibility_proof.get("discarded_train_payment")
+        != compatible.get("discarded_train_payment")
     ):
         raise ValueError("sanitizer charset compatibility proof does not match reopened sources")
     rebuilt_lineage = _build_train_only_recipient_lineage(
