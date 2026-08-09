@@ -107,11 +107,11 @@ FIXED_SOURCE_ARTIFACTS = {
     },
     "sanitized_seed": {
         "sha256": "b4e30ac514a89cb83e54cbde6d42ba007c370635785c12c1240e232e75e7c17c",
-        "size_bytes": 39154511,
+        "size_bytes": 39155451,
     },
 }
 FIXED_SOURCE_SUBJECT_ID = (
-    "9f6e21371699966f6d2623ad873b8ca4a6b20a0b3f52c4ec904afabe5ecb140c"
+    "504271a800a63deb9c0e9e4c37fc4d7001932ed27393cc957bd8a955de80dbd3"
 )
 
 _HEX = frozenset("0123456789abcdef")

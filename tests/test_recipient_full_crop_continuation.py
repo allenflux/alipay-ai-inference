@@ -492,7 +492,7 @@ def test_real_r2_source_is_hard_pinned_against_coherent_reseal(
     tmp_path: Path,
 ) -> None:
     assert FIXED_SOURCE_SUBJECT_ID == (
-        "9f6e21371699966f6d2623ad873b8ca4a6b20a0b3f52c4ec904afabe5ecb140c"
+        "504271a800a63deb9c0e9e4c37fc4d7001932ed27393cc957bd8a955de80dbd3"
     )
     assert FIXED_SOURCE_ARTIFACTS == {
         "source_best_checkpoint": {
@@ -521,7 +521,7 @@ def test_real_r2_source_is_hard_pinned_against_coherent_reseal(
         },
         "sanitized_seed": {
             "sha256": "b4e30ac514a89cb83e54cbde6d42ba007c370635785c12c1240e232e75e7c17c",
-            "size_bytes": 39154511,
+            "size_bytes": 39155451,
         },
     }
     assert continuation._canonical_sha256(
@@ -556,6 +556,13 @@ def test_real_r2_pins_are_64_hex_and_blind_pin_matches_contract_probe() -> None:
     assert FIXED_SOURCE_ARTIFACTS["blind_manifest"] == {
         "sha256": "c303c8a34348532263d3ad84ed2cd6ddcd77c1bdd9dfc8a7c713ccc35a1ff5f1",
         "size_bytes": 202226294,
+    }
+
+
+def test_real_r2_sanitized_seed_pin_matches_frozen_stat_probe() -> None:
+    assert FIXED_SOURCE_ARTIFACTS["sanitized_seed"] == {
+        "sha256": "b4e30ac514a89cb83e54cbde6d42ba007c370635785c12c1240e232e75e7c17c",
+        "size_bytes": 39155451,
     }
 
 
