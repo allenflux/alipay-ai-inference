@@ -334,13 +334,19 @@ def test_frozen_evidence_rejects_reparse_replacement(tmp_path: Path) -> None:
     evidence.write_text("bound", encoding="utf-8")
     frozen = _FrozenEvidence({"evidence": evidence})
     moved = tmp_path / "moved.json"
-    evidence.rename(moved)
     try:
-        evidence.symlink_to(moved.name)
-    except (NotImplementedError, OSError):
-        frozen.close()
-        pytest.skip("symlinks are unavailable")
-    try:
+        try:
+            evidence.rename(moved)
+        except PermissionError:
+            # Windows opens the frozen handle without delete sharing, so the
+            # kernel itself prevents the replacement before verify() runs.
+            assert evidence.read_text(encoding="utf-8") == "bound"
+            frozen.verify()
+            return
+        try:
+            evidence.symlink_to(moved.name)
+        except (NotImplementedError, OSError):
+            pytest.skip("symlinks are unavailable")
         with pytest.raises(ValueError, match="reparse point"):
             frozen.verify()
     finally:
@@ -353,9 +359,15 @@ def test_frozen_json_is_read_from_open_inode_and_replacement_is_rejected(tmp_pat
     frozen = _FrozenEvidence({"summary": evidence})
     replacement = tmp_path / "replacement.json"
     replacement.write_text('{"epoch": 8}\n', encoding="utf-8")
-    evidence.unlink()
-    replacement.rename(evidence)
     try:
+        try:
+            evidence.unlink()
+        except PermissionError:
+            # On Windows the live frozen handle is itself a no-replace gate.
+            assert frozen.json_object("summary", training=True) == {"epoch": 1}
+            frozen.verify()
+            return
+        replacement.rename(evidence)
         assert frozen.json_object("summary", training=True) == {"epoch": 1}
         with pytest.raises(RuntimeError, match="path was replaced"):
             frozen.verify()
