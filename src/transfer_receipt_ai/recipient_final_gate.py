@@ -18,6 +18,7 @@ import argparse
 import hashlib
 import json
 import math
+import os
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -119,6 +120,25 @@ def _path_from(
     if not path.is_file():
         raise FileNotFoundError(f"Missing {description}: {path}")
     return path
+
+
+def _reject_reparse_chain(raw_path: Path, *, base: Path, description: str) -> None:
+    """Reject symlink/junction/reparse aliases before ``Path.resolve`` hides them."""
+
+    path = raw_path if raw_path.is_absolute() else base / raw_path
+    path = Path(os.path.abspath(os.fspath(path.expanduser())))
+    current = path
+    while True:
+        if os.path.lexists(os.fspath(current)):
+            try:
+                attributes = int(getattr(current.lstat(), "st_file_attributes", 0))
+            except OSError as error:
+                raise ValueError(f"Unable to inspect {description} path") from error
+            if current.is_symlink() or bool(attributes & 0x400):
+                raise ValueError(f"{description} must not traverse a reparse path")
+        if current == current.parent:
+            break
+        current = current.parent
 
 
 def _require_equal(actual: object, expected: object, description: str) -> None:
@@ -371,6 +391,7 @@ def inspect_candidate(
     _require_equal(training_config.get("recipient_open_text_layers"), 4, "training recipient layers")
     initialization = _mapping(training.get("initialization"), "training initialization")
     _require_equal(initialization.get("mode"), REQUIRED_INIT_MODE, "training initialization mode")
+    training_runtime = _mapping(training.get("training_runtime"), "training runtime")
     fine_tune = _mapping(training.get("fine_tune_policy"), "training fine-tune policy")
     _require_equal(fine_tune.get("mode"), REQUIRED_FINE_TUNE_MODE, "training fine-tune mode")
     _require_equal(fine_tune.get("trainable_parameter_prefix"), "recipient_", "training parameter prefix")
@@ -384,6 +405,326 @@ def inspect_candidate(
     recipient_test_oov = _mapping(recipient_oov.get("test"), "training test recipient OOV audit")
     _require_equal(recipient_test_oov.get("records"), 0, "training test recipient OOV records")
     _require_equal(training.get("best_checkpoint_epoch"), training_binding.get("best_epoch"), "best epoch")
+
+    # Historical v14 evidence predates an explicit source-route object.  It is
+    # accepted only for the original 0.30-trim recipe.  Every newly emitted
+    # candidate has an explicit route; trim zero is authorized exclusively by
+    # a content-bound passed full-crop source plus its passed residual pilot.
+    source_guard_paths: dict[str, Path] = {}
+    source_route_binding: dict[str, object] = {"mode": "historical_legacy_v14"}
+    raw_source_route = candidate.get("source_route")
+    initialization_source_config = _mapping(
+        initialization.get("source_config"), "training initialization source config"
+    )
+    target_trim = _finite_rate(
+        training_config.get("recipient_value_left_trim"), "training recipient left trim"
+    )
+    source_trim = _finite_rate(
+        initialization_source_config.get("recipient_value_left_trim"),
+        "training source recipient left trim",
+    )
+    if not math.isclose(
+        config.recipient_value_left_trim, target_trim, rel_tol=0.0, abs_tol=1e-12
+    ):
+        raise ValueError("ONNX and training recipient left trim differ")
+    if raw_source_route is None:
+        if not math.isclose(target_trim, 0.30, rel_tol=0.0, abs_tol=1e-12) or not math.isclose(
+            source_trim, 0.30, rel_tol=0.0, abs_tol=1e-12
+        ):
+            raise ValueError(
+                "historical v14 evidence may not authorize an unbound trim-zero source"
+            )
+        # Optional claims on historical evidence remain typed when present.
+        if "analysis_only" in candidate:
+            _require_equal(candidate.get("analysis_only"), True, "candidate analysis_only")
+        if "production_route_authorized" in candidate:
+            _require_equal(
+                candidate.get("production_route_authorized"),
+                False,
+                "candidate production_route_authorized",
+            )
+    else:
+        _require_equal(candidate.get("analysis_only"), True, "candidate analysis_only")
+        _require_equal(
+            candidate.get("production_route_authorized"),
+            False,
+            "candidate production_route_authorized",
+        )
+        source_route = _mapping(raw_source_route, "candidate source_route")
+        mode = source_route.get("mode")
+        if mode not in {
+            "legacy_v13_visual_context_reinit",
+            "attested_full_crop_pilot_visual_context_reinit",
+        }:
+            raise ValueError("candidate source_route mode is unsupported")
+        route_trim = _finite_rate(
+            source_route.get("recipient_value_left_trim"), "candidate source-route trim"
+        )
+        raw_source_checkpoint = source_route.get("source_checkpoint")
+        if not isinstance(raw_source_checkpoint, str) or not raw_source_checkpoint:
+            raise ValueError("candidate source route has no source checkpoint")
+        _reject_reparse_chain(
+            Path(raw_source_checkpoint),
+            base=base,
+            description="candidate source checkpoint",
+        )
+        source_checkpoint = _path_from(
+            source_route,
+            "source_checkpoint",
+            base=base,
+            description="candidate source checkpoint",
+        )
+        source_checkpoint_sha256 = _sha256(source_checkpoint)
+        _require_claimed_hash(
+            source_route,
+            "source_checkpoint_sha256",
+            source_checkpoint_sha256,
+            "candidate source checkpoint",
+        )
+        raw_init_checkpoint = initialization.get("checkpoint_path")
+        if not isinstance(raw_init_checkpoint, str) or not raw_init_checkpoint:
+            raise ValueError("training initialization has no source checkpoint path")
+        init_checkpoint = Path(raw_init_checkpoint)
+        if not init_checkpoint.is_absolute():
+            init_checkpoint = training_summary.parent / init_checkpoint
+        init_checkpoint = init_checkpoint.resolve()
+        if not init_checkpoint.is_file() or not source_checkpoint.samefile(init_checkpoint):
+            raise ValueError("training initialization did not use the bound source checkpoint")
+        _require_equal(
+            initialization.get("checkpoint_sha256"),
+            source_checkpoint_sha256,
+            "training source checkpoint SHA-256",
+        )
+        source_guard_paths["source_checkpoint"] = source_checkpoint
+        if mode == "legacy_v13_visual_context_reinit":
+            if not math.isclose(route_trim, 0.30, rel_tol=0.0, abs_tol=1e-12):
+                raise ValueError("legacy candidate source route must keep trim 0.30")
+            if not math.isclose(target_trim, 0.30, rel_tol=0.0, abs_tol=1e-12) or not math.isclose(
+                source_trim, 0.30, rel_tol=0.0, abs_tol=1e-12
+            ):
+                raise ValueError("legacy candidate training must keep trim 0.30")
+            source_route_binding = {
+                "mode": mode,
+                "source_checkpoint_sha256": source_checkpoint_sha256,
+            }
+        else:
+            if not math.isclose(route_trim, 0.0, rel_tol=0.0, abs_tol=1e-12):
+                raise ValueError("full-crop candidate source route must lock trim zero")
+            if not math.isclose(target_trim, 0.0, rel_tol=0.0, abs_tol=1e-12) or not math.isclose(
+                source_trim, 0.0, rel_tol=0.0, abs_tol=1e-12
+            ):
+                raise ValueError("full-crop candidate training must keep source and target trim zero")
+            fixed_runtime = {
+                "num_workers": 4,
+                "prefetch_factor": 2,
+                "validation_every": 2,
+            }
+            for runtime_name, expected_runtime_value in fixed_runtime.items():
+                _require_equal(
+                    training_runtime.get(runtime_name),
+                    expected_runtime_value,
+                    f"full-crop training runtime {runtime_name}",
+                )
+            for runtime_name in (
+                "persistent_workers",
+                "cuda_tf32_requested",
+                "cudnn_benchmark_requested",
+            ):
+                _require_equal(
+                    training_runtime.get(runtime_name),
+                    True,
+                    f"full-crop training runtime {runtime_name}",
+                )
+            _require_equal(
+                training_runtime.get("device"),
+                "cuda:0",
+                "full-crop training runtime device",
+            )
+            _require_equal(
+                training_runtime.get("uses_cuda"),
+                True,
+                "full-crop training runtime uses_cuda",
+            )
+            if "4090" not in str(training_runtime.get("cuda_device_name", "")):
+                raise ValueError("full-crop training runtime is not bound to an RTX 4090")
+            raw_source_contract = source_route.get("source_contract")
+            if not isinstance(raw_source_contract, str) or not raw_source_contract:
+                raise ValueError("full-crop source route has no source contract")
+            _reject_reparse_chain(
+                Path(raw_source_contract),
+                base=base,
+                description="full-crop source contract",
+            )
+            source_contract = _path_from(
+                source_route,
+                "source_contract",
+                base=base,
+                description="full-crop source contract",
+            )
+            source_contract_sha256 = _sha256(source_contract)
+            _require_claimed_hash(
+                source_route,
+                "source_contract_sha256",
+                source_contract_sha256,
+                "full-crop source contract",
+            )
+            raw_pilot_root = source_route.get("full_crop_pilot_root")
+            if not isinstance(raw_pilot_root, str) or not raw_pilot_root:
+                raise ValueError("full-crop source route has no pilot root")
+            pilot_root = Path(raw_pilot_root)
+            if not pilot_root.is_absolute():
+                pilot_root = base / pilot_root
+            _reject_reparse_chain(
+                pilot_root,
+                base=base,
+                description="full-crop pilot root",
+            )
+            pilot_root = pilot_root.resolve()
+            if not pilot_root.is_dir():
+                raise FileNotFoundError(f"Missing full-crop pilot root: {pilot_root}")
+            raw_candidate_pilot = source_route.get("candidate_pilot_evidence")
+            if not isinstance(raw_candidate_pilot, str) or not raw_candidate_pilot:
+                raise ValueError("full-crop source route has no residual pilot evidence")
+            _reject_reparse_chain(
+                Path(raw_candidate_pilot),
+                base=base,
+                description="residual candidate-pilot evidence",
+            )
+            candidate_pilot_evidence = _path_from(
+                source_route,
+                "candidate_pilot_evidence",
+                base=base,
+                description="residual candidate-pilot evidence",
+            )
+            candidate_pilot_sha256 = _sha256(candidate_pilot_evidence)
+            _require_claimed_hash(
+                source_route,
+                "candidate_pilot_evidence_sha256",
+                candidate_pilot_sha256,
+                "residual candidate-pilot evidence",
+            )
+            from .recipient_full_crop_candidate_source import (
+                validate_full_crop_training_recipe,
+                verify_full_crop_candidate_source,
+                verify_residual_candidate_pilot,
+            )
+
+            source_contract_payload = verify_full_crop_candidate_source(
+                pilot_root=pilot_root,
+                contract_path=source_contract,
+                full_records=full_manifest,
+            )
+            candidate_pilot_payload = verify_residual_candidate_pilot(
+                evidence_path=candidate_pilot_evidence,
+                source_contract_path=source_contract,
+                full_records=full_manifest,
+            )
+            source_subject_id = source_contract_payload.get("source_subject_id")
+            candidate_pilot_subject_id = candidate_pilot_payload.get(
+                "candidate_pilot_subject_id"
+            )
+            if not isinstance(source_subject_id, str) or len(source_subject_id) != 64:
+                raise ValueError("full-crop source contract has no valid subject identity")
+            if (
+                not isinstance(candidate_pilot_subject_id, str)
+                or len(candidate_pilot_subject_id) != 64
+            ):
+                raise ValueError("candidate-pilot evidence has no valid subject identity")
+            _require_equal(
+                candidate_pilot_payload.get("source_subject_id"),
+                source_subject_id,
+                "candidate-pilot source subject identity",
+            )
+            _require_equal(
+                source_route.get("source_subject_id"),
+                source_subject_id,
+                "candidate source-route source subject identity",
+            )
+            _require_equal(
+                source_route.get("candidate_pilot_subject_id"),
+                candidate_pilot_subject_id,
+                "candidate source-route pilot subject identity",
+            )
+            raw_training_recipe = training_binding.get("recipe")
+            if not isinstance(raw_training_recipe, str) or not raw_training_recipe:
+                raise ValueError("full-crop candidate has no bound training recipe")
+            _reject_reparse_chain(
+                Path(raw_training_recipe),
+                base=base,
+                description="full-crop candidate training recipe",
+            )
+            training_recipe = _path_from(
+                training_binding,
+                "recipe",
+                base=base,
+                description="full-crop candidate training recipe",
+            )
+            training_recipe_sha256 = _sha256(training_recipe)
+            _require_claimed_hash(
+                training_binding,
+                "recipe_sha256",
+                training_recipe_sha256,
+                "full-crop candidate training recipe",
+            )
+            validate_full_crop_training_recipe(
+                _load_json(training_recipe),
+                stage="candidate-60e",
+                source_subject_id=source_subject_id,
+                candidate_pilot_subject_id=candidate_pilot_subject_id,
+                source_checkpoint_sha256=source_checkpoint_sha256,
+                full_manifest_sha256=actual_hashes["full_manifest"],
+            )
+            source_artifacts = _mapping(
+                source_contract_payload.get("artifacts"), "full-crop source artifacts"
+            )
+            source_best = _path_from(
+                _mapping(source_artifacts.get("best_checkpoint"), "source best binding"),
+                "path",
+                base=source_contract.parent,
+                description="source-contract best checkpoint",
+            )
+            source_best_sha256 = _sha256(source_best)
+            _require_claimed_hash(
+                _mapping(source_artifacts.get("best_checkpoint"), "source best binding"),
+                "sha256",
+                source_best_sha256,
+                "source-contract best checkpoint",
+            )
+            if not source_best.samefile(source_checkpoint):
+                raise ValueError("candidate source checkpoint is not the source-contract pilot best.pt")
+
+            source_guard_paths["source_contract"] = source_contract
+            source_guard_paths["candidate_pilot_evidence"] = candidate_pilot_evidence
+            source_guard_paths["training_recipe"] = training_recipe
+            for prefix, payload in (
+                ("full_crop_source", source_contract_payload),
+                ("candidate_pilot", candidate_pilot_payload),
+            ):
+                bound_artifacts = _mapping(payload.get("artifacts"), f"{prefix} artifacts")
+                for artifact_name, raw_binding in bound_artifacts.items():
+                    binding = _mapping(raw_binding, f"{prefix} {artifact_name} binding")
+                    artifact_path = _path_from(
+                        binding,
+                        "path",
+                        base=source_contract.parent,
+                        description=f"{prefix} {artifact_name}",
+                    )
+                    _require_claimed_hash(
+                        binding,
+                        "sha256",
+                        _sha256(artifact_path),
+                        f"{prefix} {artifact_name}",
+                    )
+                    source_guard_paths[f"{prefix}_{artifact_name}"] = artifact_path
+            source_route_binding = {
+                "mode": mode,
+                "source_contract_sha256": source_contract_sha256,
+                "source_subject_id": source_subject_id,
+                "source_checkpoint_sha256": source_checkpoint_sha256,
+                "candidate_pilot_evidence_sha256": candidate_pilot_sha256,
+                "candidate_pilot_subject_id": candidate_pilot_subject_id,
+                "training_recipe_sha256": training_recipe_sha256,
+            }
 
     val = _load_json(val_summary)
     _validate_evaluation_kind(val, "validation summary")
@@ -432,6 +773,7 @@ def inspect_candidate(
         "training_summary_sha256": actual_hashes["training_summary"],
         "val_summary_sha256": actual_hashes["val_summary"],
         "fixed_floors": floors,
+        "source_route": source_route_binding,
     }
     identities = derive_gate_identity(
         model=model,
@@ -440,6 +782,18 @@ def inspect_candidate(
         labels=labels,
         evidence_binding=evidence_binding,
     )
+    unique_source_guards: dict[str, dict[str, str]] = {}
+    for name, path in source_guard_paths.items():
+        resolved = path.resolve()
+        sha256 = _sha256(resolved)
+        unique_source_guards.setdefault(
+            str(resolved),
+            {"name": name, "path": str(resolved), "sha256": sha256},
+        )
+    source_guard_artifacts = sorted(
+        unique_source_guards.values(), key=lambda item: (item["path"], item["name"])
+    )
+    source_guard_digest = _canonical_sha256({"artifacts": source_guard_artifacts})
     return {
         "schema_version": SCHEMA_VERSION,
         "kind": INSPECTION_KIND,
@@ -458,6 +812,8 @@ def inspect_candidate(
             "val_summary": str(val_summary),
         },
         "artifact_sha256": actual_hashes,
+        "source_guard_artifacts": source_guard_artifacts,
+        "source_guard_digest": source_guard_digest,
         "evidence_binding": evidence_binding,
         "fixed_floors": floors,
         "val_metrics": val_metrics,
@@ -487,6 +843,33 @@ def verify_test_summary(*, inspection: Path, summary: Path) -> dict[str, Any]:
     candidate_path = Path(str(expected.get("candidate_evidence"))).resolve()
     if not candidate_path.is_file() or _sha256(candidate_path) != expected.get("candidate_evidence_sha256"):
         raise ValueError("candidate evidence changed after the one-shot lock was created")
+    raw_source_guards = expected.get("source_guard_artifacts", [])
+    if not isinstance(raw_source_guards, list):
+        raise ValueError("inspection source_guard_artifacts must be a list")
+    normalized_source_guards: list[dict[str, str]] = []
+    for index, raw_guard in enumerate(raw_source_guards):
+        guard = _mapping(raw_guard, f"inspection source guard {index}")
+        name = guard.get("name")
+        raw_path = guard.get("path")
+        sha256 = guard.get("sha256")
+        if not isinstance(name, str) or not name:
+            raise ValueError(f"inspection source guard {index} has no name")
+        if not isinstance(raw_path, str) or not raw_path:
+            raise ValueError(f"inspection source guard {index} has no path")
+        if not isinstance(sha256, str) or len(sha256) != 64:
+            raise ValueError(f"inspection source guard {index} has no valid SHA-256")
+        path = Path(raw_path).resolve()
+        if not path.is_file() or _sha256(path) != sha256:
+            raise ValueError(f"source guard {name} changed after the one-shot lock was created")
+        normalized_source_guards.append(
+            {"name": name, "path": str(path), "sha256": sha256}
+        )
+    if raw_source_guards or "source_guard_digest" in expected:
+        _require_equal(
+            expected.get("source_guard_digest"),
+            _canonical_sha256({"artifacts": normalized_source_guards}),
+            "inspection source_guard_digest",
+        )
 
     # The inspection document is written after the persistent lock.  Rebuild
     # both identities from current artifact bytes so editing that intermediate

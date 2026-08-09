@@ -166,6 +166,9 @@ try {
         }
         $leases.Add((Open-ReadLease $path $name))
     }
+    foreach ($sourceGuard in @($inspection.source_guard_artifacts)) {
+        $leases.Add((Open-ReadLease ([string]$sourceGuard.path) ("source guard " + [string]$sourceGuard.name)))
+    }
 
     # Recompute every identity while immutable read leases are held. Any
     # between-inspection mutation fails before the test-attempt lock is made.
@@ -177,7 +180,8 @@ try {
             "model_sha256",
             "full_manifest_sha256",
             "contract_sha256",
-            "labels_sha256"
+            "labels_sha256",
+            "source_guard_digest"
         )) {
         if ([string]$secondInspection.PSObject.Properties[$name].Value -ne `
             [string]$inspection.PSObject.Properties[$name].Value) {
