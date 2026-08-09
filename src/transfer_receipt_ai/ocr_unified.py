@@ -129,6 +129,12 @@ RECIPIENT_ONLY_INIT_CHECKPOINT_MODES = frozenset(
         INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_WARMSTART,
     )
 )
+V13_PRIVATE_RECIPIENT_INIT_CHECKPOINT_MODES = frozenset(
+    (
+        INIT_CHECKPOINT_MODE_RECIPIENT_VISUAL_CONTEXT_REINIT,
+        INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_WARMSTART,
+    )
+)
 # These are the mature text heads that must not silently regress while a
 # recipient-focused experiment chooses its checkpoint.  The values are supplied
 # by the caller from a baseline measured on the same validation split.
@@ -4591,8 +4597,10 @@ def _batch_loss(
             }
         }
     if recipient_only:
-        if not _is_v12(config):
-            raise ValueError("recipient_only loss is supported only by architecture v12")
+        if not _uses_v12_recipient_topology(config):
+            raise ValueError(
+                "recipient_only loss requires the architecture v12 or v13 private recipient topology"
+            )
         if recipient_logits is None or recipient_to_id is None:
             raise ValueError("recipient_only loss requires recipient logits and a train-only recipient charset")
         recipient_loss, recipient_used, recipient_oov = _ctc_loss(
@@ -4608,9 +4616,9 @@ def _batch_loss(
             return None, None if not collect_metrics else {
                 "recipient_field": {"loss": math.nan, "used": recipient_used, "oov": recipient_oov}
             }
-        # v12 normally applies its CTC multiplier alongside finite structured
-        # heads.  Preserve that scalar so recipient-only fine-tuning has the
-        # same effective recipient-loss scale as the guarded full recipe.
+        # The shared v12/v13 private recipient branch normally applies its CTC
+        # multiplier alongside finite structured heads. Preserve that scalar
+        # so recipient-only fine-tuning keeps the guarded full-recipe scale.
         loss = recipient_loss * recipient_loss_weight * ctc_loss_weight
         if not collect_metrics:
             return loss, None
@@ -5947,10 +5955,10 @@ def _recipient_only_expansion_label_override(
     """
     if init_checkpoint_mode not in RECIPIENT_ONLY_INIT_CHECKPOINT_MODES:
         raise ValueError("recipient label override requires a recipient-only expansion init mode")
-    v13_recipient_private_mode = _is_v13(config) and init_checkpoint_mode in {
-        INIT_CHECKPOINT_MODE_RECIPIENT_VISUAL_CONTEXT_REINIT,
-        INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_WARMSTART,
-    }
+    v13_recipient_private_mode = (
+        _is_v13(config)
+        and init_checkpoint_mode in V13_PRIVATE_RECIPIENT_INIT_CHECKPOINT_MODES
+    )
     if not (_is_v12(config) or v13_recipient_private_mode):
         raise ValueError(
             "recipient-only expansion is supported by architecture v12, or by an audited v13 private-recipient mode"
@@ -6599,10 +6607,10 @@ def _parameter_only_initialization(
             raise ValueError("init checkpoint status-text character map does not match the current training data")
         return state_dict, initialization
 
-    v13_recipient_private_mode = _is_v13(config) and init_checkpoint_mode in {
-        INIT_CHECKPOINT_MODE_RECIPIENT_VISUAL_CONTEXT_REINIT,
-        INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_WARMSTART,
-    }
+    v13_recipient_private_mode = (
+        _is_v13(config)
+        and init_checkpoint_mode in V13_PRIVATE_RECIPIENT_INIT_CHECKPOINT_MODES
+    )
     if not (_is_v12(config) or v13_recipient_private_mode):
         raise ValueError(
             "recipient-only expansion init modes require architecture v12, or an audited v13 private-recipient mode"
@@ -6824,11 +6832,7 @@ def _validate_validation_every(
         and init_checkpoint_mode in RECIPIENT_ONLY_INIT_CHECKPOINT_MODES
         and (
             _is_v12(config)
-            or init_checkpoint_mode
-            in {
-                INIT_CHECKPOINT_MODE_RECIPIENT_VISUAL_CONTEXT_REINIT,
-                INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_WARMSTART,
-            }
+            or init_checkpoint_mode in V13_PRIVATE_RECIPIENT_INIT_CHECKPOINT_MODES
         )
     )
     status_text_private_safe = _is_v13(config) and status_text_only_fine_tune
@@ -7029,11 +7033,20 @@ def train_unified_reader(
             "init_checkpoint_mode must be one of "
             f"{', '.join(sorted(INIT_CHECKPOINT_MODES))}"
         )
+    if (
+        recipient_only_fine_tune
+        and _is_v13(config)
+        and init_checkpoint_mode not in V13_PRIVATE_RECIPIENT_INIT_CHECKPOINT_MODES
+    ):
+        raise ValueError(
+            "v13 recipient_only_fine_tune requires an audited private-recipient init mode: "
+            f"{', '.join(sorted(V13_PRIVATE_RECIPIENT_INIT_CHECKPOINT_MODES))}"
+        )
     if init_checkpoint_mode in RECIPIENT_ONLY_INIT_CHECKPOINT_MODES:
-        v13_recipient_private_mode = _is_v13(config) and init_checkpoint_mode in {
-            INIT_CHECKPOINT_MODE_RECIPIENT_VISUAL_CONTEXT_REINIT,
-            INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_WARMSTART,
-        }
+        v13_recipient_private_mode = (
+            _is_v13(config)
+            and init_checkpoint_mode in V13_PRIVATE_RECIPIENT_INIT_CHECKPOINT_MODES
+        )
         if not recipient_only_fine_tune or not (_is_v12(config) or v13_recipient_private_mode):
             raise ValueError(
                 "recipient-only expansion init modes require v12 recipient_only_fine_tune, "

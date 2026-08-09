@@ -11,6 +11,7 @@ import pytest
 
 from transfer_receipt_ai.ocr_unified import (
     INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_WARMSTART,
+    INIT_CHECKPOINT_MODE_STRICT,
     KIND_V13,
     STATUS_CLASSES,
     STATUS_TEXT_BLANK_INDEX,
@@ -588,6 +589,21 @@ def test_full_crop_training_api_rejects_transductive_recipient_splits(tmp_path: 
             init_checkpoint=tmp_path / "not-opened.pt",
             init_checkpoint_mode=INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_WARMSTART,
         )
+
+
+def test_v13_recipient_only_strict_init_is_rejected_before_any_io(tmp_path: Path) -> None:
+    output = tmp_path / "not-created"
+    with pytest.raises(ValueError, match="v13 recipient_only_fine_tune requires"):
+        train_unified_reader(
+            records_path=tmp_path / "not-opened.jsonl",
+            dataset_root=tmp_path,
+            output_dir=output,
+            config=_target_config(),
+            recipient_only_fine_tune=True,
+            init_checkpoint=tmp_path / "not-opened.pt",
+            init_checkpoint_mode=INIT_CHECKPOINT_MODE_STRICT,
+        )
+    assert not output.exists()
 
 
 def test_full_crop_training_api_rejects_a_physical_test_row_before_loading(tmp_path: Path) -> None:

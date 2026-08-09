@@ -436,6 +436,75 @@ def test_status_text_only_loss_masks_missing_visible_labels() -> None:
     assert torch.count_nonzero(logits.grad[:, 1, :]) == 0
 
 
+def _recipient_only_batch_loss(*, torch: object, logits: object, config: UnifiedReaderConfig):
+    loss, metrics = _batch_loss(
+        None,
+        None,
+        None,
+        None,
+        [
+            {"slots": {"recipient_field": {"text": "商"}}},
+            {"slots": {"recipient_field": {"text": "户"}}},
+        ],
+        amount_to_id={},
+        time_to_id={},
+        payment_to_id={},
+        recipient_logits=logits,
+        recipient_to_id={"商": 1, "户": 2},
+        payment_bank_prefix_classes=None,
+        payment_bank_class_weights=None,
+        status_to_id={},
+        status_criterion=None,
+        status_enabled=False,
+        payment_loss_weight=1.0,
+        recipient_loss_weight=1.25,
+        config=config,
+        structured_outputs=None,
+        ctc_loss_weight=0.35,
+        structured_loss_weight=1.0,
+        torch=torch,
+        collect_metrics=False,
+        recipient_only=True,
+    )
+    assert metrics is None
+    assert loss is not None
+    return loss
+
+
+def test_v12_and_v13_recipient_only_ctc_loss_are_exactly_identical() -> None:
+    torch = pytest.importorskip("torch")
+    torch.manual_seed(17)
+    logits = torch.randn((12, 2, 3), dtype=torch.float32, requires_grad=True)
+
+    v12_loss = _recipient_only_batch_loss(
+        torch=torch, logits=logits, config=_tiny_config(12)
+    )
+    v13_loss = _recipient_only_batch_loss(
+        torch=torch, logits=logits, config=_tiny_config(13)
+    )
+
+    assert torch.equal(v12_loss, v13_loss)
+
+
+def test_v11_recipient_only_ctc_loss_remains_rejected() -> None:
+    torch = pytest.importorskip("torch")
+    config = UnifiedReaderConfig(
+        architecture_version=11,
+        image_height=32,
+        image_width=64,
+        base_channels=8,
+        numeric_hidden_size=16,
+        payment_hidden_size=16,
+        recipient_hidden_size=16,
+        pooled_width=2,
+    )
+    config.validate()
+    logits = torch.randn((12, 2, 3), dtype=torch.float32, requires_grad=True)
+
+    with pytest.raises(ValueError, match="v12 or v13 private recipient topology"):
+        _recipient_only_batch_loss(torch=torch, logits=logits, config=config)
+
+
 def _v12_seed_payload(config: UnifiedReaderConfig, state_dict: object) -> dict[str, object]:
     recipient_characters = ["商", "户"]
     return {
