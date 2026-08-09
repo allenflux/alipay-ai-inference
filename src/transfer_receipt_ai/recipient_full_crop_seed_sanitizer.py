@@ -60,6 +60,8 @@ ATTESTATION_KEY = "full_crop_seed_sanitizer_attestation"
 ATTESTATION_KIND = "receipt_recipient_full_crop_seed_sanitizer_attestation_v1"
 RECIPIENT_PREFIX = "recipient_"
 STATUS_TEXT_PREFIX = "status_text_"
+V12_PASSIVE_STATUS_TEXT_LOSS_WEIGHT_KEY = "status_text_loss_weight"
+V12_PASSIVE_STATUS_TEXT_LOSS_WEIGHT = 1.0
 REQUIRED_RECIPIENT_INPUT_WIDTH = 1536
 PUBLICATION_POLICY = "same_directory_hard_link_no_clobber_v1"
 TOPOLOGY_POLICY = "v12_v13_private_recipient_prefix_partition_v1"
@@ -722,6 +724,49 @@ def _valid_epoch(payload: Mapping[str, object], *, description: str) -> int:
     return epoch
 
 
+def _validate_v12_passive_status_text_metadata(
+    payload: Mapping[str, object], *, description: str
+) -> None:
+    """Allow only the inert status-loss scalar emitted by every v12 checkpoint.
+
+    The unified trainer persists ``status_text_loss_weight`` for every
+    architecture even though v12 has no visible-status CTC head.  The fixed
+    bootstrap recipe leaves that inert scalar at its CLI default of ``1.0``.
+    Treating its name as proof of a v13 branch rejects genuine v12 artifacts;
+    accepting any other ``status_text_`` metadata would weaken the intended
+    v12/v13 boundary.
+    """
+
+    observed = {
+        key for key in payload if isinstance(key, str) and key.startswith(STATUS_TEXT_PREFIX)
+    }
+    unexpected = sorted(observed - {V12_PASSIVE_STATUS_TEXT_LOSS_WEIGHT_KEY})
+    if unexpected:
+        raise ValueError(
+            f"{description} unexpectedly contains active status-text metadata: "
+            f"{', '.join(unexpected)}"
+        )
+    if V12_PASSIVE_STATUS_TEXT_LOSS_WEIGHT_KEY not in observed:
+        raise ValueError(
+            f"{description} is missing the fixed v12 passive status-text loss weight"
+        )
+    raw_weight = payload.get(V12_PASSIVE_STATUS_TEXT_LOSS_WEIGHT_KEY)
+    if isinstance(raw_weight, bool) or not isinstance(raw_weight, (int, float)):
+        raise ValueError(
+            f"{description} has an invalid fixed v12 passive status-text loss weight"
+        )
+    weight = float(raw_weight)
+    if not math.isfinite(weight) or not math.isclose(
+        weight,
+        V12_PASSIVE_STATUS_TEXT_LOSS_WEIGHT,
+        rel_tol=0.0,
+        abs_tol=0.0,
+    ):
+        raise ValueError(
+            f"{description} has an invalid fixed v12 passive status-text loss weight"
+        )
+
+
 def _validate_status_only_v13(payload: Mapping[str, object]) -> tuple[Any, Mapping[str, object]]:
     if payload.get("kind") != KIND_V13:
         raise ValueError("status checkpoint must be a v13 checkpoint")
@@ -805,8 +850,9 @@ def _validate_train_only_v12(payload: Mapping[str, object]) -> tuple[Any, Mappin
     if config.recipient_input_width != REQUIRED_RECIPIENT_INPUT_WIDTH:
         raise ValueError("train-only v12 checkpoint is not the required wide1536 configuration")
     _checkpoint_labels(payload, config=config)
-    if any(key.startswith(STATUS_TEXT_PREFIX) for key in payload):
-        raise ValueError("train-only v12 checkpoint unexpectedly contains status-text metadata")
+    _validate_v12_passive_status_text_metadata(
+        payload, description="train-only v12 checkpoint"
+    )
     state = _state_dict(payload, description="train-only v12 checkpoint")
     if any(key.startswith(STATUS_TEXT_PREFIX) for key in state):
         raise ValueError("train-only v12 checkpoint unexpectedly contains status_text_ tensors")
@@ -865,8 +911,7 @@ def _validate_train_only_lineage_checkpoint(
     _require_checkpoint_without_optimizer_state(payload, description=description)
     config = _checkpoint_config(payload)
     _checkpoint_labels(payload, config=config)
-    if any(key.startswith(STATUS_TEXT_PREFIX) for key in payload):
-        raise ValueError(f"{description} unexpectedly contains status-text metadata")
+    _validate_v12_passive_status_text_metadata(payload, description=description)
     state = _state_dict(payload, description=description)
     if any(key.startswith(STATUS_TEXT_PREFIX) for key in state):
         raise ValueError(f"{description} unexpectedly contains status_text_ tensors")

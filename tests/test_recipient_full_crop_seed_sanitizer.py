@@ -164,6 +164,9 @@ def _payload(
         },
         "recipient_train_split_policy": split_policy,
         "recipient_loss_weight": 1.0,
+        # ocr_unified persists this CLI scalar in every checkpoint, including
+        # v12 where no status-text head exists.
+        "status_text_loss_weight": 1.0,
         "epoch": 4,
         "metrics": {"source": "status" if architecture == 13 else "recipient"},
     }
@@ -435,6 +438,81 @@ def test_sanitizer_rejects_transductive_source_policy_provenance() -> None:
     with pytest.raises(ValueError, match="does not prove train-only"):
         status_source = _source("/status.pt", KIND_V13)
         train_source = _source("/recipient.pt", KIND_V12)
+        _build_sanitized_payload(
+            status_payload=status,
+            train_payload=recipient,
+            status_source=status_source,
+            train_source=train_source,
+            train_lineage=_lineage(recipient, train_source),
+        )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [None, True, "1.0", 0.0, -1.0, 2.0, float("nan"), float("inf")],
+)
+def test_sanitizer_rejects_invalid_v12_passive_status_text_loss_weight(
+    value: object,
+) -> None:
+    status = _payload(architecture=13, train_only=False, recipient_fill=8.0)
+    recipient = _payload(architecture=12, train_only=True, recipient_fill=3.0)
+    recipient["status_text_loss_weight"] = value
+    status_source = _source("/status.pt", KIND_V13)
+    train_source = _source("/recipient.pt", KIND_V12)
+    with pytest.raises(ValueError, match="fixed v12 passive status-text loss weight"):
+        _build_sanitized_payload(
+            status_payload=status,
+            train_payload=recipient,
+            status_source=status_source,
+            train_source=train_source,
+            train_lineage=_lineage(recipient, train_source),
+        )
+
+
+def test_sanitizer_requires_real_v12_passive_status_text_loss_weight() -> None:
+    status = _payload(architecture=13, train_only=False, recipient_fill=8.0)
+    recipient = _payload(architecture=12, train_only=True, recipient_fill=3.0)
+    del recipient["status_text_loss_weight"]
+    status_source = _source("/status.pt", KIND_V13)
+    train_source = _source("/recipient.pt", KIND_V12)
+    with pytest.raises(ValueError, match="missing the fixed v12 passive status-text loss weight"):
+        _build_sanitized_payload(
+            status_payload=status,
+            train_payload=recipient,
+            status_source=status_source,
+            train_source=train_source,
+            train_lineage=_lineage(recipient, train_source),
+        )
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["status_text_characters", "status_text_runtime_policy", "status_text_target"],
+)
+def test_sanitizer_rejects_active_status_text_metadata_in_v12(key: str) -> None:
+    status = _payload(architecture=13, train_only=False, recipient_fill=8.0)
+    recipient = _payload(architecture=12, train_only=True, recipient_fill=3.0)
+    recipient[key] = "forbidden"
+    status_source = _source("/status.pt", KIND_V13)
+    train_source = _source("/recipient.pt", KIND_V12)
+    with pytest.raises(ValueError, match="active status-text metadata"):
+        _build_sanitized_payload(
+            status_payload=status,
+            train_payload=recipient,
+            status_source=status_source,
+            train_source=train_source,
+            train_lineage=_lineage(recipient, train_source),
+        )
+
+
+def test_sanitizer_rejects_status_text_state_tensor_in_v12() -> None:
+    torch = _torch()
+    status = _payload(architecture=13, train_only=False, recipient_fill=8.0)
+    recipient = _payload(architecture=12, train_only=True, recipient_fill=3.0)
+    recipient["state_dict"]["status_text_classifier.weight"] = torch.zeros((1, 1))
+    status_source = _source("/status.pt", KIND_V13)
+    train_source = _source("/recipient.pt", KIND_V12)
+    with pytest.raises(ValueError, match="unexpectedly contains status_text_ tensors"):
         _build_sanitized_payload(
             status_payload=status,
             train_payload=recipient,
