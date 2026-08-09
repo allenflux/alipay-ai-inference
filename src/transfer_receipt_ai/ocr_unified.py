@@ -108,6 +108,8 @@ INIT_CHECKPOINT_MODE_RECIPIENT_CAPACITY_REINIT = "recipient_capacity_reinit"
 INIT_CHECKPOINT_MODE_RECIPIENT_OPEN_TEXT_ADAPTER = "recipient_open_text_adapter"
 INIT_CHECKPOINT_MODE_RECIPIENT_VISUAL_CONTEXT_REINIT = "recipient_visual_context_reinit"
 INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_WARMSTART = "recipient_full_crop_warmstart"
+INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_CONTINUATION = "recipient_full_crop_continuation"
+FULL_CROP_CONTINUATION_AUTHORITY_KEY = "full_crop_continuation_authority"
 INIT_CHECKPOINT_MODES = frozenset(
     (
         INIT_CHECKPOINT_MODE_STRICT,
@@ -117,6 +119,7 @@ INIT_CHECKPOINT_MODES = frozenset(
         INIT_CHECKPOINT_MODE_RECIPIENT_OPEN_TEXT_ADAPTER,
         INIT_CHECKPOINT_MODE_RECIPIENT_VISUAL_CONTEXT_REINIT,
         INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_WARMSTART,
+        INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_CONTINUATION,
     )
 )
 RECIPIENT_ONLY_INIT_CHECKPOINT_MODES = frozenset(
@@ -127,14 +130,37 @@ RECIPIENT_ONLY_INIT_CHECKPOINT_MODES = frozenset(
         INIT_CHECKPOINT_MODE_RECIPIENT_OPEN_TEXT_ADAPTER,
         INIT_CHECKPOINT_MODE_RECIPIENT_VISUAL_CONTEXT_REINIT,
         INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_WARMSTART,
+        INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_CONTINUATION,
     )
 )
 V13_PRIVATE_RECIPIENT_INIT_CHECKPOINT_MODES = frozenset(
     (
         INIT_CHECKPOINT_MODE_RECIPIENT_VISUAL_CONTEXT_REINIT,
         INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_WARMSTART,
+        INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_CONTINUATION,
     )
 )
+
+
+def _has_analysis_only_full_crop_continuation_lineage(
+    payload: Mapping[str, object],
+) -> bool:
+    """Recognize both the authorized source and every B8 child checkpoint."""
+
+    if FULL_CROP_CONTINUATION_AUTHORITY_KEY in payload:
+        return True
+    initialization = payload.get("initialization")
+    if not isinstance(initialization, Mapping):
+        return False
+    return (
+        initialization.get("init_checkpoint_mode")
+        == INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_CONTINUATION
+        or isinstance(
+            initialization.get("source_full_crop_continuation_authority"), Mapping
+        )
+    )
+
+
 # These are the mature text heads that must not silently regress while a
 # recipient-focused experiment chooses its checkpoint.  The values are supplied
 # by the caller from a baseline measured on the same validation split.
@@ -5902,6 +5928,61 @@ def _validate_recipient_full_crop_warmstart_config(
         )
 
 
+def _validate_recipient_full_crop_continuation_config(
+    source_config: UnifiedReaderConfig,
+    target_config: UnifiedReaderConfig,
+) -> None:
+    """Require the fixed legacy trim-zero continuation topology exactly.
+
+    Unlike the first full-crop warm start, this mode is not a topology or
+    preprocessing transition.  It may only reopen the already measured v13
+    legacy full-crop model, with every dataclass field identical.  Keeping the
+    check separate from ``strict`` prevents an ordinary checkpoint from
+    acquiring the continuation authority merely because its shapes happen to
+    match.
+    """
+
+    if not (_is_v13(source_config) and _is_v13(target_config)):
+        raise ValueError("recipient_full_crop_continuation requires v13 source and target configs")
+    if source_config.recipient_backbone != "legacy_depthwise_gru_v1":
+        raise ValueError("recipient_full_crop_continuation requires the legacy recipient backbone")
+    if not math.isclose(
+        source_config.recipient_value_left_trim, 0.0, rel_tol=0.0, abs_tol=1e-12
+    ):
+        raise ValueError("recipient_full_crop_continuation requires a trim-zero source")
+    source_values = asdict(source_config)
+    target_values = asdict(target_config)
+    if source_values != target_values:
+        changed = [
+            key
+            for key in sorted(source_values)
+            if source_values[key] != target_values.get(key)
+        ]
+        raise ValueError(
+            "recipient_full_crop_continuation requires an exact source/target config match; "
+            f"incompatible config fields: {', '.join(changed)}"
+        )
+
+
+def _validate_recipient_full_crop_continuation_policy(
+    payload: Mapping[str, object], *, torch: Any | None = None
+) -> Mapping[str, object]:
+    """Reopen the embedded, content-bound B8 source authority."""
+
+    if torch is None:
+        raise ValueError("continuation source revalidation requires the active torch runtime")
+    try:
+        from .recipient_full_crop_continuation import (
+            validate_embedded_continuation_authority,
+        )
+
+        return validate_embedded_continuation_authority(payload, torch=torch)
+    except (ImportError, OSError, TypeError, ValueError) as error:
+        raise ValueError(
+            "recipient_full_crop_continuation requires a valid embedded content-bound authority"
+        ) from error
+
+
 def _validate_recipient_full_crop_seed_policy(
     payload: Mapping[str, object], *, torch: Any | None = None
 ) -> None:
@@ -5969,8 +6050,17 @@ def _recipient_only_expansion_label_override(
     if not checkpoint_path.is_file():
         raise FileNotFoundError(checkpoint_path)
     payload = _load_checkpoint(checkpoint_path, torch=torch)
+    if (
+        _has_analysis_only_full_crop_continuation_lineage(payload)
+        and init_checkpoint_mode != INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_CONTINUATION
+    ):
+        raise ValueError(
+            "an analysis-only full-crop continuation authority cannot be used by another init mode"
+        )
     if init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_WARMSTART:
         _validate_recipient_full_crop_seed_policy(payload, torch=torch)
+    elif init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_CONTINUATION:
+        _validate_recipient_full_crop_continuation_policy(payload, torch=torch)
     source_config = _checkpoint_config(payload)
     if init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_INPUT_WIDTH_EXPANSION:
         # Validate even when the two dataclasses compare equal: this mode is a
@@ -5986,6 +6076,8 @@ def _recipient_only_expansion_label_override(
         _validate_recipient_visual_context_reinit_config(source_config, config)
     elif init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_WARMSTART:
         _validate_recipient_full_crop_warmstart_config(source_config, config)
+    elif init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_CONTINUATION:
+        _validate_recipient_full_crop_continuation_config(source_config, config)
     elif source_config != config:
         raise ValueError(
             "init checkpoint model config does not match the requested training config; "
@@ -6008,6 +6100,20 @@ def _recipient_only_expansion_label_override(
             raise ValueError(f"init checkpoint {label} does not match the current training data")
     if source_recipient_characters is None:
         raise ValueError("init checkpoint recipient character map does not match the current training data")
+    if init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_CONTINUATION:
+        for label, source_values, current_values in (
+            ("payment character map", source_payment_characters, payment_characters),
+            ("recipient character map", source_recipient_characters, recipient_characters),
+            (
+                "payment bank-prefix class map",
+                source_payment_bank_prefix_classes,
+                payment_bank_prefix_classes,
+            ),
+        ):
+            if source_values is None or current_values is None or list(source_values) != list(current_values):
+                raise ValueError(
+                    f"recipient_full_crop_continuation requires an exact {label} match"
+                )
     source_recipient_set = set(source_recipient_characters)
     fresh_train_only_recipient_map = (
         init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_VISUAL_CONTEXT_REINIT
@@ -6015,7 +6121,11 @@ def _recipient_only_expansion_label_override(
     effective_recipient_characters = (
         sorted(set(recipient_characters))
         if fresh_train_only_recipient_map
-        else sorted(source_recipient_set | set(recipient_characters))
+        else (
+            list(source_recipient_characters)
+            if init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_CONTINUATION
+            else sorted(source_recipient_set | set(recipient_characters))
+        )
     )
     if source_payment_bank_prefix_classes is None:
         raise ValueError("init checkpoint payment bank-prefix class map does not match the current training data")
@@ -6040,7 +6150,12 @@ def _recipient_only_expansion_label_override(
                                 "checkpoint_financial_label_maps_recipient_full_crop_warmstart_v1"
                                 if init_checkpoint_mode
                                 == INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_WARMSTART
-                                else "checkpoint_financial_label_maps_v1"
+                                else (
+                                    "checkpoint_all_label_maps_recipient_full_crop_continuation_v1"
+                                    if init_checkpoint_mode
+                                    == INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_CONTINUATION
+                                    else "checkpoint_financial_label_maps_v1"
+                                )
                             )
                         )
                     )
@@ -6133,6 +6248,10 @@ def _status_text_only_legacy_label_override(
     if not checkpoint_path.is_file():
         raise FileNotFoundError(checkpoint_path)
     payload = _load_checkpoint(checkpoint_path, torch=torch)
+    if _has_analysis_only_full_crop_continuation_lineage(payload):
+        raise ValueError(
+            "an analysis-only full-crop continuation authority cannot seed status-text training"
+        )
     source_config = _checkpoint_config(payload)
     if _is_v12(source_config):
         source_values = asdict(source_config)
@@ -6455,8 +6574,20 @@ def _parameter_only_initialization(
     if not checkpoint_path.is_file():
         raise FileNotFoundError(checkpoint_path)
     payload = _load_checkpoint(checkpoint_path, torch=torch)
+    if (
+        _has_analysis_only_full_crop_continuation_lineage(payload)
+        and init_checkpoint_mode != INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_CONTINUATION
+    ):
+        raise ValueError(
+            "an analysis-only full-crop continuation authority cannot be used by another init mode"
+        )
+    continuation_authority: Mapping[str, object] | None = None
     if init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_WARMSTART:
         _validate_recipient_full_crop_seed_policy(payload, torch=torch)
+    elif init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_CONTINUATION:
+        continuation_authority = _validate_recipient_full_crop_continuation_policy(
+            payload, torch=torch
+        )
     source_config = _checkpoint_config(payload)
     v12_status_text_expansion = (
         allow_v12_status_text_expansion and _is_v12(source_config) and _is_v13(config)
@@ -6474,6 +6605,8 @@ def _parameter_only_initialization(
         _validate_recipient_visual_context_reinit_config(source_config, config)
     elif init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_WARMSTART:
         _validate_recipient_full_crop_warmstart_config(source_config, config)
+    elif init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_CONTINUATION:
+        _validate_recipient_full_crop_continuation_config(source_config, config)
     elif v12_status_text_expansion:
         source_values = asdict(source_config)
         target_values = asdict(config)
@@ -6540,6 +6673,18 @@ def _parameter_only_initialization(
                 ),
             }
             if init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_WARMSTART
+            else {}
+        ),
+        **(
+            {
+                "source_full_crop_continuation_authority": dict(continuation_authority),
+                "optimizer_restored": False,
+                "scheduler_restored": False,
+                "sampler_state_restored": False,
+                "best_history_restored": False,
+                "source_epoch_restored": False,
+            }
+            if init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_CONTINUATION
             else {}
         ),
     }
@@ -6627,6 +6772,45 @@ def _parameter_only_initialization(
             raise ValueError("init checkpoint status-text character map does not match the current training data")
     elif list(source_status_text_characters) != list(status_text_characters):
         raise ValueError("init checkpoint status-text character map does not match the current training data")
+    if init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_CONTINUATION:
+        if list(source_recipient_characters) != list(recipient_characters):
+            raise ValueError(
+                "recipient_full_crop_continuation requires an exact recipient character map match"
+            )
+        source_keys = set(state_dict)
+        target_keys = set(target_state_dict)
+        if source_keys != target_keys:
+            raise ValueError(
+                "recipient_full_crop_continuation requires an exact all-state key match"
+            )
+        shape_mismatches = [
+            name
+            for name in sorted(source_keys)
+            if (
+                str(getattr(state_dict[name], "dtype", None)),
+                tuple(getattr(state_dict[name], "shape", ())),
+            )
+            != (
+                str(getattr(target_state_dict[name], "dtype", None)),
+                tuple(getattr(target_state_dict[name], "shape", ())),
+            )
+        ]
+        if shape_mismatches:
+            raise ValueError(
+                "recipient_full_crop_continuation changed state tensor dtype/shape: "
+                + ", ".join(shape_mismatches[:5])
+            )
+        initialization.update(
+            {
+                "mode": "parameter_only_recipient_full_crop_continuation_all_state_copy",
+                "init_checkpoint_mode": init_checkpoint_mode,
+                "all_state_tensor_count_copied": len(source_keys),
+                "all_state_key_set_exact": True,
+                "all_state_dtype_shape_exact": True,
+                "all_state_value_copy": "source_tensor_objects_loaded_strictly_before_cuda",
+            }
+        )
+        return state_dict, initialization
     if init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_VISUAL_CONTEXT_REINIT:
         remapped_state, visual_context_mapping = _recipient_visual_context_reinit_state(
             source_state_dict=state_dict,
@@ -6899,6 +7083,43 @@ def _non_recipient_parameter_bytes(model: Any) -> dict[str, bytes]:
     return snapshots
 
 
+def _state_dict_exact_bytes(state: Mapping[str, object]) -> dict[str, bytes]:
+    """Snapshot every state tensor for an exact continuation-copy proof."""
+
+    snapshots: dict[str, bytes] = {}
+    for name, raw_tensor in state.items():
+        if not isinstance(name, str) or not hasattr(raw_tensor, "detach"):
+            raise AssertionError(f"model state entry {name!r} is not a tensor")
+        tensor = raw_tensor.detach().cpu().contiguous()
+        try:
+            # ``view(uint8)`` also handles dtypes whose direct NumPy conversion
+            # is unavailable, and preserves signed-zero/NaN payload bits.
+            import torch
+
+            snapshots[name] = tensor.reshape(-1).view(torch.uint8).numpy().tobytes()
+        except (ImportError, RuntimeError, TypeError, ValueError) as error:
+            raise AssertionError(f"unable to snapshot model state entry {name!r}") from error
+    if not snapshots:
+        raise AssertionError("model has no state tensors")
+    return snapshots
+
+
+def _assert_state_dict_exact_copy(
+    observed: Mapping[str, object], expected: Mapping[str, object]
+) -> None:
+    observed_bytes = _state_dict_exact_bytes(observed)
+    expected_bytes = _state_dict_exact_bytes(expected)
+    if set(observed_bytes) != set(expected_bytes):
+        raise AssertionError("continuation all-state key set changed during strict load")
+    changed = [
+        name for name in sorted(observed_bytes) if observed_bytes[name] != expected_bytes[name]
+    ]
+    if changed:
+        raise AssertionError(
+            "continuation all-state copy is not byte-identical: " + ", ".join(changed[:5])
+        )
+
+
 def _assert_non_recipient_parameter_bytes(model: Any, expected: Mapping[str, bytes]) -> None:
     """Fail closed if a frozen financial/shared parameter has changed."""
     observed = _non_recipient_parameter_bytes(model)
@@ -7009,10 +7230,13 @@ def train_unified_reader(
             raise ValueError("status_text_only_fine_tune requires a compatible v12 or v13 --init-checkpoint")
     recipient_train_split_policy = _recipient_train_split_policy(recipient_train_splits)
     if (
-        init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_WARMSTART
+        init_checkpoint_mode in {
+            INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_WARMSTART,
+            INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_CONTINUATION,
+        }
         and recipient_train_split_policy["mode"] != "standard_train_only"
     ):
-        raise ValueError("recipient_full_crop_warmstart permits train-split supervision only")
+        raise ValueError("full-crop recipient init modes permit train-split supervision only")
     if recipient_only_fine_tune:
         if not _uses_v12_recipient_topology(config):
             raise ValueError("recipient_only_fine_tune is supported only by architecture v12 or v13")
@@ -7054,6 +7278,106 @@ def train_unified_reader(
             )
         if init_checkpoint is None:
             raise ValueError("recipient-only expansion init modes require a compatible --init-checkpoint")
+    if init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_CONTINUATION:
+        fixed_recipe_matches = (
+            recipient_only_fine_tune
+            and not status_text_only_fine_tune
+            and device == "cuda:0"
+            and epochs == 8
+            and batch_size == 10
+            and math.isclose(learning_rate, 0.0001, rel_tol=0.0, abs_tol=1e-12)
+            and math.isclose(weight_decay, 0.0001, rel_tol=0.0, abs_tol=1e-12)
+            and validation_every == 1
+            and checkpoint_selection == CHECKPOINT_SELECTION_RECIPIENT_PRIORITY
+            and checkpoint_min_amount_candidate_exact is not None
+            and math.isclose(
+                checkpoint_min_amount_candidate_exact,
+                0.7885,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+            and checkpoint_min_time_candidate_exact is not None
+            and math.isclose(
+                checkpoint_min_time_candidate_exact,
+                0.9840,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+            and checkpoint_min_payment_candidate_exact is not None
+            and math.isclose(
+                checkpoint_min_payment_candidate_exact,
+                0.9325,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+            and math.isclose(ctc_loss_weight, 1.0, rel_tol=0.0, abs_tol=1e-12)
+            and math.isclose(structured_loss_weight, 1.0, rel_tol=0.0, abs_tol=1e-12)
+            and math.isclose(payment_loss_weight, 1.0, rel_tol=0.0, abs_tol=1e-12)
+            and math.isclose(recipient_loss_weight, 1.0, rel_tol=0.0, abs_tol=1e-12)
+            and math.isclose(status_text_loss_weight, 1.0, rel_tol=0.0, abs_tol=1e-12)
+            and math.isclose(recipient_sampling_weight, 1.0, rel_tol=0.0, abs_tol=1e-12)
+            and recipient_rare_character_max_support == 0
+            and math.isclose(
+                recipient_rare_character_sampling_weight, 1.0, rel_tol=0.0, abs_tol=1e-12
+            )
+            and recipient_long_text_min_length == 0
+            and math.isclose(
+                recipient_long_text_sampling_weight, 1.0, rel_tol=0.0, abs_tol=1e-12
+            )
+            and recipient_low_confidence_threshold is not None
+            and math.isclose(
+                recipient_low_confidence_threshold, 0.95, rel_tol=0.0, abs_tol=1e-12
+            )
+            and math.isclose(
+                recipient_low_confidence_loss_weight, 0.50, rel_tol=0.0, abs_tol=1e-12
+            )
+            and recipient_confidence_curriculum_epochs == 10
+            and recipient_tail_rare_character_max_support == 3
+            and math.isclose(
+                recipient_tail_rare_character_loss_weight, 1.5, rel_tol=0.0, abs_tol=1e-12
+            )
+            and recipient_tail_long_text_min_length == 9
+            and math.isclose(
+                recipient_tail_long_text_loss_weight, 1.5, rel_tol=0.0, abs_tol=1e-12
+            )
+            and recipient_train_augmentation == "robust_v2"
+            and seed == 42
+            and payment_bank_prefix_min_support == 3
+            and cuda_tf32 is True
+            and cudnn_benchmark is True
+            and persistent_workers is (num_workers > 0)
+        )
+        if not fixed_recipe_matches:
+            raise ValueError(
+                "recipient_full_crop_continuation is hard-locked to the audited fixed B8 recipe"
+            )
+        # Fail before manifest/dataset/output access.  A matching v13 shape is
+        # not authority: this private mode exists only for the embedded,
+        # content-bound fixed pilot source.
+        assert init_checkpoint is not None
+        continuation_torch, _ = _require_torch()
+        try:
+            continuation_cuda_available = bool(continuation_torch.cuda.is_available())
+            continuation_cuda_name = (
+                str(continuation_torch.cuda.get_device_name(0))
+                if continuation_cuda_available
+                else ""
+            )
+        except (AttributeError, RuntimeError) as error:
+            raise ValueError(
+                "recipient_full_crop_continuation requires CUDA device 0 on an RTX 4090"
+            ) from error
+        if not continuation_cuda_available or "4090" not in continuation_cuda_name:
+            raise ValueError(
+                "recipient_full_crop_continuation requires CUDA device 0 on an RTX 4090"
+            )
+        continuation_payload = _load_checkpoint(Path(init_checkpoint).resolve(), torch=continuation_torch)
+        _validate_recipient_full_crop_continuation_policy(
+            continuation_payload, torch=continuation_torch
+        )
+        _validate_recipient_full_crop_continuation_config(
+            _checkpoint_config(continuation_payload), config
+        )
     _validate_validation_every(
         validation_every,
         config=config,
@@ -7154,7 +7478,10 @@ def train_unified_reader(
     output_dir = output_dir.resolve()
     if output_dir.exists() and any(output_dir.iterdir()):
         raise ValueError(f"training output already contains files: {output_dir}. Choose a new empty directory.")
-    if init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_WARMSTART:
+    if init_checkpoint_mode in {
+        INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_WARMSTART,
+        INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_CONTINUATION,
+    }:
         _require_manifest_without_test_rows(records_path)
     records = load_records(records_path, dataset_root=dataset_root, config=config)
     train_records = [record for record in records if record["split"] == "train"]
@@ -7497,6 +7824,8 @@ def train_unified_reader(
         # This is intentionally strict: equal tensor shapes are insufficient
         # when a CTC character or classifier-class ordering has changed.
         model.load_state_dict(initialization_state, strict=True)
+        if init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_CONTINUATION:
+            _assert_state_dict_exact_copy(model.state_dict(), initialization_state)
     if financial_label_policy is not None:
         initialization = {
             **initialization,
@@ -7584,7 +7913,11 @@ def train_unified_reader(
             validation_every > 1
             and init_checkpoint_mode in RECIPIENT_ONLY_INIT_CHECKPOINT_MODES
         )
-        or init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_WARMSTART
+        or init_checkpoint_mode
+        in {
+            INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_WARMSTART,
+            INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_CONTINUATION,
+        }
     ):
         frozen_non_recipient_parameter_snapshot = _non_recipient_parameter_bytes(model)
         fine_tune_policy = {
@@ -7592,6 +7925,15 @@ def train_unified_reader(
             "frozen_non_recipient_byte_guard": "before_every_full_validation",
             "frozen_non_recipient_state_entry_count": len(
                 frozen_non_recipient_parameter_snapshot
+            ),
+            **(
+                {
+                    "initialization_non_recipient_byte_guard":
+                    "before_epoch_zero_validation"
+                }
+                if init_checkpoint_mode
+                == INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_CONTINUATION
+                else {}
             ),
         }
     if status_text_only_fine_tune:
@@ -7680,6 +8022,7 @@ def train_unified_reader(
         INIT_CHECKPOINT_MODE_RECIPIENT_INPUT_WIDTH_EXPANSION,
         INIT_CHECKPOINT_MODE_RECIPIENT_OPEN_TEXT_ADAPTER,
         INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_WARMSTART,
+        INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_CONTINUATION,
     }:
         # Measure and persist the exact transplanted model as epoch zero so a
         # pilot cannot silently return a checkpoint worse than its own safe
@@ -7689,6 +8032,14 @@ def train_unified_reader(
         if init_checkpoint is None:
             raise AssertionError(f"{init_checkpoint_mode} has no seed checkpoint")
         initialization_started = perf_counter()
+        if (
+            init_checkpoint_mode
+            == INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_CONTINUATION
+            and frozen_non_recipient_parameter_snapshot is not None
+        ):
+            _assert_non_recipient_parameter_bytes(
+                model, frozen_non_recipient_parameter_snapshot
+            )
         model.eval()
         initialization_validation = _evaluate_model(
             model,
@@ -8611,6 +8962,10 @@ def export_unified_onnx(
         raise FileExistsError(f"Refusing to overwrite unified ONNX artifact: {existing}")
     torch, nn = _require_torch()
     payload = _load_checkpoint(checkpoint_path, torch=torch)
+    if _has_analysis_only_full_crop_continuation_lineage(payload):
+        raise ValueError(
+            "analysis-only full-crop continuation checkpoints cannot be exported to ONNX"
+        )
     config = _checkpoint_config(payload)
     if amount_format_min_confidence is not None:
         # Validate an export override before creating any output.  It is
@@ -11465,7 +11820,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     train.add_argument(
         "--init-checkpoint-mode",
-        choices=tuple(sorted(INIT_CHECKPOINT_MODES)),
+        choices=tuple(
+            sorted(
+                INIT_CHECKPOINT_MODES
+                - {INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_CONTINUATION}
+            )
+        ),
         default=INIT_CHECKPOINT_MODE_STRICT,
         help=(
             "strict requires every label map and model config to match the seed. "
@@ -11478,7 +11838,9 @@ def build_parser() -> argparse.ArgumentParser:
             "encoder, and trains only that adapter. recipient_visual_context_reinit is v13-only: it copies "
             "every non-recipient tensor from a v13 seed and freshly trains the residual visual + direct "
             "positional Transformer CTC recipient branch. recipient_full_crop_warmstart is v13-only: it "
-            "copies the compatible seed and permits exactly recipient_value_left_trim 0.30 -> 0.0."
+            "copies the compatible seed and permits exactly recipient_value_left_trim 0.30 -> 0.0. "
+            "recipient_full_crop_continuation requires a content-bound v13 legacy trim-zero authority, "
+            "exact config/maps/all-state copy, and fresh training state."
         ),
     )
     train.add_argument(
