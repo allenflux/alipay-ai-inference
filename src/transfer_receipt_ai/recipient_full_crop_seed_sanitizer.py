@@ -776,10 +776,11 @@ def _validated_status_v12_source_config(
 ) -> dict[str, object]:
     """Validate the exact v12 config recorded by a legacy v13 warm start.
 
-    Two recipient options were historically serialized as ``null`` and are
-    loaded by :func:`ocr_unified._config_from_mapping` as their current
+    Two recipient options were historically absent or serialized as ``null``
+    and are loaded by :func:`ocr_unified._config_from_mapping` as their current
     byte-compatible defaults.  Accept only those two established aliases.
-    Missing keys, extra keys, and every other value change remain fatal.
+    Every other missing key, every extra key, and every other value change
+    remain fatal.
     """
 
     if not isinstance(value, Mapping):
@@ -788,16 +789,19 @@ def _validated_status_v12_source_config(
     expected_values = dict(expected)
     source_keys = set(source)
     expected_keys = set(expected_values)
-    if source_keys != expected_keys:
-        missing = sorted(str(key) for key in expected_keys - source_keys)
-        extra = sorted(str(key) for key in source_keys - expected_keys)
+    allowed_alias_keys = set(V12_STATUS_SOURCE_LEGACY_NULL_ALIASES)
+    missing_keys = expected_keys - source_keys
+    extra_keys = source_keys - expected_keys
+    if extra_keys or not missing_keys.issubset(allowed_alias_keys):
+        missing = sorted(str(key) for key in missing_keys)
+        extra = sorted(str(key) for key in extra_keys)
         raise ValueError(
-            "status v13 source config does not preserve the exact key set: "
+            "status v13 source config has keys outside the two legacy aliases: "
             f"missing={missing}, extra={extra}"
         )
     normalized = dict(source)
     for key, default in V12_STATUS_SOURCE_LEGACY_NULL_ALIASES.items():
-        if normalized[key] is None:
+        if key not in normalized or normalized[key] is None:
             normalized[key] = default
     if normalized != expected_values:
         changed = sorted(

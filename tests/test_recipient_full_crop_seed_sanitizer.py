@@ -188,10 +188,10 @@ def _payload(
         status_keys = [key for key in state if key.startswith("status_text_")]
         source_config = asdict(config)
         source_config["architecture_version"] = 12
-        # The accepted status-only v13 artifact was created from a legacy v12
-        # config that serialized these two byte-compatible defaults as null.
-        source_config["recipient_backbone"] = None
-        source_config["recipient_open_text_dropout"] = None
+        # The accepted status-only v13 artifact was created before these two
+        # byte-compatible defaults existed in the serialized v12 config.
+        del source_config["recipient_backbone"]
+        del source_config["recipient_open_text_dropout"]
         payload.update(
             {
                 "status_text_characters": status_characters,
@@ -410,20 +410,27 @@ def test_sanitizer_preserves_status_side_and_replaces_only_recipient_side() -> N
     assert output["recipient_sampling_policy"] == recipient["recipient_sampling_policy"]
 
 
-def test_status_source_config_accepts_only_the_two_legacy_null_aliases() -> None:
+@pytest.mark.parametrize("representation", ["missing", "null"])
+def test_status_source_config_accepts_only_the_two_legacy_aliases(
+    representation: str,
+) -> None:
     expected = asdict(_config(13))
     expected["architecture_version"] = 12
     legacy = dict(expected)
-    legacy["recipient_backbone"] = None
-    legacy["recipient_open_text_dropout"] = None
+    if representation == "missing":
+        del legacy["recipient_backbone"]
+        del legacy["recipient_open_text_dropout"]
+    else:
+        legacy["recipient_backbone"] = None
+        legacy["recipient_open_text_dropout"] = None
     assert _validated_status_v12_source_config(legacy, expected=expected) == expected
 
 
 @pytest.mark.parametrize(
     "mutation, message",
     [
-        ("missing", "exact key set"),
-        ("extra", "exact key set"),
+        ("missing", "outside the two legacy aliases"),
+        ("extra", "outside the two legacy aliases"),
         ("other_null", "outside the two legacy null aliases"),
         ("backbone", "outside the two legacy null aliases"),
         ("dropout", "outside the two legacy null aliases"),
@@ -436,8 +443,8 @@ def test_status_source_config_rejects_missing_extra_and_other_drift(
     expected = asdict(_config(13))
     expected["architecture_version"] = 12
     observed = dict(expected)
-    observed["recipient_backbone"] = None
-    observed["recipient_open_text_dropout"] = None
+    del observed["recipient_backbone"]
+    del observed["recipient_open_text_dropout"]
     if mutation == "missing":
         del observed["pooled_width"]
     elif mutation == "extra":
