@@ -18,9 +18,17 @@ from transfer_receipt_ai.ocr_unified import (
     INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_CONTINUATION,
     KIND_V13,
     STATUS_CLASSES,
+    STATUS_TEXT_BLANK_INDEX,
+    STATUS_TEXT_CHARSET_SOURCE,
+    STATUS_TEXT_RUNTIME_POLICY,
+    STATUS_TEXT_TARGET,
+    V6_TIME_CHARACTERS,
+    V8_AMOUNT_CHARACTERS,
     UnifiedReaderConfig,
     _parameter_only_initialization,
+    _recipient_artifact_metadata,
     _recipient_only_expansion_label_override,
+    _recipient_train_split_policy,
     _validate_recipient_full_crop_continuation_config,
 )
 from transfer_receipt_ai.recipient_full_crop_continuation import (
@@ -778,26 +786,98 @@ def test_code_closure_contains_training_and_metric_dependencies() -> None:
     assert all(path.is_file() for path in code_paths.values())
 
 
-def _checkpoint_payload(torch) -> tuple[dict[str, object], dict[str, object]]:
+def _checkpoint_metadata_payload() -> dict[str, object]:
     config = _config()
+    recipient_characters = ["商", "户"]
+    status_text_characters = sorted(set("成功账转"))
+    recipient_sampling_policy = {
+        "mode": "uniform",
+        "recipient_sampling_weight": 1.0,
+        "recipient_train_records": 2,
+        "train_records": 2,
+    }
+    recipient_confidence_policy = {
+        "mode": "none",
+        "low_confidence_threshold": None,
+        "low_confidence_loss_weight": 1.0,
+        "curriculum_epochs": 0,
+    }
+    recipient_tail_loss_policy = {
+        "mode": "none",
+        "rare_character_max_support": 0,
+        "rare_character_loss_weight": 1.0,
+        "long_text_min_length": 0,
+        "long_text_loss_weight": 1.0,
+        "recipient_train_records": 2,
+        "rare_character_train_records": 0,
+        "long_text_train_records": 0,
+        "combined_boost_train_records": 0,
+    }
+    recipient_train_augmentation_policy = {"mode": "none"}
     payload: dict[str, object] = {
         "schema_version": 1,
         "kind": KIND_V13,
         "epoch": SOURCE_BEST_EPOCH,
         "config": asdict(config),
+        "amount_characters": list(V8_AMOUNT_CHARACTERS),
+        "time_characters": list(V6_TIME_CHARACTERS),
+        "payment_characters": ["卡", "行"],
+        "recipient_characters": recipient_characters,
+        "recipient_blank_index": 0,
+        "recipient_charset_sha256": hashlib.sha256(
+            "".join(recipient_characters).encode("utf-8")
+        ).hexdigest(),
+        "recipient_charset_source": "train_only_anchored_recipient_value",
+        "recipient_target": "anchored_recipient_value_with_dedicated_high_resolution_value_view",
+        "recipient_oov_by_split": {
+            split: {"records": 1, "oov_records": 0}
+            for split in ("train", "val", "test")
+        },
+        "status_classes": list(STATUS_CLASSES),
+        "status_text_characters": status_text_characters,
+        "status_text_blank_index": STATUS_TEXT_BLANK_INDEX,
+        "status_text_charset_sha256": hashlib.sha256(
+            "".join(status_text_characters).encode("utf-8")
+        ).hexdigest(),
+        "status_text_charset_source": STATUS_TEXT_CHARSET_SOURCE,
+        "status_text_target": STATUS_TEXT_TARGET,
+        "status_text_runtime_policy": STATUS_TEXT_RUNTIME_POLICY,
+        "status_text_oov_by_split": {
+            split: {
+                "records": 1,
+                "oov_records": 0,
+                "oov_characters": 0,
+                "examples": [],
+            }
+            for split in ("train", "val", "test")
+        },
+        "payment_bank_prefix_classes": ["__other__", "邮储银行"],
+        "recipient_train_split_policy": _recipient_train_split_policy(["train"]),
+        "recipient_sampling_policy": recipient_sampling_policy,
+        "recipient_confidence_policy": recipient_confidence_policy,
+        "recipient_tail_loss_policy": recipient_tail_loss_policy,
+        "recipient_train_augmentation_policy": recipient_train_augmentation_policy,
+        "metrics": {"epoch": SOURCE_BEST_EPOCH},
+    }
+    payload.update(
+        _recipient_artifact_metadata(
+            config,
+            recipient_sampling_policy=recipient_sampling_policy,
+            recipient_confidence_policy=recipient_confidence_policy,
+            recipient_tail_loss_policy=recipient_tail_loss_policy,
+            recipient_train_augmentation_policy=recipient_train_augmentation_policy,
+        )
+    )
+    return payload
+
+
+def _checkpoint_payload(torch) -> tuple[dict[str, object], dict[str, object]]:
+    payload = {
+        **_checkpoint_metadata_payload(),
         "state_dict": {
             "shared.weight": torch.tensor([1.0, -0.0]),
             "recipient_weight": torch.tensor([2.0, 3.0]),
         },
-        "amount_characters": ["0", "1"],
-        "time_characters": ["0", ":"],
-        "payment_characters": ["卡", "行"],
-        "recipient_characters": ["商", "户"],
-        "status_classes": list(STATUS_CLASSES),
-        "status_text_characters": ["成", "功", "账", "转"],
-        "payment_bank_prefix_classes": ["__other__", "邮储银行"],
-        "recipient_train_split_policy": {"mode": "standard_train_only", "splits": ["train"]},
-        "metrics": {"epoch": SOURCE_BEST_EPOCH},
     }
     closure = {
         "pilot_root": "/bound/r031004-06/full-crop-pilot-8e-r2",
@@ -816,6 +896,21 @@ def _checkpoint_payload(torch) -> tuple[dict[str, object], dict[str, object]]:
         ),
     }
     return payload, {**payload, AUTHORITY_KEY: authority}
+
+
+def test_synthetic_checkpoint_metadata_matches_the_exact_v13_label_abi() -> None:
+    payload = _checkpoint_metadata_payload()
+    config = unified._checkpoint_config(payload)
+    amount, time, _, recipient, _, _ = unified._checkpoint_labels(
+        payload, config=config
+    )
+    status_text = unified._checkpoint_status_text_characters(payload, config=config)
+
+    assert amount == list(V8_AMOUNT_CHARACTERS)
+    assert time == list(V6_TIME_CHARACTERS)
+    assert recipient == payload["recipient_characters"]
+    assert payload["status_text_characters"] == ["功", "成", "账", "转"]
+    assert status_text == payload["status_text_characters"]
 
 
 def test_embedded_authority_binds_state_config_maps_and_source(
@@ -846,7 +941,9 @@ def test_embedded_authority_binds_state_config_maps_and_source(
         continuation.validate_embedded_continuation_authority(tampered_state, torch=torch)
 
     tampered_map = dict(authorized)
-    tampered_map["recipient_characters"] = ["户", "商"]
+    # Payment characters have no sorted-order contract, so this remains a
+    # structurally valid v13 map and reaches the embedded content proof.
+    tampered_map["payment_characters"] = ["行", "卡"]
     with pytest.raises(ValueError, match="content does not match"):
         continuation.validate_embedded_continuation_authority(tampered_map, torch=torch)
 
@@ -877,11 +974,11 @@ def test_initializer_copies_every_state_tensor_and_rejects_map_or_tensor_changes
         init_checkpoint=checkpoint,
         init_checkpoint_mode=INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_CONTINUATION,
         config=_config(),
-        amount_characters=["0", "1"],
-        time_characters=["0", ":"],
+        amount_characters=list(V8_AMOUNT_CHARACTERS),
+        time_characters=list(V6_TIME_CHARACTERS),
         payment_characters=["卡", "行"],
         recipient_characters=["商", "户"],
-        status_text_characters=["成", "功", "账", "转"],
+        status_text_characters=authorized["status_text_characters"],
         payment_bank_prefix_classes=["__other__", "邮储银行"],
         torch=torch,
         target_state_dict=target_state,
@@ -897,8 +994,8 @@ def test_initializer_copies_every_state_tensor_and_rejects_map_or_tensor_changes
         _recipient_only_expansion_label_override(
             init_checkpoint=checkpoint,
             config=_config(),
-            amount_characters=["0", "1"],
-            time_characters=["0", ":"],
+            amount_characters=list(V8_AMOUNT_CHARACTERS),
+            time_characters=list(V6_TIME_CHARACTERS),
             payment_characters=["行", "卡"],
             recipient_characters=["商", "户"],
             payment_bank_prefix_classes=["__other__", "邮储银行"],
@@ -912,11 +1009,11 @@ def test_initializer_copies_every_state_tensor_and_rejects_map_or_tensor_changes
             init_checkpoint=checkpoint,
             init_checkpoint_mode=INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_CONTINUATION,
             config=_config(),
-            amount_characters=["0", "1"],
-            time_characters=["0", ":"],
+            amount_characters=list(V8_AMOUNT_CHARACTERS),
+            time_characters=list(V6_TIME_CHARACTERS),
             payment_characters=["卡", "行"],
             recipient_characters=["商", "户"],
-            status_text_characters=["成", "功", "账", "转"],
+            status_text_characters=authorized["status_text_characters"],
             payment_bank_prefix_classes=["__other__", "邮储银行"],
             torch=torch,
             target_state_dict=missing,
