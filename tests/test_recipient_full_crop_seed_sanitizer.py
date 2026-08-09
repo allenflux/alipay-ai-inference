@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import pytest
@@ -35,6 +35,7 @@ from transfer_receipt_ai.recipient_full_crop_seed_sanitizer import (
     _canonical_sha256,
     _metadata_partitions,
     _partition_descriptor,
+    _validate_recipient_metadata,
     _validated_status_v12_source_config,
     sanitize_recipient_full_crop_seed,
     validate_recipient_full_crop_seed_attestation,
@@ -194,12 +195,22 @@ def _payload(
     if architecture == 13:
         status_characters = sorted(set("转账成功"))
         status_keys = [key for key in state if key.startswith("status_text_")]
+        raw_config = payload["config"]
+        assert isinstance(raw_config, dict)
+        # The accepted status-only v13 cohort predates both additive config
+        # fields in the checkpoint config as well as its v12 source config.
+        del raw_config["recipient_backbone"]
+        del raw_config["recipient_open_text_dropout"]
         source_config = asdict(config)
         source_config["architecture_version"] = 12
         # The accepted status-only v13 artifact was created before these two
         # byte-compatible defaults existed in the serialized v12 config.
         del source_config["recipient_backbone"]
         del source_config["recipient_open_text_dropout"]
+        # The accepted status-only v13 artifact also predates this additive
+        # top-level recipient artifact metadata key.  Its normalized config
+        # and frozen legacy state still unambiguously declare the backbone.
+        del payload["recipient_backbone"]
         payload.update(
             {
                 "status_text_characters": status_characters,
@@ -582,6 +593,105 @@ def test_status_source_config_rejects_missing_extra_and_other_drift(
         raise AssertionError(mutation)
     with pytest.raises(ValueError, match=message):
         _validated_status_v12_source_config(observed, expected=expected)
+
+
+def test_train_source_rejects_missing_top_level_recipient_backbone() -> None:
+    recipient = _payload(architecture=12, train_only=True, recipient_fill=3.0)
+    del recipient["recipient_backbone"]
+    with pytest.raises(
+        ValueError,
+        match="recipient artifact metadata 'recipient_backbone' is incompatible",
+    ):
+        _validate_recipient_metadata(
+            recipient,
+            config=_config(12),
+            description="train-only v12 checkpoint",
+            require_train_only=True,
+        )
+
+
+def test_status_source_rejects_other_missing_recipient_metadata() -> None:
+    status = _payload(architecture=13, train_only=False, recipient_fill=8.0)
+    del status["recipient_time_steps"]
+    with pytest.raises(
+        ValueError,
+        match="recipient artifact metadata 'recipient_time_steps' is incompatible",
+    ):
+        _validate_recipient_metadata(
+            status,
+            config=_config(13),
+            description="status v13 checkpoint",
+            require_train_only=False,
+            allow_legacy_status_missing_recipient_backbone=True,
+        )
+
+
+def test_status_source_rejects_missing_backbone_for_residual_config() -> None:
+    status = _payload(architecture=13, train_only=False, recipient_fill=8.0)
+    residual_config = replace(
+        _config(13), recipient_backbone="residual_positional_transformer_v2"
+    )
+    # Keep the earlier artifact fields consistent with the residual topology
+    # so this regression reaches the historical missing-backbone gate itself.
+    status["recipient_time_steps"] = 192
+    with pytest.raises(
+        ValueError,
+        match="recipient artifact metadata 'recipient_backbone' is incompatible",
+    ):
+        _validate_recipient_metadata(
+            status,
+            config=residual_config,
+            description="status v13 checkpoint",
+            require_train_only=False,
+            allow_legacy_status_missing_recipient_backbone=True,
+        )
+
+
+@pytest.mark.parametrize("representation", ["current", "null"])
+def test_status_source_rejects_top_level_alias_with_present_raw_config_fields(
+    representation: str,
+) -> None:
+    status = _payload(architecture=13, train_only=False, recipient_fill=8.0)
+    raw_config = status["config"]
+    assert isinstance(raw_config, dict)
+    if representation == "current":
+        raw_config["recipient_backbone"] = "legacy_depthwise_gru_v1"
+        raw_config["recipient_open_text_dropout"] = 0.0
+    else:
+        raw_config["recipient_backbone"] = None
+        raw_config["recipient_open_text_dropout"] = None
+    with pytest.raises(
+        ValueError,
+        match="recipient artifact metadata 'recipient_backbone' is incompatible",
+    ):
+        _validate_recipient_metadata(
+            status,
+            config=_config(13),
+            description="status v13 checkpoint",
+            require_train_only=False,
+            allow_legacy_status_missing_recipient_backbone=True,
+        )
+
+
+@pytest.mark.parametrize(
+    "observed_backbone", [None, "residual_positional_transformer_v2"]
+)
+def test_status_source_rejects_explicit_nonlegacy_backbone(
+    observed_backbone: str | None,
+) -> None:
+    status = _payload(architecture=13, train_only=False, recipient_fill=8.0)
+    status["recipient_backbone"] = observed_backbone
+    with pytest.raises(
+        ValueError,
+        match="recipient artifact metadata 'recipient_backbone' is incompatible",
+    ):
+        _validate_recipient_metadata(
+            status,
+            config=_config(13),
+            description="status v13 checkpoint",
+            require_train_only=False,
+            allow_legacy_status_missing_recipient_backbone=True,
+        )
 
 
 def test_warmstart_rejects_top_level_policy_laundering_without_attestation() -> None:
@@ -1029,6 +1139,10 @@ def test_atomic_file_publication_is_fresh_and_reloads(tmp_path: Path) -> None:
         recipient_fill=3.0,
         payment_characters=["卡", "行", "银", "储"],
     )
+    assert "recipient_backbone" not in status
+    assert "recipient_backbone" not in status["config"]
+    assert "recipient_open_text_dropout" not in status["config"]
+    assert recipient["recipient_backbone"] == "legacy_depthwise_gru_v1"
     status_path = tmp_path / "status.pt"
     recipient_path = tmp_path / "recipient.pt"
     output_path = tmp_path / "sanitized.pt"
@@ -1047,6 +1161,7 @@ def test_atomic_file_publication_is_fresh_and_reloads(tmp_path: Path) -> None:
         reloaded = torch.load(output_path, map_location="cpu", weights_only=True)
     except TypeError:
         reloaded = torch.load(output_path, map_location="cpu")
+    assert reloaded["recipient_backbone"] == "legacy_depthwise_gru_v1"
     validate_recipient_full_crop_seed_attestation(reloaded)
     _validate_recipient_full_crop_seed_policy(reloaded, torch=torch)
     with pytest.raises(ValueError, match="Refusing to overwrite"):

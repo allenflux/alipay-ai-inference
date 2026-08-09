@@ -783,7 +783,12 @@ def _validate_no_laundered_recipient_policy(payload: Mapping[str, object]) -> No
 
 
 def _validate_recipient_metadata(
-    payload: Mapping[str, object], *, config: Any, description: str, require_train_only: bool
+    payload: Mapping[str, object],
+    *,
+    config: Any,
+    description: str,
+    require_train_only: bool,
+    allow_legacy_status_missing_recipient_backbone: bool = False,
 ) -> tuple[list[str], dict[str, object]]:
     labels = _checkpoint_labels(payload, config=config)
     recipient_characters = labels[3]
@@ -804,11 +809,28 @@ def _validate_recipient_metadata(
         recipient_tail_loss_policy=payload.get("recipient_tail_loss_policy"),
         recipient_train_augmentation_policy=payload.get("recipient_train_augmentation_policy"),
     )
+    raw_config = payload.get("config")
+    legacy_status_missing_recipient_backbone = (
+        allow_legacy_status_missing_recipient_backbone
+        and payload.get("kind") == KIND_V13
+        and "recipient_backbone" not in payload
+        and isinstance(raw_config, Mapping)
+        and all(key not in raw_config for key in V12_STATUS_SOURCE_LEGACY_NULL_ALIASES)
+        and getattr(config, "architecture_version", None) == 13
+        and getattr(config, "recipient_backbone", None)
+        == V12_STATUS_SOURCE_LEGACY_NULL_ALIASES["recipient_backbone"]
+        and expected_artifact.get("recipient_backbone")
+        == V12_STATUS_SOURCE_LEGACY_NULL_ALIASES["recipient_backbone"]
+    )
     for key, expected in expected_artifact.items():
+        if key == "recipient_backbone" and legacy_status_missing_recipient_backbone:
+            continue
         if payload.get(key) != expected:
             raise ValueError(f"{description} recipient artifact metadata {key!r} is incompatible")
     observed_keys = {key for key in payload if key.startswith(RECIPIENT_PREFIX)}
     expected_keys = set(expected_artifact) | set(_FIXED_RECIPIENT_METADATA_KEYS)
+    if legacy_status_missing_recipient_backbone:
+        expected_keys.remove("recipient_backbone")
     if observed_keys != expected_keys:
         raise ValueError(
             f"{description} has an unsupported recipient metadata key set: "
@@ -1238,6 +1260,7 @@ def _validate_compatible_sources(
         config=status_config,
         description="status v13 checkpoint",
         require_train_only=False,
+        allow_legacy_status_missing_recipient_backbone=True,
     )
     train_characters, train_recipient_metadata = _validate_recipient_metadata(
         train_payload,
@@ -1297,7 +1320,14 @@ def _validate_compatible_sources(
         allow_hidden_change=False,
         description="v13 status to train-only v12 transplant",
     )
-    if set(status_recipient_metadata) != set(train_recipient_metadata):
+    comparable_status_recipient_keys = set(status_recipient_metadata)
+    # The sole accepted legacy status omission was already proven above from
+    # all three raw status metadata/config representations.  Normalize it only
+    # for this compatibility comparison; retain the raw partition for the
+    # discarded-source attestation hash.
+    if "recipient_backbone" not in status_recipient_metadata:
+        comparable_status_recipient_keys.add("recipient_backbone")
+    if comparable_status_recipient_keys != set(train_recipient_metadata):
         raise ValueError("v13 status and train-only v12 recipient metadata key sets do not match")
     discarded_train_payment = _discarded_train_payment_proof(
         status_characters=status_payment_characters,
