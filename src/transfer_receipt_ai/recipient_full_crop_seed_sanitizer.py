@@ -62,6 +62,10 @@ RECIPIENT_PREFIX = "recipient_"
 STATUS_TEXT_PREFIX = "status_text_"
 V12_PASSIVE_STATUS_TEXT_LOSS_WEIGHT_KEY = "status_text_loss_weight"
 V12_PASSIVE_STATUS_TEXT_LOSS_WEIGHT = 1.0
+V12_STATUS_SOURCE_LEGACY_NULL_ALIASES = {
+    "recipient_backbone": "legacy_depthwise_gru_v1",
+    "recipient_open_text_dropout": 0.0,
+}
 REQUIRED_RECIPIENT_INPUT_WIDTH = 1536
 PUBLICATION_POLICY = "same_directory_hard_link_no_clobber_v1"
 TOPOLOGY_POLICY = "v12_v13_private_recipient_prefix_partition_v1"
@@ -767,6 +771,45 @@ def _validate_v12_passive_status_text_metadata(
         )
 
 
+def _validated_status_v12_source_config(
+    value: object, *, expected: Mapping[str, object]
+) -> dict[str, object]:
+    """Validate the exact v12 config recorded by a legacy v13 warm start.
+
+    Two recipient options were historically serialized as ``null`` and are
+    loaded by :func:`ocr_unified._config_from_mapping` as their current
+    byte-compatible defaults.  Accept only those two established aliases.
+    Missing keys, extra keys, and every other value change remain fatal.
+    """
+
+    if not isinstance(value, Mapping):
+        raise ValueError("status v13 checkpoint has no v12 source config provenance")
+    source = dict(value)
+    expected_values = dict(expected)
+    source_keys = set(source)
+    expected_keys = set(expected_values)
+    if source_keys != expected_keys:
+        missing = sorted(str(key) for key in expected_keys - source_keys)
+        extra = sorted(str(key) for key in source_keys - expected_keys)
+        raise ValueError(
+            "status v13 source config does not preserve the exact key set: "
+            f"missing={missing}, extra={extra}"
+        )
+    normalized = dict(source)
+    for key, default in V12_STATUS_SOURCE_LEGACY_NULL_ALIASES.items():
+        if normalized[key] is None:
+            normalized[key] = default
+    if normalized != expected_values:
+        changed = sorted(
+            key for key in expected_keys if normalized[key] != expected_values[key]
+        )
+        raise ValueError(
+            "status v13 source config differs outside the two legacy null aliases: "
+            f"{', '.join(changed)}"
+        )
+    return normalized
+
+
 def _validate_status_only_v13(payload: Mapping[str, object]) -> tuple[Any, Mapping[str, object]]:
     if payload.get("kind") != KIND_V13:
         raise ValueError("status checkpoint must be a v13 checkpoint")
@@ -798,16 +841,17 @@ def _validate_status_only_v13(payload: Mapping[str, object]) -> tuple[Any, Mappi
     if not isinstance(fine_tune, Mapping) or not isinstance(runtime, Mapping):
         raise ValueError("status v13 checkpoint has no status-only training provenance")
     source_config = initialization.get("source_config")
-    if not isinstance(source_config, Mapping):
-        raise ValueError("status v13 checkpoint has no v12 source config provenance")
     expected_source_config = asdict(config)
     expected_source_config["architecture_version"] = 12
+    _validated_status_v12_source_config(
+        source_config,
+        expected=expected_source_config,
+    )
     legacy_count = len(state) - len(status_keys)
     financial_policy = initialization.get("financial_label_policy")
     if (
         initialization.get("mode") != "parameter_only_v12_to_v13_status_text_expansion"
         or initialization.get("source_kind") != KIND_V12
-        or dict(source_config) != expected_source_config
         or initialization.get("optimizer_restored") is not False
         or initialization.get("epoch_reset") is not True
         or initialization.get("new_parameter_prefix") != STATUS_TEXT_PREFIX
