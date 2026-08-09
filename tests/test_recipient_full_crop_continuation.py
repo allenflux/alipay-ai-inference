@@ -492,7 +492,7 @@ def test_real_r2_source_is_hard_pinned_against_coherent_reseal(
     tmp_path: Path,
 ) -> None:
     assert FIXED_SOURCE_SUBJECT_ID == (
-        "acad17751217302330e3413698943d66f18683bea0fac229fec120941e5857bf"
+        "9f6e21371699966f6d2623ad873b8ca4a6b20a0b3f52c4ec904afabe5ecb140c"
     )
     assert FIXED_SOURCE_ARTIFACTS == {
         "source_best_checkpoint": {
@@ -508,7 +508,7 @@ def test_real_r2_source_is_hard_pinned_against_coherent_reseal(
             "size_bytes": 3314,
         },
         "blind_manifest": {
-            "sha256": "c303c8a34348532263d3ad84ed2c6dddcd77c1bdd9dfc8a7c713ccc35a1ff5f1",
+            "sha256": "c303c8a34348532263d3ad84ed2cd6ddcd77c1bdd9dfc8a7c713ccc35a1ff5f1",
             "size_bytes": 202226294,
         },
         "blind_contract": {
@@ -543,6 +543,20 @@ def test_real_r2_source_is_hard_pinned_against_coherent_reseal(
                 {name: forged_same_topology},
                 (name,),
             )
+
+
+def test_real_r2_pins_are_64_hex_and_blind_pin_matches_contract_probe() -> None:
+    for descriptor in FIXED_SOURCE_ARTIFACTS.values():
+        digest = descriptor["sha256"]
+        assert isinstance(digest, str)
+        assert len(digest) == 64
+        assert digest == digest.lower()
+        assert len(bytes.fromhex(digest)) == 32
+
+    assert FIXED_SOURCE_ARTIFACTS["blind_manifest"] == {
+        "sha256": "c303c8a34348532263d3ad84ed2cd6ddcd77c1bdd9dfc8a7c713ccc35a1ff5f1",
+        "size_bytes": 202226294,
+    }
 
 
 def test_real_r2_pins_precede_corresponding_semantic_reads() -> None:
@@ -729,6 +743,18 @@ def test_pilot_blind_semantics_are_read_from_hard_pinned_bytes(tmp_path: Path) -
     )
     assert observed["split_counts"] == {"train": 1, "val": 1, "test_excluded": 1}
     assert _file_identity(blind)[3] != hashlib.sha256(captured).hexdigest()
+
+    mismatched_contract = {
+        **contract_payload,
+        "blind_manifest_sha256": "0" * 64,
+    }
+    with pytest.raises(ValueError, match="contract is incomplete or unsafe"):
+        _verify_frozen_blind_manifest_contract(
+            records_path=blind,
+            records_data=captured,
+            contract_path=contract,
+            contract_data=json.dumps(mismatched_contract).encode("utf-8"),
+        )
 
 
 def test_windows_wrapper_locks_gpu_recipe_leases_and_analysis_boundaries() -> None:

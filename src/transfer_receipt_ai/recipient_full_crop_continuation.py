@@ -94,7 +94,7 @@ FIXED_SOURCE_ARTIFACTS = {
         "size_bytes": 3314,
     },
     "blind_manifest": {
-        "sha256": "c303c8a34348532263d3ad84ed2c6dddcd77c1bdd9dfc8a7c713ccc35a1ff5f1",
+        "sha256": "c303c8a34348532263d3ad84ed2cd6ddcd77c1bdd9dfc8a7c713ccc35a1ff5f1",
         "size_bytes": 202226294,
     },
     "blind_contract": {
@@ -111,7 +111,7 @@ FIXED_SOURCE_ARTIFACTS = {
     },
 }
 FIXED_SOURCE_SUBJECT_ID = (
-    "acad17751217302330e3413698943d66f18683bea0fac229fec120941e5857bf"
+    "9f6e21371699966f6d2623ad873b8ca4a6b20a0b3f52c4ec904afabe5ecb140c"
 )
 
 _HEX = frozenset("0123456789abcdef")
