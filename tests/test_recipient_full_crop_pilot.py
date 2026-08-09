@@ -133,6 +133,9 @@ def _seed_source_payloads(
         "recipient_target": "anchored_recipient_value_with_dedicated_high_resolution_value_view",
         "recipient_train_split_policy": _recipient_train_split_policy(["train", "val"]),
         "recipient_loss_weight": 1.0,
+        # The trainer persists this passive CLI scalar in both v12 and v13
+        # checkpoints; it is not evidence of a v13 status-text head.
+        "status_text_loss_weight": 1.0,
         "recipient_oov_by_split": {
             split: {"records": 1, "oov_records": 0}
             for split in ("train", "val", "test")
@@ -216,7 +219,11 @@ def _seed_source_payloads(
             "epoch_reset": True,
         },
     }
-    for key in [key for key in train_payload if key.startswith("status_text_")]:
+    for key in [
+        key
+        for key in train_payload
+        if key.startswith("status_text_") and key != "status_text_loss_weight"
+    ]:
         del train_payload[key]
     for key in ("fine_tune_policy",):
         del train_payload[key]
