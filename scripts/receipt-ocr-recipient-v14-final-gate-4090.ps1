@@ -292,6 +292,9 @@ try {
         time = $null
         payment_method_field = $null
         recipient_field = $null
+        recipient_records = $null
+        recipient_exact_matches = $null
+        recipient_candidate_coverage = $null
         visible_transfer_status_cjk_text = $null
         status_non_success_to_success = $null
     }
@@ -302,9 +305,17 @@ try {
             $verified.metrics.payment_method_field "verified payment exact"
         $metrics.recipient_field = Get-VerifiedRate `
             $verified.metrics.recipient_field "verified recipient exact"
+        $metrics.recipient_records = [int]$verified.recipient_records
+        $metrics.recipient_exact_matches = [int]$verified.recipient_exact_matches
+        $metrics.recipient_candidate_coverage = Get-VerifiedRate `
+            $verified.recipient_candidate_coverage "verified recipient candidate coverage"
         $metrics.visible_transfer_status_cjk_text = Get-VerifiedRate `
             $verified.metrics.visible_transfer_status_cjk_text "verified status OCR exact"
         $metrics.status_non_success_to_success = [int]$verified.status_non_success_to_success
+        if ($metrics.recipient_field -le $recipientFloor `
+            -and $failures -notcontains "recipient_field_not_strictly_above_floor") {
+            $failures += "recipient_field_not_strictly_above_floor"
+        }
     }
     $passed = $failures.Count -eq 0 -and $null -ne $verified -and $verified.passed -eq $true
     $gatePath = Join-Path $OutputRoot "recipient_v14_final_test.json"

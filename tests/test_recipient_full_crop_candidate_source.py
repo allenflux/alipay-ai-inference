@@ -21,11 +21,14 @@ from transfer_receipt_ai.recipient_blind_manifest import build_blind_manifest
 from transfer_receipt_ai.recipient_full_crop_candidate_source import (
     CANDIDATE_PILOT_DECISION,
     CANDIDATE_PILOT_KIND,
+    EXPECTED_RECIPIENT_VAL_RECORDS,
     SOURCE_DECISION,
     SOURCE_KIND,
     attest_full_crop_candidate_source,
     evaluate_residual_candidate_pilot,
     seal_residual_candidate_pilot,
+    validate_full_crop_candidate_training_metrics,
+    validate_full_crop_candidate_val_metrics,
     verify_full_crop_candidate_source,
     verify_residual_candidate_pilot,
 )
@@ -42,6 +45,20 @@ def _write_json(path: Path, payload: object) -> None:
         + "\n",
         encoding="utf-8",
     )
+
+
+def _bind_recipient_epoch_counts(summary: dict[str, object]) -> dict[str, object]:
+    for record in summary["records"]:
+        metric = record["val_candidate_text_by_field"]["recipient_field"]
+        matches = round(float(metric["exact_match"]) * EXPECTED_RECIPIENT_VAL_RECORDS)
+        metric.update(
+            {
+                "records": EXPECTED_RECIPIENT_VAL_RECORDS,
+                "exact_matches": matches,
+                "exact_match": matches / EXPECTED_RECIPIENT_VAL_RECORDS,
+            }
+        )
+    return summary
 
 
 @pytest.fixture()
@@ -91,12 +108,35 @@ def fake_checkpoints(monkeypatch: pytest.MonkeyPatch):
     return register
 
 
-def _full_and_blind(root: Path) -> tuple[Path, Path, Path]:
+def _full_and_blind(
+    root: Path,
+    *,
+    recipient_val_records: int = EXPECTED_RECIPIENT_VAL_RECORDS,
+) -> tuple[Path, Path, Path]:
     full = root / "full.jsonl"
     rows = [
-        {"id": "train-one", "split": "train", "slots": {}},
-        {"id": "val-one", "split": "val", "slots": {}},
-        {"id": "test-secret", "split": "test", "slots": {}},
+        {
+            "id": "train-one",
+            "split": "train",
+            "slots": {"recipient_field": {"text": "甲"}},
+        },
+        *(
+            {
+                "id": f"val-{index}",
+                "split": "val",
+                "slots": (
+                    {"recipient_field": {"text": "乙"}}
+                    if index < recipient_val_records
+                    else {}
+                ),
+            }
+            for index in range(EXPECTED_RECIPIENT_VAL_RECORDS)
+        ),
+        {
+            "id": "test-secret",
+            "split": "test",
+            "slots": {"recipient_field": {"text": "绝密"}},
+        },
     ]
     full.write_text(
         "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
@@ -108,6 +148,19 @@ def _full_and_blind(root: Path) -> tuple[Path, Path, Path]:
     contract = blind_root / "blind.contract.json"
     build_blind_manifest(source=full, output=blind, contract=contract)
     return full, blind, contract
+
+
+def test_blind_recipient_denominator_rejects_6788_of_6789(tmp_path: Path) -> None:
+    _, blind, contract = _full_and_blind(
+        tmp_path,
+        recipient_val_records=EXPECTED_RECIPIENT_VAL_RECORDS - 1,
+    )
+    binding = verify_blind_manifest_contract(
+        records_path=blind,
+        blind_contract_path=contract,
+    )
+    with pytest.raises(ValueError, match="expected 6789, found 6788"):
+        source_contract._blind_recipient_val_records(binding)
 
 
 def _build_passed_full_crop_pilot(
@@ -122,7 +175,9 @@ def _build_passed_full_crop_pilot(
     training = pilot_root / "training-full-crop-pilot"
     training.mkdir()
     seed = tmp_path / "sanitized-seed.pt"
-    summary = _summary(best=best, epoch4=0.76, epoch8=0.79)
+    summary = _bind_recipient_epoch_counts(
+        _summary(best=best, epoch4=0.76, epoch8=0.79)
+    )
     summary["status_text_runtime_policy"] = "decode_and_normalize_review_only"
     initialization = dict(summary["initialization"])
     initialization.update(
@@ -200,7 +255,21 @@ def test_source_attestor_replays_every_binding_and_is_no_clobber(
     assert contract["onnx_exported"] is False
     assert len(contract["source_subject_id"]) == 64
     assert contract["recomputed_pilot_decision"]["decision"] == SOURCE_DECISION
-    assert contract["observed"]["best_recipient_exact"] == pytest.approx(0.80)
+    assert (
+        contract["recomputed_pilot_decision"]["blind_manifest_contract"][
+            "recipient_val_records"
+        ]
+        == EXPECTED_RECIPIENT_VAL_RECORDS
+    )
+    assert contract["recomputed_pilot_decision"][
+        "recipient_candidate_metric_audit"
+    ]["validated_epochs"] == list(range(9))
+    assert contract["recomputed_pilot_decision"][
+        "recipient_candidate_metric_audit"
+    ]["recipient_candidate_coverage"] == 1.0
+    assert contract["observed"]["best_recipient_exact"] == pytest.approx(
+        round(0.80 * 6789) / 6789
+    )
     assert {
         "best_checkpoint",
         "training_summary",
@@ -311,19 +380,39 @@ def test_source_attestor_rejects_mutation_copy_and_onnx(
         )
 
 
-def test_source_attestor_rejects_best_at_or_above_delivery_floor(
+def test_source_attestor_uses_strict_6110_6111_delivery_boundary(
     tmp_path: Path,
     fake_checkpoints,
 ) -> None:
+    at_floor_root = tmp_path / "at-floor"
+    at_floor_root.mkdir()
     pilot_root, _, _ = _build_passed_full_crop_pilot(
-        tmp_path,
+        at_floor_root,
         fake_checkpoints,
-        best=0.90,
+        best=6110 / 6789,
     )
-    with pytest.raises(ValueError, match="already reached the 90%"):
+    contract = attest_full_crop_candidate_source(
+        pilot_root=pilot_root,
+        output_contract=at_floor_root / "source.contract.json",
+        torch=object(),
+    )
+    assert contract["observed"]["best_recipient_exact"] == 6110 / 6789
+    assert (
+        contract["fixed_source_gate"]["maximum_best_recipient_exact_inclusive"]
+        == 0.90
+    )
+
+    above_floor_root = tmp_path / "above-floor"
+    above_floor_root.mkdir()
+    above_pilot_root, _, _ = _build_passed_full_crop_pilot(
+        above_floor_root,
+        fake_checkpoints,
+        best=6111 / 6789,
+    )
+    with pytest.raises(ValueError, match="already exceeded the 90%"):
         attest_full_crop_candidate_source(
-            pilot_root=pilot_root,
-            output_contract=tmp_path / "source.contract.json",
+            pilot_root=above_pilot_root,
+            output_contract=above_floor_root / "source.contract.json",
             torch=object(),
         )
 
@@ -351,7 +440,7 @@ def test_source_attestor_reopens_real_torch_checkpoints_when_available(
     full, blind, blind_contract = _full_and_blind(pilot_root)
     training = pilot_root / "training-full-crop-pilot"
     training.mkdir()
-    summary = _summary()
+    summary = _bind_recipient_epoch_counts(_summary())
     summary["status_text_runtime_policy"] = "decode_and_normalize_review_only"
     seed_payload = torch.load(seed, map_location="cpu", weights_only=False)
     initialization = dict(summary["initialization"])
@@ -370,6 +459,7 @@ def test_source_attestor_reopens_real_torch_checkpoints_when_available(
     best_row = next(row for row in summary["records"] if row["epoch"] == best_epoch)
     torch.save(
         {
+            "schema_version": 1,
             "kind": "receipt_unified_field_reader_v13",
             "state_dict": state,
             "epoch": best_epoch,
@@ -385,6 +475,9 @@ def test_source_attestor_reopens_real_torch_checkpoints_when_available(
         },
         training / "best.pt",
     )
+    assert torch.load(
+        training / "best.pt", map_location="cpu", weights_only=False
+    )["schema_version"] == 1
     _write_json(training / "training_summary.json", summary)
     binding = verify_blind_manifest_contract(
         records_path=blind,
@@ -431,6 +524,8 @@ def _residual_summary(
         recipient = 0.76 if epoch == 4 else 0.79 if epoch == 8 else 0.70
         if epoch == 5:
             recipient = 0.80
+        recipient_matches = round(recipient * EXPECTED_RECIPIENT_VAL_RECORDS)
+        recipient_exact = recipient_matches / EXPECTED_RECIPIENT_VAL_RECORDS
         records.append(
             {
                 "epoch": epoch,
@@ -439,7 +534,11 @@ def _residual_summary(
                     "amount": {"exact_match": 0.80},
                     "time": {"exact_match": 0.99},
                     "payment_method_field": {"exact_match": 0.94},
-                    "recipient_field": {"exact_match": recipient},
+                    "recipient_field": {
+                        "records": EXPECTED_RECIPIENT_VAL_RECORDS,
+                        "exact_matches": recipient_matches,
+                        "exact_match": recipient_exact,
+                    },
                 },
                 "val_ctc_by_field": {"transfer_status": {"exact_match": 0.91}},
                 "val_status_non_success_to_success": 0,
@@ -494,11 +593,19 @@ def _residual_summary(
         },
         "recipient_oov_by_split": {
             "train": {"records": 5},
-            "val": {"records": 3},
+            "val": {"records": EXPECTED_RECIPIENT_VAL_RECORDS},
             "test": {"records": 0},
         },
         "field_counts": {
-            field: {"train": 5, "val": 3, "test": 0}
+            field: {
+                "train": 5,
+                "val": (
+                    EXPECTED_RECIPIENT_VAL_RECORDS
+                    if field == "recipient_field"
+                    else 3
+                ),
+                "test": 0,
+            }
             for field in (
                 "amount",
                 "time",
@@ -547,6 +654,120 @@ def _residual_recipe(
     }
 
 
+def _candidate_60_summary(
+    *,
+    source_summary: dict[str, object],
+    source_checkpoint: Path,
+    source_sha256: str,
+    best_matches: int = 6111,
+) -> dict[str, object]:
+    summary = _residual_summary(
+        source_summary=source_summary,
+        source_checkpoint=source_checkpoint,
+        source_sha256=source_sha256,
+    )
+    records = []
+    for epoch in range(1, 61):
+        validated = epoch == 1 or epoch == 60 or epoch % 2 == 0
+        matches = best_matches if epoch == 60 else min(best_matches - 1, 6000)
+        records.append(
+            {
+                "epoch": epoch,
+                "validation_performed": validated,
+                "val_candidate_text_by_field": (
+                    {
+                        "recipient_field": {
+                            "records": EXPECTED_RECIPIENT_VAL_RECORDS,
+                            "exact_matches": matches,
+                            "exact_match": matches / EXPECTED_RECIPIENT_VAL_RECORDS,
+                        }
+                    }
+                    if validated
+                    else None
+                ),
+            }
+        )
+    summary["records"] = records
+    summary["best_checkpoint_epoch"] = 60
+    return summary
+
+
+def test_candidate_60e_and_onnx_val_replay_complete_recipient_counts(
+    tmp_path: Path,
+) -> None:
+    source_checkpoint = tmp_path / "best.pt"
+    source_checkpoint.write_bytes(b"full-crop-best")
+    source_sha = hashlib.sha256(source_checkpoint.read_bytes()).hexdigest()
+    summary = _candidate_60_summary(
+        source_summary=_summary(),
+        source_checkpoint=source_checkpoint,
+        source_sha256=source_sha,
+    )
+    audit = validate_full_crop_candidate_training_metrics(summary)
+    assert audit["recipient_val_records"] == 6789
+    assert audit["recipient_candidate_coverage"] == 1.0
+    assert audit["best_recipient_exact_matches"] == 6111
+    assert audit["validated_epochs"] == [1, *range(2, 61, 2)]
+
+    incomplete = json.loads(json.dumps(summary))
+    incomplete["records"][1]["val_candidate_text_by_field"]["recipient_field"][
+        "records"
+    ] = 6788
+    with pytest.raises(ValueError, match="records must equal.*6789"):
+        validate_full_crop_candidate_training_metrics(incomplete)
+
+    missing_matches = json.loads(json.dumps(summary))
+    del missing_matches["records"][1]["val_candidate_text_by_field"][
+        "recipient_field"
+    ]["exact_matches"]
+    with pytest.raises(ValueError, match="exact_matches must be an integer"):
+        validate_full_crop_candidate_training_metrics(missing_matches)
+
+    inconsistent = json.loads(json.dumps(summary))
+    inconsistent["records"][1]["val_candidate_text_by_field"]["recipient_field"][
+        "exact_match"
+    ] = 0.5
+    with pytest.raises(ValueError, match="inconsistent with exact_matches/records"):
+        validate_full_crop_candidate_training_metrics(inconsistent)
+
+    wrong_field_count = json.loads(json.dumps(summary))
+    wrong_field_count["field_counts"]["recipient_field"]["val"] = 6788
+    with pytest.raises(ValueError, match="recipient val count"):
+        validate_full_crop_candidate_training_metrics(wrong_field_count)
+
+    wrong_oov_count = json.loads(json.dumps(summary))
+    wrong_oov_count["recipient_oov_by_split"]["val"]["records"] = 6788
+    with pytest.raises(ValueError, match="val OOV records"):
+        validate_full_crop_candidate_training_metrics(wrong_oov_count)
+
+    at_floor_or_below = _candidate_60_summary(
+        source_summary=_summary(),
+        source_checkpoint=source_checkpoint,
+        source_sha256=source_sha,
+        best_matches=6110,
+    )
+    with pytest.raises(ValueError, match="strictly above 90%"):
+        validate_full_crop_candidate_training_metrics(at_floor_or_below)
+
+    val_summary = {
+        "evaluation_split": "val",
+        "by_field": {
+            "recipient_field": {
+                "records": 6789,
+                "raw_exact_matches": 6111,
+                "raw_exact_match": 6111 / 6789,
+            }
+        },
+    }
+    val_audit = validate_full_crop_candidate_val_metrics(val_summary)
+    assert val_audit["recipient_records"] == 6789
+    assert val_audit["recipient_exact_matches"] == 6111
+    assert val_audit["recipient_candidate_coverage"] == 1.0
+    val_summary["by_field"]["recipient_field"]["records"] = 6788
+    with pytest.raises(ValueError, match="records must equal.*6789"):
+        validate_full_crop_candidate_val_metrics(val_summary)
+
+
 def test_residual_pilot_gate_requires_trim_zero_full_fields_and_safe_status(
     tmp_path: Path,
 ) -> None:
@@ -578,6 +799,50 @@ def test_residual_pilot_gate_requires_trim_zero_full_fields_and_safe_status(
     assert decision["passed"] is True
     assert decision["decision"] == CANDIDATE_PILOT_DECISION
     assert decision["production_route_authorized"] is False
+    assert decision["observed"]["recipient_candidate_records"] == 6789
+    assert decision["observed"]["recipient_candidate_coverage"] == 1.0
+
+    incomplete_coverage = json.loads(json.dumps(summary))
+    incomplete_coverage["records"][0]["val_candidate_text_by_field"]["recipient_field"][
+        "records"
+    ] = 6788
+    with pytest.raises(ValueError, match="records must equal.*6789"):
+        evaluate_residual_candidate_pilot(
+            incomplete_coverage,
+            recipe=recipe,
+            source_subject_id=source_subject_id,
+            source_checkpoint=source_checkpoint,
+            source_checkpoint_sha256=source_sha,
+            full_manifest_sha256=full_manifest_sha256,
+        )
+
+    inconsistent_rate = json.loads(json.dumps(summary))
+    inconsistent_rate["records"][0]["val_candidate_text_by_field"]["recipient_field"][
+        "exact_match"
+    ] = 0.5
+    with pytest.raises(ValueError, match="inconsistent with exact_matches/records"):
+        evaluate_residual_candidate_pilot(
+            inconsistent_rate,
+            recipe=recipe,
+            source_subject_id=source_subject_id,
+            source_checkpoint=source_checkpoint,
+            source_checkpoint_sha256=source_sha,
+            full_manifest_sha256=full_manifest_sha256,
+        )
+
+    non_integer_matches = json.loads(json.dumps(summary))
+    non_integer_matches["records"][0]["val_candidate_text_by_field"]["recipient_field"][
+        "exact_matches"
+    ] = 1.0
+    with pytest.raises(ValueError, match="exact_matches must be an integer"):
+        evaluate_residual_candidate_pilot(
+            non_integer_matches,
+            recipe=recipe,
+            source_subject_id=source_subject_id,
+            source_checkpoint=source_checkpoint,
+            source_checkpoint_sha256=source_sha,
+            full_manifest_sha256=full_manifest_sha256,
+        )
 
     wrong_trim = json.loads(json.dumps(summary))
     wrong_trim["config"]["recipient_value_left_trim"] = 0.30
@@ -720,6 +985,8 @@ def test_residual_pilot_evidence_is_required_content_bound_and_no_onnx(
     assert sealed["onnx_exported"] is False
     assert len(sealed["candidate_pilot_subject_id"]) == 64
     assert sealed["source_subject_id"] == source["source_subject_id"]
+    assert sealed["blind_manifest_contract"]["recipient_val_records"] == 6789
+    assert sealed["observed"]["recipient_candidate_coverage"] == 1.0
 
     copied_candidate_root = tmp_path / "copied-residual-pilot"
     shutil.copytree(candidate_root, copied_candidate_root, copy_function=os.link)
@@ -810,9 +1077,16 @@ def test_candidate_runner_has_mutually_exclusive_source_and_8_to_60_gates() -> N
     assert "Require-FreshNonReparseOutput $OutputRoot" in runner
     assert "production_route_authorized = $false" in runner
     assert "test_evaluated = $false" in runner
+    assert "if ($bestRecipient -le $recipientFloor)" in runner
+    assert '(Get-RawExact $validation "recipient_field") -le $recipientFloor' in runner
+    assert (
+        "recomputed_pilot_decision.observed.best_recipient_exact -gt $recipientFloor"
+        in runner
+    )
     assert "recipient_full_crop_candidate_source import main" in wrapper
     assert "source_guard_artifacts" in final_gate
     assert "source_guard_digest" in final_gate
+    assert "$metrics.recipient_field -le $recipientFloor" in final_gate
 
 
 def test_final_gate_accepts_only_the_bound_full_crop_subject_route(
@@ -820,10 +1094,28 @@ def test_final_gate_accepts_only_the_bound_full_crop_subject_route(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     full = tmp_path / "full.jsonl"
+    full_rows = [
+        {
+            "id": "train",
+            "split": "train",
+            "slots": {"recipient_field": {"text": "甲"}},
+        },
+        *(
+            {
+                "id": f"val-{index}",
+                "split": "val",
+                "slots": {"recipient_field": {"text": "乙"}},
+            }
+            for index in range(EXPECTED_RECIPIENT_VAL_RECORDS)
+        ),
+        {
+            "id": "test",
+            "split": "test",
+            "slots": {"recipient_field": {"text": "丙"}},
+        },
+    ]
     full.write_text(
-        '{"id":"train","split":"train","slots":{}}\n'
-        '{"id":"val","split":"val","slots":{}}\n'
-        '{"id":"test","split":"test","slots":{}}\n',
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in full_rows),
         encoding="utf-8",
     )
     blind = tmp_path / "blind.jsonl"
@@ -872,41 +1164,13 @@ def test_final_gate_accepts_only_the_bound_full_crop_subject_route(
         }
     )
     training_summary = tmp_path / "training_summary.json"
-    _write_json(
-        training_summary,
-        {
-            "kind": "receipt_unified_field_reader_v13",
-            "config": asdict(target_config),
-            "initialization": {
-                "mode": "parameter_only_recipient_visual_context_reinit",
-                "source_config": asdict(source_config),
-                "checkpoint_path": str(source_checkpoint),
-                "checkpoint_sha256": sha(source_checkpoint),
-            },
-            "fine_tune_policy": {
-                "mode": "recipient_only_v13",
-                "trainable_parameter_prefix": "recipient_",
-            },
-            "training_runtime": {
-                "device": "cuda:0",
-                "uses_cuda": True,
-                "cuda_device_name": "NVIDIA GeForce RTX 4090",
-                "num_workers": 4,
-                "prefetch_factor": 2,
-                "persistent_workers": True,
-                "validation_every": 2,
-                "cuda_tf32_requested": True,
-                "cudnn_benchmark_requested": True,
-            },
-            "recipient_train_split_policy": {
-                "mode": "standard_train_only",
-                "splits": ["train"],
-            },
-            "field_counts": {"recipient_field": {"train": 1, "val": 1, "test": 0}},
-            "recipient_oov_by_split": {"test": {"records": 0}},
-            "best_checkpoint_epoch": 60,
-        },
+    candidate_training = _candidate_60_summary(
+        source_summary={"config": asdict(source_config)},
+        source_checkpoint=source_checkpoint,
+        source_sha256=sha(source_checkpoint),
     )
+    candidate_training["training_runtime"]["validation_every"] = 2
+    _write_json(training_summary, candidate_training)
     recipe_path = tmp_path / "recipient_v14_training_recipe.json"
     _write_json(
         recipe_path,
@@ -928,11 +1192,16 @@ def test_final_gate_accepts_only_the_bound_full_crop_subject_route(
     checkpoint = tmp_path / "candidate-best.pt"
     checkpoint.write_bytes(b"sealed-candidate-checkpoint")
     val_summary = tmp_path / "val.json"
+    recipient_strict_pass = 6111 / EXPECTED_RECIPIENT_VAL_RECORDS
     by_field = {
         "amount": {"records": 1, "raw_exact_match": 0.80},
         "time": {"records": 1, "raw_exact_match": 0.99},
         "payment_method_field": {"records": 1, "raw_exact_match": 0.94},
-        "recipient_field": {"records": 1, "raw_exact_match": 0.91},
+        "recipient_field": {
+            "records": EXPECTED_RECIPIENT_VAL_RECORDS,
+            "raw_exact_matches": 6111,
+            "raw_exact_match": recipient_strict_pass,
+        },
         "transfer_status": {
             "records": 1,
             "ctc_records": 1,
@@ -1062,7 +1331,10 @@ def test_final_gate_accepts_only_the_bound_full_crop_subject_route(
             "amount": 0.80,
             "time": 0.99,
             "payment_method_field": 0.94,
-            "recipient_field": 0.91,
+            "recipient_field": recipient_strict_pass,
+            "recipient_records": EXPECTED_RECIPIENT_VAL_RECORDS,
+            "recipient_exact_matches": 6111,
+            "recipient_candidate_coverage": 1.0,
             "visible_transfer_status_cjk_text": 0.92,
             "status_non_success_to_success": 0,
         },
@@ -1071,6 +1343,59 @@ def test_final_gate_accepts_only_the_bound_full_crop_subject_route(
     inspection = inspect_candidate(evidence, trusted_full_manifest_sha256=sha(full))
     assert inspection["evidence_binding"]["source_route"]["source_subject_id"] == source_subject_id
     assert inspection["source_guard_artifacts"]
+
+    for rejected_matches in (6110,):
+        rejected_recipient = rejected_matches / EXPECTED_RECIPIENT_VAL_RECORDS
+        by_field["recipient_field"]["raw_exact_matches"] = rejected_matches
+        by_field["recipient_field"]["raw_exact_match"] = rejected_recipient
+        _write_json(
+            val_summary,
+            {
+                "schema_version": 1,
+                "kind": "receipt_unified_field_reader_truth_evaluation_v1",
+                "model_sha256": sha(model),
+                "records_sha256": sha(blind),
+                "evaluation_split": "val",
+                "providers": ["CUDAExecutionProvider"],
+                "status_text_policy": {
+                    "runtime_policy": "decode_and_normalize_review_only",
+                    "review_value": "review",
+                },
+                "acceptance": acceptance,
+                "by_field": by_field,
+            },
+        )
+        candidate_document["val_evaluation"]["summary_sha256"] = sha(val_summary)
+        candidate_document["val_evaluation"]["recipient_field"] = rejected_recipient
+        candidate_document["val_evaluation"][
+            "recipient_exact_matches"
+        ] = rejected_matches
+        _write_json(evidence, candidate_document)
+        with pytest.raises(ValueError, match="recipient_field is"):
+            inspect_candidate(evidence, trusted_full_manifest_sha256=sha(full))
+
+    by_field["recipient_field"]["raw_exact_matches"] = 6111
+    by_field["recipient_field"]["raw_exact_match"] = recipient_strict_pass
+    _write_json(
+        val_summary,
+        {
+            "schema_version": 1,
+            "kind": "receipt_unified_field_reader_truth_evaluation_v1",
+            "model_sha256": sha(model),
+            "records_sha256": sha(blind),
+            "evaluation_split": "val",
+            "providers": ["CUDAExecutionProvider"],
+            "status_text_policy": {
+                "runtime_policy": "decode_and_normalize_review_only",
+                "review_value": "review",
+            },
+            "acceptance": acceptance,
+            "by_field": by_field,
+        },
+    )
+    candidate_document["val_evaluation"]["summary_sha256"] = sha(val_summary)
+    candidate_document["val_evaluation"]["recipient_field"] = recipient_strict_pass
+    candidate_document["val_evaluation"]["recipient_exact_matches"] = 6111
 
     candidate_document["source_route"]["source_subject_id"] = "c" * 64
     _write_json(evidence, candidate_document)
@@ -1084,9 +1409,9 @@ def test_final_gate_mechanically_rejects_unbound_trim_zero_candidate(
 ) -> None:
     full = tmp_path / "full.jsonl"
     full.write_text(
-        '{"id":"train","split":"train","slots":{}}\n'
-        '{"id":"val","split":"val","slots":{}}\n'
-        '{"id":"test","split":"test","slots":{}}\n',
+        '{"id":"train","split":"train","slots":{"recipient_field":{"text":"甲"}}}\n'
+        '{"id":"val","split":"val","slots":{"recipient_field":{"text":"乙"}}}\n'
+        '{"id":"test","split":"test","slots":{"recipient_field":{"text":"丙"}}}\n',
         encoding="utf-8",
     )
     blind = tmp_path / "blind.jsonl"

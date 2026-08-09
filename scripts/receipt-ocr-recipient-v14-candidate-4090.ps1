@@ -281,7 +281,7 @@ if ($fullCropSourceMode) {
         -or $sourceContract.test_opened -ne $false `
         -or $sourceContract.onnx_exported -ne $false `
         -or [double]$sourceContract.recomputed_pilot_decision.observed.best_recipient_exact -lt $pilotMinimumBestRecipient `
-        -or [double]$sourceContract.recomputed_pilot_decision.observed.best_recipient_exact -ge $recipientFloor `
+        -or [double]$sourceContract.recomputed_pilot_decision.observed.best_recipient_exact -gt $recipientFloor `
         -or [string]$sourceContract.recomputed_pilot_decision.decision -ne "analysis_only_continue_to_separate_guarded_candidate") {
         throw "Full-crop source contract does not authorize the separate guarded candidate."
     }
@@ -597,6 +597,12 @@ if ($bestRows.Count -ne 1 -or $bestRows[0].checkpoint_selection_eligible -ne $tr
 $bestRecipient = [double]$bestRows[0].val_candidate_text_by_field.recipient_field.exact_match
 $sourceLeases.Add((Open-ReadLease $trainingSummaryPath "candidate training summary"))
 $sourceLeases.Add((Open-ReadLease $checkpoint "candidate best checkpoint"))
+if ($fullCropSourceMode -and -not $Pilot) {
+    Invoke-Python @(
+        "-m", $sourceModule, "verify-candidate-training",
+        "--summary", $trainingSummaryPath
+    ) "full-crop candidate 60e recipient coverage verification"
+}
 if ($Pilot) {
     $epoch4Rows = @($training.records | Where-Object { [int]$_.epoch -eq 4 })
     $epoch8Rows = @($training.records | Where-Object { [int]$_.epoch -eq 8 })
@@ -643,8 +649,8 @@ if ($Pilot) {
     }
     exit 0
 }
-if ($bestRecipient -lt $recipientFloor) {
-    throw ("Val recipient exact {0:P2} is below {1:P2}; test remains unopened." -f $bestRecipient, $recipientFloor)
+if ($bestRecipient -le $recipientFloor) {
+    throw ("Val recipient exact {0:P2} is not strictly above {1:P2}; test remains unopened." -f $bestRecipient, $recipientFloor)
 }
 Require-File $checkpoint "best recipient v14 checkpoint"
 
@@ -672,6 +678,13 @@ Invoke-Python @(
 ) "recipient v14 val-only ONNX gate"
 
 $validation = Read-Json $validationSummaryPath
+$sourceLeases.Add((Open-ReadLease $validationSummaryPath "candidate validation summary"))
+if ($fullCropSourceMode) {
+    Invoke-Python @(
+        "-m", $sourceModule, "verify-candidate-val",
+        "--summary", $validationSummaryPath
+    ) "full-crop candidate ONNX val recipient coverage verification"
+}
 $statusRaw = [double]$validation.by_field.transfer_status.ctc_raw_exact_match
 if ($validation.providers -notcontains "CUDAExecutionProvider" `
     -or $validation.acceptance.passed -ne $true `
@@ -679,7 +692,7 @@ if ($validation.providers -notcontains "CUDAExecutionProvider" `
     -or (Get-RawExact $validation "amount") -lt $amountFloor `
     -or (Get-RawExact $validation "time") -lt $timeFloor `
     -or (Get-RawExact $validation "payment_method_field") -lt $paymentFloor `
-    -or (Get-RawExact $validation "recipient_field") -lt $recipientFloor `
+    -or (Get-RawExact $validation "recipient_field") -le $recipientFloor `
     -or $statusRaw -lt $statusTextFloor `
     -or [int]$validation.by_field.transfer_status.non_success_to_success -ne 0) {
     throw "Val-only ONNX evidence did not pass fixed delivery floors."
@@ -692,7 +705,6 @@ Require-File $modelLabelsPath "candidate ONNX labels"
 $sourceLeases.Add((Open-ReadLease $model "candidate ONNX model"))
 $sourceLeases.Add((Open-ReadLease $modelContractPath "candidate ONNX contract"))
 $sourceLeases.Add((Open-ReadLease $modelLabelsPath "candidate ONNX labels"))
-$sourceLeases.Add((Open-ReadLease $validationSummaryPath "candidate validation summary"))
 $sourceRouteEvidence = if ($fullCropSourceMode) {
     [ordered]@{
         mode = $sourceRouteMode
@@ -765,6 +777,9 @@ $evidence = [ordered]@{
         time = Get-RawExact $validation "time"
         payment_method_field = Get-RawExact $validation "payment_method_field"
         recipient_field = Get-RawExact $validation "recipient_field"
+        recipient_records = [int]$validation.by_field.recipient_field.records
+        recipient_exact_matches = [int]$validation.by_field.recipient_field.raw_exact_matches
+        recipient_candidate_coverage = 1.0
         visible_transfer_status_cjk_text = $statusRaw
         status_non_success_to_success = [int]$validation.by_field.transfer_status.non_success_to_success
     }

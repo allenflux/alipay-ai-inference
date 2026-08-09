@@ -47,6 +47,7 @@ EVALUATION_KINDS = {
     "receipt_unified_field_reader_truth_evaluation_v1",
     "receipt_unified_field_reader_teacher_parity_v1",
 }
+EXPECTED_RECIPIENT_VAL_RECORDS = 6789
 
 
 def _sha256(path: Path) -> str:
@@ -95,6 +96,54 @@ def _load_json(path: Path) -> dict[str, Any]:
 
     reject_nonfinite(value, "$")
     return value
+
+
+def _manifest_recipient_records(path: Path, *, split: str) -> int:
+    """Count scoreable recipient targets directly from frozen manifest bytes."""
+
+    records = 0
+    seen_ids: set[str] = set()
+    with path.open("r", encoding="utf-8-sig") as stream:
+        for line_number, line in enumerate(stream, start=1):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise ValueError(
+                    f"{path}:{line_number}: invalid recipient manifest JSON"
+                ) from error
+            if not isinstance(row, Mapping):
+                raise ValueError(f"{path}:{line_number}: manifest row must be an object")
+            record_id = row.get("id")
+            if (
+                not isinstance(record_id, str)
+                or not record_id
+                or record_id in seen_ids
+            ):
+                raise ValueError(f"{path}:{line_number}: missing or duplicate record id")
+            seen_ids.add(record_id)
+            slots = row.get("slots")
+            if not isinstance(slots, Mapping):
+                raise ValueError(f"{path}:{line_number}: slots must be an object")
+            recipient = slots.get("recipient_field")
+            if recipient is not None and not isinstance(recipient, Mapping):
+                raise ValueError(f"{path}:{line_number}: recipient slot must be an object")
+            if isinstance(recipient, Mapping):
+                text = recipient.get("text")
+                if (
+                    not isinstance(text, str)
+                    or not text
+                    or any(not character.isprintable() for character in text)
+                ):
+                    raise ValueError(
+                        f"{path}:{line_number}: recipient target must be non-empty and printable"
+                    )
+            if row.get("split") == split and recipient is not None:
+                records += 1
+    if records <= 0:
+        raise ValueError(f"{path}: no scoreable {split} recipient records")
+    return records
 
 
 def _mapping(value: object, description: str) -> Mapping[str, Any]:
@@ -161,6 +210,12 @@ def _finite_rate(value: object, description: str) -> float:
     return number
 
 
+def _fails_fixed_floor(name: str, metric: float, floor: float) -> bool:
+    """Recipient delivery is strictly above 90%; other fixed floors are inclusive."""
+
+    return metric <= floor if name == "recipient_field" else metric < floor
+
+
 def _fixed_floor_payload(value: object, description: str) -> dict[str, float]:
     floors = _mapping(value, description)
     output: dict[str, float] = {}
@@ -225,15 +280,46 @@ def _require_claimed_hash(
         raise ValueError(f"{description} claimed SHA-256 does not match actual bytes")
 
 
-def _raw_exact(summary: Mapping[str, Any], field: str, metric: str = "raw_exact_match") -> float:
+def _raw_exact(
+    summary: Mapping[str, Any],
+    field: str,
+    metric: str = "raw_exact_match",
+    *,
+    expected_records: int | None = None,
+    require_count_consistency: bool = False,
+) -> float:
     by_field = _mapping(summary.get("by_field"), "evaluation by_field")
     field_metrics = _mapping(by_field.get(field), f"evaluation by_field.{field}")
     records = field_metrics.get("records")
     if isinstance(records, bool) or not isinstance(records, int) or records <= 0:
         raise ValueError(f"evaluation by_field.{field}.records must be positive")
+    if expected_records is not None and records != expected_records:
+        raise ValueError(
+            f"evaluation by_field.{field}.records must equal {expected_records}"
+        )
     if metric == "ctc_raw_exact_match" and field_metrics.get("ctc_records") != records:
         raise ValueError(f"evaluation by_field.{field}.ctc_records must equal records")
-    return _finite_rate(field_metrics.get(metric), f"evaluation by_field.{field}.{metric}")
+    exact = _finite_rate(field_metrics.get(metric), f"evaluation by_field.{field}.{metric}")
+    if require_count_consistency:
+        matches_name = (
+            "ctc_raw_exact_matches"
+            if metric == "ctc_raw_exact_match"
+            else "raw_exact_matches"
+        )
+        matches = field_metrics.get(matches_name)
+        if (
+            isinstance(matches, bool)
+            or not isinstance(matches, int)
+            or not 0 <= matches <= records
+        ):
+            raise ValueError(
+                f"evaluation by_field.{field}.{matches_name} must be an integer in [0, records]"
+            )
+        if not math.isclose(exact, matches / records, rel_tol=0.0, abs_tol=1e-12):
+            raise ValueError(
+                f"evaluation by_field.{field}.{metric} is inconsistent with {matches_name}/records"
+            )
+    return exact
 
 
 def _validate_evaluation_kind(summary: Mapping[str, Any], description: str) -> None:
@@ -412,6 +498,7 @@ def inspect_candidate(
     # a content-bound passed full-crop source plus its passed residual pilot.
     source_guard_paths: dict[str, Path] = {}
     source_route_binding: dict[str, object] = {"mode": "historical_legacy_v14"}
+    full_crop_source_route = False
     raw_source_route = candidate.get("source_route")
     initialization_source_config = _mapping(
         initialization.get("source_config"), "training initialization source config"
@@ -508,6 +595,7 @@ def inspect_candidate(
                 "source_checkpoint_sha256": source_checkpoint_sha256,
             }
         else:
+            full_crop_source_route = True
             if not math.isclose(route_trim, 0.0, rel_tol=0.0, abs_tol=1e-12):
                 raise ValueError("full-crop candidate source route must lock trim zero")
             if not math.isclose(target_trim, 0.0, rel_tol=0.0, abs_tol=1e-12) or not math.isclose(
@@ -604,6 +692,7 @@ def inspect_candidate(
                 "residual candidate-pilot evidence",
             )
             from .recipient_full_crop_candidate_source import (
+                validate_full_crop_candidate_training_metrics,
                 validate_full_crop_training_recipe,
                 verify_full_crop_candidate_source,
                 verify_residual_candidate_pilot,
@@ -674,6 +763,7 @@ def inspect_candidate(
                 source_checkpoint_sha256=source_checkpoint_sha256,
                 full_manifest_sha256=actual_hashes["full_manifest"],
             )
+            validate_full_crop_candidate_training_metrics(training)
             source_artifacts = _mapping(
                 source_contract_payload.get("artifacts"), "full-crop source artifacts"
             )
@@ -726,6 +816,15 @@ def inspect_candidate(
                 "training_recipe_sha256": training_recipe_sha256,
             }
 
+    blind_recipient_val_records = _manifest_recipient_records(blind_manifest, split="val")
+    if (
+        full_crop_source_route
+        and blind_recipient_val_records != EXPECTED_RECIPIENT_VAL_RECORDS
+    ):
+        raise ValueError(
+            "full-crop blind manifest recipient val denominator must equal 6789"
+        )
+
     val = _load_json(val_summary)
     _validate_evaluation_kind(val, "validation summary")
     _require_equal(val.get("model_sha256"), actual_hashes["model"], "validation model hash")
@@ -740,7 +839,12 @@ def inspect_candidate(
         "amount": _raw_exact(val, "amount"),
         "time": _raw_exact(val, "time"),
         "payment_method_field": _raw_exact(val, "payment_method_field"),
-        "recipient_field": _raw_exact(val, "recipient_field"),
+        "recipient_field": _raw_exact(
+            val,
+            "recipient_field",
+            expected_records=blind_recipient_val_records,
+            require_count_consistency=full_crop_source_route,
+        ),
         "visible_transfer_status_cjk_text": _raw_exact(
             val,
             "transfer_status",
@@ -758,11 +862,33 @@ def inspect_candidate(
         "candidate validation unsafe status errors",
     )
     for name, floor in FIXED_FLOORS.items():
-        if val_metrics[name] < floor:
-            raise ValueError(f"validation {name} is below the fixed floor")
+        if _fails_fixed_floor(name, val_metrics[name], floor):
+            relation = "not strictly above" if name == "recipient_field" else "below"
+            raise ValueError(f"validation {name} is {relation} the fixed floor")
         claimed = _finite_rate(val_binding.get(name), f"candidate val_evaluation.{name}")
         if not math.isclose(claimed, val_metrics[name], rel_tol=0.0, abs_tol=1e-12):
             raise ValueError(f"candidate val_evaluation.{name} differs from its bound summary")
+    if full_crop_source_route:
+        recipient_metric = _mapping(
+            _mapping(val.get("by_field"), "validation by_field").get("recipient_field"),
+            "validation recipient metric",
+        )
+        _require_equal(
+            val_binding.get("recipient_records"),
+            blind_recipient_val_records,
+            "candidate val recipient records",
+        )
+        _require_equal(
+            val_binding.get("recipient_exact_matches"),
+            recipient_metric.get("raw_exact_matches"),
+            "candidate val recipient exact matches",
+        )
+        coverage = _finite_rate(
+            val_binding.get("recipient_candidate_coverage"),
+            "candidate val recipient coverage",
+        )
+        if not math.isclose(coverage, 1.0, rel_tol=0.0, abs_tol=1e-12):
+            raise ValueError("candidate val recipient coverage must equal 100%")
 
     evidence_binding: dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
@@ -772,6 +898,8 @@ def inspect_candidate(
         "blind_contract_sha256": actual_hashes["blind_contract"],
         "training_summary_sha256": actual_hashes["training_summary"],
         "val_summary_sha256": actual_hashes["val_summary"],
+        "recipient_val_records": blind_recipient_val_records,
+        "recipient_candidate_coverage": 1.0,
         "fixed_floors": floors,
         "source_route": source_route_binding,
     }
@@ -817,6 +945,8 @@ def inspect_candidate(
         "evidence_binding": evidence_binding,
         "fixed_floors": floors,
         "val_metrics": val_metrics,
+        "recipient_val_records": blind_recipient_val_records,
+        "recipient_candidate_coverage": 1.0,
         "status_non_success_to_success": 0,
     }
 
@@ -903,11 +1033,23 @@ def verify_test_summary(*, inspection: Path, summary: Path) -> dict[str, Any]:
     _validate_status_policy(result)
     reported_failures = _validate_acceptance(result, require_passed=False)
 
+    # This runs only after the PowerShell launcher has created the permanent
+    # one-shot lock. Recount the held-out recipient denominator here rather
+    # than exposing test-label semantics during pre-lock candidate inspection.
+    test_recipient_records = _manifest_recipient_records(
+        Path(str(paths.get("full_manifest"))), split="test"
+    )
+
     metrics = {
         "amount": _raw_exact(result, "amount"),
         "time": _raw_exact(result, "time"),
         "payment_method_field": _raw_exact(result, "payment_method_field"),
-        "recipient_field": _raw_exact(result, "recipient_field"),
+        "recipient_field": _raw_exact(
+            result,
+            "recipient_field",
+            expected_records=test_recipient_records,
+            require_count_consistency=True,
+        ),
         "visible_transfer_status_cjk_text": _raw_exact(
             result,
             "transfer_status",
@@ -922,9 +1064,13 @@ def verify_test_summary(*, inspection: Path, summary: Path) -> dict[str, Any]:
     if isinstance(unsafe, bool) or not isinstance(unsafe, int) or unsafe < 0:
         raise ValueError("test non_success_to_success must be a non-negative integer")
     computed_failures = [
-        f"{name}_below_floor"
+        (
+            "recipient_field_not_strictly_above_floor"
+            if name == "recipient_field"
+            else f"{name}_below_floor"
+        )
         for name, floor in FIXED_FLOORS.items()
-        if metrics[name] < floor
+        if _fails_fixed_floor(name, metrics[name], floor)
     ]
     if unsafe != 0:
         computed_failures.append("status_non_success_to_success")
@@ -940,6 +1086,12 @@ def verify_test_summary(*, inspection: Path, summary: Path) -> dict[str, Any]:
         "passed": passed,
         "failures": computed_failures,
         "metrics": metrics,
+        "recipient_records": test_recipient_records,
+        "recipient_exact_matches": _mapping(
+            _mapping(result.get("by_field"), "test by_field").get("recipient_field"),
+            "test recipient metrics",
+        ).get("raw_exact_matches"),
+        "recipient_candidate_coverage": 1.0,
         "status_non_success_to_success": unsafe,
         "summary": str(summary.resolve()),
         "summary_sha256": _sha256(summary.resolve()),

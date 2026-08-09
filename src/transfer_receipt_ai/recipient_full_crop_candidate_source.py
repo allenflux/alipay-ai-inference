@@ -61,6 +61,7 @@ SOURCE_SUBJECT_DOMAIN = "receipt-recipient-full-crop-source-subject-v1"
 CANDIDATE_PILOT_SUBJECT_DOMAIN = "receipt-recipient-v14-residual-pilot-subject-v1"
 TRAINING_RECIPE_KIND = "receipt_recipient_v14_full_crop_training_recipe_v1"
 RECIPIENT_DELIVERY_FLOOR = 0.90
+EXPECTED_RECIPIENT_VAL_RECORDS = 6789
 REQUIRED_BACKBONE = "residual_positional_transformer_v2"
 REQUIRED_SOURCE_BACKBONE = "legacy_depthwise_gru_v1"
 
@@ -234,9 +235,241 @@ def _blind_semantic_identity(binding: Mapping[str, Any]) -> dict[str, object]:
         "source_manifest_sha256": binding.get("source_manifest_sha256"),
         "blind_manifest_sha256": binding.get("blind_manifest_sha256"),
         "split_counts": binding.get("split_counts"),
+        "recipient_val_records": binding.get("recipient_val_records"),
         "optimizer_supervision_splits": binding.get("optimizer_supervision_splits"),
         "checkpoint_selection_splits": binding.get("checkpoint_selection_splits"),
         "test_opened_by_training": binding.get("test_opened_by_training"),
+    }
+
+
+def _blind_recipient_val_records(binding: Mapping[str, Any]) -> int:
+    """Recount the recipient validation denominator from frozen manifest bytes."""
+
+    raw_path = binding.get("blind_manifest")
+    if not isinstance(raw_path, str) or not raw_path:
+        raise ValueError("blind-manifest binding has no manifest path")
+    path = _existing_non_reparse(
+        Path(raw_path), directory=False, description="blind recipient manifest"
+    )
+    records = 0
+    with path.open("r", encoding="utf-8-sig") as stream:
+        for line_number, line in enumerate(stream, start=1):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise ValueError(
+                    f"blind recipient manifest line {line_number} is invalid JSON"
+                ) from error
+            if not isinstance(row, Mapping):
+                raise ValueError(
+                    f"blind recipient manifest line {line_number} is not an object"
+                )
+            slots = row.get("slots")
+            if not isinstance(slots, Mapping):
+                raise ValueError(
+                    f"blind recipient manifest line {line_number} has invalid slots"
+                )
+            recipient = slots.get("recipient_field")
+            if recipient is not None and not isinstance(recipient, Mapping):
+                raise ValueError(
+                    f"blind recipient manifest line {line_number} has an invalid recipient slot"
+                )
+            if isinstance(recipient, Mapping):
+                text = recipient.get("text")
+                if (
+                    not isinstance(text, str)
+                    or not text
+                    or any(not character.isprintable() for character in text)
+                ):
+                    raise ValueError(
+                        f"blind recipient manifest line {line_number} has no valid recipient target"
+                    )
+            if row.get("split") == "val" and recipient is not None:
+                records += 1
+    if records != EXPECTED_RECIPIENT_VAL_RECORDS:
+        raise ValueError(
+            "blind manifest recipient val denominator mismatch: "
+            f"expected {EXPECTED_RECIPIENT_VAL_RECORDS}, found {records}"
+        )
+    return records
+
+
+def _exact_count_metric(
+    metric: Mapping[str, Any], *, expected_records: int, description: str
+) -> tuple[int, float]:
+    records = metric.get("records")
+    matches = metric.get("exact_matches")
+    if (
+        isinstance(records, bool)
+        or not isinstance(records, int)
+        or records != expected_records
+    ):
+        raise ValueError(
+            f"{description} records must equal the frozen recipient val denominator "
+            f"{expected_records}"
+        )
+    if (
+        isinstance(matches, bool)
+        or not isinstance(matches, int)
+        or not 0 <= matches <= records
+    ):
+        raise ValueError(f"{description} exact_matches must be an integer in [0, records]")
+    exact = _finite_rate(metric.get("exact_match"), f"{description} exact_match")
+    expected_exact = matches / records
+    if not math.isclose(exact, expected_exact, rel_tol=0.0, abs_tol=1e-12):
+        raise ValueError(
+            f"{description} exact_match is inconsistent with exact_matches/records"
+        )
+    return matches, exact
+
+
+def validate_full_crop_candidate_training_metrics(
+    summary: Mapping[str, Any],
+) -> dict[str, object]:
+    """Replay recipient coverage/count semantics for the fixed fresh 60e run."""
+
+    field_counts = _mapping(summary.get("field_counts"), "candidate field counts")
+    recipient_counts = _mapping(
+        field_counts.get("recipient_field"), "candidate recipient field counts"
+    )
+    _require_equal(
+        recipient_counts.get("val"),
+        EXPECTED_RECIPIENT_VAL_RECORDS,
+        "candidate recipient val count",
+    )
+    _require_equal(recipient_counts.get("test"), 0, "candidate recipient test count")
+    recipient_oov = _mapping(
+        summary.get("recipient_oov_by_split"), "candidate recipient OOV"
+    )
+    recipient_val_oov = _mapping(recipient_oov.get("val"), "candidate val OOV")
+    recipient_test_oov = _mapping(recipient_oov.get("test"), "candidate test OOV")
+    _require_equal(
+        recipient_val_oov.get("records"),
+        EXPECTED_RECIPIENT_VAL_RECORDS,
+        "candidate val OOV records",
+    )
+    _require_equal(
+        recipient_test_oov.get("records"), 0, "candidate test OOV records"
+    )
+
+    raw_records = summary.get("records")
+    if not isinstance(raw_records, Sequence) or isinstance(raw_records, (str, bytes)):
+        raise ValueError("candidate 60e summary has invalid epoch records")
+    records = [_mapping(record, "candidate 60e epoch record") for record in raw_records]
+    if [record.get("epoch") for record in records] != list(range(1, 61)):
+        raise ValueError("candidate 60e summary requires ordered epochs 1 through 60")
+
+    validated_epochs: list[int] = []
+    recipient_by_epoch: dict[int, tuple[int, float]] = {}
+    for record in records:
+        epoch = int(record["epoch"])
+        expected_validation = epoch == 1 or epoch == 60 or epoch % 2 == 0
+        _require_equal(
+            record.get("validation_performed"),
+            expected_validation,
+            f"candidate epoch {epoch} validation schedule",
+        )
+        fields = record.get("val_candidate_text_by_field")
+        if not expected_validation:
+            _require_equal(fields, None, f"candidate epoch {epoch} skipped validation metrics")
+            continue
+        validated_epochs.append(epoch)
+        field_metrics = _mapping(fields, f"candidate epoch {epoch} fields")
+        recipient_metric = _mapping(
+            field_metrics.get("recipient_field"),
+            f"candidate epoch {epoch} recipient metric",
+        )
+        recipient_by_epoch[epoch] = _exact_count_metric(
+            recipient_metric,
+            expected_records=EXPECTED_RECIPIENT_VAL_RECORDS,
+            description=f"candidate epoch {epoch} recipient metric",
+        )
+
+    best_epoch = summary.get("best_checkpoint_epoch")
+    if (
+        isinstance(best_epoch, bool)
+        or not isinstance(best_epoch, int)
+        or best_epoch not in recipient_by_epoch
+    ):
+        raise ValueError("candidate best checkpoint epoch has no complete validation metric")
+    maximum = max(exact for _, exact in recipient_by_epoch.values())
+    best_matches, best_exact = recipient_by_epoch[best_epoch]
+    if not math.isclose(best_exact, maximum, rel_tol=0.0, abs_tol=1e-12):
+        raise ValueError("candidate best checkpoint is not recipient-optimal")
+    if best_exact <= RECIPIENT_DELIVERY_FLOOR:
+        raise ValueError("candidate best recipient exact must be strictly above 90%")
+    return {
+        "recipient_val_records": EXPECTED_RECIPIENT_VAL_RECORDS,
+        "recipient_candidate_coverage": 1.0,
+        "validated_epochs": validated_epochs,
+        "best_epoch": best_epoch,
+        "best_recipient_exact_matches": best_matches,
+        "best_recipient_exact": best_exact,
+    }
+
+
+def validate_full_crop_candidate_val_metrics(
+    summary: Mapping[str, Any],
+) -> dict[str, object]:
+    """Validate the independently exported ONNX val recipient count evidence."""
+
+    _require_equal(summary.get("evaluation_split"), "val", "candidate evaluation split")
+    by_field = _mapping(summary.get("by_field"), "candidate evaluation fields")
+    recipient = _mapping(
+        by_field.get("recipient_field"), "candidate evaluation recipient metric"
+    )
+    metric = {
+        "records": recipient.get("records"),
+        "exact_matches": recipient.get("raw_exact_matches"),
+        "exact_match": recipient.get("raw_exact_match"),
+    }
+    matches, exact = _exact_count_metric(
+        metric,
+        expected_records=EXPECTED_RECIPIENT_VAL_RECORDS,
+        description="candidate ONNX val recipient metric",
+    )
+    if exact <= RECIPIENT_DELIVERY_FLOOR:
+        raise ValueError("candidate ONNX val recipient exact must be strictly above 90%")
+    return {
+        "recipient_records": EXPECTED_RECIPIENT_VAL_RECORDS,
+        "recipient_exact_matches": matches,
+        "recipient_exact_match": exact,
+        "recipient_candidate_coverage": 1.0,
+    }
+
+
+def _validate_source_pilot_recipient_metrics(
+    summary: Mapping[str, Any], *, expected_records: int
+) -> dict[str, object]:
+    raw_records = summary.get("records")
+    if not isinstance(raw_records, Sequence) or isinstance(raw_records, (str, bytes)):
+        raise ValueError("source pilot has invalid epoch records")
+    validated_epochs: list[int] = []
+    for raw_record in raw_records:
+        record = _mapping(raw_record, "source pilot epoch record")
+        epoch = record.get("epoch")
+        if isinstance(epoch, bool) or not isinstance(epoch, int):
+            raise ValueError("source pilot epoch must be an integer")
+        fields = _mapping(
+            record.get("val_candidate_text_by_field"),
+            f"source pilot epoch {epoch} fields",
+        )
+        recipient = _mapping(
+            fields.get("recipient_field"),
+            f"source pilot epoch {epoch} recipient metric",
+        )
+        _exact_count_metric(
+            recipient,
+            expected_records=expected_records,
+            description=f"source pilot epoch {epoch} recipient metric",
+        )
+        validated_epochs.append(epoch)
+    return {
+        "recipient_val_records": expected_records,
+        "recipient_candidate_coverage": 1.0,
+        "validated_epochs": validated_epochs,
     }
 
 
@@ -435,6 +668,19 @@ def _load_and_validate_pilot(
         "stored full-crop pilot decision",
     )
     _validate_blind_binding_equivalent(stored_blind, recomputed_blind)
+    blind_binding = {
+        **blind_binding,
+        "recipient_val_records": _blind_recipient_val_records(blind_binding),
+    }
+    recipient_metric_audit = _validate_source_pilot_recipient_metrics(
+        summary,
+        expected_records=int(blind_binding["recipient_val_records"]),
+    )
+    recomputed = {
+        **recomputed,
+        "blind_manifest_contract": blind_binding,
+        "recipient_candidate_metric_audit": recipient_metric_audit,
+    }
     _require_equal(decision.get("passed"), True, "pilot passed")
     _require_equal(decision.get("analysis_only"), True, "pilot analysis_only")
     _require_equal(
@@ -458,9 +704,9 @@ def _load_and_validate_pilot(
     )
     if best_recipient < PILOT_MINIMUM_BEST_RECIPIENT:
         raise ValueError("full-crop source did not pass its fixed recipient pilot floor")
-    if best_recipient >= RECIPIENT_DELIVERY_FLOOR:
+    if best_recipient > RECIPIENT_DELIVERY_FLOOR:
         raise ValueError(
-            "full-crop source already reached the 90% recipient delivery floor; "
+            "full-crop source already exceeded the 90% recipient delivery floor; "
             "the separate residual candidate route is not authorized"
         )
 
@@ -550,6 +796,9 @@ def _load_and_validate_pilot(
             "passed": recomputed.get("passed"),
             "failures": recomputed.get("failures"),
             "decision": recomputed.get("decision"),
+            "recipient_candidate_metric_audit": recomputed.get(
+                "recipient_candidate_metric_audit"
+            ),
             "blind_manifest_contract": _blind_semantic_identity(blind_binding),
         },
         "best_checkpoint": {
@@ -574,7 +823,7 @@ def _source_contract_payload(pilot_root: Path, *, torch: Any) -> dict[str, objec
     observed = _mapping(decision.get("observed"), "pilot observations")
     fixed_source_gate = {
         "minimum_best_recipient_exact": PILOT_MINIMUM_BEST_RECIPIENT,
-        "maximum_best_recipient_exact_exclusive": RECIPIENT_DELIVERY_FLOOR,
+        "maximum_best_recipient_exact_inclusive": RECIPIENT_DELIVERY_FLOOR,
         "minimum_epoch4_to_8_gain": PILOT_MINIMUM_EPOCH4_TO_8_GAIN,
     }
     source_subject_id = _canonical_sha256(
@@ -800,8 +1049,19 @@ def evaluate_residual_candidate_pilot(
     source_checkpoint: Path,
     source_checkpoint_sha256: str,
     full_manifest_sha256: str,
+    expected_recipient_records: int = EXPECTED_RECIPIENT_VAL_RECORDS,
 ) -> dict[str, object]:
     """Validate the fixed eight-epoch trim-zero residual candidate pilot."""
+
+    if (
+        isinstance(expected_recipient_records, bool)
+        or not isinstance(expected_recipient_records, int)
+        or expected_recipient_records != EXPECTED_RECIPIENT_VAL_RECORDS
+    ):
+        raise ValueError(
+            "candidate pilot recipient val denominator must be exactly "
+            f"{EXPECTED_RECIPIENT_VAL_RECORDS}"
+        )
 
     config = _mapping(summary.get("config"), "candidate-pilot config")
     initialization = _mapping(summary.get("initialization"), "candidate-pilot initialization")
@@ -903,8 +1163,22 @@ def evaluate_residual_candidate_pilot(
     for field, raw_counts in field_counts.items():
         counts = _mapping(raw_counts, f"candidate-pilot {field} counts")
         _require_equal(counts.get("test"), 0, f"candidate-pilot {field} test count")
+    recipient_counts = _mapping(
+        field_counts.get("recipient_field"), "candidate-pilot recipient field counts"
+    )
+    _require_equal(
+        recipient_counts.get("val"),
+        expected_recipient_records,
+        "candidate-pilot recipient val count",
+    )
     recipient_oov = _mapping(
         summary.get("recipient_oov_by_split"), "candidate-pilot recipient OOV"
+    )
+    recipient_val = _mapping(recipient_oov.get("val"), "candidate-pilot val OOV")
+    _require_equal(
+        recipient_val.get("records"),
+        expected_recipient_records,
+        "candidate-pilot val OOV records",
     )
     recipient_test = _mapping(recipient_oov.get("test"), "candidate-pilot test OOV")
     _require_equal(recipient_test.get("records"), 0, "candidate-pilot test OOV records")
@@ -921,6 +1195,15 @@ def evaluate_residual_candidate_pilot(
         epoch = int(record["epoch"])
         fields = _mapping(
             record.get("val_candidate_text_by_field"), f"candidate-pilot epoch {epoch} fields"
+        )
+        recipient_metric = _mapping(
+            fields.get("recipient_field"),
+            f"candidate-pilot epoch {epoch} recipient metric",
+        )
+        _exact_count_metric(
+            recipient_metric,
+            expected_records=expected_recipient_records,
+            description=f"candidate-pilot epoch {epoch} recipient metric",
         )
         for name, floor in {
             "amount": AMOUNT_FLOOR,
@@ -981,6 +1264,7 @@ def evaluate_residual_candidate_pilot(
             "payment_candidate_exact_floor": PAYMENT_FLOOR,
             "visible_status_raw_exact_floor": STATUS_TEXT_FLOOR,
             "status_non_success_to_success_max": 0,
+            "required_recipient_candidate_records": expected_recipient_records,
         },
         "observed": {
             "best_epoch": best_epoch,
@@ -988,6 +1272,8 @@ def evaluate_residual_candidate_pilot(
             "epoch4_recipient_exact": epoch4_recipient,
             "epoch8_recipient_exact": epoch8_recipient,
             "epoch4_to_8_gain": gain,
+            "recipient_candidate_records": expected_recipient_records,
+            "recipient_candidate_coverage": 1.0,
         },
         "passed": not failures,
         "failures": failures,
@@ -1045,6 +1331,10 @@ def _candidate_pilot_payload(
         records_path=paths["candidate_blind_manifest"],
         blind_contract_path=paths["candidate_blind_contract"],
     )
+    blind_binding = {
+        **blind_binding,
+        "recipient_val_records": _blind_recipient_val_records(blind_binding),
+    }
     supplied_full = _existing_non_reparse(
         full_records, directory=False, description="candidate full manifest"
     )
@@ -1069,6 +1359,7 @@ def _candidate_pilot_payload(
         source_checkpoint=source_checkpoint,
         source_checkpoint_sha256=source_sha,
         full_manifest_sha256=supplied_full_sha256,
+        expected_recipient_records=int(blind_binding["recipient_val_records"]),
     )
     _require_equal(decision.get("passed"), True, "candidate pilot passed")
     paths["full_manifest"] = supplied_full
@@ -1251,6 +1542,10 @@ def build_parser() -> argparse.ArgumentParser:
     verify_pilot.add_argument("--evidence", type=Path, required=True)
     verify_pilot.add_argument("--source-contract", type=Path, required=True)
     verify_pilot.add_argument("--full-records", type=Path, required=True)
+    verify_training = subparsers.add_parser("verify-candidate-training")
+    verify_training.add_argument("--summary", type=Path, required=True)
+    verify_val = subparsers.add_parser("verify-candidate-val")
+    verify_val.add_argument("--summary", type=Path, required=True)
     return parser
 
 
@@ -1274,11 +1569,31 @@ def main(argv: list[str] | None = None) -> None:
             full_records=args.full_records,
             output_evidence=args.output_evidence,
         )
-    else:
+    elif args.command == "verify-candidate-pilot":
         payload = verify_residual_candidate_pilot(
             evidence_path=args.evidence,
             source_contract_path=args.source_contract,
             full_records=args.full_records,
+        )
+    elif args.command == "verify-candidate-training":
+        payload = validate_full_crop_candidate_training_metrics(
+            _strict_json(
+                _existing_non_reparse(
+                    args.summary,
+                    directory=False,
+                    description="candidate training summary",
+                )
+            )
+        )
+    else:
+        payload = validate_full_crop_candidate_val_metrics(
+            _strict_json(
+                _existing_non_reparse(
+                    args.summary,
+                    directory=False,
+                    description="candidate validation summary",
+                )
+            )
         )
     print(json.dumps(payload, ensure_ascii=False, allow_nan=False, sort_keys=True))
 

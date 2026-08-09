@@ -25,6 +25,7 @@ from transfer_receipt_ai.ocr_unified import (
     _parameter_only_initialization,
     _recipient_only_expansion_label_override,
     _recipient_only_logits,
+    _v12_recipient_export_probe,
     _validate_recipient_visual_context_reinit_config,
     build_unified_reader,
     export_unified_onnx,
@@ -73,6 +74,29 @@ def _model(config: UnifiedReaderConfig):
         status_text_vocab_size=5,
         config=config,
     )
+
+
+def _onnx_parity_fixture_model(config: UnifiedReaderConfig, *, torch: object):
+    """Build a well-conditioned export fixture independent of process RNG state."""
+
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(0)
+        model = _model(config).eval()
+        # A random untrained three-class head can put two logits on an
+        # artificial near-tie.  Keep the production exact-argmax policy and
+        # give only this synthetic export fixture a deterministic margin.
+        with torch.no_grad():
+            model.recipient_classifier.weight.mul_(0.01)
+            model.recipient_classifier.bias.copy_(
+                torch.linspace(
+                    -4.0,
+                    4.0,
+                    steps=model.recipient_classifier.bias.numel(),
+                    dtype=model.recipient_classifier.bias.dtype,
+                    device=model.recipient_classifier.bias.device,
+                )
+            )
+    return model
 
 
 def _v13_seed_payload(config: UnifiedReaderConfig, state_dict: object) -> dict[str, object]:
@@ -271,8 +295,9 @@ def test_candidate_and_final_wrappers_keep_test_out_of_selection() -> None:
     gate_helper = (
         repo / "src" / "transfer_receipt_ai" / "recipient_final_gate.py"
     ).read_text(encoding="utf-8")
-    assert 'f"{name}_below_floor"' in gate_helper
-    assert "if metrics[name] < floor" in gate_helper
+    assert "def _fails_fixed_floor" in gate_helper
+    assert "recipient_field_not_strictly_above_floor" in gate_helper
+    assert "if _fails_fixed_floor(name, metrics[name], floor)" in gate_helper
     assert "checkpoint_selection_used_test = $false" in final_gate
     assert "CommonApplicationData" in final_gate
     assert "gate_subject_id" in final_gate
@@ -357,7 +382,24 @@ def test_verified_test_summary_cross_checks_hashes_and_rejects_nonfinite_json(
         "val_summary",
     ):
         path = tmp_path / f"{name}.bin"
-        path.write_bytes((name + "-sealed").encode())
+        if name == "full_manifest":
+            path.write_text(
+                "".join(
+                    json.dumps(
+                        {
+                            "id": f"test-{index}",
+                            "split": "test",
+                            "slots": {"recipient_field": {"text": "乙"}},
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                    for index in range(10)
+                ),
+                encoding="utf-8",
+            )
+        else:
+            path.write_bytes((name + "-sealed").encode())
         paths[name] = path
     candidate_evidence = tmp_path / "candidate.json"
     candidate_evidence.write_text("{}\n", encoding="utf-8")
@@ -419,7 +461,11 @@ def test_verified_test_summary_cross_checks_hashes_and_rejects_nonfinite_json(
             "amount": {"records": 1, "raw_exact_match": 0.80},
             "time": {"records": 1, "raw_exact_match": 0.99},
             "payment_method_field": {"records": 1, "raw_exact_match": 0.94},
-            "recipient_field": {"records": 1, "raw_exact_match": 0.91},
+            "recipient_field": {
+                "records": 10,
+                "raw_exact_matches": 10,
+                "raw_exact_match": 1.0,
+            },
             "transfer_status": {
                 "records": 1,
                 "ctc_records": 1,
@@ -432,7 +478,31 @@ def test_verified_test_summary_cross_checks_hashes_and_rejects_nonfinite_json(
     summary.write_text(json.dumps(summary_payload), encoding="utf-8")
     verified = verify_test_summary(inspection=inspection, summary=summary)
     assert verified["passed"] is True
-    assert verified["metrics"]["recipient_field"] == 0.91
+    assert verified["metrics"]["recipient_field"] == 1.0
+    assert verified["recipient_records"] == 10
+    assert verified["recipient_exact_matches"] == 10
+    assert verified["recipient_candidate_coverage"] == 1.0
+
+    for recipient_matches, expected_pass in (
+        (9, False),
+        (10, True),
+    ):
+        recipient_rate = recipient_matches / 10
+        summary_payload["by_field"]["recipient_field"][
+            "raw_exact_matches"
+        ] = recipient_matches  # type: ignore[index]
+        summary_payload["by_field"]["recipient_field"]["raw_exact_match"] = recipient_rate  # type: ignore[index]
+        summary_payload["acceptance"]["passed"] = expected_pass  # type: ignore[index]
+        summary_payload["acceptance"]["failures"] = (  # type: ignore[index]
+            [] if expected_pass else ["recipient delivery requires strictly above 90%"]
+        )
+        summary.write_text(json.dumps(summary_payload), encoding="utf-8")
+        boundary = verify_test_summary(inspection=inspection, summary=summary)
+        assert boundary["passed"] is expected_pass
+        if expected_pass:
+            assert boundary["failures"] == []
+        else:
+            assert "recipient_field_not_strictly_above_floor" in boundary["failures"]
 
     inspection_payload = json.loads(inspection.read_text(encoding="utf-8"))
     inspection_payload["gate_subject_id"] = "f" * 64
@@ -459,11 +529,37 @@ def test_verified_test_summary_cross_checks_hashes_and_rejects_nonfinite_json(
     with pytest.raises(ValueError, match="non-finite JSON constant"):
         verify_test_summary(inspection=inspection, summary=summary)
 
-    summary_payload["by_field"]["recipient_field"]["raw_exact_match"] = 0.91  # type: ignore[index]
+    summary_payload["by_field"]["recipient_field"]["raw_exact_matches"] = 10  # type: ignore[index]
+    summary_payload["by_field"]["recipient_field"]["raw_exact_match"] = 1.0  # type: ignore[index]
     overflow_json = json.dumps(summary_payload)[:-1] + ', "ignored_future_metric": 1e999}'
     summary.write_text(overflow_json, encoding="utf-8")
     with pytest.raises(ValueError, match="non-finite JSON number"):
         verify_test_summary(inspection=inspection, summary=summary)
+
+
+def test_v14_onnx_parity_fixture_ignores_prior_rng_and_has_decision_margin() -> None:
+    torch = pytest.importorskip("torch")
+    config = _candidate_config()
+    repeated_logits: list[list[object]] = []
+
+    with torch.random.fork_rng(devices=[]):
+        for perturbation_seed in (17, 29):
+            torch.manual_seed(perturbation_seed)
+            torch.rand(257)
+            model = _onnx_parity_fixture_model(config, torch=torch)
+            recipient_zero = torch.zeros((1, 1, 32, 128), dtype=torch.float32)
+            recipient_probe = _v12_recipient_export_probe(recipient_zero, torch=torch)
+            current_logits: list[object] = []
+            with torch.no_grad():
+                for recipient_input in (recipient_zero, recipient_probe):
+                    logits = _recipient_only_logits(model, recipient_input, config=config)
+                    top_two = torch.topk(logits, k=2, dim=-1).values
+                    assert float((top_two[..., 0] - top_two[..., 1]).min()) > 2.0
+                    current_logits.append(logits.detach().clone())
+            repeated_logits.append(current_logits)
+
+    for first, second in zip(repeated_logits[0], repeated_logits[1]):
+        torch.testing.assert_close(first, second, rtol=0.0, atol=0.0)
 
 
 def test_v14_real_onnx_export_shapes_and_internal_ort_parity_when_available(
@@ -473,7 +569,7 @@ def test_v14_real_onnx_export_shapes_and_internal_ort_parity_when_available(
     onnx = pytest.importorskip("onnx")
     ort = pytest.importorskip("onnxruntime")
     config = _candidate_config()
-    model = _model(config).eval()
+    model = _onnx_parity_fixture_model(config, torch=torch)
     checkpoint = tmp_path / "recipient-v14.pt"
     payload = _v13_seed_payload(config, model.state_dict())
     slot_order = ("amount", "time", "transfer_status", "payment_method_field", "recipient_field")
