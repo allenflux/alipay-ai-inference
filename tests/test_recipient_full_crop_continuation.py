@@ -1405,7 +1405,7 @@ def test_initializer_copies_every_state_tensor_and_rejects_map_or_tensor_changes
             config=_config(),
             amount_characters=list(V8_AMOUNT_CHARACTERS),
             time_characters=list(V6_TIME_CHARACTERS),
-            payment_characters=["卡", "行"],
+            payment_characters=["卡", "行", "银"],
             recipient_characters=["商", "户"],
             status_text_characters=authorized["status_text_characters"],
             payment_bank_prefix_classes=["__other__", "邮储银行"],
