@@ -108,12 +108,37 @@ def _epoch_record(epoch: int, matches: int) -> dict[str, object]:
     }
 
 
+def _continuation_payment_provenance(
+    *, checkpoint_count: int = 585, data_derived_count: int = 566
+) -> dict[str, object]:
+    checkpoint_values = [chr(0x3400 + index) for index in range(checkpoint_count)]
+    data_derived_values = checkpoint_values[:data_derived_count]
+    checkpoint_sha256 = unified._label_map_sha256(checkpoint_values)
+    data_derived_sha256 = unified._label_map_sha256(data_derived_values)
+    return {
+        "checkpoint_count": checkpoint_count,
+        "checkpoint_sha256": checkpoint_sha256,
+        "data_derived_count": data_derived_count,
+        "data_derived_sha256": data_derived_sha256,
+        "identical": checkpoint_values == data_derived_values,
+        "effective_count": checkpoint_count,
+        "effective_sha256": checkpoint_sha256,
+        "checkpoint_characters_retained_not_in_current_train_count": (
+            checkpoint_count - data_derived_count
+        ),
+        "new_data_derived_character_count": 0,
+        "data_derived_subset_of_checkpoint": True,
+        "continuation_binding": "fixed_pilot_payment_data_derived_provenance_v1",
+    }
+
+
 def _summary(
     *,
     best_matches: int = MINIMUM_BEST_MATCHES,
     epoch4_matches: int = 5600,
     epoch8_matches: int = MINIMUM_BEST_MATCHES,
 ) -> dict[str, object]:
+    payment_provenance = _continuation_payment_provenance()
     records: list[dict[str, object]] = []
     for epoch in range(CONTINUATION_EPOCHS + 1):
         matches = SOURCE_RECIPIENT_MATCHES + epoch * 20
@@ -150,7 +175,8 @@ def _summary(
             "all_state_dtype_shape_exact": True,
             "source_full_crop_continuation_authority": authority,
             "financial_label_policy": {
-                "mode": "checkpoint_all_label_maps_recipient_full_crop_continuation_v1"
+                "mode": "checkpoint_all_label_maps_recipient_full_crop_continuation_v1",
+                "payment_character_map": payment_provenance,
             },
         },
         "fine_tune_policy": {
@@ -410,7 +436,8 @@ def test_b8_gate_exact_boundaries_and_pass_authorization() -> None:
             best_matches=MINIMUM_BEST_MATCHES,
             epoch4_matches=MINIMUM_BEST_MATCHES - MINIMUM_EPOCH4_TO_8_GAIN_MATCHES,
             epoch8_matches=MINIMUM_BEST_MATCHES,
-        )
+        ),
+        expected_payment_provenance=_continuation_payment_provenance(),
     )
     assert decision["passed"] is True
     assert decision["analysis_only"] is True
@@ -436,22 +463,74 @@ def test_b8_gate_exact_boundaries_and_pass_authorization() -> None:
     }
 
     below_best = evaluate_continuation_summary(
-        _summary(best_matches=5789, epoch4_matches=5653, epoch8_matches=5789)
+        _summary(best_matches=5789, epoch4_matches=5653, epoch8_matches=5789),
+        expected_payment_provenance=_continuation_payment_provenance(),
     )
     assert "best_recipient_below_5790_of_6789" in below_best["failures"]
     below_gain = evaluate_continuation_summary(
-        _summary(best_matches=5790, epoch4_matches=5655, epoch8_matches=5790)
+        _summary(best_matches=5790, epoch4_matches=5655, epoch8_matches=5790),
+        expected_payment_provenance=_continuation_payment_provenance(),
     )
     assert "epoch4_to_8_gain_below_136_matches" in below_gain["failures"]
 
     tail_boundary = evaluate_continuation_summary(
-        _summary(best_matches=5857, epoch4_matches=5654, epoch8_matches=5790)
+        _summary(best_matches=5857, epoch4_matches=5654, epoch8_matches=5790),
+        expected_payment_provenance=_continuation_payment_provenance(),
     )
     assert tail_boundary["passed"] is True
     tail_failure = evaluate_continuation_summary(
-        _summary(best_matches=5858, epoch4_matches=5654, epoch8_matches=5790)
+        _summary(best_matches=5858, epoch4_matches=5654, epoch8_matches=5790),
+        expected_payment_provenance=_continuation_payment_provenance(),
     )
     assert "best_to_epoch8_decay_above_67_matches" in tail_failure["failures"]
+
+
+def test_expected_payment_proof_rebuilds_the_585_566_historical_subset() -> None:
+    checkpoint_values = [chr(0x3400 + index) for index in range(585)]
+    data_derived_values = checkpoint_values[:566]
+    source = _checkpoint_metadata_payload()
+    source["payment_characters"] = checkpoint_values
+    source["initialization"] = {
+        "financial_label_policy": {
+            "mode": "checkpoint_financial_label_maps_recipient_full_crop_warmstart_v1",
+            "payment_character_map": unified._label_map_provenance(
+                checkpoint_values,
+                data_derived_values=data_derived_values,
+            ),
+        }
+    }
+
+    proof = continuation._expected_continuation_payment_provenance(
+        source,
+        data_derived_values=data_derived_values,
+    )
+    assert proof["checkpoint_count"] == 585
+    assert proof["data_derived_count"] == 566
+    assert proof["effective_count"] == 585
+    assert proof["checkpoint_characters_retained_not_in_current_train_count"] == 19
+    assert proof["new_data_derived_character_count"] == 0
+    assert proof["data_derived_subset_of_checkpoint"] is True
+
+
+@pytest.mark.parametrize("mutation", ["change", "delete", "add"])
+def test_evaluator_rejects_any_payment_provenance_field_mutation(
+    mutation: str,
+) -> None:
+    summary = _summary()
+    proof = summary["initialization"]["financial_label_policy"][
+        "payment_character_map"
+    ]
+    if mutation == "change":
+        proof["checkpoint_characters_retained_not_in_current_train_count"] = 18
+    elif mutation == "delete":
+        proof.pop("continuation_binding")
+    else:
+        proof["unbound_extra"] = True
+    with pytest.raises(ValueError, match="payment character map provenance"):
+        evaluate_continuation_summary(
+            summary,
+            expected_payment_provenance=_continuation_payment_provenance(),
+        )
 
 
 @pytest.mark.parametrize(
@@ -476,7 +555,10 @@ def test_b8_rejects_safety_denominator_nan_and_test_rows(mutation, message: str)
     summary = _summary()
     mutation(summary)
     with pytest.raises(ValueError, match=message):
-        evaluate_continuation_summary(summary)
+        evaluate_continuation_summary(
+            summary,
+            expected_payment_provenance=_continuation_payment_provenance(),
+        )
 
 
 def test_fixed_recipe_cannot_be_24_or_80_epochs() -> None:
@@ -833,6 +915,12 @@ def test_last_checkpoint_cannot_strip_analysis_only_policy_metadata() -> None:
         continuation._validate_continuation_training_artifacts
     )
     assert validator_source.count("_require_checkpoint_summary_metadata(") == 2
+    assert (
+        validator_source.count(
+            "_require_expected_continuation_payment_provenance("
+        )
+        == 3
+    )
 
 
 def test_recipient_coverage_denominator_is_rescanned_from_bound_blind_manifest(
@@ -861,8 +949,37 @@ def test_recipient_coverage_denominator_is_rescanned_from_bound_blind_manifest(
         )
     with pytest.raises(ValueError, match="bound blind manifest recipient denominator"):
         evaluate_continuation_summary(
-            _summary(), bound_recipient_val_denominator=1
+            _summary(),
+            expected_payment_provenance=_continuation_payment_provenance(),
+            bound_recipient_val_denominator=1,
         )
+
+
+def test_bound_payment_map_rebuild_uses_train_rows_and_sorted_order() -> None:
+    rows = [
+        {
+            "id": "train-a",
+            "split": "train",
+            "slots": {"payment_method_field": {"text": "行卡"}},
+        },
+        {
+            "id": "train-b",
+            "split": "train",
+            "slots": {"payment_method_field": {"text": "银卡"}},
+        },
+        {
+            "id": "val",
+            "split": "val",
+            "slots": {"payment_method_field": {"text": "新"}},
+        },
+    ]
+    data = "".join(
+        json.dumps(row, ensure_ascii=False) + "\n" for row in rows
+    ).encode("utf-8")
+    assert continuation._train_payment_characters_from_manifest_bytes(
+        data,
+        description="test manifest",
+    ) == ["卡", "行", "银"]
 
 
 def test_pilot_blind_semantics_are_read_from_hard_pinned_bytes(tmp_path: Path) -> None:
@@ -972,6 +1089,8 @@ def test_code_closure_contains_training_and_metric_dependencies() -> None:
 
 def _checkpoint_metadata_payload() -> dict[str, object]:
     config = _config()
+    payment_characters = ["卡", "行", "银"]
+    pilot_data_payment_characters = ["卡", "行"]
     recipient_characters = ["商", "户"]
     status_text_characters = sorted(set("成功账转"))
     recipient_sampling_policy = {
@@ -1005,7 +1124,7 @@ def _checkpoint_metadata_payload() -> dict[str, object]:
         "config": asdict(config),
         "amount_characters": list(V8_AMOUNT_CHARACTERS),
         "time_characters": list(V6_TIME_CHARACTERS),
-        "payment_characters": ["卡", "行"],
+        "payment_characters": payment_characters,
         "recipient_characters": recipient_characters,
         "recipient_blank_index": 0,
         "recipient_charset_sha256": hashlib.sha256(
@@ -1041,6 +1160,15 @@ def _checkpoint_metadata_payload() -> dict[str, object]:
         "recipient_confidence_policy": recipient_confidence_policy,
         "recipient_tail_loss_policy": recipient_tail_loss_policy,
         "recipient_train_augmentation_policy": recipient_train_augmentation_policy,
+        "initialization": {
+            "financial_label_policy": {
+                "mode": "checkpoint_financial_label_maps_recipient_full_crop_warmstart_v1",
+                "payment_character_map": unified._label_map_provenance(
+                    payment_characters,
+                    data_derived_values=pilot_data_payment_characters,
+                ),
+            }
+        },
         "metrics": {"epoch": SOURCE_BEST_EPOCH},
     }
     payload.update(
@@ -1097,6 +1225,39 @@ def test_synthetic_checkpoint_metadata_matches_the_exact_v13_label_abi() -> None
     assert status_text == payload["status_text_characters"]
 
 
+def test_continuation_payment_exception_is_bound_to_exact_pilot_data_map() -> None:
+    payload = _checkpoint_metadata_payload()
+    provenance = unified._full_crop_continuation_payment_map_provenance(
+        payload,
+        source_values=["卡", "行", "银"],
+        data_derived_values=["卡", "行"],
+    )
+    assert provenance["effective_count"] == 3
+    assert provenance["checkpoint_characters_retained_not_in_current_train_count"] == 1
+    assert provenance["new_data_derived_character_count"] == 0
+
+    with pytest.raises(ValueError, match="pinned pilot data-derived provenance"):
+        unified._full_crop_continuation_payment_map_provenance(
+            payload,
+            source_values=["卡", "行", "银"],
+            data_derived_values=["行", "卡"],
+        )
+
+    added_data = ["卡", "新"]
+    added_payload = _checkpoint_metadata_payload()
+    added_payload["initialization"]["financial_label_policy"][
+        "payment_character_map"
+    ] = unified._label_map_provenance(
+        ["卡", "行", "银"], data_derived_values=added_data
+    )
+    with pytest.raises(ValueError, match="introduced characters absent"):
+        unified._full_crop_continuation_payment_map_provenance(
+            added_payload,
+            source_values=["卡", "行", "银"],
+            data_derived_values=added_data,
+        )
+
+
 def test_embedded_authority_binds_state_config_maps_and_source(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1127,7 +1288,7 @@ def test_embedded_authority_binds_state_config_maps_and_source(
     tampered_map = dict(authorized)
     # Payment characters have no sorted-order contract, so this remains a
     # structurally valid v13 map and reaches the embedded content proof.
-    tampered_map["payment_characters"] = ["行", "卡"]
+    tampered_map["payment_characters"] = ["行", "卡", "银"]
     with pytest.raises(ValueError, match="content does not match"):
         continuation.validate_embedded_continuation_authority(tampered_map, torch=torch)
 
@@ -1160,7 +1321,7 @@ def test_initializer_copies_every_state_tensor_and_rejects_map_or_tensor_changes
         config=_config(),
         amount_characters=list(V8_AMOUNT_CHARACTERS),
         time_characters=list(V6_TIME_CHARACTERS),
-        payment_characters=["卡", "行"],
+        payment_characters=["卡", "行", "银"],
         recipient_characters=["商", "户"],
         status_text_characters=authorized["status_text_characters"],
         payment_bank_prefix_classes=["__other__", "邮储银行"],
@@ -1174,6 +1335,31 @@ def test_initializer_copies_every_state_tensor_and_rejects_map_or_tensor_changes
     for name in target_state:
         torch.testing.assert_close(state[name], authorized["state_dict"][name], rtol=0, atol=0)
 
+    effective_payment, effective_banks, effective_recipient, policy = (
+        _recipient_only_expansion_label_override(
+            init_checkpoint=checkpoint,
+            config=_config(),
+            amount_characters=list(V8_AMOUNT_CHARACTERS),
+            time_characters=list(V6_TIME_CHARACTERS),
+            payment_characters=["卡", "行"],
+            recipient_characters=["商", "户"],
+            payment_bank_prefix_classes=["__other__", "邮储银行"],
+            torch=torch,
+            init_checkpoint_mode=INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_CONTINUATION,
+        )
+    )
+    assert effective_payment == ["卡", "行", "银"]
+    assert effective_banks == ["__other__", "邮储银行"]
+    assert effective_recipient == ["商", "户"]
+    payment_policy = policy["payment_character_map"]
+    assert payment_policy["checkpoint_count"] == 3
+    assert payment_policy["data_derived_count"] == 2
+    assert payment_policy["identical"] is False
+    assert payment_policy["effective_count"] == 3
+    assert payment_policy["checkpoint_characters_retained_not_in_current_train_count"] == 1
+    assert payment_policy["new_data_derived_character_count"] == 0
+    assert payment_policy["data_derived_subset_of_checkpoint"] is True
+
     with pytest.raises(ValueError, match="payment character map"):
         _recipient_only_expansion_label_override(
             init_checkpoint=checkpoint,
@@ -1183,6 +1369,30 @@ def test_initializer_copies_every_state_tensor_and_rejects_map_or_tensor_changes
             payment_characters=["行", "卡"],
             recipient_characters=["商", "户"],
             payment_bank_prefix_classes=["__other__", "邮储银行"],
+            torch=torch,
+            init_checkpoint_mode=INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_CONTINUATION,
+        )
+    with pytest.raises(ValueError, match="recipient character map"):
+        _recipient_only_expansion_label_override(
+            init_checkpoint=checkpoint,
+            config=_config(),
+            amount_characters=list(V8_AMOUNT_CHARACTERS),
+            time_characters=list(V6_TIME_CHARACTERS),
+            payment_characters=["卡", "行"],
+            recipient_characters=["户", "商"],
+            payment_bank_prefix_classes=["__other__", "邮储银行"],
+            torch=torch,
+            init_checkpoint_mode=INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_CONTINUATION,
+        )
+    with pytest.raises(ValueError, match="payment bank-prefix class map"):
+        _recipient_only_expansion_label_override(
+            init_checkpoint=checkpoint,
+            config=_config(),
+            amount_characters=list(V8_AMOUNT_CHARACTERS),
+            time_characters=list(V6_TIME_CHARACTERS),
+            payment_characters=["卡", "行"],
+            recipient_characters=["商", "户"],
+            payment_bank_prefix_classes=["__other__", "招商银行"],
             torch=torch,
             init_checkpoint_mode=INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_CONTINUATION,
         )

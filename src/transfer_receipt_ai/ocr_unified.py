@@ -5739,6 +5739,76 @@ def _label_map_provenance(
     }
 
 
+def _full_crop_continuation_payment_map_provenance(
+    payload: Mapping[str, object],
+    *,
+    source_values: Sequence[str],
+    data_derived_values: Sequence[str],
+) -> dict[str, object]:
+    """Validate the one historical-map exception recorded by the B8 pilot.
+
+    The full-crop pilot kept payment classifier rows from its sanitized seed
+    even though some of those characters were absent from the pilot's current
+    train split.  Its checkpoint-bound ``financial_label_policy`` records both
+    ordered maps by count and digest.  A continuation may reproduce that exact
+    data-derived map while retaining the checkpoint map as the effective map;
+    it may not introduce a new character, reorder the current map, or extend
+    this exception to recipient or bank labels.
+    """
+
+    initialization = payload.get("initialization")
+    if not isinstance(initialization, Mapping):
+        raise ValueError(
+            "recipient_full_crop_continuation source has no pinned pilot initialization"
+        )
+    policy = initialization.get("financial_label_policy")
+    if (
+        not isinstance(policy, Mapping)
+        or policy.get("mode")
+        != "checkpoint_financial_label_maps_recipient_full_crop_warmstart_v1"
+    ):
+        raise ValueError(
+            "recipient_full_crop_continuation source has no pinned pilot financial label policy"
+        )
+    recorded = policy.get("payment_character_map")
+    expected = _label_map_provenance(
+        source_values, data_derived_values=data_derived_values
+    )
+    if not isinstance(recorded, Mapping) or set(recorded) != set(expected) or any(
+        type(recorded[key]) is not type(value) or recorded[key] != value
+        for key, value in expected.items()
+    ):
+        raise ValueError(
+            "recipient_full_crop_continuation payment character map does not match "
+            "the pinned pilot data-derived provenance"
+        )
+    source_set = set(source_values)
+    data_derived_set = set(data_derived_values)
+    if len(source_set) != len(source_values) or len(data_derived_set) != len(
+        data_derived_values
+    ):
+        raise ValueError(
+            "recipient_full_crop_continuation payment character maps must contain unique labels"
+        )
+    additions = data_derived_set - source_set
+    if additions:
+        raise ValueError(
+            "recipient_full_crop_continuation payment data introduced characters absent "
+            "from the source checkpoint"
+        )
+    return {
+        **expected,
+        "effective_count": len(source_values),
+        "effective_sha256": _label_map_sha256(source_values),
+        "checkpoint_characters_retained_not_in_current_train_count": len(
+            source_set - data_derived_set
+        ),
+        "new_data_derived_character_count": 0,
+        "data_derived_subset_of_checkpoint": True,
+        "continuation_binding": "fixed_pilot_payment_data_derived_provenance_v1",
+    }
+
+
 def _validate_recipient_input_width_expansion_config(
     source_config: UnifiedReaderConfig,
     target_config: UnifiedReaderConfig,
@@ -6100,9 +6170,14 @@ def _recipient_only_expansion_label_override(
             raise ValueError(f"init checkpoint {label} does not match the current training data")
     if source_recipient_characters is None:
         raise ValueError("init checkpoint recipient character map does not match the current training data")
+    continuation_payment_provenance: dict[str, object] | None = None
     if init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_CONTINUATION:
+        continuation_payment_provenance = _full_crop_continuation_payment_map_provenance(
+            payload,
+            source_values=source_payment_characters,
+            data_derived_values=payment_characters,
+        )
         for label, source_values, current_values in (
-            ("payment character map", source_payment_characters, payment_characters),
             ("recipient character map", source_recipient_characters, recipient_characters),
             (
                 "payment bank-prefix class map",
@@ -6184,9 +6259,13 @@ def _recipient_only_expansion_label_override(
                 if init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_WARMSTART
                 else {}
             ),
-            "payment_character_map": _label_map_provenance(
-                source_payment_characters,
-                data_derived_values=payment_characters,
+            "payment_character_map": (
+                continuation_payment_provenance
+                if continuation_payment_provenance is not None
+                else _label_map_provenance(
+                    source_payment_characters,
+                    data_derived_values=payment_characters,
+                )
             ),
             "payment_bank_prefix_class_map": _label_map_provenance(
                 source_payment_bank_prefix_classes,

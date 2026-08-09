@@ -465,6 +465,52 @@ def _blind_recipient_validation_denominator(
     return count
 
 
+def _train_payment_characters_from_manifest_bytes(
+    data: bytes, *, description: str
+) -> list[str]:
+    """Independently rebuild the ordered train-only payment character map."""
+
+    characters: set[str] = set()
+    for line_number, raw_line in enumerate(io.BytesIO(data), start=1):
+        if not raw_line.strip():
+            continue
+        try:
+            value = json.loads(raw_line.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError(
+                f"{description} line {line_number} is invalid JSON"
+            ) from error
+        record = _mapping(value, f"{description} line {line_number}")
+        if record.get("split") != "train":
+            continue
+        slots = _mapping(record.get("slots"), f"{description} line {line_number} slots")
+        payment = slots.get("payment_method_field")
+        if not isinstance(payment, Mapping):
+            continue
+        text = payment.get("text")
+        if not isinstance(text, str):
+            raise ValueError(
+                f"{description} line {line_number} has invalid payment text"
+            )
+        characters.update(text)
+    if not characters:
+        raise ValueError(f"{description} has no train payment characters")
+    return sorted(characters)
+
+
+def _bound_train_payment_characters(
+    records_path: Path, *, expected_sha256: str
+) -> list[str]:
+    data, identity = _read_frozen_regular_file(
+        records_path, description="bound blind payment manifest"
+    )
+    if identity[3] != expected_sha256:
+        raise ValueError("bound blind manifest changed during payment-map reconstruction")
+    return _train_payment_characters_from_manifest_bytes(
+        data, description="bound blind payment manifest"
+    )
+
+
 def _verify_frozen_blind_manifest_contract(
     *,
     records_path: Path,
@@ -701,6 +747,157 @@ def _label_map_proof(payload: Mapping[str, object]) -> dict[str, object]:
             ),
         }
     return proof
+
+
+def _ordered_label_map_sha256(values: Sequence[str]) -> str:
+    return hashlib.sha256("\0".join(values).encode("utf-8")).hexdigest()
+
+
+def _expected_continuation_payment_provenance(
+    source_payload: Mapping[str, object],
+    *,
+    data_derived_values: Sequence[str],
+) -> dict[str, object]:
+    """Derive the B8 payment proof independently from source and bound data."""
+
+    source_config = _checkpoint_config(source_payload)
+    _, _, source_payment, _, _, _ = _checkpoint_labels(
+        source_payload, config=source_config
+    )
+    source_values = list(source_payment)
+    current_values = list(data_derived_values)
+    source_set = set(source_values)
+    current_set = set(current_values)
+    if len(source_set) != len(source_values) or len(current_set) != len(current_values):
+        raise ValueError("continuation payment character maps must contain unique labels")
+    if current_set - source_set:
+        raise ValueError(
+            "continuation payment data introduced characters absent from the source checkpoint"
+        )
+    source_initialization = _mapping(
+        source_payload.get("initialization"), "source pilot initialization"
+    )
+    source_policy = _mapping(
+        source_initialization.get("financial_label_policy"),
+        "source pilot financial label policy",
+    )
+    if (
+        source_policy.get("mode")
+        != "checkpoint_financial_label_maps_recipient_full_crop_warmstart_v1"
+    ):
+        raise ValueError("source checkpoint has no pinned pilot financial label policy")
+    recorded = _mapping(
+        source_policy.get("payment_character_map"),
+        "source pilot payment character map",
+    )
+    base = {
+        "checkpoint_count": len(source_values),
+        "checkpoint_sha256": _ordered_label_map_sha256(source_values),
+        "data_derived_count": len(current_values),
+        "data_derived_sha256": _ordered_label_map_sha256(current_values),
+        "identical": source_values == current_values,
+    }
+    if set(recorded) != set(base) or any(
+        type(recorded[key]) is not type(value) or recorded[key] != value
+        for key, value in base.items()
+    ):
+        raise ValueError(
+            "bound payment data does not match the source checkpoint's pinned pilot provenance"
+        )
+    return {
+        **base,
+        "effective_count": len(source_values),
+        "effective_sha256": _ordered_label_map_sha256(source_values),
+        "checkpoint_characters_retained_not_in_current_train_count": len(
+            source_set - current_set
+        ),
+        "new_data_derived_character_count": 0,
+        "data_derived_subset_of_checkpoint": True,
+        "continuation_binding": "fixed_pilot_payment_data_derived_provenance_v1",
+    }
+
+
+_CONTINUATION_PAYMENT_PROVENANCE_KEYS = frozenset(
+    {
+        "checkpoint_count",
+        "checkpoint_sha256",
+        "data_derived_count",
+        "data_derived_sha256",
+        "identical",
+        "effective_count",
+        "effective_sha256",
+        "checkpoint_characters_retained_not_in_current_train_count",
+        "new_data_derived_character_count",
+        "data_derived_subset_of_checkpoint",
+        "continuation_binding",
+    }
+)
+
+
+def _validated_expected_continuation_payment_provenance(
+    value: object,
+) -> Mapping[str, object]:
+    proof = _mapping(value, "expected continuation payment character map provenance")
+    if set(proof) != _CONTINUATION_PAYMENT_PROVENANCE_KEYS:
+        raise ValueError("expected continuation payment character map provenance is incomplete")
+    checkpoint_count = proof.get("checkpoint_count")
+    data_count = proof.get("data_derived_count")
+    retained_count = proof.get(
+        "checkpoint_characters_retained_not_in_current_train_count"
+    )
+    for name, count in (
+        ("checkpoint_count", checkpoint_count),
+        ("data_derived_count", data_count),
+        ("effective_count", proof.get("effective_count")),
+        ("retained_count", retained_count),
+        ("new_data_derived_character_count", proof.get("new_data_derived_character_count")),
+    ):
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise ValueError(f"expected continuation payment provenance has invalid {name}")
+    for name in ("checkpoint_sha256", "data_derived_sha256", "effective_sha256"):
+        digest = proof.get(name)
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in _HEX for character in digest)
+        ):
+            raise ValueError(f"expected continuation payment provenance has invalid {name}")
+    if (
+        proof.get("effective_count") != checkpoint_count
+        or proof.get("effective_sha256") != proof.get("checkpoint_sha256")
+        or proof.get("new_data_derived_character_count") != 0
+        or proof.get("data_derived_subset_of_checkpoint") is not True
+        or proof.get("continuation_binding")
+        != "fixed_pilot_payment_data_derived_provenance_v1"
+        or retained_count != checkpoint_count - data_count
+        or proof.get("identical")
+        is not (
+            checkpoint_count == data_count
+            and proof.get("checkpoint_sha256") == proof.get("data_derived_sha256")
+        )
+    ):
+        raise ValueError("expected continuation payment character map provenance is inconsistent")
+    return proof
+
+
+def _require_expected_continuation_payment_provenance(
+    payload: Mapping[str, object],
+    expected: Mapping[str, object],
+    *,
+    description: str,
+) -> None:
+    initialization = _mapping(payload.get("initialization"), f"{description} initialization")
+    policy = _mapping(
+        initialization.get("financial_label_policy"),
+        f"{description} financial label policy",
+    )
+    if policy.get("mode") != "checkpoint_all_label_maps_recipient_full_crop_continuation_v1":
+        raise ValueError(f"{description} changed the continuation financial label policy mode")
+    actual = _mapping(
+        policy.get("payment_character_map"),
+        f"{description} payment character map provenance",
+    )
+    _json_equal(actual, expected, f"{description} payment character map provenance")
 
 
 def _sanitizer_transitive_source_paths(
@@ -1320,6 +1517,7 @@ def verify_continuation_source(
 def evaluate_continuation_summary(
     summary: Mapping[str, object],
     *,
+    expected_payment_provenance: Mapping[str, object],
     expected_authority: Mapping[str, object] | None = None,
     bound_recipient_val_denominator: int | None = None,
 ) -> dict[str, object]:
@@ -1426,6 +1624,14 @@ def evaluate_continuation_summary(
     )
     if financial_policy.get("mode") != "checkpoint_all_label_maps_recipient_full_crop_continuation_v1":
         raise ValueError("continuation summary does not prove exact source label maps")
+    expected_payment = _validated_expected_continuation_payment_provenance(
+        expected_payment_provenance
+    )
+    _require_expected_continuation_payment_provenance(
+        summary,
+        expected_payment,
+        description="continuation summary",
+    )
     field_counts = _mapping(summary.get("field_counts"), "field counts")
     for field, value in field_counts.items():
         counts = _mapping(value, f"{field} counts")
@@ -1576,6 +1782,7 @@ def _validate_continuation_training_artifacts(
     *,
     output: Path,
     source_payload: Mapping[str, object],
+    expected_payment_provenance: Mapping[str, object],
     torch: Any,
 ) -> tuple[
     dict[str, object],
@@ -1618,6 +1825,14 @@ def _validate_continuation_training_artifacts(
     summary = _strict_json_bytes(
         frozen["training_summary"][0], "continuation training summary"
     )
+    expected_payment = _validated_expected_continuation_payment_provenance(
+        expected_payment_provenance
+    )
+    _require_expected_continuation_payment_provenance(
+        summary,
+        expected_payment,
+        description="continuation summary",
+    )
     for path in output.rglob("*"):
         if _is_reparse(path):
             raise ValueError("continuation output contains a symlink/junction/reparse entry")
@@ -1633,6 +1848,11 @@ def _validate_continuation_training_artifacts(
     )
     _require_checkpoint_without_optimizer_state(
         best_payload, description="continuation best checkpoint"
+    )
+    _require_expected_continuation_payment_provenance(
+        best_payload,
+        expected_payment,
+        description="continuation best",
     )
     best_config = _checkpoint_config(best_payload)
     _validate_recipient_full_crop_continuation_config(source_config, best_config)
@@ -1682,6 +1902,11 @@ def _validate_continuation_training_artifacts(
     )
     _require_checkpoint_without_optimizer_state(
         last_payload, description="continuation last checkpoint"
+    )
+    _require_expected_continuation_payment_provenance(
+        last_payload,
+        expected_payment,
+        description="continuation last",
     )
     last_config = _checkpoint_config(last_payload)
     _validate_recipient_full_crop_continuation_config(source_config, last_config)
@@ -1813,6 +2038,14 @@ def run_continuation(
     verified_authority = validate_embedded_continuation_authority(payload, torch=torch)
     config = _checkpoint_config(payload)
     _validate_recipient_full_crop_continuation_config(config, config)
+    bound_payment_characters = _bound_train_payment_characters(
+        bound_blind,
+        expected_sha256=str(blind["blind_manifest_sha256"]),
+    )
+    expected_payment_provenance = _expected_continuation_payment_provenance(
+        payload,
+        data_derived_values=bound_payment_characters,
+    )
     train_unified_reader(
         records_path=Path(records_path),
         dataset_root=dataset,
@@ -1866,11 +2099,13 @@ def run_continuation(
         _validate_continuation_training_artifacts(
             output=output,
             source_payload=payload,
+            expected_payment_provenance=expected_payment_provenance,
             torch=torch,
         )
     )
     decision = evaluate_continuation_summary(
         summary,
+        expected_payment_provenance=expected_payment_provenance,
         expected_authority=verified_authority,
         bound_recipient_val_denominator=bound_recipient_val_denominator,
     )
