@@ -280,11 +280,22 @@ def test_actual_train_argv_rejects_injected_weight_decay(tmp_path: Path) -> None
 
 
 def test_031004_identity_is_fixed_by_hash_denominators_and_metrics() -> None:
+    assert EXPECTED_031004_INPUT_CONTRACT_SHA256 == (
+        "7f6f2b07b33a5707ea376739e6853629c806675b22b320a9898c45f5bede91fc"
+    )
     _assert_expected_031004_source_identity(
         input_contract_sha256=EXPECTED_031004_INPUT_CONTRACT_SHA256,
         candidate_denominators=EXPECTED_031004_CANDIDATE_DENOMINATORS,
         observed=EXPECTED_031004_RECIPIENT_OBSERVED,
     )
+    with pytest.raises(ValueError, match="hash-bound 031004"):
+        _assert_expected_031004_source_identity(
+            input_contract_sha256=(
+                "7f6f2b07b3335707ea376739e6853629c806675b22b320a9898c45f5bede91fc"
+            ),
+            candidate_denominators=EXPECTED_031004_CANDIDATE_DENOMINATORS,
+            observed=EXPECTED_031004_RECIPIENT_OBSERVED,
+        )
     with pytest.raises(ValueError, match="hash-bound 031004"):
         _assert_expected_031004_source_identity(
             input_contract_sha256="0" * 64,
