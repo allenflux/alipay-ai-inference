@@ -161,7 +161,7 @@ if ($LASTEXITCODE -ne 0 -or $gpuRows.Count -eq 0 -or [string]$gpuRows[0] -notmat
 }
 
 Write-Host "receipt_recipient_multiview_fixed2_exact8 preflight"
-Write-Host "  views=standard,fixed_value; selector=sha256 rank parity; train multiplier=1"
+Write-Host "  views=standard,fixed_value; selector=context-distinct fixed-value pair anti-repeat v2; train multiplier=1"
 Write-Host "  initialization=original full-crop pilot best via fresh visual-context reinit"
 Write-Host "  epochs=8; validation=every epoch; held-out final gate remains unopened"
 Write-Host ("  GPU: {0}" -f ($gpuRows -join "; "))
@@ -180,17 +180,18 @@ $inspectArguments = @(
     "--candidate-pilot-evidence", $CandidatePilotEvidence,
     "--failure-evidence", $FailureEvidence,
     "--failure-attempt-registry", $FailureAttemptRegistry,
-    "--overlay-contract", $Fixed2OverlayContract
+    "--overlay-contract", $Fixed2OverlayContract,
+    "--require-unconsumed"
 )
 $opening = Invoke-Inspection $inspectArguments "opening exact8 authority inspection"
 $inspection = $opening.Payload
-if ([string]$inspection.kind -ne "receipt_recipient_multiview_fixed2_exact8_subject_v1" `
+if ([string]$inspection.kind -ne "receipt_recipient_multiview_fixed2_exact8_subject_v2" `
     -or $inspection.analysis_only -ne $true `
     -or $inspection.production_route_authorized -ne $false `
     -or $inspection.test_opened -ne $false `
     -or $inspection.onnx_exported -ne $false `
     -or [string]$inspection.route_subject_id -notmatch "^[0-9a-f]{64}$" `
-    -or [string]$inspection.attempt_id -ne [string]$inspection.route_subject_id) {
+    -or [string]$inspection.attempt_id -notmatch "^[0-9a-f]{64}$") {
     throw "Exact8 inspection did not return the fixed analysis-only subject."
 }
 
@@ -219,16 +220,22 @@ try {
     $receiptRoot = Join-Path $commonData "ReceiptAI"
     $auditRoot = Join-Path $receiptRoot "recipient-v14-multiview-fixed2-training-v1"
     Assert-NoReparseChain $auditRoot "Exact8 attempt registry"
-    $attemptPath = Join-Path $auditRoot (([string]$inspection.attempt_id) + ".attempt.json")
-    $attemptEntry = Get-Item -LiteralPath $attemptPath -Force -ErrorAction SilentlyContinue
-    if ($null -ne $attemptEntry -or (Test-Path -LiteralPath $attemptPath)) {
-        throw "Fixed2 exact8 one-shot subject is already consumed: $attemptPath"
+    $auditEntry = Get-Item -LiteralPath $auditRoot -Force -ErrorAction SilentlyContinue
+    if ($null -ne $auditEntry) {
+        if (-not $auditEntry.PSIsContainer) {
+            throw "Exact8 attempt registry is not a directory: $auditRoot"
+        }
+        $registryEntries = @(Get-ChildItem -LiteralPath $auditRoot -Force)
+        if ($registryEntries.Count -ne 0) {
+            throw "Fixed2 exact8 lineage is already consumed or its dedicated registry is not empty: $auditRoot"
+        }
     }
+    $attemptPath = Join-Path $auditRoot (([string]$inspection.attempt_id) + ".attempt.json")
 
     if ($CheckOnly) {
         Write-Host "receipt_recipient_multiview_fixed2_exact8 preflight=passed"
         Write-Host ("  route_subject_id={0}" -f [string]$inspection.route_subject_id)
-        Write-Host "  fixed ProgramData one-shot marker is absent"
+        Write-Host "  fixed ProgramData one-shot registry is absent or empty"
         Write-Host "  no attempt lock or output was created"
         exit 0
     }

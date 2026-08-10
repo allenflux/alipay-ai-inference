@@ -58,9 +58,9 @@ from .recipient_multiview_teacher_export import (
 
 SCHEMA_VERSION = 1
 CONSUMER_KIND = "receipt_recipient_multiview_overlay_consumer_v1"
-FIXED2_CONTRACT_KIND = "receipt_recipient_fixed2_overlay_contract_v1"
+FIXED2_CONTRACT_KIND = "receipt_recipient_fixed2_overlay_contract_v2"
 FIXED2_ANALYSIS_CONTRACT_KIND = (
-    "receipt_recipient_fixed2_overlay_analysis_fixture_v1"
+    "receipt_recipient_fixed2_overlay_analysis_fixture_v2"
 )
 FIXED2_PUBLICATION_AUTHORITY = "windows_parent_relative_ntcreatefile_v1"
 FIXED2_ANALYSIS_PUBLICATION_AUTHORITY = (
@@ -70,9 +70,15 @@ FIXED2_CANONICAL_CONTRACT_NAME = "fixed2_overlay.contract.json"
 FIXED2_ANALYSIS_MARKER_NAME = "fixed2_overlay.analysis.json"
 ATTACHMENT_KEY = "_recipient_multiview_overlay_v1"
 SELECTOR_MODE = "sha256_seed_source_offset_plus_epoch_cycle_v1"
-FIXED2_SELECTOR_MODE = "sha256_rank_parity_v1"
+FIXED2_SELECTOR_MODE = "context_distinct_fixed_value_pair_anti_repeat_v2"
 FIXED2_VIEWS = ("standard", "fixed_value")
-FIXED2_SELECTOR_DOMAIN = "receipt-recipient-fixed2-rank-v1"
+FIXED2_SELECTOR_DOMAIN = "receipt-recipient-fixed2-context-distinct-pair-v2"
+FIXED2_SUBJECT_DOMAIN = "receipt-recipient-fixed2-overlay-subject-v2"
+FIXED2_REUSE_POLICY = "context_distinct_fixed_value_pair_reuse_v1"
+FIXED2_REUSE_CLASS_DOMAIN = (
+    "receipt-recipient-fixed2-context-distinct-fixed-value-pair-v1"
+)
+FIXED2_NONBLANK_PREDICATE = "decoded_rgb_global_range_gt_zero_v1"
 EXPECTED_ADAPTER_MARKER = "strict_recipient_multiview_overlay_loader_not_implemented"
 _HEX = frozenset("0123456789abcdef")
 _CODE_ARTIFACT_FILES = {
@@ -156,6 +162,24 @@ class RecipientMultiviewOverlayVerification:
     attachments: dict[str, dict[str, object]]
 
 
+@dataclass(frozen=True)
+class _Fixed2DecodedViewOwner:
+    source_record_id: str
+    group_id: str
+    target_sha256: str
+    view: str
+    pixel_sha256: str
+    width: int
+    height: int
+    rgb_min: int
+    rgb_max: int
+    standard_pixel_sha256: str
+    source: Path
+    source_sha256: str
+    result_json: Path
+    result_json_sha256: str
+
+
 FileIdentity = tuple[int, int, int, int, int, str]
 DirectoryIdentity = tuple[int, int, int]
 WindowsDirectoryIdentity = tuple[int, int, int]
@@ -178,6 +202,26 @@ def _canonical_sha256(value: object) -> str:
         separators=(",", ":"),
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _exact_json_value(actual: object, expected: object) -> bool:
+    """Compare JSON-shaped values without Python's bool/int equivalence."""
+
+    if type(actual) is not type(expected):
+        return False
+    if isinstance(expected, Mapping):
+        if set(actual) != set(expected):  # type: ignore[arg-type]
+            return False
+        return all(
+            _exact_json_value(actual[key], value)  # type: ignore[index]
+            for key, value in expected.items()
+        )
+    if isinstance(expected, list):
+        return len(actual) == len(expected) and all(  # type: ignore[arg-type]
+            _exact_json_value(left, right)
+            for left, right in zip(actual, expected)  # type: ignore[arg-type]
+        )
+    return actual == expected
 
 
 def _strict_json(path: Path) -> dict[str, Any]:
@@ -1639,7 +1683,290 @@ def _rounded_bbox(value: object, *, description: str) -> list[float]:
     return result
 
 
-def _verify_overlay_rows(
+def _fixed2_declared_heldout_crop_hashes(blind_manifest: Path) -> set[str]:
+    """Read only declared held-out crop identities, never held-out targets/files."""
+
+    declared: set[str] = set()
+    for row_number, row in enumerate(_strict_jsonl(blind_manifest), start=1):
+        if row.get("split") != "val":
+            continue
+        slots = row.get("slots")
+        if not isinstance(slots, Mapping):
+            raise ValueError(
+                f"{blind_manifest}:{row_number}: held-out slots must be an object"
+            )
+        recipient = slots.get("recipient_field")
+        if recipient is None:
+            continue
+        if not isinstance(recipient, Mapping):
+            raise ValueError(
+                f"{blind_manifest}:{row_number}: held-out recipient must be an object"
+            )
+        declared.add(
+            _require_sha(
+                recipient.get("crop_sha256"),
+                description=(
+                    f"{blind_manifest}:{row_number}: held-out recipient crop"
+                ),
+            )
+        )
+    return declared
+
+
+def _same_physical_file(left: Path, right: Path, *, description: str) -> bool:
+    try:
+        return os.path.samefile(left, right)
+    except OSError as error:
+        raise ValueError(
+            f"unable to compare fixed2 consumer {description} identity"
+        ) from error
+
+
+def _fixed2_consumer_selected_view_hash_closure(
+    *,
+    attachments: Mapping[str, Mapping[str, object]],
+    recipients: Mapping[str, Mapping[str, object]],
+    heldout_crop_hashes: set[str],
+) -> dict[str, object]:
+    """Independently rebuild the fixed2 producer's decoded-pixel reuse ABI."""
+
+    if set(attachments) != set(recipients):
+        raise ValueError("fixed2 consumer reuse closure source coverage changed")
+    owners: list[_Fixed2DecodedViewOwner] = []
+    for source_id in sorted(attachments):
+        attachment = _mapping(
+            attachments[source_id],
+            description=f"fixed2 consumer attachment {source_id}",
+        )
+        blind = _mapping(
+            recipients[source_id],
+            description=f"fixed2 consumer blind owner {source_id}",
+        )
+        views = _mapping(
+            attachment.get("views"),
+            description=f"fixed2 consumer views {source_id}",
+        )
+        if set(views) != set(FIXED2_VIEWS):
+            raise ValueError(
+                f"fixed2 consumer generated view coverage changed: {source_id}"
+            )
+        standard = _mapping(
+            views["standard"],
+            description=f"fixed2 consumer standard view {source_id}",
+        )
+        standard_sha256 = _require_sha(
+            standard.get("pixel_sha256"),
+            description=f"fixed2 consumer standard pixels {source_id}",
+        )
+        for view_name in FIXED2_VIEWS:
+            view = _mapping(
+                views[view_name],
+                description=f"fixed2 consumer {view_name} view {source_id}",
+            )
+            numeric: dict[str, int] = {}
+            for field in ("width", "height", "rgb_min", "rgb_max"):
+                value = view.get(field)
+                if isinstance(value, bool) or not isinstance(value, int):
+                    raise ValueError(
+                        f"fixed2 consumer {source_id}/{view_name} {field} changed"
+                    )
+                if field in {"width", "height"} and value <= 0:
+                    raise ValueError(
+                        f"fixed2 consumer {source_id}/{view_name} {field} changed"
+                    )
+                if field in {"rgb_min", "rgb_max"} and not 0 <= value <= 255:
+                    raise ValueError(
+                        f"fixed2 consumer {source_id}/{view_name} {field} changed"
+                    )
+                numeric[field] = value
+            owners.append(
+                _Fixed2DecodedViewOwner(
+                    source_record_id=source_id,
+                    group_id=str(blind["group_id"]),
+                    target_sha256=_require_sha(
+                        blind.get("target_sha256"),
+                        description=f"fixed2 consumer target {source_id}",
+                    ),
+                    view=view_name,
+                    pixel_sha256=_require_sha(
+                        view.get("pixel_sha256"),
+                        description=(
+                            f"fixed2 consumer {view_name} pixels {source_id}"
+                        ),
+                    ),
+                    width=numeric["width"],
+                    height=numeric["height"],
+                    rgb_min=numeric["rgb_min"],
+                    rgb_max=numeric["rgb_max"],
+                    standard_pixel_sha256=standard_sha256,
+                    source=Path(str(blind["source"])),
+                    source_sha256=_require_sha(
+                        blind.get("source_sha256"),
+                        description=f"fixed2 consumer source {source_id}",
+                    ),
+                    result_json=Path(str(blind["result_json"])),
+                    result_json_sha256=_require_sha(
+                        blind.get("result_json_sha256"),
+                        description=f"fixed2 consumer result {source_id}",
+                    ),
+                )
+            )
+
+    by_record: dict[str, dict[str, _Fixed2DecodedViewOwner]] = {}
+    by_pixel: dict[str, list[_Fixed2DecodedViewOwner]] = {}
+    for owner in owners:
+        views = by_record.setdefault(owner.source_record_id, {})
+        if owner.view in views:
+            raise ValueError(
+                f"fixed2 consumer duplicate generated view "
+                f"{owner.source_record_id}/{owner.view}"
+            )
+        views[owner.view] = owner
+        if owner.pixel_sha256 in heldout_crop_hashes:
+            raise ValueError(
+                f"fixed2 generated train view {owner.pixel_sha256} crosses "
+                "declared held-out crop boundary"
+            )
+        by_pixel.setdefault(owner.pixel_sha256, []).append(owner)
+    if any(set(views) != set(FIXED2_VIEWS) for views in by_record.values()):
+        raise ValueError(
+            "fixed2 consumer generated view coverage changed before reuse closure"
+        )
+
+    reuse_classes: list[dict[str, object]] = []
+    for pixel_sha256, raw_bucket in sorted(by_pixel.items()):
+        if len(raw_bucket) == 1:
+            continue
+        bucket = sorted(
+            raw_bucket,
+            key=lambda item: (item.source_record_id, item.view),
+        )
+        if len({item.target_sha256 for item in bucket}) != 1:
+            raise ValueError(
+                f"generated view hash {pixel_sha256} conflict: "
+                "target_conflict=true; fixed2 cross-target pixel reuse is forbidden"
+            )
+        if any(item.view != "fixed_value" for item in bucket):
+            views = sorted({item.view for item in bucket})
+            raise ValueError(
+                f"generated view hash {pixel_sha256} standard/cross-view collision: "
+                f"views={views!r}"
+            )
+        if len(bucket) != 2:
+            raise ValueError(
+                f"generated fixed_value hash {pixel_sha256} reuse class has "
+                f"class_size={len(bucket)}; exactly two owners are required"
+            )
+        first, second = bucket
+        if first.source_record_id == second.source_record_id:
+            raise ValueError(
+                f"generated fixed_value hash {pixel_sha256} reuses one source record"
+            )
+        if first.group_id == second.group_id:
+            raise ValueError(
+                f"generated fixed_value hash {pixel_sha256} same-group reuse is forbidden"
+            )
+        if first.standard_pixel_sha256 == second.standard_pixel_sha256:
+            raise ValueError(
+                f"generated fixed_value hash {pixel_sha256} has a standard context collision"
+            )
+        if (
+            first.width != second.width
+            or first.height != second.height
+            or first.rgb_min != second.rgb_min
+            or first.rgb_max != second.rgb_max
+        ):
+            raise ValueError(
+                f"generated fixed_value hash {pixel_sha256} decoded proof changed "
+                "across owners"
+            )
+        if first.rgb_max <= first.rgb_min:
+            raise ValueError(
+                f"generated fixed_value hash {pixel_sha256} is uniform under "
+                f"{FIXED2_NONBLANK_PREDICATE}"
+            )
+        for name, left_path, right_path, left_sha, right_sha in (
+            (
+                "source",
+                first.source,
+                second.source,
+                first.source_sha256,
+                second.source_sha256,
+            ),
+            (
+                "result_json",
+                first.result_json,
+                second.result_json,
+                first.result_json_sha256,
+                second.result_json_sha256,
+            ),
+        ):
+            if _same_physical_file(
+                left_path,
+                right_path,
+                description=name,
+            ) or left_sha == right_sha:
+                raise ValueError(
+                    f"generated fixed_value hash {pixel_sha256} reuses {name} lineage"
+                )
+        class_material: dict[str, object] = {
+            "domain": FIXED2_REUSE_CLASS_DOMAIN,
+            "split": "train",
+            "view": "fixed_value",
+            "fixed_value_pixel_sha256": pixel_sha256,
+            "target_sha256": first.target_sha256,
+            "width": first.width,
+            "height": first.height,
+            "rgb_min": first.rgb_min,
+            "rgb_max": first.rgb_max,
+            "nonblank_predicate": FIXED2_NONBLANK_PREDICATE,
+            "owners": [
+                {
+                    "source_record_id": item.source_record_id,
+                    "group_id": item.group_id,
+                    "standard_pixel_sha256": item.standard_pixel_sha256,
+                }
+                for item in bucket
+            ],
+        }
+        reuse_classes.append(
+            {
+                **class_material,
+                "reuse_class_id": _canonical_sha256(class_material),
+            }
+        )
+    reuse_classes.sort(key=lambda item: str(item["reuse_class_id"]))
+    return {
+        "views_per_train_record": len(FIXED2_VIEWS),
+        "decoded_pixels_reverified": True,
+        "blind_owner_fields": [
+            "split",
+            "source_record_id",
+            "group_id",
+            "target_sha256",
+        ],
+        "cross_split_conflicts": 0,
+        "cross_target_conflicts": 0,
+        "forbidden_cross_group_conflicts": 0,
+        "policy": FIXED2_REUSE_POLICY,
+        "allowed_reuse_view": "fixed_value",
+        "allowed_reuse_class_size": 2,
+        "nonblank_predicate": FIXED2_NONBLANK_PREDICATE,
+        "standard_pixel_reuse_allowed": False,
+        "cross_view_pixel_reuse_allowed": False,
+        "same_group_pixel_reuse_allowed": False,
+        "source_or_result_lineage_reuse_allowed": False,
+        "fixed_value_reuse_class_count": len(reuse_classes),
+        "allowed_cross_group_reuse_class_count": len(reuse_classes),
+        "fixed_value_reused_record_count": len(reuse_classes) * 2,
+        "fixed_value_reuse_classes": reuse_classes,
+        "fixed_value_reuse_class_closure_sha256": _canonical_sha256(
+            reuse_classes
+        ),
+    }
+
+
+def _verify_overlay_rows_impl(
     *,
     rows: Sequence[Mapping[str, Any]],
     export_root: Path,
@@ -1647,7 +1974,14 @@ def _verify_overlay_rows(
     recipients: Mapping[str, Mapping[str, object]],
     expected_views: Sequence[str] = VIEWS,
     expected_record_kind: str = EXPORT_RECORD_KIND,
-) -> tuple[dict[str, dict[str, object]], list[dict[str, object]], list[str]]:
+    fixed2_reuse_policy: bool,
+    heldout_crop_hashes: set[str] | None,
+) -> tuple[
+    dict[str, dict[str, object]],
+    list[dict[str, object]],
+    list[str],
+    dict[str, object] | None,
+]:
     expected_views = tuple(expected_views)
     if not expected_views or len(set(expected_views)) != len(expected_views):
         raise ValueError("overlay expected view profile is invalid")
@@ -1656,6 +1990,16 @@ def _verify_overlay_rows(
     image_bindings: list[dict[str, object]] = []
     source_artifacts: dict[str, dict[str, object]] = {}
     generated_hash_owners: dict[str, _GeneratedViewOwner] = {}
+    if fixed2_reuse_policy:
+        if (
+            expected_views != FIXED2_VIEWS
+            or expected_record_kind
+            not in {FIXED2_SOURCE_RECORD_KIND, FIXED2_SOURCE_ANALYSIS_RECORD_KIND}
+            or heldout_crop_hashes is None
+        ):
+            raise ValueError("fixed2 consumer reuse profile is invalid")
+    elif heldout_crop_hashes is not None:
+        raise ValueError("legacy overlay cannot accept fixed2 held-out evidence")
     for row_number, row in enumerate(rows, start=1):
         if row.get("schema_version") != SCHEMA_VERSION or row.get("kind") != expected_record_kind:
             raise ValueError(f"overlay row {row_number} kind/schema changed")
@@ -1726,21 +2070,22 @@ def _verify_overlay_rows(
         _expect(height, int(pixels.shape[0]), description=f"overlay height {source_id}/{view}")
         pixel_sha = _crop_digest(pixels)
         _expect(row.get("view_pixel_sha256"), pixel_sha, description=f"overlay pixel SHA {source_id}/{view}")
-        # The producer's zero-conflict contract field is evidence, not
-        # authority.  Rebuild the global pixel/group/target closure from the
-        # decoded images and blind-manifest owners before accepting any row.
-        _register_generated_view_owner(
-            generated_hash_owners,
-            pixel_sha256=pixel_sha,
-            owner=_GeneratedViewOwner(
-                line_number=row_number,
-                record_id=row_id,
-                view=str(view),
-                group_id=str(blind["group_id"]),
-                target_sha256=str(blind["target_sha256"]),
-                shape=tuple(int(size) for size in pixels.shape),
-            ),
-        )
+        if not fixed2_reuse_policy:
+            # The legacy four-view path remains strictly fail-closed.  Its
+            # shared registrar is intentionally never taught the fixed2 v2
+            # exception.
+            _register_generated_view_owner(
+                generated_hash_owners,
+                pixel_sha256=pixel_sha,
+                owner=_GeneratedViewOwner(
+                    line_number=row_number,
+                    record_id=row_id,
+                    view=str(view),
+                    group_id=str(blind["group_id"]),
+                    target_sha256=str(blind["target_sha256"]),
+                    shape=tuple(int(size) for size in pixels.shape),
+                ),
+            )
         image_bindings.append(
             {
                 "source_record_id": source_id,
@@ -1751,6 +2096,8 @@ def _verify_overlay_rows(
                 "pixel_sha256": pixel_sha,
                 "width": width,
                 "height": height,
+                "rgb_min": int(np.min(pixels)),
+                "rgb_max": int(np.max(pixels)),
             }
         )
         source_artifacts[source_id] = {
@@ -1820,6 +2167,8 @@ def _verify_overlay_rows(
                     "pixel_sha256": image_by_key[(source_id, view)]["pixel_sha256"],
                     "width": image_by_key[(source_id, view)]["width"],
                     "height": image_by_key[(source_id, view)]["height"],
+                    "rgb_min": image_by_key[(source_id, view)]["rgb_min"],
+                    "rgb_max": image_by_key[(source_id, view)]["rgb_max"],
                 }
                 for view in expected_views
             },
@@ -1834,7 +2183,82 @@ def _verify_overlay_rows(
             expected_views.index(str(item["view"])),
         )
     )
-    return attachments, image_bindings + source_binding_rows, closure_ids
+    reuse_closure = (
+        _fixed2_consumer_selected_view_hash_closure(
+            attachments=attachments,
+            recipients=recipients,
+            heldout_crop_hashes=(
+                heldout_crop_hashes
+                if heldout_crop_hashes is not None
+                else set()
+            ),
+        )
+        if fixed2_reuse_policy
+        else None
+    )
+    return (
+        attachments,
+        image_bindings + source_binding_rows,
+        closure_ids,
+        reuse_closure,
+    )
+
+
+def _verify_overlay_rows(
+    *,
+    rows: Sequence[Mapping[str, Any]],
+    export_root: Path,
+    blind_sha256: str,
+    recipients: Mapping[str, Mapping[str, object]],
+    expected_views: Sequence[str] = VIEWS,
+    expected_record_kind: str = EXPORT_RECORD_KIND,
+) -> tuple[dict[str, dict[str, object]], list[dict[str, object]], list[str]]:
+    """Verify the legacy profile with its original strict collision policy."""
+
+    attachments, bindings, closures, reuse = _verify_overlay_rows_impl(
+        rows=rows,
+        export_root=export_root,
+        blind_sha256=blind_sha256,
+        recipients=recipients,
+        expected_views=expected_views,
+        expected_record_kind=expected_record_kind,
+        fixed2_reuse_policy=False,
+        heldout_crop_hashes=None,
+    )
+    if reuse is not None:
+        raise AssertionError("legacy overlay unexpectedly produced fixed2 reuse evidence")
+    return attachments, bindings, closures
+
+
+def _verify_fixed2_overlay_rows(
+    *,
+    rows: Sequence[Mapping[str, Any]],
+    export_root: Path,
+    blind_sha256: str,
+    recipients: Mapping[str, Mapping[str, object]],
+    expected_record_kind: str,
+    heldout_crop_hashes: set[str],
+) -> tuple[
+    dict[str, dict[str, object]],
+    list[dict[str, object]],
+    list[str],
+    dict[str, object],
+]:
+    """Verify only a producer-verified fixed2 v2 source and rebuild reuse."""
+
+    attachments, bindings, closures, reuse = _verify_overlay_rows_impl(
+        rows=rows,
+        export_root=export_root,
+        blind_sha256=blind_sha256,
+        recipients=recipients,
+        expected_views=FIXED2_SOURCE_VIEWS,
+        expected_record_kind=expected_record_kind,
+        fixed2_reuse_policy=True,
+        heldout_crop_hashes=heldout_crop_hashes,
+    )
+    if reuse is None:
+        raise AssertionError("fixed2 overlay reuse evidence was not rebuilt")
+    return attachments, bindings, closures, reuse
 
 
 def verify_recipient_multiview_overlay(
@@ -2134,15 +2558,31 @@ def _verify_fixed2_teacher_overlay_source(
     )
     rows = _strict_jsonl(export_manifest)
     # This is a second, consumer-owned decoded-pixel -> blind-owner closure.
-    # It does not trust the producer's zero-conflict summary or subject seal.
-    attachments, overlay_bindings, closure_ids = _verify_overlay_rows(
+    # It independently rebuilds the complete v2 reuse class ABI and then
+    # requires exact equality with the producer declaration.
+    (
+        attachments,
+        overlay_bindings,
+        closure_ids,
+        selected_view_hash_closure,
+    ) = _verify_fixed2_overlay_rows(
         rows=rows,
         export_root=export_root,
         blind_sha256=_sha256(blind_manifest),
         recipients=recipients,
-        expected_views=FIXED2_SOURCE_VIEWS,
         expected_record_kind=expected_record_kind,
+        heldout_crop_hashes=_fixed2_declared_heldout_crop_hashes(
+            blind_manifest
+        ),
     )
+    producer_reuse_closure = export_contract.get("selected_view_hash_closure")
+    if not _exact_json_value(
+        producer_reuse_closure,
+        selected_view_hash_closure,
+    ):
+        raise ValueError(
+            "fixed2 consumer selected-view reuse closure differs from producer"
+        )
     bindings = {
         "blind_manifest": _binding(blind_manifest),
         "blind_contract": _binding(blind_contract),
@@ -2175,6 +2615,10 @@ def _verify_fixed2_teacher_overlay_source(
         "producer_manifest_semantic_sha256": export_contract[
             "source_manifest_semantic_sha256"
         ],
+        "selected_view_hash_closure": selected_view_hash_closure,
+        "selected_view_hash_closure_sha256": _canonical_sha256(
+            selected_view_hash_closure
+        ),
         "counts": {
             "blind_train_records": int(split_counts["train"]),
             "blind_val_records": int(split_counts["val"]),
@@ -2291,42 +2735,280 @@ def _relative_to_common(path: Path, common_root: Path) -> str:
     return relative.as_posix()
 
 
+def _fixed2_bound_rank_sha256(
+    source_id: str, *, blind_manifest_sha256: str
+) -> str:
+    return hashlib.sha256(
+        b"\x00".join(
+            (
+                FIXED2_SELECTOR_DOMAIN.encode("ascii"),
+                blind_manifest_sha256.encode("ascii"),
+                source_id.encode("utf-8"),
+            )
+        )
+    ).hexdigest()
+
+
 def _fixed2_selection(
-    source_ids: Sequence[str], *, blind_manifest_sha256: str
-) -> tuple[dict[str, str], list[dict[str, object]]]:
+    attachments: Mapping[str, Mapping[str, object]],
+    *,
+    reuse_closure: Mapping[str, object],
+    blind_manifest_sha256: str,
+) -> tuple[
+    dict[str, str],
+    dict[str, dict[str, object]],
+    dict[str, object],
+]:
     blind_manifest_sha256 = _require_sha(
         blind_manifest_sha256,
         description="fixed2 selector blind manifest",
     )
-    ranked = sorted(
-        (
-            hashlib.sha256(
-                b"\x00".join(
-                    (
-                        FIXED2_SELECTOR_DOMAIN.encode("ascii"),
-                        blind_manifest_sha256.encode("ascii"),
-                        source_id.encode("utf-8"),
-                    )
-                )
-            ).hexdigest(),
+    source_ids = set(attachments)
+    if not source_ids or any(
+        not isinstance(source_id, str) or not source_id
+        for source_id in source_ids
+    ):
+        raise ValueError("fixed2 selector source identities are invalid")
+    raw_classes = reuse_closure.get("fixed_value_reuse_classes")
+    if not isinstance(raw_classes, Sequence) or isinstance(
+        raw_classes, (str, bytes)
+    ):
+        raise ValueError("fixed2 selector reuse classes must be a list")
+    declared_count = reuse_closure.get("fixed_value_reuse_class_count")
+    if (
+        isinstance(declared_count, bool)
+        or not isinstance(declared_count, int)
+        or declared_count != len(raw_classes)
+    ):
+        raise ValueError("fixed2 selector reuse class count changed")
+
+    rank_sha256 = {
+        source_id: _fixed2_bound_rank_sha256(
             source_id,
+            blind_manifest_sha256=blind_manifest_sha256,
         )
         for source_id in source_ids
-    )
+    }
     selected: dict[str, str] = {}
-    evidence: list[dict[str, object]] = []
-    for rank, (digest, source_id) in enumerate(ranked):
-        view = FIXED2_VIEWS[rank % len(FIXED2_VIEWS)]
-        selected[source_id] = view
-        evidence.append(
+    assignment_rows: list[dict[str, object]] = []
+    pair_assignment_rows: list[dict[str, object]] = []
+    paired_source_ids: set[str] = set()
+    for raw_class in raw_classes:
+        reuse_class = _mapping(
+            raw_class,
+            description="fixed2 selector reuse class",
+        )
+        reuse_class_id = _require_sha(
+            reuse_class.get("reuse_class_id"),
+            description="fixed2 selector reuse class id",
+        )
+        class_material = {
+            key: value
+            for key, value in reuse_class.items()
+            if key != "reuse_class_id"
+        }
+        if _canonical_sha256(class_material) != reuse_class_id:
+            raise ValueError("fixed2 selector reuse class id changed")
+        if (
+            reuse_class.get("view") != "fixed_value"
+            or reuse_class.get("split") != "train"
+        ):
+            raise ValueError("fixed2 selector reuse class profile changed")
+        class_pixel_sha256 = _require_sha(
+            reuse_class.get("fixed_value_pixel_sha256"),
+            description="fixed2 selector reuse fixed pixels",
+        )
+        class_target_sha256 = _require_sha(
+            reuse_class.get("target_sha256"),
+            description="fixed2 selector reuse target",
+        )
+        raw_owners = reuse_class.get("owners")
+        if (
+            not isinstance(raw_owners, Sequence)
+            or isinstance(raw_owners, (str, bytes))
+            or len(raw_owners) != 2
+        ):
+            raise ValueError("fixed2 selector reuse class must have two owners")
+        members: list[str] = []
+        for raw_owner in raw_owners:
+            owner = _mapping(
+                raw_owner,
+                description=f"fixed2 selector reuse owner {reuse_class_id}",
+            )
+            source_id = owner.get("source_record_id")
+            if (
+                not isinstance(source_id, str)
+                or source_id not in source_ids
+                or source_id in paired_source_ids
+            ):
+                raise ValueError(
+                    "fixed2 selector reuse class membership overlaps or is unknown"
+                )
+            attachment = _mapping(
+                attachments[source_id],
+                description=f"fixed2 selector attachment {source_id}",
+            )
+            views = _mapping(
+                attachment.get("views"),
+                description=f"fixed2 selector views {source_id}",
+            )
+            standard = _mapping(
+                views.get("standard"),
+                description=f"fixed2 selector standard view {source_id}",
+            )
+            fixed_value = _mapping(
+                views.get("fixed_value"),
+                description=f"fixed2 selector fixed view {source_id}",
+            )
+            for actual, expected, description in (
+                (
+                    attachment.get("group_id"),
+                    owner.get("group_id"),
+                    "group",
+                ),
+                (
+                    attachment.get("target_sha256"),
+                    class_target_sha256,
+                    "target",
+                ),
+                (
+                    standard.get("pixel_sha256"),
+                    owner.get("standard_pixel_sha256"),
+                    "standard pixels",
+                ),
+                (
+                    fixed_value.get("pixel_sha256"),
+                    class_pixel_sha256,
+                    "fixed pixels",
+                ),
+            ):
+                if actual != expected:
+                    raise ValueError(
+                        f"fixed2 selector reuse owner {source_id} {description} changed"
+                    )
+            paired_source_ids.add(source_id)
+            members.append(source_id)
+        ordered_members = sorted(
+            members,
+            key=lambda source_id: (rank_sha256[source_id], source_id),
+        )
+        pair_views = ("standard", "fixed_value")
+        pair_roles = ("reuse_pair_standard", "reuse_pair_fixed_value")
+        for pair_rank, (source_id, view, role) in enumerate(
+            zip(ordered_members, pair_views, pair_roles)
+        ):
+            selected[source_id] = view
+            assignment_rows.append(
+                {
+                    "source_record_id": source_id,
+                    "partition": "reuse_pair",
+                    "partition_rank": pair_rank,
+                    "bound_rank_sha256": rank_sha256[source_id],
+                    "reuse_class_id": reuse_class_id,
+                    "selection_role": role,
+                    "selected_view": view,
+                }
+            )
+        pair_assignment_rows.append(
             {
-                "rank": rank,
+                "reuse_class_id": reuse_class_id,
+                "standard_source_record_id": ordered_members[0],
+                "fixed_value_source_record_id": ordered_members[1],
+                "fixed_value_pixel_sha256": class_pixel_sha256,
+                "target_sha256": class_target_sha256,
+            }
+        )
+
+    singleton_ids = sorted(
+        source_ids - paired_source_ids,
+        key=lambda source_id: (rank_sha256[source_id], source_id),
+    )
+    for singleton_rank, source_id in enumerate(singleton_ids):
+        view = FIXED2_VIEWS[singleton_rank % len(FIXED2_VIEWS)]
+        selected[source_id] = view
+        assignment_rows.append(
+            {
                 "source_record_id": source_id,
-                "bound_rank_sha256": digest,
+                "partition": "singleton",
+                "partition_rank": singleton_rank,
+                "bound_rank_sha256": rank_sha256[source_id],
+                "reuse_class_id": None,
+                "selection_role": "singleton_rank_parity",
                 "selected_view": view,
             }
         )
-    return selected, evidence
+    if set(selected) != source_ids:
+        raise AssertionError("fixed2 selector assignment coverage changed")
+    assignment_rows.sort(key=lambda item: str(item["source_record_id"]))
+    pair_assignment_rows.sort(key=lambda item: str(item["reuse_class_id"]))
+    selector_assignment_sha256 = _canonical_sha256(assignment_rows)
+    assignments = {
+        str(row["source_record_id"]): {
+            "reuse_class_id": row["reuse_class_id"],
+            "selection_role": row["selection_role"],
+            "selector_assignment_sha256": selector_assignment_sha256,
+        }
+        for row in assignment_rows
+    }
+    return (
+        selected,
+        assignments,
+        {
+            "reuse_class_count": len(raw_classes),
+            "reuse_class_record_count": len(paired_source_ids),
+            "singleton_record_count": len(singleton_ids),
+            "reuse_pair_assignment_rule": (
+                "ascending_bound_rank_then_standard_fixed_value_v1"
+            ),
+            "singleton_assignment_rule": (
+                "ascending_bound_rank_then_standard_fixed_value_parity_v1"
+            ),
+            "reuse_class_assignment_sha256": _canonical_sha256(
+                pair_assignment_rows
+            ),
+            "selector_assignment_sha256": selector_assignment_sha256,
+        },
+    )
+
+
+def _selected_pixel_target_closure(
+    bindings: Sequence[Mapping[str, object]],
+) -> dict[str, object]:
+    rows: list[dict[str, object]] = []
+    owners: dict[tuple[str, str], str] = {}
+    for raw in bindings:
+        binding = _mapping(raw, description="fixed2 selected pixel/target binding")
+        record_id = binding.get("record_id")
+        target = binding.get("target")
+        if not isinstance(record_id, str) or not record_id:
+            raise ValueError("fixed2 selected pixel/target record identity changed")
+        if not isinstance(target, str) or not target:
+            raise ValueError("fixed2 selected pixel/target value changed")
+        pixel_sha256 = _require_sha(
+            binding.get("pixel_sha256"),
+            description=f"fixed2 selected pixels {record_id}",
+        )
+        target_sha256 = hashlib.sha256(target.encode("utf-8")).hexdigest()
+        key = (pixel_sha256, target_sha256)
+        prior = owners.setdefault(key, record_id)
+        if prior != record_id:
+            raise ValueError(
+                "fixed2 selected (pixel,target) identity is duplicated: "
+                f"prior={prior!r} current={record_id!r}"
+            )
+        rows.append(
+            {
+                "record_id": record_id,
+                "pixel_sha256": pixel_sha256,
+                "target_sha256": target_sha256,
+            }
+        )
+    rows.sort(key=lambda item: str(item["record_id"]))
+    return {
+        "selected_pixel_target_unique": True,
+        "selected_pixel_target_count": len(rows),
+        "selected_pixel_target_closure_sha256": _canonical_sha256(rows),
+    }
 
 
 def _composite_rows(
@@ -2354,8 +3036,13 @@ def _composite_rows(
         blind_binding.get("sha256"),
         description="overlay selector blind manifest binding",
     )
-    selected, rank_evidence = _fixed2_selection(
-        sorted(verification.attachments),
+    reuse_closure = _mapping(
+        verification.policy.get("selected_view_hash_closure"),
+        description="fixed2 selector reuse closure",
+    )
+    selected, assignment_by_source, assignment_evidence = _fixed2_selection(
+        verification.attachments,
+        reuse_closure=reuse_closure,
         blind_manifest_sha256=bound_blind_manifest_sha256,
     )
     selected_counts: Counter[str] = Counter()
@@ -2461,6 +3148,10 @@ def _composite_rows(
                 slot["crop_sha256"] = view_binding["pixel_sha256"]
                 selected_counts[selected_view] += 1
                 train_recipient_ids.add(record_id)
+                assignment = _mapping(
+                    assignment_by_source.get(record_id),
+                    description=f"fixed2 selector assignment {record_id}",
+                )
                 selected_composite_bindings.append(
                     {
                         "record_id": record_id,
@@ -2470,6 +3161,11 @@ def _composite_rows(
                         "view": selected_view,
                         "pixel_sha256": view_binding["pixel_sha256"],
                         "file_sha256": view_binding["file_sha256"],
+                        "reuse_class_id": assignment["reuse_class_id"],
+                        "selection_role": assignment["selection_role"],
+                        "selector_assignment_sha256": assignment[
+                            "selector_assignment_sha256"
+                        ],
                     }
                 )
             else:
@@ -2491,8 +3187,11 @@ def _composite_rows(
     if sum(selected_counts.values()) != len(verification.attachments):
         raise AssertionError("fixed2 selector changed the train multiplier")
     if abs(selected_counts[FIXED2_VIEWS[0]] - selected_counts[FIXED2_VIEWS[1]]) > 1:
-        raise AssertionError("fixed2 hash-rank parity did not balance the selected views")
+        raise AssertionError("fixed2 v2 selector did not balance the selected views")
     selected_composite_bindings.sort(key=lambda item: str(item["record_id"]))
+    selected_pixel_target_evidence = _selected_pixel_target_closure(
+        selected_composite_bindings
+    )
     validation_pixel_bindings.sort(
         key=lambda item: (str(item["record_id"]), str(item["field"]))
     )
@@ -2500,9 +3199,14 @@ def _composite_rows(
         "selector_mode": FIXED2_SELECTOR_MODE,
         "selector_domain": FIXED2_SELECTOR_DOMAIN,
         "selected_views": list(FIXED2_VIEWS),
+        "verified_reuse_policy": reuse_closure["policy"],
+        "verified_reuse_class_closure_sha256": reuse_closure[
+            "fixed_value_reuse_class_closure_sha256"
+        ],
         "selector_input": (
-            "sha256(domain_nul_bound_blind_manifest_sha256_nul_utf8_source_record_id)"
-            "_sorted_ascending_then_rank_parity"
+            "sha256(domain_nul_bound_blind_manifest_sha256_nul_utf8_source_record_id);"
+            "verified_reuse_pairs_sorted_independently_then_one_standard_one_fixed;"
+            "singletons_sorted_independently_then_rank_parity"
         ),
         "bound_blind_manifest_sha256": bound_blind_manifest_sha256,
         "even_rank_view": FIXED2_VIEWS[0],
@@ -2515,7 +3219,8 @@ def _composite_rows(
         "selected_view_counts": {
             view: int(selected_counts[view]) for view in FIXED2_VIEWS
         },
-        "selector_assignment_sha256": _canonical_sha256(rank_evidence),
+        **assignment_evidence,
+        **selected_pixel_target_evidence,
     }
     return output, evidence, selected_composite_bindings, validation_pixel_bindings
 
@@ -2691,6 +3396,9 @@ def _normalized_selected_composite_bindings(
         "view",
         "pixel_sha256",
         "file_sha256",
+        "reuse_class_id",
+        "selection_role",
+        "selector_assignment_sha256",
     }
     normalized: list[dict[str, object]] = []
     identities: set[str] = set()
@@ -2710,6 +3418,27 @@ def _normalized_selected_composite_bindings(
             raise ValueError("selected composite target is invalid")
         if binding.get("split") != "train" or view not in FIXED2_VIEWS:
             raise ValueError("selected composite split/view is invalid")
+        reuse_class_id = binding.get("reuse_class_id")
+        selection_role = binding.get("selection_role")
+        if selection_role == "reuse_pair_standard":
+            if view != "standard" or reuse_class_id is None:
+                raise ValueError("selected composite reuse-pair standard role changed")
+        elif selection_role == "reuse_pair_fixed_value":
+            if view != "fixed_value" or reuse_class_id is None:
+                raise ValueError("selected composite reuse-pair fixed role changed")
+        elif selection_role == "singleton_rank_parity":
+            if reuse_class_id is not None:
+                raise ValueError("selected composite singleton reuse class changed")
+        else:
+            raise ValueError("selected composite selection role changed")
+        normalized_reuse_class_id = (
+            _require_sha(
+                reuse_class_id,
+                description=f"selected composite reuse class {record_id}",
+            )
+            if reuse_class_id is not None
+            else None
+        )
         identities.add(record_id)
         normalized.append(
             {
@@ -2725,6 +3454,12 @@ def _normalized_selected_composite_bindings(
                 "file_sha256": _require_sha(
                     binding.get("file_sha256"),
                     description=f"selected composite file {record_id}",
+                ),
+                "reuse_class_id": normalized_reuse_class_id,
+                "selection_role": selection_role,
+                "selector_assignment_sha256": _require_sha(
+                    binding.get("selector_assignment_sha256"),
+                    description=f"selected composite assignment {record_id}",
                 ),
             }
         )
@@ -2976,6 +3711,17 @@ def _fixed2_contract_payload(
     selected_bindings = _normalized_selected_composite_bindings(
         selected_composite_bindings
     )
+    selector_assignment_sha256 = _require_sha(
+        selector_evidence.get("selector_assignment_sha256"),
+        description="fixed2 selector assignment closure",
+    )
+    if {
+        binding["selector_assignment_sha256"]
+        for binding in selected_bindings
+    } != {selector_assignment_sha256}:
+        raise ValueError(
+            "selected composite bindings do not bind one selector assignment closure"
+        )
     validation_bindings = _normalized_validation_pixel_bindings(
         validation_pixel_bindings
     )
@@ -2990,6 +3736,11 @@ def _fixed2_contract_payload(
             ).hexdigest(),
             "view": binding["view"],
             "pixel_sha256": binding["pixel_sha256"],
+            "reuse_class_id": binding["reuse_class_id"],
+            "selection_role": binding["selection_role"],
+            "selector_assignment_sha256": binding[
+                "selector_assignment_sha256"
+            ],
         }
         for binding in selected_bindings
     ]
@@ -3031,7 +3782,7 @@ def _fixed2_contract_payload(
         if key != "bound_blind_manifest_sha256"
     }
     subject_material = {
-        "domain": "receipt-recipient-fixed2-overlay-subject-v1",
+        "domain": FIXED2_SUBJECT_DOMAIN,
         "selected_views": list(FIXED2_VIEWS),
         "selector": selector_subject,
         "producer_subject_id": producer_subject_id,

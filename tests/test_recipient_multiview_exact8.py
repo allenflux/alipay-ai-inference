@@ -262,6 +262,11 @@ def _inspection(tmp_path: Path) -> dict[str, object]:
     composite_root = tmp_path / "composite-root"
     composite_root.mkdir()
     _source_config, target_config = _configs()
+    attempt_material, attempt_id = exact8._fixed2_lineage_attempt_identity(
+        source_subject_id=exact8.ATTESTED_SOURCE_SUBJECT_ID,
+        candidate_pilot_subject_id=exact8.ATTESTED_A8_SUBJECT_ID,
+        failure_subject_id="b" * 64,
+    )
     return {
         "schema_version": 1,
         "kind": exact8.INSPECTION_KIND,
@@ -270,7 +275,8 @@ def _inspection(tmp_path: Path) -> dict[str, object]:
         "test_opened": False,
         "onnx_exported": False,
         "route_subject_id": "a" * 64,
-        "attempt_id": "a" * 64,
+        "attempt_id": attempt_id,
+        "attempt_material": attempt_material,
         "source_subject_id": exact8.ATTESTED_SOURCE_SUBJECT_ID,
         "candidate_pilot_subject_id": exact8.ATTESTED_A8_SUBJECT_ID,
         "failure_subject_id": "b" * 64,
@@ -1220,7 +1226,9 @@ def test_fixed_recipe_is_exactly_two_views_one_train_copy_and_eight_epochs(
     args = recipe["training_args"]
 
     assert recipe["selected_views"] == ["standard", "fixed_value"]
-    assert recipe["selector_mode"] == "sha256_rank_parity_v1"
+    assert recipe["selector_mode"] == (
+        "context_distinct_fixed_value_pair_anti_repeat_v2"
+    )
     assert recipe["train_multiplier"] == 1
     assert recipe["val_unchanged"] is True
     assert args["epochs"] == 8
@@ -1240,6 +1248,105 @@ def test_exact8_code_closure_includes_dedicated_fixed2_producer_and_registry_is_
     )
     assert code["code_fixed2_attestation"].is_file()
     assert exact8.ATTEMPT_REGISTRY_NAME == "recipient-v14-multiview-fixed2-training-v1"
+
+
+def test_exact8_v2_kind_and_selector_match_overlay_interface() -> None:
+    assert exact8.INSPECTION_KIND == (
+        "receipt_recipient_multiview_fixed2_exact8_subject_v2"
+    )
+    assert exact8.RECIPE_KIND == (
+        "receipt_recipient_multiview_fixed2_exact8_recipe_v2"
+    )
+    assert exact8.DECISION_KIND == (
+        "receipt_recipient_multiview_fixed2_exact8_decision_v2"
+    )
+    assert exact8.ATTEMPT_KIND == (
+        "receipt_recipient_multiview_fixed2_exact8_attempt_v2"
+    )
+    assert exact8.ROUTE_DOMAIN == "receipt-recipient-multiview-fixed2-exact8-v2"
+    assert exact8.OVERLAY_KIND == overlay_module.FIXED2_CONTRACT_KIND == (
+        "receipt_recipient_fixed2_overlay_contract_v2"
+    )
+    assert exact8.SELECTOR_MODE == overlay_module.FIXED2_SELECTOR_MODE == (
+        "context_distinct_fixed_value_pair_anti_repeat_v2"
+    )
+
+
+def test_route_changes_with_v2_overlay_but_lineage_attempt_is_stable() -> None:
+    source = exact8.ATTESTED_SOURCE_SUBJECT_ID
+    a8 = exact8.ATTESTED_A8_SUBJECT_ID
+    failure = "b" * 64
+    first_route_material, first_route = exact8._fixed2_route_identity(
+        source_subject_id=source,
+        candidate_pilot_subject_id=a8,
+        failure_subject_id=failure,
+        overlay_subject_id="c" * 64,
+    )
+    second_route_material, second_route = exact8._fixed2_route_identity(
+        source_subject_id=source,
+        candidate_pilot_subject_id=a8,
+        failure_subject_id=failure,
+        overlay_subject_id="d" * 64,
+    )
+    first_attempt_material, first_attempt = (
+        exact8._fixed2_lineage_attempt_identity(
+            source_subject_id=source,
+            candidate_pilot_subject_id=a8,
+            failure_subject_id=failure,
+        )
+    )
+    second_attempt_material, second_attempt = (
+        exact8._fixed2_lineage_attempt_identity(
+            source_subject_id=source,
+            candidate_pilot_subject_id=a8,
+            failure_subject_id=failure,
+        )
+    )
+
+    assert first_route != second_route
+    assert first_route_material["overlay_subject_id"] != second_route_material[
+        "overlay_subject_id"
+    ]
+    assert first_attempt == second_attempt
+    assert first_attempt_material == second_attempt_material
+    assert set(first_attempt_material) == {
+        "domain",
+        "source_subject_id",
+        "candidate_pilot_subject_id",
+        "b8_fixed_source_subject_id",
+        "failure_subject_id",
+    }
+    assert not {
+        "overlay_subject_id",
+        "selector_mode",
+        "selected_views",
+        "code",
+        "epochs",
+    } & set(first_attempt_material)
+    assert first_attempt != first_route
+    assert first_attempt != second_route
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("source_subject_id", "1" * 64),
+        ("candidate_pilot_subject_id", "2" * 64),
+        ("failure_subject_id", "3" * 64),
+    ],
+)
+def test_lineage_attempt_changes_for_each_upstream_authority_subject(
+    field: str, replacement: str
+) -> None:
+    values = {
+        "source_subject_id": exact8.ATTESTED_SOURCE_SUBJECT_ID,
+        "candidate_pilot_subject_id": exact8.ATTESTED_A8_SUBJECT_ID,
+        "failure_subject_id": "b" * 64,
+    }
+    _material, expected = exact8._fixed2_lineage_attempt_identity(**values)
+    values[field] = replacement
+    _changed_material, changed = exact8._fixed2_lineage_attempt_identity(**values)
+    assert changed != expected
 
 
 def test_analysis_overlay_fixture_cannot_be_promoted_to_exact8_authority(
@@ -1567,6 +1674,66 @@ def test_attempt_must_samefile_real_common_application_data_registry(
             output_root=output,
             snapshot=exact8._freeze_file(fake, description="fake attempt"),
         )
+
+
+def test_unconsumed_preflight_is_read_only_for_absent_and_empty_registry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inspection = _inspection(tmp_path)
+    program_data = tmp_path / "ProgramData"
+    program_data.mkdir()
+    monkeypatch.setattr(exact8, "_common_application_data_path", lambda: program_data)
+
+    exact8._require_attempt_lineage_unconsumed(inspection=inspection)
+    receipt_root = program_data / exact8.ATTEMPT_REGISTRY_PARENT
+    registry = receipt_root / exact8.ATTEMPT_REGISTRY_NAME
+    assert not receipt_root.exists()
+    assert not registry.exists()
+
+    registry.mkdir(parents=True)
+    exact8._require_attempt_lineage_unconsumed(inspection=inspection)
+    assert list(registry.iterdir()) == []
+
+
+@pytest.mark.parametrize("entry_kind", ["legacy", "unknown", "directory"])
+def test_unconsumed_preflight_fails_closed_for_any_dedicated_registry_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entry_kind: str,
+) -> None:
+    inspection = _inspection(tmp_path)
+    program_data = tmp_path / "ProgramData"
+    registry = (
+        program_data
+        / exact8.ATTEMPT_REGISTRY_PARENT
+        / exact8.ATTEMPT_REGISTRY_NAME
+    )
+    registry.mkdir(parents=True)
+    if entry_kind == "legacy":
+        entry = registry / f"{'e' * 64}.attempt.json"
+        entry.write_text(
+            json.dumps(
+                {
+                    "kind": exact8.LEGACY_ATTEMPT_KIND,
+                    "attempt_id": "e" * 64,
+                    "route_subject_id": "e" * 64,
+                }
+            ),
+            encoding="utf-8",
+        )
+    elif entry_kind == "unknown":
+        entry = registry / "unknown.bin"
+        entry.write_bytes(b"unknown")
+    else:
+        entry = registry / "unexpected-directory"
+        entry.mkdir()
+    before = sorted(path.name for path in registry.iterdir())
+    monkeypatch.setattr(exact8, "_common_application_data_path", lambda: program_data)
+
+    with pytest.raises(ValueError, match="already consumed|not empty"):
+        exact8._require_attempt_lineage_unconsumed(inspection=inspection)
+
+    assert sorted(path.name for path in registry.iterdir()) == before
 
 
 def test_program_data_known_folder_abi_ignores_programdata_environment(
@@ -2935,10 +3102,120 @@ def test_python_run_consumes_marker_before_output_and_second_run_is_rejected(
         "_exact8_output_anchor_hook",
         lambda _checkpoint, *, parent, output_root: None,
     )
+    alternate_route = dict(inspection)
+    alternate_route["route_subject_id"] = "d" * 64
+    alternate_route["overlay_subject_id"] = "e" * 64
+    assert alternate_route["attempt_id"] == inspection["attempt_id"]
+    assert alternate_route["route_subject_id"] != inspection["route_subject_id"]
+    monkeypatch.setattr(
+        exact8, "inspect_exact8_subject", lambda **_: alternate_route
+    )
     second_output = tmp_path / "second-run"
     with pytest.raises(ValueError, match="already consumed"):
         exact8.run_exact8(output_root=second_output, **kwargs)
     assert not os.path.lexists(second_output)
+
+
+def test_python_run_rejects_any_legacy_registry_entry_before_stable_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inspection = _inspection(tmp_path)
+    attempt = _formal_attempt_path(tmp_path, inspection, monkeypatch)
+    legacy = attempt.parent / f"{'e' * 64}.attempt.json"
+    legacy_bytes = json.dumps(
+        {
+            "kind": exact8.LEGACY_ATTEMPT_KIND,
+            "attempt_id": "e" * 64,
+            "route_subject_id": "e" * 64,
+            "overlay_subject_id": "d" * 64,
+        },
+        sort_keys=True,
+    ).encode("utf-8")
+    legacy.write_bytes(legacy_bytes)
+    output = tmp_path / "must-remain-absent"
+    monkeypatch.setattr(exact8, "inspect_exact8_subject", lambda **_: inspection)
+
+    with pytest.raises(ValueError, match="already consumed|registry changed"):
+        exact8.run_exact8(
+            full_records=tmp_path / "unused-full",
+            original_dataset_root=tmp_path / "unused-dataset",
+            full_crop_pilot_root=tmp_path / "unused-pilot",
+            source_contract_path=tmp_path / "unused-source",
+            candidate_pilot_evidence_path=tmp_path / "unused-a8",
+            failure_evidence_path=tmp_path / "unused-failure",
+            failure_attempt_registry=tmp_path / "unused-registry",
+            overlay_contract_path=tmp_path / "unused-overlay",
+            output_root=output,
+            attempt_lock=attempt,
+            torch=object(),
+        )
+
+    assert legacy.read_bytes() == legacy_bytes
+    assert not attempt.exists()
+    assert not output.exists()
+
+
+def test_python_run_rejects_entry_injected_immediately_after_create_new(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inspection = _inspection(tmp_path)
+    attempt = _formal_attempt_path(tmp_path, inspection, monkeypatch)
+    output = tmp_path / "must-remain-absent"
+    injected = attempt.parent / "injected-after-create-new"
+    monkeypatch.setattr(exact8, "inspect_exact8_subject", lambda **_: inspection)
+    original_create = exact8._create_attempt_file_lease
+
+    def create_and_inject(
+        path: Path, payload: bytes
+    ) -> exact8._AttemptFileLease:
+        lease = original_create(path, payload)
+        injected.write_bytes(b"injected")
+        return lease
+
+    monkeypatch.setattr(exact8, "_create_attempt_file_lease", create_and_inject)
+
+    with pytest.raises(ValueError, match="registry changed"):
+        exact8.run_exact8(
+            full_records=tmp_path / "unused-full",
+            original_dataset_root=tmp_path / "unused-dataset",
+            full_crop_pilot_root=tmp_path / "unused-pilot",
+            source_contract_path=tmp_path / "unused-source",
+            candidate_pilot_evidence_path=tmp_path / "unused-a8",
+            failure_evidence_path=tmp_path / "unused-failure",
+            failure_attempt_registry=tmp_path / "unused-registry",
+            overlay_contract_path=tmp_path / "unused-overlay",
+            output_root=output,
+            attempt_lock=attempt,
+            torch=object(),
+        )
+
+    assert attempt.is_file()
+    assert injected.is_file()
+    assert not output.exists()
+
+
+def test_attempt_guard_rejects_registry_entry_injected_at_later_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inspection = _inspection(tmp_path)
+    attempt = _formal_attempt_path(tmp_path, inspection, monkeypatch)
+    guard = exact8._consume_attempt(
+        attempt,
+        inspection=inspection,
+        output_root=tmp_path / "unused-output",
+    )
+    injected = attempt.parent / "injected-later"
+    injected.write_bytes(b"injected")
+
+    with pytest.raises(ValueError, match="registry changed"):
+        guard.require("injected_later_checkpoint")
+    with pytest.raises(ValueError, match="registry changed"):
+        guard.close()
+
+    assert guard.closed is True
+    assert guard.file_lease.closed is True
+    assert attempt.is_file()
+    assert injected.is_file()
 
 
 def test_python_run_failure_before_consumption_leaves_no_marker(
@@ -3060,8 +3337,19 @@ def test_windows_runner_is_one_shot_streaming_and_never_opens_delivery_route() -
     assert script.index("if ($CheckOnly)") < script.index(
         "New-Item -ItemType Directory -Path $auditRoot"
     )
-    assert script.index("Test-Path -LiteralPath $attemptPath") < script.index(
+    assert script.index("Get-ChildItem -LiteralPath $auditRoot -Force") < script.index(
         "if ($CheckOnly)"
+    )
+    assert '"--require-unconsumed"' in script
+    assert "receipt_recipient_multiview_fixed2_exact8_subject_v2" in script
+    assert "receipt_recipient_multiview_fixed2_exact8_subject_v1" not in script
+    assert (
+        '[string]$inspection.attempt_id -notmatch "^[0-9a-f]{64}$"'
+        in script
+    )
+    assert (
+        "$inspection.attempt_id -ne [string]$inspection.route_subject_id"
+        not in script
     )
     module = Path(exact8.__file__).read_text(encoding="utf-8")
     assert "os.O_WRONLY | os.O_CREAT | os.O_EXCL" in module
@@ -3081,6 +3369,49 @@ def test_windows_runner_is_one_shot_streaming_and_never_opens_delivery_route() -
     assert "ocr_unified\", \"evaluate" not in lower
     assert "materialize_fixed2_overlay" not in script
     assert "--output-root\", $OutputRoot" in script
+
+
+def test_cli_inspect_require_unconsumed_is_read_only_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    inspection = _inspection(tmp_path)
+    observed: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        exact8, "inspect_exact8_subject", lambda **_kwargs: inspection
+    )
+    monkeypatch.setattr(
+        exact8,
+        "_require_attempt_lineage_unconsumed",
+        lambda *, inspection: observed.append(dict(inspection)),
+    )
+
+    exact8.main(
+        [
+            "inspect",
+            "--full-records",
+            "unused-full",
+            "--dataset-root",
+            "unused-data",
+            "--full-crop-pilot-root",
+            "unused-pilot",
+            "--source-contract",
+            "unused-source",
+            "--candidate-pilot-evidence",
+            "unused-a8",
+            "--failure-evidence",
+            "unused-failure",
+            "--failure-attempt-registry",
+            "unused-failure-registry",
+            "--overlay-contract",
+            "unused-overlay",
+            "--require-unconsumed",
+        ]
+    )
+
+    assert observed == [inspection]
+    assert json.loads(capsys.readouterr().out) == inspection
 
 
 def test_cli_exposes_independent_verify_without_treating_verified_fail_as_error() -> None:

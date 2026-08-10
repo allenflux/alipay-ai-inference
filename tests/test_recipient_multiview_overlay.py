@@ -72,16 +72,23 @@ def _train_row(
     *,
     index: int,
     target: str,
+    context_distinct_fixed_value_pair: bool = False,
 ) -> dict[str, object]:
+    pixel_variant = 0 if context_distinct_fixed_value_pair and index == 1 else index
     y, x = np.mgrid[:60, :100]
     pixels = np.stack(
         (
-            (x * (index + 3) + y) % 256,
-            (x + y * (index + 5)) % 256,
-            (x * 7 + y * 11 + index * 17) % 256,
+            (x * (pixel_variant + 3) + y) % 256,
+            (x + y * (pixel_variant + 5)) % 256,
+            (x * 7 + y * 11 + pixel_variant * 17) % 256,
         ),
         axis=2,
     ).astype(np.uint8)
+    if context_distinct_fixed_value_pair and index == 1:
+        # The standard crop begins at source x=15 and fixed_value begins at
+        # source x=36.  Change only the discarded left context so standard is
+        # distinct while fixed_value remains byte-identical.
+        pixels[:, 15:36, 0] ^= np.uint8(0x5A)
     source = root / "raw" / f"train-{index}.png"
     _write_png(source, pixels)
     result = root / "results" / f"train-{index}.json"
@@ -104,7 +111,11 @@ def _train_row(
         ),
         encoding="utf-8",
     )
-    bbox = (20.0 + index, 20.0, 80.0, 40.0)
+    bbox = (
+        (20.0, 20.0, 80.0, 40.0)
+        if context_distinct_fixed_value_pair
+        else (20.0 + index, 20.0, 80.0, 40.0)
+    )
     crop_pixels = np.ascontiguousarray(crop_field_with_margin(pixels, bbox))
     crop_sha = _crop_digest(crop_pixels)
     crop = dataset_root / "images" / "recipient_field" / f"{crop_sha}.png"
@@ -139,11 +150,20 @@ def _fixture(
     second_target: str = "商户乙",
     second_group_id: str | None = None,
     materialize_analysis_source: bool = True,
+    context_distinct_fixed_value_pair: bool = False,
 ) -> dict[str, object]:
     dataset_root = tmp_path / "source-data" / "paddle-dataset"
     rows = [
         _train_row(tmp_path, dataset_root, index=0, target="商户甲"),
-        _train_row(tmp_path, dataset_root, index=1, target=second_target),
+        _train_row(
+            tmp_path,
+            dataset_root,
+            index=1,
+            target=second_target,
+            context_distinct_fixed_value_pair=(
+                context_distinct_fixed_value_pair
+            ),
+        ),
     ]
     if second_group_id is not None:
         rows[1]["group_id"] = second_group_id
@@ -551,7 +571,12 @@ def test_fixed2_consumer_rejects_resealed_pixel_owner_conflict_on_each_axis(
             encoding="utf-8"
         )
     )
-    assert export_contract["selected_view_hash_closure"]["cross_group_conflicts"] == 0
+    assert (
+        export_contract["selected_view_hash_closure"][
+            "forbidden_cross_group_conflicts"
+        ]
+        == 0
+    )
     recipients, _split_counts, _recipient_counts, _base = (
         overlay_module._blind_recipient_rows(
             blind_manifest=fixture["blind_records"],
@@ -582,6 +607,272 @@ def test_fixed2_consumer_rejects_resealed_pixel_owner_conflict_on_each_axis(
     assert str(prior["text"]) not in message
     assert str(current["text"]) not in message
     assert not list(tmp_path.glob(".fixed2-resealed-conflict.*.tmp"))
+
+
+def test_fixed2_v2_consumer_rebuilds_pair_and_selects_each_pixel_target_once(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(
+        tmp_path,
+        second_target="商户甲",
+        context_distinct_fixed_value_pair=True,
+    )
+    multiview_root = Path(fixture["multiview_root"])
+    producer_contract = json.loads(
+        (multiview_root / overlay_module.FIXED2_SOURCE_ANALYSIS_CONTRACT_NAME)
+        .read_text(encoding="utf-8")
+    )
+    producer_closure = producer_contract["selected_view_hash_closure"]
+    assert producer_closure["fixed_value_reuse_class_count"] == 1
+    assert producer_closure["fixed_value_reused_record_count"] == 2
+
+    contract = materialize_fixed2_overlay(
+        multiview_root=multiview_root,
+        full_records=fixture["full_records"],
+        blind_records=fixture["blind_records"],
+        blind_contract=fixture["blind_contract"],
+        original_dataset_root=fixture["dataset_root"],
+        output_root=tmp_path / "fixed2-pair-output",
+    )
+
+    selected = contract["selected_composite_bindings"]
+    assert {binding["view"] for binding in selected} == {
+        "standard",
+        "fixed_value",
+    }
+    assert {binding["selection_role"] for binding in selected} == {
+        "reuse_pair_standard",
+        "reuse_pair_fixed_value",
+    }
+    class_ids = {binding["reuse_class_id"] for binding in selected}
+    assert class_ids == {
+        producer_closure["fixed_value_reuse_classes"][0]["reuse_class_id"]
+    }
+    assignment_ids = {
+        binding["selector_assignment_sha256"] for binding in selected
+    }
+    assert assignment_ids == {contract["selector"]["selector_assignment_sha256"]}
+    assert contract["selector"]["reuse_class_count"] == 1
+    assert contract["selector"]["reuse_class_record_count"] == 2
+    assert contract["selector"]["singleton_record_count"] == 0
+    assert contract["selector"]["selected_view_counts"] == {
+        "standard": 1,
+        "fixed_value": 1,
+    }
+    assert contract["selector"]["selected_pixel_target_unique"] is True
+    assert contract["selector"]["selected_pixel_target_count"] == 2
+    assert contract["test_physical_files_opened"] == 0
+
+
+def test_fixed2_consumer_rejects_a_forged_producer_reuse_closure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _fixture(
+        tmp_path,
+        second_target="商户甲",
+        context_distinct_fixed_value_pair=True,
+    )
+    multiview_root = Path(fixture["multiview_root"])
+    verified = overlay_module._verify_recipient_fixed2_teacher_analysis_test_only(
+        export_root=multiview_root
+    )
+    forged = json.loads(json.dumps(verified))
+    forged["selected_view_hash_closure"][
+        "fixed_value_reuse_class_count"
+    ] = 0
+    monkeypatch.setattr(
+        overlay_module,
+        "_verify_recipient_fixed2_teacher_analysis_test_only",
+        lambda **_kwargs: forged,
+    )
+
+    with pytest.raises(ValueError, match="differs from producer"):
+        overlay_module._verify_fixed2_teacher_overlay_source(
+            blind_manifest=fixture["blind_records"],
+            blind_contract=fixture["blind_contract"],
+            export_root=multiview_root,
+            dataset_root=fixture["dataset_root"],
+            formal_windows_source=False,
+        )
+
+
+def test_legacy_overlay_registrar_still_rejects_a_valid_fixed2_v2_pair(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(
+        tmp_path,
+        second_target="商户甲",
+        context_distinct_fixed_value_pair=True,
+    )
+    recipients, _splits, _recipient_counts, _bindings = (
+        overlay_module._blind_recipient_rows(
+            blind_manifest=fixture["blind_records"],
+            dataset_root=fixture["dataset_root"],
+        )
+    )
+    rows = overlay_module._strict_jsonl(
+        Path(fixture["multiview_root"])
+        / overlay_module.FIXED2_SOURCE_MANIFEST_NAME
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="group_conflict=true target_conflict=false",
+    ):
+        overlay_module._verify_overlay_rows(
+            rows=rows,
+            export_root=fixture["multiview_root"],
+            blind_sha256=hashlib.sha256(
+                Path(fixture["blind_records"]).read_bytes()
+            ).hexdigest(),
+            recipients=recipients,
+            expected_views=overlay_module.FIXED2_VIEWS,
+            expected_record_kind=(
+                overlay_module.FIXED2_SOURCE_ANALYSIS_RECORD_KIND
+            ),
+        )
+
+
+def test_fixed2_selected_pixel_target_uniqueness_is_fail_closed() -> None:
+    duplicate_pixel = "a" * 64
+    with pytest.raises(ValueError, match=r"\(pixel,target\).*duplicated"):
+        overlay_module._selected_pixel_target_closure(
+            [
+                {
+                    "record_id": "receipt-a",
+                    "target": "商户甲",
+                    "pixel_sha256": duplicate_pixel,
+                },
+                {
+                    "record_id": "receipt-b",
+                    "target": "商户甲",
+                    "pixel_sha256": duplicate_pixel,
+                },
+            ]
+        )
+
+
+def test_fixed2_selector_balances_real_audit_shape_and_is_order_stable() -> None:
+    target_sha256 = hashlib.sha256("商户甲".encode("utf-8")).hexdigest()
+    attachments: dict[str, dict[str, object]] = {}
+    reuse_classes: list[dict[str, object]] = []
+    for index in range(53_558):
+        source_id = f"receipt-{index:05d}"
+        standard_sha256 = hashlib.sha256(
+            f"standard:{index}".encode("ascii")
+        ).hexdigest()
+        fixed_sha256 = hashlib.sha256(
+            (
+                f"fixed-pair:{index // 2}"
+                if index < 94
+                else f"fixed-singleton:{index}"
+            ).encode("ascii")
+        ).hexdigest()
+        attachments[source_id] = {
+            "source_record_id": source_id,
+            "group_id": f"group-{index:05d}",
+            "target": "商户甲",
+            "target_sha256": target_sha256,
+            "views": {
+                "standard": {"pixel_sha256": standard_sha256},
+                "fixed_value": {"pixel_sha256": fixed_sha256},
+            },
+        }
+    for class_index in range(47):
+        members = [f"receipt-{class_index * 2 + offset:05d}" for offset in range(2)]
+        fixed_sha256 = attachments[members[0]]["views"]["fixed_value"][
+            "pixel_sha256"
+        ]
+        material = {
+            "domain": overlay_module.FIXED2_REUSE_CLASS_DOMAIN,
+            "split": "train",
+            "view": "fixed_value",
+            "fixed_value_pixel_sha256": fixed_sha256,
+            "target_sha256": target_sha256,
+            "width": 515,
+            "height": 60,
+            "rgb_min": 6,
+            "rgb_max": 255,
+            "nonblank_predicate": overlay_module.FIXED2_NONBLANK_PREDICATE,
+            "owners": [
+                {
+                    "source_record_id": source_id,
+                    "group_id": attachments[source_id]["group_id"],
+                    "standard_pixel_sha256": attachments[source_id]["views"][
+                        "standard"
+                    ]["pixel_sha256"],
+                }
+                for source_id in members
+            ],
+        }
+        reuse_classes.append(
+            {
+                **material,
+                "reuse_class_id": overlay_module._canonical_sha256(material),
+            }
+        )
+    closure = {
+        "fixed_value_reuse_class_count": len(reuse_classes),
+        "fixed_value_reuse_classes": reuse_classes,
+    }
+    blind_sha256 = "b" * 64
+    selected, metadata, evidence = overlay_module._fixed2_selection(
+        attachments,
+        reuse_closure=closure,
+        blind_manifest_sha256=blind_sha256,
+    )
+    reversed_selected, reversed_metadata, reversed_evidence = (
+        overlay_module._fixed2_selection(
+            dict(reversed(list(attachments.items()))),
+            reuse_closure={
+                **closure,
+                "fixed_value_reuse_classes": list(reversed(reuse_classes)),
+            },
+            blind_manifest_sha256=blind_sha256,
+        )
+    )
+
+    assert selected == reversed_selected
+    assert metadata == reversed_metadata
+    assert evidence == reversed_evidence
+    assert list(selected.values()).count("standard") == 26_779
+    assert list(selected.values()).count("fixed_value") == 26_779
+    assert evidence["reuse_class_count"] == 47
+    assert evidence["reuse_class_record_count"] == 94
+    assert evidence["singleton_record_count"] == 53_464
+    for reuse_class in reuse_classes:
+        members = [
+            owner["source_record_id"] for owner in reuse_class["owners"]
+        ]
+        assert {selected[source_id] for source_id in members} == {
+            "standard",
+            "fixed_value",
+        }
+        assert {
+            metadata[source_id]["reuse_class_id"] for source_id in members
+        } == {reuse_class["reuse_class_id"]}
+    overlapping_classes = json.loads(json.dumps(reuse_classes[:2]))
+    overlapping_classes[1]["owners"][0] = dict(
+        overlapping_classes[0]["owners"][0]
+    )
+    overlapping_material = {
+        key: value
+        for key, value in overlapping_classes[1].items()
+        if key != "reuse_class_id"
+    }
+    overlapping_classes[1]["reuse_class_id"] = (
+        overlay_module._canonical_sha256(overlapping_material)
+    )
+    with pytest.raises(ValueError, match="membership overlaps"):
+        overlay_module._fixed2_selection(
+            attachments,
+            reuse_closure={
+                "fixed_value_reuse_class_count": len(overlapping_classes),
+                "fixed_value_reuse_classes": overlapping_classes,
+            },
+            blind_manifest_sha256=blind_sha256,
+        )
 
 
 def test_fixed2_materializer_is_schema_compatible_balanced_and_val_unchanged(
@@ -643,6 +934,9 @@ def test_fixed2_materializer_is_schema_compatible_balanced_and_val_unchanged(
             "view",
             "pixel_sha256",
             "file_sha256",
+            "reuse_class_id",
+            "selection_role",
+            "selector_assignment_sha256",
         }
         for binding in contract["selected_composite_bindings"]
     )

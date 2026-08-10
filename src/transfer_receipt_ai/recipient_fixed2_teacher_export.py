@@ -9,9 +9,10 @@ only so the semantic verifier can be exercised in unit tests; it cannot mint a
 formal kind, authority, or optimizer-ready artifact.
 
 All generated selected-view pixels are closed globally against their blind
-manifest owner.  A decoded pixel hash may not cross a split, target, or group,
-including the same-target/different-group case.  The complete collision pass
-runs before any staging directory is created.
+manifest owner.  A decoded pixel hash may not cross a split or target.  The
+only cross-group reuse accepted is one exactly-two-owner ``fixed_value`` class
+whose source/result lineages and untrimmed ``standard`` contexts are distinct.
+The complete collision pass runs before any staging directory is created.
 """
 
 from __future__ import annotations
@@ -45,7 +46,6 @@ from .recipient_multiview_teacher_export import (
     STANDARD_MARGIN_RATIO,
     SUPPORTED_UNIFIED_KINDS,
     TRAIN_SPLIT,
-    _GeneratedViewOwner,
     _absolute_existing_file,
     _assert_no_reparse_components,
     _assert_output_separate,
@@ -53,7 +53,6 @@ from .recipient_multiview_teacher_export import (
     _fixed_value_view,
     _path_identity,
     _production_standard_view,
-    _register_generated_view_owner,
     _relative_existing_file,
     _require_sha256,
     _sha256,
@@ -62,11 +61,11 @@ from .recipient_multiview_teacher_export import (
 from .status_crops import _result_payload, _source_path, reconstruct_rectified
 
 
-KIND = "receipt_recipient_fixed2_teacher_train_export_v1"
-ANALYSIS_KIND = "receipt_recipient_fixed2_teacher_train_export_analysis_fixture_v1"
-RECORD_KIND = "receipt_recipient_fixed2_teacher_train_record_v1"
+KIND = "receipt_recipient_fixed2_teacher_train_export_v2"
+ANALYSIS_KIND = "receipt_recipient_fixed2_teacher_train_export_analysis_fixture_v2"
+RECORD_KIND = "receipt_recipient_fixed2_teacher_train_record_v2"
 ANALYSIS_RECORD_KIND = (
-    "receipt_recipient_fixed2_teacher_train_record_analysis_fixture_v1"
+    "receipt_recipient_fixed2_teacher_train_record_analysis_fixture_v2"
 )
 VIEWS = ("standard", "fixed_value")
 PUBLICATION_AUTHORITY = (
@@ -77,7 +76,15 @@ HARD_ATTESTATION_SCHEME = "two_stage_code_pinned_contract_sha_size_subject_v1"
 CONTRACT_NAME = "dataset.contract.json"
 ANALYSIS_CONTRACT_NAME = "fixed2_teacher.analysis.json"
 MANIFEST_NAME = "multiview_train.jsonl"
-SUBJECT_DOMAIN = "receipt-recipient-fixed2-teacher-subject-v1"
+SUBJECT_DOMAIN = "receipt-recipient-fixed2-teacher-subject-v2"
+FIXED_VALUE_REUSE_POLICY = "context_distinct_fixed_value_pair_reuse_v1"
+FIXED_VALUE_REUSE_CLASS_DOMAIN = (
+    "receipt-recipient-fixed2-context-distinct-fixed-value-pair-v1"
+)
+FIXED_VALUE_NONBLANK_PREDICATE = "decoded_rgb_global_range_gt_zero_v1"
+ATTESTATION_CANDIDATE_KIND = (
+    "receipt_recipient_fixed2_teacher_attestation_candidate_v2"
+)
 ADAPTER_MARKER = "strict_recipient_multiview_overlay_loader_not_implemented"
 RECORD_KEYS = frozenset(
     (
@@ -208,6 +215,8 @@ class _PreparedView:
     pixel_sha256: str
     width: int
     height: int
+    rgb_min: int
+    rgb_max: int
 
 
 @dataclass(frozen=True)
@@ -227,6 +236,241 @@ class _PreparedRow:
     bbox: tuple[float, float, float, float]
     views: tuple[_PreparedView, ...]
     group_closure_sha256: str
+
+
+@dataclass(frozen=True)
+class _Fixed2ViewOwner:
+    line_number: int
+    record_id: str
+    group_id: str
+    target_sha256: str
+    view: str
+    pixel_sha256: str
+    width: int
+    height: int
+    rgb_min: int
+    rgb_max: int
+    standard_pixel_sha256: str
+    source: Path
+    source_sha256: str
+    result_json: Path
+    result_json_sha256: str
+
+
+def _prepared_view_owners(
+    prepared: Sequence[_PreparedRow],
+) -> list[_Fixed2ViewOwner]:
+    owners: list[_Fixed2ViewOwner] = []
+    for item in prepared:
+        views = {view.name: view for view in item.views}
+        if set(views) != set(VIEWS):
+            raise ValueError(f"fixed2 prepared view coverage changed: {item.record_id}")
+        standard_sha256 = views["standard"].pixel_sha256
+        for view_name in VIEWS:
+            view = views[view_name]
+            owners.append(
+                _Fixed2ViewOwner(
+                    line_number=item.line_number,
+                    record_id=item.record_id,
+                    group_id=item.group_id,
+                    target_sha256=item.target_sha256,
+                    view=view.name,
+                    pixel_sha256=view.pixel_sha256,
+                    width=view.width,
+                    height=view.height,
+                    rgb_min=view.rgb_min,
+                    rgb_max=view.rgb_max,
+                    standard_pixel_sha256=standard_sha256,
+                    source=item.source,
+                    source_sha256=item.source_sha256,
+                    result_json=item.result_json,
+                    result_json_sha256=item.result_json_sha256,
+                )
+            )
+    return owners
+
+
+def _same_physical_file(left: Path, right: Path, *, description: str) -> bool:
+    try:
+        return os.path.samefile(left, right)
+    except OSError as error:
+        raise ValueError(f"unable to compare fixed2 {description} identity") from error
+
+
+def _fixed2_selected_view_hash_closure(
+    owners: Sequence[_Fixed2ViewOwner],
+) -> dict[str, object]:
+    """Rebuild the sole allowed generated-pixel reuse policy.
+
+    Every repeated decoded-pixel identity is rejected unless it is an exact
+    pair of non-uniform ``fixed_value`` views for the same target, backed by
+    different receipt groups, source/result artifacts, and standard contexts.
+    The returned class list is path-free and is sealed into the producer
+    subject as well as the raw contract.
+    """
+
+    by_pixel: dict[str, list[_Fixed2ViewOwner]] = {}
+    by_record: dict[str, dict[str, _Fixed2ViewOwner]] = {}
+    for owner in owners:
+        views = by_record.setdefault(owner.record_id, {})
+        if owner.view in views:
+            raise ValueError(
+                f"fixed2 duplicate generated view {owner.record_id}/{owner.view}"
+            )
+        views[owner.view] = owner
+        by_pixel.setdefault(owner.pixel_sha256, []).append(owner)
+    if any(set(views) != set(VIEWS) for views in by_record.values()):
+        raise ValueError("fixed2 generated view coverage changed before collision closure")
+    for record_id, views in by_record.items():
+        standard = views["standard"]
+        for view in views.values():
+            if (
+                view.group_id != standard.group_id
+                or view.target_sha256 != standard.target_sha256
+                or view.standard_pixel_sha256 != standard.pixel_sha256
+                or view.source != standard.source
+                or view.source_sha256 != standard.source_sha256
+                or view.result_json != standard.result_json
+                or view.result_json_sha256 != standard.result_json_sha256
+            ):
+                raise ValueError(
+                    f"fixed2 generated view owner binding changed: {record_id}"
+                )
+
+    reuse_classes: list[dict[str, object]] = []
+    for pixel_sha256, raw_bucket in sorted(by_pixel.items()):
+        if len(raw_bucket) == 1:
+            continue
+        bucket = sorted(raw_bucket, key=lambda item: (item.record_id, item.view))
+        target_conflict = len({item.target_sha256 for item in bucket}) != 1
+        if target_conflict:
+            raise ValueError(
+                f"generated view hash {pixel_sha256} conflict: "
+                "target_conflict=true; fixed2 cross-target pixel reuse is forbidden"
+            )
+        if any(item.view != "fixed_value" for item in bucket):
+            views = sorted({item.view for item in bucket})
+            raise ValueError(
+                f"generated view hash {pixel_sha256} standard/cross-view collision: "
+                f"views={views!r}"
+            )
+        if len(bucket) != 2:
+            raise ValueError(
+                f"generated fixed_value hash {pixel_sha256} reuse class has "
+                f"class_size={len(bucket)}; exactly two owners are required"
+            )
+        first, second = bucket
+        if first.record_id == second.record_id:
+            raise ValueError(
+                f"generated fixed_value hash {pixel_sha256} reuses one source record"
+            )
+        if first.group_id == second.group_id:
+            raise ValueError(
+                f"generated fixed_value hash {pixel_sha256} same-group reuse is forbidden"
+            )
+        if first.standard_pixel_sha256 == second.standard_pixel_sha256:
+            raise ValueError(
+                f"generated fixed_value hash {pixel_sha256} has a standard context collision"
+            )
+        if (
+            first.width != second.width
+            or first.height != second.height
+            or first.rgb_min != second.rgb_min
+            or first.rgb_max != second.rgb_max
+        ):
+            raise ValueError(
+                f"generated fixed_value hash {pixel_sha256} decoded proof changed across owners"
+            )
+        if first.rgb_max <= first.rgb_min:
+            raise ValueError(
+                f"generated fixed_value hash {pixel_sha256} is uniform under "
+                f"{FIXED_VALUE_NONBLANK_PREDICATE}"
+            )
+        for name, left_path, right_path, left_sha, right_sha in (
+            (
+                "source",
+                first.source,
+                second.source,
+                first.source_sha256,
+                second.source_sha256,
+            ),
+            (
+                "result_json",
+                first.result_json,
+                second.result_json,
+                first.result_json_sha256,
+                second.result_json_sha256,
+            ),
+        ):
+            if _same_physical_file(
+                left_path,
+                right_path,
+                description=name,
+            ) or left_sha == right_sha:
+                raise ValueError(
+                    f"generated fixed_value hash {pixel_sha256} reuses {name} lineage"
+                )
+        # Source/result identity and byte-SHA inequality are authority checks
+        # above, but their raw hashes are deliberately not semantic subject
+        # material: result JSON bytes contain absolute source paths.  Record,
+        # group, target, and decoded standard/fixed pixels are the path-free
+        # identity of this context-distinct reuse class.
+        class_owners = [
+            {
+                "source_record_id": item.record_id,
+                "group_id": item.group_id,
+                "standard_pixel_sha256": item.standard_pixel_sha256,
+            }
+            for item in bucket
+        ]
+        class_material: dict[str, object] = {
+            "domain": FIXED_VALUE_REUSE_CLASS_DOMAIN,
+            "split": TRAIN_SPLIT,
+            "view": "fixed_value",
+            "fixed_value_pixel_sha256": pixel_sha256,
+            "target_sha256": first.target_sha256,
+            "width": first.width,
+            "height": first.height,
+            "rgb_min": first.rgb_min,
+            "rgb_max": first.rgb_max,
+            "nonblank_predicate": FIXED_VALUE_NONBLANK_PREDICATE,
+            "owners": class_owners,
+        }
+        reuse_classes.append(
+            {
+                **class_material,
+                "reuse_class_id": _canonical_sha256(class_material),
+            }
+        )
+    reuse_classes.sort(key=lambda item: str(item["reuse_class_id"]))
+    return {
+        "views_per_train_record": len(VIEWS),
+        "decoded_pixels_reverified": True,
+        "blind_owner_fields": [
+            "split",
+            "source_record_id",
+            "group_id",
+            "target_sha256",
+        ],
+        "cross_split_conflicts": 0,
+        "cross_target_conflicts": 0,
+        "forbidden_cross_group_conflicts": 0,
+        "policy": FIXED_VALUE_REUSE_POLICY,
+        "allowed_reuse_view": "fixed_value",
+        "allowed_reuse_class_size": 2,
+        "nonblank_predicate": FIXED_VALUE_NONBLANK_PREDICATE,
+        "standard_pixel_reuse_allowed": False,
+        "cross_view_pixel_reuse_allowed": False,
+        "same_group_pixel_reuse_allowed": False,
+        "source_or_result_lineage_reuse_allowed": False,
+        "fixed_value_reuse_class_count": len(reuse_classes),
+        "allowed_cross_group_reuse_class_count": len(reuse_classes),
+        "fixed_value_reused_record_count": len(reuse_classes) * 2,
+        "fixed_value_reuse_classes": reuse_classes,
+        "fixed_value_reuse_class_closure_sha256": _canonical_sha256(
+            reuse_classes
+        ),
+    }
 
 
 @dataclass(frozen=True)
@@ -1134,7 +1378,6 @@ def _prepare(
     # manifest pass.  Hash it once; recomputing the full ~88k-row payload for
     # every train recipient would make the formal producer quadratic.
     source_semantic_sha = _canonical_sha256(semantic_source_rows)
-    owners: dict[str, _GeneratedViewOwner] = {}
     prepared: list[_PreparedRow] = []
     for line_number, record, target, slot in train_rows:
         record_id = str(record["id"])
@@ -1185,19 +1428,16 @@ def _prepare(
                 raise ValueError(
                     f"generated fixed2 train view hash {digest} crosses declared {declared_split} crop boundary"
                 )
-            _register_generated_view_owner(
-                owners,
-                pixel_sha256=digest,
-                owner=_GeneratedViewOwner(
-                    line_number=line_number,
-                    record_id=record_id,
-                    view=name,
-                    group_id=group_id,
-                    target_sha256=target_sha,
-                    shape=tuple(int(size) for size in view.shape),
-                ),
+            view_specs.append(
+                _PreparedView(
+                    name=name,
+                    pixel_sha256=digest,
+                    width=int(view.shape[1]),
+                    height=int(view.shape[0]),
+                    rgb_min=int(np.min(view)),
+                    rgb_max=int(np.max(view)),
+                )
             )
-            view_specs.append(_PreparedView(name, digest, int(view.shape[1]), int(view.shape[0])))
         closure_payload = {
             "source_record_id": record_id,
             "source_group_id": group_id,
@@ -1219,6 +1459,9 @@ def _prepare(
             )
         )
     prepared.sort(key=lambda item: item.record_id)
+    selected_view_hash_closure = _fixed2_selected_view_hash_closure(
+        _prepared_view_owners(prepared)
+    )
     selected_semantic = [
         {
             "source_record_id": item.record_id,
@@ -1249,13 +1492,20 @@ def _prepare(
             "fixed_value_left_trim": FIXED_VALUE_LEFT_TRIM,
         },
         "selected_semantic_bindings": selected_semantic,
-        "same_target_different_group_duplicate_policy": "reject",
+        "generated_pixel_reuse_policy": FIXED_VALUE_REUSE_POLICY,
+        "fixed_value_reuse_classes": selected_view_hash_closure[
+            "fixed_value_reuse_classes"
+        ],
+        "fixed_value_reuse_class_closure_sha256": selected_view_hash_closure[
+            "fixed_value_reuse_class_closure_sha256"
+        ],
     }
     evidence: dict[str, object] = {
         "source_contract": contract,
         "manifest_sha256": manifest_sha256,
         "contract_sha256": contract_sha256,
         "source_manifest_semantic_sha256": source_semantic_sha,
+        "selected_view_hash_closure": selected_view_hash_closure,
         "producer_subject_id": _canonical_sha256(subject_material),
         "subject_material": subject_material,
         "split_counts": split_counts,
@@ -1691,15 +1941,9 @@ def _materialize_impl(
                     "rounding": "bankers_round_midpoint_to_even",
                 },
             },
-            "selected_view_hash_closure": {
-                "views_per_train_record": len(VIEWS),
-                "decoded_pixels_reverified": True,
-                "blind_owner_fields": ["split", "group_id", "target_sha256"],
-                "cross_split_conflicts": 0,
-                "cross_target_conflicts": 0,
-                "cross_group_conflicts": 0,
-                "same_target_different_group_duplicate_policy": "reject",
-            },
+            "selected_view_hash_closure": evidence[
+                "selected_view_hash_closure"
+            ],
             "producer_subject_id": evidence["producer_subject_id"],
             "subject_domain": SUBJECT_DOMAIN,
             "subject_path_stable": True,
@@ -2352,7 +2596,7 @@ def _verify_payload(
     if observed_row_order != expected_row_order:
         raise ValueError("fixed2 teacher manifest canonical row order changed")
     by_source: dict[str, set[str]] = {}
-    generated: dict[str, _GeneratedViewOwner] = {}
+    verified_view_specs: dict[str, dict[str, _PreparedView]] = {}
     png_seals_by_name: dict[str, _FrozenFileSeal] = {}
     closing_input_seals: dict[Path, _FrozenFileSeal] = {}
     semantic_selected: list[dict[str, object]] = []
@@ -2474,10 +2718,13 @@ def _verify_payload(
         declared_split = crop_splits.get(digest)
         if declared_split is not None and declared_split != TRAIN_SPLIT:
             raise ValueError("fixed2 teacher selected PNG crosses split boundary")
-        _register_generated_view_owner(
-            generated,
+        verified_view_specs.setdefault(source_id, {})[str(view)] = _PreparedView(
+            name=str(view),
             pixel_sha256=digest,
-            owner=_GeneratedViewOwner(number, str(row.get("id")), str(view), group_id, target_sha, tuple(int(x) for x in decoded.shape)),
+            width=int(decoded.shape[1]),
+            height=int(decoded.shape[0]),
+            rgb_min=int(np.min(decoded)),
+            rgb_max=int(np.max(decoded)),
         )
         png_seals_by_name[relative.name] = _snapshot_seal(png_snapshot)
         closing_input_seals[png_snapshot.path] = _snapshot_seal(png_snapshot)
@@ -2508,24 +2755,38 @@ def _verify_payload(
             raise ValueError(f"fixed2 teacher contract {key} changed")
     if dict(actual_view_counts) != expected_view_counts:
         raise ValueError("fixed2 teacher manifest view counts changed")
+    verified_owners: list[_Fixed2ViewOwner] = []
+    for source_id in sorted(owners_by_id):
+        owner = owners_by_id[source_id]
+        specs = verified_view_specs.get(source_id)
+        if specs is None or set(specs) != set(VIEWS):
+            raise ValueError(f"fixed2 verified view coverage changed: {source_id}")
+        standard_sha256 = specs["standard"].pixel_sha256
+        for view_name in VIEWS:
+            spec = specs[view_name]
+            verified_owners.append(
+                _Fixed2ViewOwner(
+                    line_number=int(owner["line_number"]),
+                    record_id=source_id,
+                    group_id=str(owner["group_id"]),
+                    target_sha256=str(owner["target_sha256"]),
+                    view=view_name,
+                    pixel_sha256=spec.pixel_sha256,
+                    width=spec.width,
+                    height=spec.height,
+                    rgb_min=spec.rgb_min,
+                    rgb_max=spec.rgb_max,
+                    standard_pixel_sha256=standard_sha256,
+                    source=Path(str(owner["source"])),
+                    source_sha256=str(owner["source_sha256"]),
+                    result_json=Path(str(owner["result_json"])),
+                    result_json_sha256=str(owner["result_json_sha256"]),
+                )
+            )
+    expected_closure = _fixed2_selected_view_hash_closure(verified_owners)
     closure = contract.get("selected_view_hash_closure")
-    expected_closure = {
-        "views_per_train_record": len(VIEWS),
-        "decoded_pixels_reverified": True,
-        "blind_owner_fields": ["split", "group_id", "target_sha256"],
-        "cross_split_conflicts": 0,
-        "cross_target_conflicts": 0,
-        "cross_group_conflicts": 0,
-        "same_target_different_group_duplicate_policy": "reject",
-    }
-    if (
-        not isinstance(closure, Mapping)
-        or set(closure) != set(expected_closure)
-        or any(
-            type(closure[key]) is not type(expected)
-            or closure[key] != expected
-            for key, expected in expected_closure.items()
-        )
+    if not isinstance(closure, Mapping) or not _exact_json_value(
+        dict(closure), expected_closure
     ):
         raise ValueError("fixed2 teacher selected-view closure declaration changed")
     expected_image_names = {
@@ -2595,7 +2856,13 @@ def _verify_payload(
             "fixed_value_left_trim": FIXED_VALUE_LEFT_TRIM,
         },
         "selected_semantic_bindings": semantic_selected,
-        "same_target_different_group_duplicate_policy": "reject",
+        "generated_pixel_reuse_policy": FIXED_VALUE_REUSE_POLICY,
+        "fixed_value_reuse_classes": expected_closure[
+            "fixed_value_reuse_classes"
+        ],
+        "fixed_value_reuse_class_closure_sha256": expected_closure[
+            "fixed_value_reuse_class_closure_sha256"
+        ],
     }
     if contract.get("producer_subject_id") != _canonical_sha256(subject_material):
         raise ValueError("fixed2 teacher path-stable semantic subject changed")
@@ -2726,14 +2993,29 @@ def inspect_recipient_fixed2_teacher_attestation_candidate(
         require_hard_attestation=False,
         contract_snapshot=contract_snapshot,
     )
+    reuse_closure = verified.get("selected_view_hash_closure")
+    if not isinstance(reuse_closure, Mapping):
+        raise ValueError("formal fixed2 teacher candidate reuse closure is missing")
     return {
         "schema_version": SCHEMA_VERSION,
-        "kind": "receipt_recipient_fixed2_teacher_attestation_candidate_v1",
+        "kind": ATTESTATION_CANDIDATE_KIND,
         "formal_authority_granted": False,
         "contract_path": str(contract_snapshot.path),
         "contract_sha256": contract_snapshot.sha256,
         "contract_size_bytes": contract_snapshot.size_bytes,
         "producer_subject_id": verified["producer_subject_id"],
+        "fixed_value_reuse_policy": reuse_closure[
+            "policy"
+        ],
+        "fixed_value_reuse_class_count": reuse_closure[
+            "fixed_value_reuse_class_count"
+        ],
+        "fixed_value_reused_record_count": reuse_closure[
+            "fixed_value_reused_record_count"
+        ],
+        "fixed_value_reuse_class_closure_sha256": reuse_closure[
+            "fixed_value_reuse_class_closure_sha256"
+        ],
         "publication_identity_sha256": _canonical_sha256(
             verified["publication_identity"]
         ),

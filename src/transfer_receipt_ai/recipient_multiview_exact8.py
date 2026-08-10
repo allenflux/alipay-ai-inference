@@ -80,20 +80,25 @@ from .recipient_v14_failure_attestor import (
 
 
 SCHEMA_VERSION = 1
-INSPECTION_KIND = "receipt_recipient_multiview_fixed2_exact8_subject_v1"
-RECIPE_KIND = "receipt_recipient_multiview_fixed2_exact8_recipe_v1"
-DECISION_KIND = "receipt_recipient_multiview_fixed2_exact8_decision_v1"
-ATTEMPT_KIND = "receipt_recipient_multiview_fixed2_exact8_attempt_v1"
+INSPECTION_KIND = "receipt_recipient_multiview_fixed2_exact8_subject_v2"
+RECIPE_KIND = "receipt_recipient_multiview_fixed2_exact8_recipe_v2"
+DECISION_KIND = "receipt_recipient_multiview_fixed2_exact8_decision_v2"
+LEGACY_ATTEMPT_KIND = "receipt_recipient_multiview_fixed2_exact8_attempt_v1"
+ATTEMPT_KIND = "receipt_recipient_multiview_fixed2_exact8_attempt_v2"
 ATTEMPT_REGISTRY_NAME = "recipient-v14-multiview-fixed2-training-v1"
 ATTEMPT_REGISTRY_PARENT = "ReceiptAI"
 ATTEMPT_THREAT_MODEL = (
-    "persistent current-SID no-rerun guard; crash and failed training consume "
-    "fixed2 exact8; owner WRITE_DAC and local-administrator bypass are out of scope, "
-    "including elevated ProgramData FILE_DELETE_CHILD"
+    "persistent current-SID lineage no-rerun guard; any preexisting dedicated-"
+    "registry entry, crash, and failed training consume fixed2 exact8 across "
+    "overlay revisions; owner WRITE_DAC and local-administrator bypass are out "
+    "of scope, including elevated ProgramData FILE_DELETE_CHILD"
 )
-OVERLAY_KIND = "receipt_recipient_fixed2_overlay_contract_v1"
-ROUTE_DOMAIN = "receipt-recipient-multiview-fixed2-exact8-v1"
-SELECTOR_MODE = "sha256_rank_parity_v1"
+OVERLAY_KIND = "receipt_recipient_fixed2_overlay_contract_v2"
+ROUTE_DOMAIN = "receipt-recipient-multiview-fixed2-exact8-v2"
+LINEAGE_ATTEMPT_DOMAIN = (
+    "receipt-recipient-multiview-fixed2-exact8-lineage-attempt-v1"
+)
+SELECTOR_MODE = "context_distinct_fixed_value_pair_anti_repeat_v2"
 SELECTED_VIEWS = ["standard", "fixed_value"]
 PASS_AUTHORIZATION = "fresh_fixed2_60_from_original_pilot_best_only"
 
@@ -1213,7 +1218,7 @@ def _fixed2_route_identity(
     failure_subject_id: str,
     overlay_subject_id: str,
 ) -> tuple[dict[str, object], str]:
-    """Return the one-shot route identity from semantic subjects only."""
+    """Return the exact downstream route identity from semantic subjects."""
 
     material: dict[str, object] = {
         "domain": ROUTE_DOMAIN,
@@ -1230,6 +1235,35 @@ def _fixed2_route_identity(
         ),
         "selector_mode": SELECTOR_MODE,
         "selected_views": SELECTED_VIEWS,
+    }
+    return material, _canonical_sha256(material)
+
+
+def _fixed2_lineage_attempt_identity(
+    *,
+    source_subject_id: str,
+    candidate_pilot_subject_id: str,
+    failure_subject_id: str,
+) -> tuple[dict[str, object], str]:
+    """Return one stable consumption identity for the upstream authority.
+
+    Deliberately exclude the overlay, selector, code, and recipe.  A revised
+    downstream view policy is a new route under the same source/A8/failure
+    authorization, not a fresh authorization to train again.
+    """
+
+    material: dict[str, object] = {
+        "domain": LINEAGE_ATTEMPT_DOMAIN,
+        "source_subject_id": _require_hex(source_subject_id, "source subject id"),
+        "candidate_pilot_subject_id": _require_hex(
+            candidate_pilot_subject_id, "A8 subject id"
+        ),
+        "b8_fixed_source_subject_id": _require_hex(
+            FIXED_SOURCE_SUBJECT_ID, "B8 fixed source subject id"
+        ),
+        "failure_subject_id": _require_hex(
+            failure_subject_id, "failure subject id"
+        ),
     }
     return material, _canonical_sha256(material)
 
@@ -1416,6 +1450,11 @@ def inspect_exact8_subject(
         failure_subject_id=failure_subject,
         overlay_subject_id=overlay_subject,
     )
+    attempt_material, attempt_id = _fixed2_lineage_attempt_identity(
+        source_subject_id=source_subject,
+        candidate_pilot_subject_id=a8_subject,
+        failure_subject_id=failure_subject,
+    )
     code = {
         name: _binding(path, description=name) for name, path in _code_paths().items()
     }
@@ -1482,8 +1521,9 @@ def inspect_exact8_subject(
         "test_opened": False,
         "onnx_exported": False,
         "route_subject_id": route_subject_id,
-        "attempt_id": route_subject_id,
+        "attempt_id": attempt_id,
         "route_material": route_material,
+        "attempt_material": attempt_material,
         "source_subject_id": source_subject,
         "candidate_pilot_subject_id": a8_subject,
         "failure_subject_id": failure_subject,
@@ -2081,6 +2121,73 @@ def _require_attempt_marker_acl(handle: int) -> None:
     )
 
 
+def _require_attempt_registry_entry_closure(
+    registry_lease: Any,
+    *,
+    expected_names: set[str],
+    checkpoint: str,
+) -> None:
+    """Require the dedicated registry to contain exactly the expected names."""
+
+    from .recipient_multiview_overlay import _anchored_directory_names
+
+    try:
+        observed = _anchored_directory_names(registry_lease)
+    except (OSError, ValueError) as error:
+        raise ValueError(
+            f"unable to inspect exact8 attempt registry at {checkpoint}: {error}"
+        ) from error
+    if observed != expected_names:
+        raise ValueError(
+            "exact8 lineage attempt is already consumed or its dedicated "
+            f"registry changed at {checkpoint}: "
+            f"expected={sorted(expected_names)!r}, observed={sorted(observed)!r}"
+        )
+
+
+def _require_attempt_lineage_unconsumed(
+    *, inspection: Mapping[str, Any]
+) -> None:
+    """Read-only preflight: an absent or empty dedicated registry is unused."""
+
+    _require_hex(inspection.get("attempt_id"), "lineage attempt id")
+    program_data_value = _common_application_data_path()
+    if program_data_value is None:
+        raise ValueError(
+            "exact8 preflight requires the fixed Windows CommonApplicationData registry"
+        )
+    program_data = _existing(
+        program_data_value,
+        directory=True,
+        description="Windows FOLDERID_ProgramData",
+    )
+    receipt_root_raw = program_data / ATTEMPT_REGISTRY_PARENT
+    if not os.path.lexists(os.fspath(receipt_root_raw)):
+        return
+    receipt_root = _existing(
+        receipt_root_raw,
+        directory=True,
+        description="exact8 ReceiptAI root",
+    )
+    registry_raw = receipt_root / ATTEMPT_REGISTRY_NAME
+    if not os.path.lexists(os.fspath(registry_raw)):
+        return
+    registry = _existing(
+        registry_raw,
+        directory=True,
+        description="CommonApplicationData exact8 attempt registry",
+    )
+    try:
+        observed = {entry.name for entry in os.scandir(registry)}
+    except OSError as error:
+        raise ValueError("unable to inspect exact8 attempt registry") from error
+    if observed:
+        raise ValueError(
+            "exact8 lineage attempt is already consumed or its dedicated "
+            f"registry is not empty: {sorted(observed)!r}"
+        )
+
+
 def _expected_attempt_path(
     path: Path, *, inspection: Mapping[str, Any]
 ) -> Path:
@@ -2201,6 +2308,11 @@ class _GuardedAttempt:
             _require_attempt_program_data_acl(self.program_data_lease)
             _require_attempt_receipt_root_acl(self.receipt_root_lease)
             _require_attempt_registry_acl(self.registry_lease)
+            _require_attempt_registry_entry_closure(
+                self.registry_lease,
+                expected_names={self.path.name},
+                checkpoint=checkpoint,
+            )
             self.file_lease.require(self.snapshot, checkpoint=checkpoint)
         except (OSError, ValueError) as error:
             raise ValueError(
@@ -2413,7 +2525,17 @@ def _consume_attempt(
         _require_attempt_program_data_acl(program_data_lease)
         _require_attempt_receipt_root_acl(receipt_root_lease)
         _require_attempt_registry_acl(registry_lease)
+        _require_attempt_registry_entry_closure(
+            registry_lease,
+            expected_names=set(),
+            checkpoint="immediately_before_CreateNew",
+        )
         file_lease = _create_attempt_file_lease(attempt_path, encoded)
+        _require_attempt_registry_entry_closure(
+            registry_lease,
+            expected_names={attempt_path.name},
+            checkpoint="immediately_after_CreateNew",
+        )
         snapshot = _freeze_file(
             attempt_path,
             description="Python-created exact8 one-shot attempt lock",
@@ -3831,6 +3953,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     inspect_parser = subparsers.add_parser("inspect")
     common(inspect_parser)
+    inspect_parser.add_argument("--require-unconsumed", action="store_true")
     run_parser = subparsers.add_parser("run")
     common(run_parser)
     run_parser.add_argument("--output-root", type=Path, required=True)
@@ -3860,6 +3983,8 @@ def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
     if args.command == "inspect":
         payload = inspect_exact8_subject(**_common_kwargs(args))
+        if args.require_unconsumed:
+            _require_attempt_lineage_unconsumed(inspection=payload)
     elif args.command == "run":
         payload = run_exact8(
             **_common_kwargs(args),

@@ -5,6 +5,7 @@ import inspect
 import json
 import os
 import shutil
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -185,6 +186,60 @@ def _materialize(fixture: dict[str, Path], name: str) -> dict[str, object]:
         dataset_root=fixture["dataset_root"],
         output_root=fixture["output_parent"] / name,
     )
+
+
+def _policy_owner_records(
+    tmp_path: Path,
+    *,
+    count: int = 2,
+) -> list[fixed2._Fixed2ViewOwner]:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    target_sha256 = hashlib.sha256("商户甲".encode("utf-8")).hexdigest()
+    fixed_sha256 = "f" * 64
+    owners: list[fixed2._Fixed2ViewOwner] = []
+    for index in range(count):
+        source = tmp_path / f"source-{index}.png"
+        result = tmp_path / f"result-{index}.json"
+        source_bytes = f"source-{index}".encode("ascii")
+        result_bytes = json.dumps(
+            {"source": str(source.resolve()), "index": index},
+            sort_keys=True,
+        ).encode("utf-8")
+        source.write_bytes(source_bytes)
+        result.write_bytes(result_bytes)
+        source_sha256 = hashlib.sha256(source_bytes).hexdigest()
+        result_sha256 = hashlib.sha256(result_bytes).hexdigest()
+        standard_sha256 = f"{index + 1:064x}"
+        common = {
+            "line_number": index + 1,
+            "record_id": f"receipt-train-{index}",
+            "group_id": f"receipt:train:{index}",
+            "target_sha256": target_sha256,
+            "width": 70,
+            "height": 28,
+            "rgb_min": 6,
+            "rgb_max": 255,
+            "standard_pixel_sha256": standard_sha256,
+            "source": source.resolve(),
+            "source_sha256": source_sha256,
+            "result_json": result.resolve(),
+            "result_json_sha256": result_sha256,
+        }
+        owners.extend(
+            (
+                fixed2._Fixed2ViewOwner(
+                    **common,
+                    view="standard",
+                    pixel_sha256=standard_sha256,
+                ),
+                fixed2._Fixed2ViewOwner(
+                    **common,
+                    view="fixed_value",
+                    pixel_sha256=fixed_sha256,
+                ),
+            )
+        )
+    return owners
 
 
 def _swap_path_during_snapshot_use(
@@ -385,6 +440,9 @@ def test_analysis_producer_emits_only_fixed2_and_has_path_stable_subject(
     second = _materialize(fixture, "fixed2-b")
 
     assert first["kind"] == fixed2.ANALYSIS_KIND
+    assert fixed2.KIND == "receipt_recipient_fixed2_teacher_train_export_v2"
+    assert fixed2.RECORD_KIND == "receipt_recipient_fixed2_teacher_train_record_v2"
+    assert fixed2.SUBJECT_DOMAIN == "receipt-recipient-fixed2-teacher-subject-v2"
     assert first["publication_authority"] == fixed2.ANALYSIS_PUBLICATION_AUTHORITY
     assert first["publication_identity"] is None
     assert first["optimizer_input_ready"] is False
@@ -432,31 +490,248 @@ def test_copied_publication_cannot_claim_the_declared_nominal_destination(
         )
 
 
-@pytest.mark.parametrize(
-    ("second_target", "second_group", "expected"),
-    [
-        ("商户甲", "receipt:train:1", "group_conflict=true target_conflict=false"),
-        ("商户乙", "receipt:train:1", "group_conflict=true target_conflict=true"),
-        ("商户乙", "receipt:train:0", "group_conflict=false target_conflict=true"),
-    ],
-)
-def test_selected_duplicate_across_groups_fails_before_stage(
+def test_context_distinct_same_target_fixed_value_pair_is_subject_bound(
     tmp_path: Path,
-    second_target: str,
-    second_group: str,
-    expected: str,
 ) -> None:
     fixture = _fixture(
         tmp_path,
         duplicate=True,
-        second_target=second_target,
-        second_group=second_group,
+    )
+    first = _materialize(fixture, "fixed2-pair-a")
+    second = _materialize(fixture, "fixed2-pair-b")
+    relocated_fixture = _fixture(tmp_path / "relocated", duplicate=True)
+    relocated = _materialize(relocated_fixture, "fixed2-pair-relocated")
+
+    closure = first["selected_view_hash_closure"]
+    assert closure["policy"] == (
+        fixed2.FIXED_VALUE_REUSE_POLICY
+    )
+    assert closure["fixed_value_reuse_class_count"] == 1
+    assert closure["fixed_value_reused_record_count"] == 2
+    assert len(closure["fixed_value_reuse_classes"]) == 1
+    reuse_class = closure["fixed_value_reuse_classes"][0]
+    assert reuse_class["view"] == "fixed_value"
+    assert reuse_class["split"] == "train"
+    assert reuse_class["rgb_max"] > reuse_class["rgb_min"]
+    assert reuse_class["nonblank_predicate"] == (
+        fixed2.FIXED_VALUE_NONBLANK_PREDICATE
+    )
+    assert len(reuse_class["owners"]) == 2
+    assert len({owner["group_id"] for owner in reuse_class["owners"]}) == 2
+    assert len(
+        {owner["standard_pixel_sha256"] for owner in reuse_class["owners"]}
+    ) == 2
+    assert reuse_class["reuse_class_id"] == fixed2._canonical_sha256(
+        {
+            key: value
+            for key, value in reuse_class.items()
+            if key != "reuse_class_id"
+        }
+    )
+    assert closure["fixed_value_reuse_class_closure_sha256"] == (
+        fixed2._canonical_sha256(closure["fixed_value_reuse_classes"])
+    )
+    assert first["producer_subject_id"] == second["producer_subject_id"]
+    assert first["producer_subject_id"] == relocated["producer_subject_id"]
+    assert closure["fixed_value_reuse_classes"] == relocated[
+        "selected_view_hash_closure"
+    ]["fixed_value_reuse_classes"]
+    assert fixed2._verify_recipient_fixed2_teacher_analysis_test_only(
+        export_root=fixture["output_parent"] / "fixed2-pair-a"
+    )["producer_subject_id"] == first["producer_subject_id"]
+
+
+def test_cross_target_fixed_value_pair_still_fails_before_stage(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(
+        tmp_path,
+        duplicate=True,
+        second_target="商户乙",
     )
     output = fixture["output_parent"] / "blocked"
-    with pytest.raises(ValueError, match=expected):
+    with pytest.raises(ValueError, match="target_conflict=true"):
         _materialize(fixture, "blocked")
     assert not output.exists()
     assert not list(fixture["output_parent"].glob(".blocked.*.tmp"))
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected"),
+    [
+        ("same_group", "same-group reuse is forbidden"),
+        ("standard_collision", "standard/cross-view collision"),
+        ("cross_view", "standard/cross-view collision"),
+        ("class3", "class_size=3"),
+        ("uniform", "is uniform"),
+        ("source_reuse", "reuses source lineage"),
+        ("result_reuse", "reuses result_json lineage"),
+    ],
+)
+def test_fixed2_pair_policy_rejects_every_nonexception_collision_axis(
+    tmp_path: Path,
+    mutation: str,
+    expected: str,
+) -> None:
+    owners = _policy_owner_records(
+        tmp_path,
+        count=3 if mutation == "class3" else 2,
+    )
+    if mutation == "same_group":
+        owners = [
+            replace(owner, group_id="receipt:train:0")
+            if owner.record_id == "receipt-train-1"
+            else owner
+            for owner in owners
+        ]
+    elif mutation == "standard_collision":
+        first_standard = next(
+            owner.pixel_sha256
+            for owner in owners
+            if owner.record_id == "receipt-train-0" and owner.view == "standard"
+        )
+        owners = [
+            replace(
+                owner,
+                pixel_sha256=(
+                    first_standard if owner.view == "standard" else owner.pixel_sha256
+                ),
+                standard_pixel_sha256=first_standard,
+            )
+            if owner.record_id == "receipt-train-1"
+            else owner
+            for owner in owners
+        ]
+    elif mutation == "cross_view":
+        first_standard = next(
+            owner.pixel_sha256
+            for owner in owners
+            if owner.record_id == "receipt-train-0" and owner.view == "standard"
+        )
+        owners = [
+            replace(owner, pixel_sha256=first_standard)
+            if owner.record_id == "receipt-train-1" and owner.view == "fixed_value"
+            else owner
+            for owner in owners
+        ]
+    elif mutation == "uniform":
+        owners = [
+            replace(owner, rgb_min=255, rgb_max=255)
+            if owner.view == "fixed_value"
+            else owner
+            for owner in owners
+        ]
+    elif mutation in {"source_reuse", "result_reuse"}:
+        first = next(
+            owner
+            for owner in owners
+            if owner.record_id == "receipt-train-0" and owner.view == "standard"
+        )
+        owners = [
+            replace(
+                owner,
+                **(
+                    {
+                        "source": first.source,
+                        "source_sha256": first.source_sha256,
+                    }
+                    if mutation == "source_reuse"
+                    else {
+                        "result_json": first.result_json,
+                        "result_json_sha256": first.result_json_sha256,
+                    }
+                ),
+            )
+            if owner.record_id == "receipt-train-1"
+            else owner
+            for owner in owners
+        ]
+
+    with pytest.raises(ValueError, match=expected):
+        fixed2._fixed2_selected_view_hash_closure(owners)
+
+
+def test_forty_seven_pair_classes_have_canonical_path_free_closure(
+    tmp_path: Path,
+) -> None:
+    def build(root: Path) -> list[fixed2._Fixed2ViewOwner]:
+        result: list[fixed2._Fixed2ViewOwner] = []
+        for class_index in range(47):
+            for owner in _policy_owner_records(root / f"class-{class_index}"):
+                member = int(owner.record_id.rsplit("-", 1)[1])
+                standard_sha256 = f"{class_index * 2 + member + 1:064x}"
+                result.append(
+                    replace(
+                        owner,
+                        record_id=f"receipt-class-{class_index:02d}-{member}",
+                        group_id=f"receipt:class:{class_index:02d}:{member}",
+                        pixel_sha256=(
+                            f"{1000 + class_index:064x}"
+                            if owner.view == "fixed_value"
+                            else standard_sha256
+                        ),
+                        standard_pixel_sha256=standard_sha256,
+                    )
+                )
+        return result
+
+    first = fixed2._fixed2_selected_view_hash_closure(build(tmp_path / "first"))
+    second = fixed2._fixed2_selected_view_hash_closure(
+        list(reversed(build(tmp_path / "second")))
+    )
+
+    assert first == second
+    assert first["fixed_value_reuse_class_count"] == 47
+    assert first["fixed_value_reused_record_count"] == 94
+    assert len(first["fixed_value_reuse_classes"]) == 47
+    assert len(
+        {
+            reuse_class["reuse_class_id"]
+            for reuse_class in first["fixed_value_reuse_classes"]
+        }
+    ) == 47
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["policy", "class_count", "class_owner", "class_closure"],
+)
+def test_verifier_rebuilds_v2_pair_policy_instead_of_trusting_resealed_contract(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    fixture = _fixture(tmp_path, duplicate=True)
+    _materialize(fixture, "fixed2-pair")
+    root = fixture["output_parent"] / "fixed2-pair"
+    marker = root / fixed2.ANALYSIS_CONTRACT_NAME
+    contract = json.loads(marker.read_text(encoding="utf-8"))
+    closure = contract["selected_view_hash_closure"]
+    if mutation == "policy":
+        closure["policy"] = "forged"
+    elif mutation == "class_count":
+        closure["fixed_value_reuse_class_count"] = 0
+    elif mutation == "class_owner":
+        reuse_class = closure["fixed_value_reuse_classes"][0]
+        reuse_class["owners"][0]["standard_pixel_sha256"] = "0" * 64
+        class_material = {
+            key: value
+            for key, value in reuse_class.items()
+            if key != "reuse_class_id"
+        }
+        reuse_class["reuse_class_id"] = fixed2._canonical_sha256(class_material)
+        closure["fixed_value_reuse_class_closure_sha256"] = (
+            fixed2._canonical_sha256(closure["fixed_value_reuse_classes"])
+        )
+    else:
+        closure["fixed_value_reuse_class_closure_sha256"] = "0" * 64
+    unsigned = {
+        key: value for key, value in contract.items() if key != "integrity_sha256"
+    }
+    contract["integrity_sha256"] = fixed2._canonical_sha256(unsigned)
+    marker.write_text(json.dumps(contract, ensure_ascii=False), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="selected-view closure declaration changed"):
+        fixed2._verify_recipient_fixed2_teacher_analysis_test_only(export_root=root)
 
 
 def test_excluded_four_view_builders_are_never_called(
@@ -1059,6 +1334,64 @@ def test_public_materialize_and_verify_fail_closed_off_windows(tmp_path: Path) -
         )
 
 
+def test_candidate_inspection_reports_v2_reuse_policy_count_and_closure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "candidate"
+    root.mkdir()
+    contract_sha256 = "a" * 64
+    contract_size = 1234
+    snapshot = fixed2._FrozenFileSnapshot(
+        path=(root / fixed2.CONTRACT_NAME).resolve(),
+        identity=(1, 2, 0, contract_size, 0, contract_sha256),
+        data=b"{}",
+    )
+    reuse_closure = {
+        "policy": (
+            fixed2.FIXED_VALUE_REUSE_POLICY
+        ),
+        "fixed_value_reuse_class_count": 47,
+        "fixed_value_reused_record_count": 94,
+        "fixed_value_reuse_class_closure_sha256": "b" * 64,
+    }
+    monkeypatch.setattr(fixed2, "_running_on_windows", lambda: True)
+    monkeypatch.setattr(
+        fixed2,
+        "_snapshot_json",
+        lambda *_args, **_kwargs: (snapshot, {}),
+    )
+    monkeypatch.setattr(
+        fixed2,
+        "_verify_payload",
+        lambda *_args, **_kwargs: {
+            "producer_subject_id": "c" * 64,
+            "publication_identity": {},
+            "selected_view_hash_closure": reuse_closure,
+        },
+    )
+
+    candidate = fixed2.inspect_recipient_fixed2_teacher_attestation_candidate(
+        export_root=root
+    )
+
+    assert candidate == {
+        "schema_version": fixed2.SCHEMA_VERSION,
+        "kind": fixed2.ATTESTATION_CANDIDATE_KIND,
+        "formal_authority_granted": False,
+        "contract_path": str(snapshot.path),
+        "contract_sha256": contract_sha256,
+        "contract_size_bytes": contract_size,
+        "producer_subject_id": "c" * 64,
+        "fixed_value_reuse_policy": fixed2.FIXED_VALUE_REUSE_POLICY,
+        "fixed_value_reuse_class_count": 47,
+        "fixed_value_reused_record_count": 94,
+        "fixed_value_reuse_class_closure_sha256": "b" * 64,
+        "publication_identity_sha256": fixed2._canonical_sha256({}),
+        "required_pin_module": "recipient_fixed2_teacher_attestation.py",
+    }
+
+
 def test_analysis_materialize_and_verify_fail_closed_under_windows_policy(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1465,12 +1798,12 @@ def test_cli_routes_materialize_and_verify(
             fixed2,
             "inspect_recipient_fixed2_teacher_attestation_candidate",
             lambda **kwargs: observed.update(kwargs)
-            or {"kind": "receipt_recipient_fixed2_teacher_attestation_candidate_v1"},
+            or {"kind": fixed2.ATTESTATION_CANDIDATE_KIND},
         )
         fixed2.main(["inspect-candidate", "--export-root", "fixed2"])
         assert observed["export_root"] == Path("fixed2")
     expected_kind = (
-        "receipt_recipient_fixed2_teacher_attestation_candidate_v1"
+        fixed2.ATTESTATION_CANDIDATE_KIND
         if command == "inspect-candidate"
         else fixed2.KIND
     )
