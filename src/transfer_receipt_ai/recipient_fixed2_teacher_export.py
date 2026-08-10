@@ -743,7 +743,7 @@ def _create_child(parent: _DirectoryLease, *, name: str, rename_capable: bool) -
             share_access=_WINDOWS_DIRECTORY_SHARE,
         )
         identity = _windows_directory_identity(handle)
-        observer = _windows_nt_directory(
+        verification_handle = _windows_nt_directory(
             parent.windows_handle,
             name=name,
             disposition=_WINDOWS_FILE_OPEN,
@@ -753,10 +753,10 @@ def _create_child(parent: _DirectoryLease, *, name: str, rename_capable: bool) -
             ),
         )
         try:
-            if _windows_directory_identity(observer) != identity:
+            if _windows_directory_identity(verification_handle) != identity:
                 raise ValueError("created directory is not the parent-relative entry")
         finally:
-            _windows_close(observer)
+            _windows_close(verification_handle)
         return _DirectoryLease(path, identity, windows_handle=handle, rename_capable=rename_capable)
     if parent.posix_fd is None:
         raise OSError(errno.ENOTSUP, "fixed2 producer has no anchored parent", os.fspath(path))
@@ -768,47 +768,23 @@ def _create_child(parent: _DirectoryLease, *, name: str, rename_capable: bool) -
     return _DirectoryLease(path, identity, posix_fd=descriptor, rename_capable=rename_capable)
 
 
-def _open_windows_child_share_delete_observer(
+def _reopen_windows_child_deny_delete_lease(
     parent: _DirectoryLease,
     *,
     name: str,
+    path: Path,
     expected_identity: DirectoryIdentity,
-) -> int:
-    """Anchor a child while permitting the parent's one atomic rename."""
+) -> _DirectoryLease:
+    """Reacquire a child from its continuously held parent directory handle."""
 
     if parent.windows_handle is None:
-        raise OSError(errno.ENOTSUP, "Windows child observer requires a parent handle")
+        raise OSError(errno.ENOTSUP, "Windows child reopen requires a parent handle")
     _require_lease(parent)
     handle = _windows_nt_directory(
         parent.windows_handle,
         name=name,
         disposition=_WINDOWS_FILE_OPEN,
-        desired_access=_WINDOWS_FILE_READ_ATTRIBUTES | _WINDOWS_SYNCHRONIZE,
-        share_access=(
-            _WINDOWS_FILE_SHARE_READ
-            | _WINDOWS_FILE_SHARE_WRITE
-            | _WINDOWS_FILE_SHARE_DELETE
-        ),
-    )
-    try:
-        if _windows_directory_identity(handle) != expected_identity:
-            raise ValueError("fixed2 images observer identity changed")
-    except BaseException:
-        _windows_close(handle)
-        raise
-    return handle
-
-
-def _reopen_windows_path_deny_delete_lease(
-    path: Path,
-    *,
-    expected_identity: DirectoryIdentity,
-) -> _DirectoryLease:
-    """Reacquire the renamed images directory without sharing delete."""
-
-    handle = _windows_open_path_directory(
-        path,
-        desired_access=_WINDOWS_DIRECTORY_ACCESS,
+        desired_access=_WINDOWS_DIRECTORY_ACCESS | _WINDOWS_SYNCHRONIZE,
         share_access=_WINDOWS_DIRECTORY_SHARE,
     )
     try:
@@ -1397,8 +1373,7 @@ def _materialize_impl(
     stage = parent / f".{output.name}.{hashlib.sha256(os.urandom(32)).hexdigest()[:24]}.tmp"
     stage_lease: _DirectoryLease | None = None
     images_lease: _DirectoryLease | None = None
-    images_observer_handle: int | None = None
-    images_observer_identity: DirectoryIdentity | None = None
+    windows_images_identity: DirectoryIdentity | None = None
     renamed = False
 
     def checkpoint(name: str) -> None:
@@ -1464,20 +1439,18 @@ def _materialize_impl(
     def quarantine_published_output() -> Path:
         """Move a failed nominal publication back under a fresh hidden name."""
 
-        nonlocal renamed, images_lease, images_observer_handle, images_observer_identity
+        nonlocal renamed, images_lease, windows_images_identity
         if stage_lease is None or not renamed:
             return stage_lease.path if stage_lease is not None else stage
         if stage_lease.windows_handle is not None:
             if images_lease is None:
                 raise ValueError("fixed2 quarantine images lease is unavailable")
-            if images_observer_handle is None:
-                images_observer_identity = images_lease.identity
-                images_observer_handle = _open_windows_child_share_delete_observer(
-                    stage_lease,
-                    name="images",
-                    expected_identity=images_observer_identity,
-                )
+            if images_lease.windows_handle is not None:
+                _require_lease(images_lease)
+                windows_images_identity = images_lease.identity
                 images_lease.close()
+            if windows_images_identity is None:
+                raise ValueError("fixed2 quarantine images identity is unavailable")
         last_collision: BaseException | None = None
         for _attempt in range(8):
             quarantine = parent / (
@@ -1492,22 +1465,17 @@ def _materialize_impl(
             renamed = False
             if not _same_directory_identity(quarantine, stage_lease.identity):
                 raise ValueError("fixed2 quarantine output identity changed after rename")
-            if images_observer_handle is not None:
-                if images_observer_identity is None:
+            if stage_lease.windows_handle is not None:
+                if windows_images_identity is None:
                     raise AssertionError(
-                        "fixed2 quarantine images observer identity is unavailable"
+                        "fixed2 quarantine images identity is unavailable"
                     )
-                if (
-                    _windows_directory_identity(images_observer_handle)
-                    != images_observer_identity
-                ):
-                    raise ValueError("fixed2 quarantine images observer changed")
-                images_lease = _reopen_windows_path_deny_delete_lease(
-                    quarantine / "images",
-                    expected_identity=images_observer_identity,
+                images_lease = _reopen_windows_child_deny_delete_lease(
+                    stage_lease,
+                    name="images",
+                    path=quarantine / "images",
+                    expected_identity=windows_images_identity,
                 )
-                _windows_close(images_observer_handle)
-                images_observer_handle = None
             elif images_lease is not None:
                 images_lease.path = quarantine / "images"
             if output.exists():
@@ -1740,7 +1708,10 @@ def _materialize_impl(
             "train_manifest": MANIFEST_NAME,
             "train_manifest_sha256": manifest_identity[-1],
             "artifacts": artifacts,
-            "publication": "private_stage_contract_verified_then_anchored_no_replace_directory_v1",
+            "publication": (
+                "private_stage_verified_descendants_closed_anchored_no_replace_"
+                "parent_relative_reopen_identity_full_reverify_v1"
+            ),
             "commit_marker": contract_marker_name,
             "publication_complete": True,
             "failure_policy": "preflight_conflicts_create_no_stage; publication_failures_are_quarantined",
@@ -1814,27 +1785,54 @@ def _materialize_impl(
         if stage_lease.windows_handle is not None:
             if images_lease.windows_handle is None:
                 raise ValueError("fixed2 Windows images deny-delete lease is unavailable")
-            images_observer_identity = images_lease.identity
-            images_observer_handle = _open_windows_child_share_delete_observer(
-                stage_lease,
-                name="images",
-                expected_identity=images_observer_identity,
-            )
+            _require_lease(images_lease)
+            windows_images_identity = images_lease.identity
+            # Windows forbids renaming a directory while any descendant has an
+            # open handle, even when that handle shares delete.  The bounded
+            # residual window begins after this close and ends at the
+            # parent-handle-relative reopen below.  Directory replacement is
+            # rejected by the stored identity; byte mutation is rejected by
+            # the complete post-publication verifier.
             images_lease.close()
-        _rename_no_replace(parent_lease, stage_lease, output)
+        try:
+            _rename_no_replace(parent_lease, stage_lease, output)
+        except BaseException as rename_error:
+            if (
+                stage_lease.windows_handle is not None
+                and windows_images_identity is not None
+            ):
+                try:
+                    images_lease = _reopen_windows_child_deny_delete_lease(
+                        stage_lease,
+                        name="images",
+                        path=stage_lease.path / "images",
+                        expected_identity=windows_images_identity,
+                    )
+                except BaseException as restore_error:
+                    setattr(
+                        rename_error,
+                        "fixed2_images_lease_restore_error",
+                        restore_error,
+                    )
+                    if hasattr(rename_error, "add_note"):
+                        rename_error.add_note(
+                            "fixed2 images deny-delete lease recovery failed after "
+                            f"rename error: {restore_error}"
+                        )
+            raise
         renamed = True
         stage_lease.path = output
-        if images_observer_handle is not None:
-            if images_observer_identity is None:
-                raise AssertionError("fixed2 images observer identity is unavailable")
+        if stage_lease.windows_handle is not None:
+            if windows_images_identity is None:
+                raise AssertionError("fixed2 images identity is unavailable")
             if not _same_directory_identity(output, stage_lease.identity):
                 raise ValueError("fixed2 nominal output identity changed after rename")
-            images_lease = _reopen_windows_path_deny_delete_lease(
-                output / "images",
-                expected_identity=images_observer_identity,
+            images_lease = _reopen_windows_child_deny_delete_lease(
+                stage_lease,
+                name="images",
+                path=output / "images",
+                expected_identity=windows_images_identity,
             )
-            _windows_close(images_observer_handle)
-            images_observer_handle = None
         else:
             images_lease.path = output / "images"
         _require_lease(parent_lease)
@@ -1882,8 +1880,6 @@ def _materialize_impl(
                 error.add_note(note)
         raise
     finally:
-        if images_observer_handle is not None:
-            _windows_close(images_observer_handle)
         if images_lease is not None:
             images_lease.close()
         if stage_lease is not None:
@@ -2046,7 +2042,8 @@ def _verify_payload(
         ("subject_code_stable", True),
         (
             "publication",
-            "private_stage_contract_verified_then_anchored_no_replace_directory_v1",
+            "private_stage_verified_descendants_closed_anchored_no_replace_"
+            "parent_relative_reopen_identity_full_reverify_v1",
         ),
         (
             "failure_policy",
