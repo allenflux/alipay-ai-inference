@@ -18,6 +18,7 @@ import io
 import json
 import math
 import os
+import re
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict
@@ -136,6 +137,31 @@ EXPECTED_RUN_ARTIFACT_PINS: dict[str, dict[str, int | str]] = {
         "sha256": "9e6916c91073cf2cad837f2cde593e5151d8315c630074991e4e682701ef5e24",
     },
 }
+
+_DOTNET_ROUND_TRIP_UTC_RE = re.compile(
+    r"(?P<date>[0-9]{4}-[0-9]{2}-[0-9]{2})"
+    r"T(?P<time>[0-9]{2}:[0-9]{2}:[0-9]{2})"
+    r"\.(?P<fraction>[0-9]{7})Z"
+)
+
+
+def _validate_dotnet_round_trip_utc(value: str) -> None:
+    """Validate the fixed attempt writer's UTC ``DateTime:O`` shape."""
+
+    match = _DOTNET_ROUND_TRIP_UTC_RE.fullmatch(value)
+    if match is None:
+        raise ValueError("attempt creation timestamp is invalid")
+    # CPython versions before 3.11 reject .NET's seventh (100 ns) digit.
+    # The full seven digits were checked above; drop only that last digit for
+    # calendar/clock validation by datetime's strict parser.
+    normalized = (
+        f"{match.group('date')}T{match.group('time')}"
+        f".{match.group('fraction')[:6]}+00:00"
+    )
+    try:
+        datetime.fromisoformat(normalized)
+    except ValueError as error:
+        raise ValueError("attempt creation timestamp is invalid") from error
 
 
 def _sha256(path: Path) -> str:
@@ -1813,10 +1839,7 @@ def _validate_attempt(
     created = payload.get("created_at_utc")
     if not isinstance(created, str) or not created:
         raise ValueError("attempt creation timestamp is missing")
-    try:
-        datetime.fromisoformat(created.replace("Z", "+00:00"))
-    except ValueError as error:
-        raise ValueError("attempt creation timestamp is invalid") from error
+    _validate_dotnet_round_trip_utc(created)
     output_root = payload.get("output_root")
     if not isinstance(output_root, str) or not output_root:
         raise ValueError("attempt output_root is missing")

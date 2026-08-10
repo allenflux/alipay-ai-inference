@@ -633,7 +633,7 @@ def _make_failure_fixture(
         {
             "schema_version": 1,
             "kind": ATTEMPT_KIND,
-            "created_at_utc": "2026-08-10T00:00:00+00:00",
+            "created_at_utc": "2026-08-09T19:18:45.2704798Z",
             "attempt_id": attempt_id,
             "stage": "candidate-60e",
             "source_subject_id": source_subject,
@@ -776,6 +776,22 @@ def _verify(fixture: SimpleNamespace, evidence: Path) -> dict[str, object]:
     )
 
 
+def _validate_fixture_attempt(
+    fixture: SimpleNamespace, payload: Mapping[str, object]
+) -> tuple[dict[str, object], str]:
+    return failure_attestor._validate_attempt(
+        fixture.attempt_path,
+        payload=payload,
+        registry=fixture.registry,
+        candidate_root=fixture.candidate_root,
+        source_subject_id=failure_attestor.EXPECTED_SOURCE_SUBJECT_ID,
+        candidate_pilot_subject_id=(
+            failure_attestor.EXPECTED_CANDIDATE_PILOT_SUBJECT_ID
+        ),
+        full_manifest_sha256=_sha(fixture.full),
+    )
+
+
 def _refresh_fixture_pin(name: str, path: Path) -> None:
     failure_attestor.EXPECTED_RUN_ARTIFACT_PINS[name] = {
         "sha256": _sha(path),
@@ -855,6 +871,41 @@ def test_seals_and_reopens_only_the_different_view_exact8_authority(
     }
     with pytest.raises(ValueError, match="Refusing to overwrite"):
         _attest(failure_fixture, evidence)
+
+
+def test_attempt_accepts_fixed_dotnet_round_trip_utc_timestamp(
+    failure_fixture: SimpleNamespace,
+) -> None:
+    payload = json.loads(failure_fixture.attempt_path.read_text(encoding="utf-8"))
+    assert payload["created_at_utc"] == "2026-08-09T19:18:45.2704798Z"
+    validated, attempt_id = _validate_fixture_attempt(failure_fixture, payload)
+    assert validated == payload
+    assert attempt_id == failure_attestor.EXPECTED_ATTEMPT_ID
+
+
+@pytest.mark.parametrize(
+    "timestamp",
+    [
+        pytest.param("2026-02-30T19:18:45.2704798Z", id="invalid-calendar"),
+        pytest.param("2026-08-09T19:18:45.2704798", id="naive"),
+        pytest.param("2026-08-09T19:18:45.2704798+08:00", id="non-utc"),
+        pytest.param(
+            "2026-08-09T19:18:45.2704798+00:00", id="noncanonical-utc-offset"
+        ),
+        pytest.param("2026-08-09T19:18:45.270479Z", id="too-few-digits"),
+        pytest.param("2026-08-09T19:18:45Z", id="missing-fraction"),
+        pytest.param("2026-08-09T19:18:45.27047980Z", id="too-many-digits"),
+        pytest.param("2026-08-09T19:18:45.2704798z", id="lowercase-zone"),
+        pytest.param("2026-08-09T19:18:45.2704798Zjunk", id="trailing-junk"),
+    ],
+)
+def test_attempt_rejects_non_dotnet_round_trip_utc_timestamps(
+    failure_fixture: SimpleNamespace, timestamp: str
+) -> None:
+    payload = json.loads(failure_fixture.attempt_path.read_text(encoding="utf-8"))
+    payload["created_at_utc"] = timestamp
+    with pytest.raises(ValueError, match="attempt creation timestamp is invalid"):
+        _validate_fixture_attempt(failure_fixture, payload)
 
 
 def test_failure_subject_is_path_stable_across_two_strictly_verified_roots(
