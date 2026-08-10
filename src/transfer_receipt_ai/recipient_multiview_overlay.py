@@ -1021,9 +1021,14 @@ def _rename_directory_no_replace_anchored(
 
         encoded_name = destination.name.encode("utf-16-le")
         name_offset = _FileRenameInfoPrefix.file_name.offset
-        buffer_size = name_offset + len(encoded_name)
-        allocation_size = max(buffer_size, ctypes.sizeof(_FileRenameInfoPrefix))
-        buffer = ctypes.create_string_buffer(allocation_size)
+        # Windows requires the reported FILE_RENAME_INFO buffer length to
+        # include the complete fixed structure *and* FileNameLength bytes.
+        # On 64-bit Windows sizeof(FILE_RENAME_INFO) is 24 while FileName is at
+        # offset 20, so using offsetof(FileName) here under-reports the buffer
+        # by four bytes and SetFileInformationByHandle fails with
+        # ERROR_INVALID_PARAMETER.
+        buffer_size = ctypes.sizeof(_FileRenameInfoPrefix) + len(encoded_name)
+        buffer = ctypes.create_string_buffer(buffer_size)
         information = _FileRenameInfoPrefix.from_buffer(buffer)
         information.flags = 0  # FileRenameInfo: ReplaceIfExists == FALSE.
         information.root_directory = parent.windows_handle

@@ -88,7 +88,8 @@ ATTEMPT_REGISTRY_NAME = "recipient-v14-multiview-fixed2-training-v1"
 ATTEMPT_REGISTRY_PARENT = "ReceiptAI"
 ATTEMPT_THREAT_MODEL = (
     "persistent current-SID no-rerun guard; crash and failed training consume "
-    "fixed2 exact8; owner WRITE_DAC and local-administrator bypass are out of scope"
+    "fixed2 exact8; owner WRITE_DAC and local-administrator bypass are out of scope, "
+    "including elevated ProgramData FILE_DELETE_CHILD"
 )
 OVERLAY_KIND = "receipt_recipient_fixed2_overlay_contract_v1"
 ROUTE_DOMAIN = "receipt-recipient-multiview-fixed2-exact8-v1"
@@ -2020,7 +2021,11 @@ def _require_attempt_program_data_acl(program_data_lease: Any) -> None:
         required_mask=None,
         required_flags=0,
         forbidden_flags=0,
-        effective_denied_accesses=(_WINDOWS_FILE_DELETE_CHILD,),
+        # An elevated local administrator can legitimately hold DELETE_CHILD on
+        # the system ProgramData directory.  That authority is explicitly out
+        # of scope; still validate the anchored handle's owner/group/DACL, but
+        # do not turn the excluded administrator capability into a route gate.
+        effective_denied_accesses=(),
     )
 
 
@@ -3196,7 +3201,12 @@ def _sealed_decision_payload(
             "formal_platform": "windows",
             "program_data_resolved_by_known_folder_api": True,
             "one_shot_marker_created_by_python_run": True,
-            "program_data_delete_child_effectively_denied": True,
+            "program_data_directory_identity_lease_held": True,
+            "program_data_acl_descriptor_reverified": True,
+            "program_data_delete_child_accesscheck_required": False,
+            "program_data_delete_child_threat_scope": (
+                "excluded_elevated_local_admin_and_owner_WRITE_DAC"
+            ),
             "receipt_root_explicit_inheritable_delete_dacl": True,
             "attempt_registry_explicit_inheritable_delete_dacl": True,
             "attempt_marker_inherited_delete_dacl": True,

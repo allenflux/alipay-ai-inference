@@ -1823,6 +1823,90 @@ def test_windows_atomic_stage_creation_binds_created_handle_to_parent_entry(
     assert closed == [603, 602]
 
 
+def test_windows_anchored_rename_reports_complete_file_rename_info_buffer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent_identity = (13, 41, 0x10)
+    stage_identity = (13, 42, 0x10)
+    parent = overlay_module._DirectoryLease(
+        path=tmp_path,
+        identity=parent_identity,
+        windows_handle=611,
+        windows_identity=parent_identity,
+    )
+    source = tmp_path / ".stage-atomic"
+    destination = tmp_path / "published-output"
+    stage = overlay_module._DirectoryLease(
+        path=source,
+        identity=stage_identity,
+        windows_handle=612,
+        windows_rename_capable=True,
+        windows_identity=stage_identity,
+    )
+    calls: list[tuple[ctypes.c_void_p, int, bytes, int]] = []
+
+    class _FakeSetFileInformationByHandle:
+        argtypes: object = None
+        restype: object = None
+
+        def __call__(
+            self,
+            handle: ctypes.c_void_p,
+            information_class: int,
+            information: object,
+            size: int,
+        ) -> int:
+            calls.append(
+                (handle, information_class, ctypes.string_at(information, size), size)
+            )
+            return 1
+
+    class _FakeKernel32:
+        SetFileInformationByHandle = _FakeSetFileInformationByHandle()
+
+    monkeypatch.setattr(
+        overlay_module,
+        "_windows_directory_handle_identity",
+        lambda handle: {611: parent_identity, 612: stage_identity}[handle],
+    )
+    monkeypatch.setattr(
+        overlay_module.ctypes,
+        "WinDLL",
+        lambda *args, **kwargs: _FakeKernel32(),
+        raising=False,
+    )
+
+    overlay_module._rename_directory_no_replace_anchored(
+        parent,
+        stage,
+        source=source,
+        destination=destination,
+    )
+
+    assert len(calls) == 1
+    handle, information_class, raw, reported_size = calls[0]
+    assert handle.value == 612
+    assert information_class == 3  # FileRenameInfo
+
+    class _FileRenameInfoPrefix(ctypes.Structure):
+        _fields_ = (
+            ("flags", ctypes.c_uint32),
+            ("root_directory", ctypes.c_void_p),
+            ("file_name_length", ctypes.c_uint32),
+            ("file_name", ctypes.c_uint16 * 1),
+        )
+
+    encoded_name = destination.name.encode("utf-16-le")
+    assert reported_size == ctypes.sizeof(_FileRenameInfoPrefix) + len(encoded_name)
+    information = _FileRenameInfoPrefix.from_buffer_copy(raw)
+    assert information.flags == 0  # ReplaceIfExists == FALSE: no clobber.
+    assert information.root_directory == 611
+    assert information.file_name_length == len(encoded_name)
+    name_offset = _FileRenameInfoPrefix.file_name.offset
+    assert raw[name_offset : name_offset + len(encoded_name)] == encoded_name
+
+
 def test_windows_atomic_stage_creation_rejects_postcreate_entry_substitution(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

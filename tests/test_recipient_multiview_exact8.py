@@ -8,6 +8,7 @@ import os
 import runpy
 from dataclasses import asdict, replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -1713,17 +1714,81 @@ def test_valid_registry_marker_and_programdata_acl_evidence_is_accepted() -> Non
         required_mask=None,
         required_flags=0,
         forbidden_flags=0,
-        effective_access={exact8._WINDOWS_FILE_DELETE_CHILD: False},
+        effective_access={},
     )
-    with pytest.raises(ValueError, match="effectively deny"):
-        exact8._require_windows_acl_evidence(
-            description="ProgramData DACL",
-            deny_aces=[],
-            required_mask=None,
-            required_flags=0,
-            forbidden_flags=0,
-            effective_access={exact8._WINDOWS_FILE_DELETE_CHILD: True},
-        )
+
+
+def test_programdata_admin_delete_child_is_out_of_scope_but_child_acl_gates_remain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[dict[str, object]] = []
+
+    monkeypatch.setattr(exact8.os, "name", "nt")
+    monkeypatch.setattr(
+        exact8,
+        "_require_windows_acl_policy",
+        lambda handle, **kwargs: captured.append({"handle": handle, **kwargs}),
+    )
+    exact8._require_attempt_program_data_acl(
+        SimpleNamespace(windows_handle=1701)
+    )
+    exact8._require_attempt_receipt_root_acl(
+        SimpleNamespace(windows_handle=1702)
+    )
+    exact8._require_attempt_registry_acl(SimpleNamespace(windows_handle=1703))
+    exact8._require_attempt_marker_acl(1704)
+    child_mask = exact8._WINDOWS_DELETE | exact8._WINDOWS_FILE_DELETE_CHILD
+    child_flags = (
+        exact8._WINDOWS_OBJECT_INHERIT_ACE
+        | exact8._WINDOWS_CONTAINER_INHERIT_ACE
+    )
+    assert captured == [
+        {
+            "handle": 1701,
+            "description": "exact8 ProgramData DACL",
+            "required_mask": None,
+            "required_flags": 0,
+            "forbidden_flags": 0,
+            "effective_denied_accesses": (),
+        },
+        {
+            "handle": 1702,
+            "description": "exact8 ReceiptAI root DACL",
+            "required_mask": child_mask,
+            "required_flags": child_flags,
+            "forbidden_flags": (
+                exact8._WINDOWS_INHERITED_ACE
+                | exact8._WINDOWS_INHERIT_ONLY_ACE
+            ),
+            "effective_denied_accesses": (
+                exact8._WINDOWS_DELETE,
+                exact8._WINDOWS_FILE_DELETE_CHILD,
+            ),
+        },
+        {
+            "handle": 1703,
+            "description": "exact8 attempt registry DACL",
+            "required_mask": child_mask,
+            "required_flags": child_flags,
+            "forbidden_flags": (
+                exact8._WINDOWS_INHERITED_ACE
+                | exact8._WINDOWS_INHERIT_ONLY_ACE
+            ),
+            "effective_denied_accesses": (
+                exact8._WINDOWS_DELETE,
+                exact8._WINDOWS_FILE_DELETE_CHILD,
+            ),
+        },
+        {
+            "handle": 1704,
+            "description": "exact8 attempt marker DACL",
+            "required_mask": exact8._WINDOWS_DELETE,
+            "required_flags": exact8._WINDOWS_INHERITED_ACE,
+            "forbidden_flags": exact8._WINDOWS_INHERIT_ONLY_ACE,
+            "effective_denied_accesses": (exact8._WINDOWS_DELETE,),
+        },
+    ]
+    assert "local-administrator bypass are out of scope" in exact8.ATTEMPT_THREAT_MODEL
 
 
 @pytest.mark.parametrize(
@@ -2241,7 +2306,12 @@ def test_mocked_run_uses_original_source_and_independent_verifier_replays_decisi
         "formal_platform": "windows",
         "program_data_resolved_by_known_folder_api": True,
         "one_shot_marker_created_by_python_run": True,
-        "program_data_delete_child_effectively_denied": True,
+        "program_data_directory_identity_lease_held": True,
+        "program_data_acl_descriptor_reverified": True,
+        "program_data_delete_child_accesscheck_required": False,
+        "program_data_delete_child_threat_scope": (
+            "excluded_elevated_local_admin_and_owner_WRITE_DAC"
+        ),
         "receipt_root_explicit_inheritable_delete_dacl": True,
         "attempt_registry_explicit_inheritable_delete_dacl": True,
         "attempt_marker_inherited_delete_dacl": True,

@@ -233,7 +233,9 @@ try {
     }
 
     # The wrapper protects both parent levels but never creates the marker.
-    # Python independently verifies ProgramData/ReceiptAI/registry ACLs.
+    # Python anchors ProgramData and revalidates its ACL descriptor, but the
+    # elevated-admin ProgramData DELETE_CHILD capability is explicitly outside
+    # the threat model. ReceiptAI/registry effective delete denials remain gates.
     # Python run owns the atomic CreateNew, verifies the marker's inherited deny, and holds all
     # leases through training and decision publication.
     New-Item -ItemType Directory -Path $auditRoot -Force | Out-Null
