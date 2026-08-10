@@ -138,6 +138,7 @@ def _fixture(
     *,
     second_target: str = "商户乙",
     second_group_id: str | None = None,
+    materialize_analysis_source: bool = True,
 ) -> dict[str, object]:
     dataset_root = tmp_path / "source-data" / "paddle-dataset"
     rows = [
@@ -248,13 +249,14 @@ def _fixture(
         contract=blind_contract,
     )
     multiview_root = tmp_path / "overlay-data" / "multiview"
-    multiview_root.parent.mkdir(parents=True)
-    _materialize_recipient_fixed2_teacher_analysis_test_only(
-        manifest=blind_records,
-        dataset_contract=source_contract,
-        dataset_root=dataset_root,
-        output_root=multiview_root,
-    )
+    if materialize_analysis_source:
+        multiview_root.parent.mkdir(parents=True)
+        _materialize_recipient_fixed2_teacher_analysis_test_only(
+            manifest=blind_records,
+            dataset_contract=source_contract,
+            dataset_root=dataset_root,
+            output_root=multiview_root,
+        )
     return {
         "dataset_root": dataset_root,
         "full_records": full_records,
@@ -279,6 +281,18 @@ def _materialize(tmp_path: Path) -> tuple[dict[str, object], dict[str, object]]:
         output_root=tmp_path / "fixed2-output",
     )
     return fixture, contract
+
+
+def test_fixture_can_build_raw_formal_inputs_without_minting_analysis_source(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path, materialize_analysis_source=False)
+
+    assert Path(fixture["full_records"]).is_file()
+    assert Path(fixture["source_contract"]).is_file()
+    assert Path(fixture["blind_records"]).is_file()
+    assert Path(fixture["blind_contract"]).is_file()
+    assert not Path(fixture["multiview_root"]).exists()
 
 
 def _materialize_formal_windows_mock(
@@ -1207,7 +1221,7 @@ def test_windows_formal_fixed2_source_to_overlay_real_kernel(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    fixture = _fixture(tmp_path)
+    fixture = _fixture(tmp_path, materialize_analysis_source=False)
     formal_source_parent = tmp_path / "formal-source-parent"
     formal_source_parent.mkdir()
     formal_source = formal_source_parent / "fixed2-source"

@@ -1195,6 +1195,192 @@ def test_ntcreatefile_pending_or_nonzero_completion_is_never_success() -> None:
     assert fixed2._failed_ntstatus(0, -1073741771) == -1073741771
 
 
+def test_windows_images_rename_handoff_uses_temporary_share_delete_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent_identity = (7, 11, 0x10)
+    images_identity = (7, 12, 0x10)
+    identities = {
+        101: parent_identity,
+        202: images_identity,
+        303: images_identity,
+    }
+    nt_calls: list[dict[str, int | str]] = []
+    path_calls: list[dict[str, object]] = []
+    closed: list[int] = []
+
+    monkeypatch.setattr(
+        fixed2,
+        "_windows_directory_identity",
+        lambda handle: identities[handle],
+    )
+
+    def open_relative(
+        parent_handle: int,
+        *,
+        name: str,
+        disposition: int,
+        desired_access: int,
+        share_access: int,
+    ) -> int:
+        nt_calls.append(
+            {
+                "parent_handle": parent_handle,
+                "name": name,
+                "disposition": disposition,
+                "desired_access": desired_access,
+                "share_access": share_access,
+            }
+        )
+        return 202
+
+    def open_path(
+        path: Path, *, desired_access: int, share_access: int
+    ) -> int:
+        path_calls.append(
+            {
+                "path": path,
+                "desired_access": desired_access,
+                "share_access": share_access,
+            }
+        )
+        return 303
+
+    monkeypatch.setattr(fixed2, "_windows_nt_directory", open_relative)
+    monkeypatch.setattr(fixed2, "_windows_open_path_directory", open_path)
+    monkeypatch.setattr(fixed2, "_windows_close", closed.append)
+    parent = fixed2._DirectoryLease(
+        path=tmp_path,
+        identity=parent_identity,
+        windows_handle=101,
+    )
+
+    observer = fixed2._open_windows_child_share_delete_observer(
+        parent,
+        name="images",
+        expected_identity=images_identity,
+    )
+    reopened = fixed2._reopen_windows_path_deny_delete_lease(
+        tmp_path / "nominal" / "images",
+        expected_identity=images_identity,
+    )
+
+    assert observer == 202
+    assert nt_calls[0]["share_access"] & fixed2._WINDOWS_FILE_SHARE_DELETE
+    assert not (
+        int(path_calls[0]["share_access"])
+        & fixed2._WINDOWS_FILE_SHARE_DELETE
+    )
+    assert reopened.identity == images_identity
+    assert reopened.windows_handle == 303
+    assert closed == []
+
+
+def test_windows_images_rename_handoff_closes_identity_drift_handles(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = (3, 4, 0x10)
+    parent = fixed2._DirectoryLease(
+        path=tmp_path,
+        identity=(3, 2, 0x10),
+        windows_handle=101,
+    )
+    closed: list[int] = []
+    identities = {
+        101: parent.identity,
+        202: (3, 99, 0x10),
+        303: (3, 98, 0x10),
+    }
+    monkeypatch.setattr(
+        fixed2,
+        "_windows_directory_identity",
+        lambda handle: identities[handle],
+    )
+    monkeypatch.setattr(
+        fixed2,
+        "_windows_nt_directory",
+        lambda *_args, **_kwargs: 202,
+    )
+    monkeypatch.setattr(
+        fixed2,
+        "_windows_open_path_directory",
+        lambda *_args, **_kwargs: 303,
+    )
+    monkeypatch.setattr(fixed2, "_windows_close", closed.append)
+
+    with pytest.raises(ValueError, match="observer identity"):
+        fixed2._open_windows_child_share_delete_observer(
+            parent,
+            name="images",
+            expected_identity=expected,
+        )
+    with pytest.raises(ValueError, match="renamed images identity"):
+        fixed2._reopen_windows_path_deny_delete_lease(
+            tmp_path / "nominal" / "images",
+            expected_identity=expected,
+        )
+    assert closed == [202, 303]
+
+
+def test_materializer_images_lease_handoff_order_is_fail_closed() -> None:
+    source = inspect.getsource(fixed2._materialize_impl)
+    start = source.index('checkpoint("immediately_before_rename")')
+    end = source.index('checkpoint("immediately_after_rename")')
+    handoff = source[start:end]
+
+    observer = handoff.index("_open_windows_child_share_delete_observer")
+    close_deny = handoff.index("images_lease.close()", observer)
+    rename = handoff.index("_rename_no_replace", close_deny)
+    reopen_deny = handoff.index("_reopen_windows_path_deny_delete_lease", rename)
+    close_observer = handoff.index("_windows_close(images_observer_handle)", reopen_deny)
+    assert observer < close_deny < rename < reopen_deny < close_observer
+
+    quarantine_start = source.index("def quarantine_published_output")
+    publication_start = source.index(
+        "\n    try:\n        retained_prefix", quarantine_start
+    )
+    quarantine = source[quarantine_start:publication_start]
+    quarantine_observer = quarantine.index(
+        "_open_windows_child_share_delete_observer"
+    )
+    quarantine_close_deny = quarantine.index(
+        "images_lease.close()", quarantine_observer
+    )
+    quarantine_rename = quarantine.index(
+        "_rename_no_replace", quarantine_close_deny
+    )
+    quarantine_stage_identity = quarantine.index(
+        "_same_directory_identity(quarantine, stage_lease.identity)",
+        quarantine_rename,
+    )
+    quarantine_observer_identity = quarantine.index(
+        "_windows_directory_identity(images_observer_handle)",
+        quarantine_stage_identity,
+    )
+    quarantine_reopen = quarantine.index(
+        "_reopen_windows_path_deny_delete_lease", quarantine_observer_identity
+    )
+    quarantine_close_observer = quarantine.index(
+        "_windows_close(images_observer_handle)", quarantine_reopen
+    )
+    assert (
+        quarantine_observer
+        < quarantine_close_deny
+        < quarantine_rename
+        < quarantine_stage_identity
+        < quarantine_observer_identity
+        < quarantine_reopen
+        < quarantine_close_observer
+    )
+
+    finalizer = source[source.rindex("    finally:") :]
+    assert finalizer.index("_windows_close(images_observer_handle)") < (
+        finalizer.index("images_lease.close()")
+    )
+
+
 @pytest.mark.parametrize(
     ("returned_status", "completion_status", "translated", "error_type"),
     [

@@ -768,6 +768,64 @@ def _create_child(parent: _DirectoryLease, *, name: str, rename_capable: bool) -
     return _DirectoryLease(path, identity, posix_fd=descriptor, rename_capable=rename_capable)
 
 
+def _open_windows_child_share_delete_observer(
+    parent: _DirectoryLease,
+    *,
+    name: str,
+    expected_identity: DirectoryIdentity,
+) -> int:
+    """Anchor a child while permitting the parent's one atomic rename."""
+
+    if parent.windows_handle is None:
+        raise OSError(errno.ENOTSUP, "Windows child observer requires a parent handle")
+    _require_lease(parent)
+    handle = _windows_nt_directory(
+        parent.windows_handle,
+        name=name,
+        disposition=_WINDOWS_FILE_OPEN,
+        desired_access=_WINDOWS_FILE_READ_ATTRIBUTES | _WINDOWS_SYNCHRONIZE,
+        share_access=(
+            _WINDOWS_FILE_SHARE_READ
+            | _WINDOWS_FILE_SHARE_WRITE
+            | _WINDOWS_FILE_SHARE_DELETE
+        ),
+    )
+    try:
+        if _windows_directory_identity(handle) != expected_identity:
+            raise ValueError("fixed2 images observer identity changed")
+    except BaseException:
+        _windows_close(handle)
+        raise
+    return handle
+
+
+def _reopen_windows_path_deny_delete_lease(
+    path: Path,
+    *,
+    expected_identity: DirectoryIdentity,
+) -> _DirectoryLease:
+    """Reacquire the renamed images directory without sharing delete."""
+
+    handle = _windows_open_path_directory(
+        path,
+        desired_access=_WINDOWS_DIRECTORY_ACCESS,
+        share_access=_WINDOWS_DIRECTORY_SHARE,
+    )
+    try:
+        observed = _windows_directory_identity(handle)
+        if observed != expected_identity:
+            raise ValueError("fixed2 renamed images identity changed")
+    except BaseException:
+        _windows_close(handle)
+        raise
+    return _DirectoryLease(
+        path=path,
+        identity=expected_identity,
+        windows_handle=handle,
+        rename_capable=False,
+    )
+
+
 def _require_lease(lease: _DirectoryLease) -> None:
     if lease.windows_handle is not None:
         if _windows_directory_identity(lease.windows_handle) != lease.identity:
@@ -1339,6 +1397,8 @@ def _materialize_impl(
     stage = parent / f".{output.name}.{hashlib.sha256(os.urandom(32)).hexdigest()[:24]}.tmp"
     stage_lease: _DirectoryLease | None = None
     images_lease: _DirectoryLease | None = None
+    images_observer_handle: int | None = None
+    images_observer_identity: DirectoryIdentity | None = None
     renamed = False
 
     def checkpoint(name: str) -> None:
@@ -1404,9 +1464,20 @@ def _materialize_impl(
     def quarantine_published_output() -> Path:
         """Move a failed nominal publication back under a fresh hidden name."""
 
-        nonlocal renamed
+        nonlocal renamed, images_lease, images_observer_handle, images_observer_identity
         if stage_lease is None or not renamed:
             return stage_lease.path if stage_lease is not None else stage
+        if stage_lease.windows_handle is not None:
+            if images_lease is None:
+                raise ValueError("fixed2 quarantine images lease is unavailable")
+            if images_observer_handle is None:
+                images_observer_identity = images_lease.identity
+                images_observer_handle = _open_windows_child_share_delete_observer(
+                    stage_lease,
+                    name="images",
+                    expected_identity=images_observer_identity,
+                )
+                images_lease.close()
         last_collision: BaseException | None = None
         for _attempt in range(8):
             quarantine = parent / (
@@ -1418,9 +1489,27 @@ def _materialize_impl(
                 last_collision = error
                 continue
             stage_lease.path = quarantine
-            if images_lease is not None:
-                images_lease.path = quarantine / "images"
             renamed = False
+            if not _same_directory_identity(quarantine, stage_lease.identity):
+                raise ValueError("fixed2 quarantine output identity changed after rename")
+            if images_observer_handle is not None:
+                if images_observer_identity is None:
+                    raise AssertionError(
+                        "fixed2 quarantine images observer identity is unavailable"
+                    )
+                if (
+                    _windows_directory_identity(images_observer_handle)
+                    != images_observer_identity
+                ):
+                    raise ValueError("fixed2 quarantine images observer changed")
+                images_lease = _reopen_windows_path_deny_delete_lease(
+                    quarantine / "images",
+                    expected_identity=images_observer_identity,
+                )
+                _windows_close(images_observer_handle)
+                images_observer_handle = None
+            elif images_lease is not None:
+                images_lease.path = quarantine / "images"
             if output.exists():
                 raise ValueError("failed fixed2 nominal output remained after quarantine")
             return quarantine
@@ -1722,10 +1811,32 @@ def _materialize_impl(
             expected_contract_identity=contract_identity,
         )
         require_inputs_unchanged("immediately-before-rename")
+        if stage_lease.windows_handle is not None:
+            if images_lease.windows_handle is None:
+                raise ValueError("fixed2 Windows images deny-delete lease is unavailable")
+            images_observer_identity = images_lease.identity
+            images_observer_handle = _open_windows_child_share_delete_observer(
+                stage_lease,
+                name="images",
+                expected_identity=images_observer_identity,
+            )
+            images_lease.close()
         _rename_no_replace(parent_lease, stage_lease, output)
         renamed = True
         stage_lease.path = output
-        images_lease.path = output / "images"
+        if images_observer_handle is not None:
+            if images_observer_identity is None:
+                raise AssertionError("fixed2 images observer identity is unavailable")
+            if not _same_directory_identity(output, stage_lease.identity):
+                raise ValueError("fixed2 nominal output identity changed after rename")
+            images_lease = _reopen_windows_path_deny_delete_lease(
+                output / "images",
+                expected_identity=images_observer_identity,
+            )
+            _windows_close(images_observer_handle)
+            images_observer_handle = None
+        else:
+            images_lease.path = output / "images"
         _require_lease(parent_lease)
         _require_lease(stage_lease)
         _require_lease(images_lease)
@@ -1771,6 +1882,8 @@ def _materialize_impl(
                 error.add_note(note)
         raise
     finally:
+        if images_observer_handle is not None:
+            _windows_close(images_observer_handle)
         if images_lease is not None:
             images_lease.close()
         if stage_lease is not None:
