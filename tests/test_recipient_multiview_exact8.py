@@ -603,6 +603,67 @@ def _formal_attempt_path(
     # Unit tests exercise the same descriptor-anchored lifecycle with POSIX
     # directory descriptors. Production run itself remains Windows-only.
     monkeypatch.setattr(exact8, "_require_formal_windows_output_anchor", lambda: None)
+
+    def require_fixture_acl_policy(
+        _handle: int,
+        *,
+        description: str,
+        required_mask: int | None,
+        required_flags: int,
+        forbidden_flags: int,
+        effective_denied_accesses: tuple[int, ...],
+    ) -> None:
+        child_mask = exact8._WINDOWS_DELETE | exact8._WINDOWS_FILE_DELETE_CHILD
+        child_flags = (
+            exact8._WINDOWS_OBJECT_INHERIT_ACE
+            | exact8._WINDOWS_CONTAINER_INHERIT_ACE
+        )
+        child_forbidden = (
+            exact8._WINDOWS_INHERITED_ACE
+            | exact8._WINDOWS_INHERIT_ONLY_ACE
+        )
+        if description == "exact8 ProgramData DACL":
+            assert required_mask is None
+            assert required_flags == 0
+            assert forbidden_flags == 0
+            assert effective_denied_accesses == ()
+            deny_aces: list[tuple[int, int]] = []
+        elif description in {
+            "exact8 ReceiptAI root DACL",
+            "exact8 attempt registry DACL",
+        }:
+            assert required_mask == child_mask
+            assert required_flags == child_flags
+            assert forbidden_flags == child_forbidden
+            assert effective_denied_accesses == (
+                exact8._WINDOWS_DELETE,
+                exact8._WINDOWS_FILE_DELETE_CHILD,
+            )
+            deny_aces = [(child_mask, child_flags)]
+        elif description == "exact8 attempt marker DACL":
+            assert required_mask == exact8._WINDOWS_DELETE
+            assert required_flags == exact8._WINDOWS_INHERITED_ACE
+            assert forbidden_flags == exact8._WINDOWS_INHERIT_ONLY_ACE
+            assert effective_denied_accesses == (exact8._WINDOWS_DELETE,)
+            deny_aces = [
+                (exact8._WINDOWS_DELETE, exact8._WINDOWS_INHERITED_ACE)
+            ]
+        else:
+            raise AssertionError(f"unexpected exact8 ACL fixture policy: {description}")
+        exact8._require_windows_acl_evidence(
+            description=description,
+            deny_aces=deny_aces,
+            required_mask=required_mask,
+            required_flags=required_flags,
+            forbidden_flags=forbidden_flags,
+            effective_access={access: False for access in effective_denied_accesses},
+        )
+
+    monkeypatch.setattr(
+        exact8,
+        "_require_windows_acl_policy",
+        require_fixture_acl_policy,
+    )
     return registry / f"{inspection['attempt_id']}.attempt.json"
 
 
@@ -2099,7 +2160,9 @@ def test_registry_acl_failure_precedes_attempt_create_new(
     monkeypatch.setattr(
         exact8,
         "_require_attempt_registry_acl",
-        lambda _lease: (_ for _ in ()).throw(ValueError("registry DACL rejected")),
+        lambda _lease: (_ for _ in ()).throw(
+            ValueError("exact8 attempt registry DACL rejected")
+        ),
     )
     monkeypatch.setattr(
         exact8,
@@ -2107,7 +2170,7 @@ def test_registry_acl_failure_precedes_attempt_create_new(
         lambda path, _payload: created.append(path),
     )
 
-    with pytest.raises(ValueError, match="registry DACL rejected"):
+    with pytest.raises(ValueError, match="exact8 attempt registry DACL rejected"):
         exact8._consume_attempt(
             attempt,
             inspection=inspection,
@@ -2169,7 +2232,9 @@ def test_marker_acl_failure_after_create_new_retains_consumed_marker(
     monkeypatch.setattr(
         exact8,
         "_require_attempt_marker_acl",
-        lambda _handle: (_ for _ in ()).throw(ValueError("marker inherited deny missing")),
+        lambda _handle: (_ for _ in ()).throw(
+            ValueError("exact8 attempt marker DACL inherited deny missing")
+        ),
     )
     monkeypatch.setattr(
         exact8,
@@ -2177,7 +2242,10 @@ def test_marker_acl_failure_after_create_new_retains_consumed_marker(
         lambda handle: closed.append(handle),
     )
 
-    with pytest.raises(ValueError, match="marker inherited deny missing"):
+    with pytest.raises(
+        ValueError,
+        match="exact8 attempt marker DACL inherited deny missing",
+    ):
         exact8._create_attempt_file_lease(marker, b"consumed\n")
     assert payload_written == [b"consumed\n"]
     assert marker.read_bytes() == b"consumed\n"
@@ -2899,14 +2967,17 @@ def test_python_run_marker_acl_failure_consumes_marker_before_output(
 
     def create_then_reject(path: Path, payload: bytes) -> None:
         path.write_bytes(payload)
-        raise ValueError("marker inherited deny missing")
+        raise ValueError("exact8 attempt marker DACL inherited deny missing")
 
     monkeypatch.setattr(
         exact8,
         "_create_attempt_file_lease",
         create_then_reject,
     )
-    with pytest.raises(ValueError, match="marker inherited deny missing"):
+    with pytest.raises(
+        ValueError,
+        match="exact8 attempt marker DACL inherited deny missing",
+    ):
         exact8.run_exact8(
             full_records=tmp_path / "unused-full",
             original_dataset_root=tmp_path / "unused-dataset",

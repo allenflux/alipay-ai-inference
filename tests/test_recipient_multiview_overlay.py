@@ -272,6 +272,9 @@ def _materialize_formal_windows_mock(
 ) -> tuple[dict[str, object], dict[str, object], list[str]]:
     fixture = _fixture(tmp_path)
     created_names: list[str] = []
+    native_windows_atomic_create = (
+        overlay_module.create_anchored_stage_directory
+    )
 
     def simulated_windows_atomic_create(
         parent: object,
@@ -279,6 +282,8 @@ def _materialize_formal_windows_mock(
         name: str,
     ) -> object:
         created_names.append(name)
+        if getattr(parent, "windows_handle", None) is not None:
+            return native_windows_atomic_create(parent, name=name)
         return overlay_module._create_stage_lease(
             parent,
             stage=parent.path / name,

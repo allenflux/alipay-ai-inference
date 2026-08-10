@@ -1710,9 +1710,13 @@ def test_fixed_json_swap_read_restore_never_reopens_the_path(
 
     def freeze_then_swap(paths, **kwargs):
         frozen = original_freeze(paths, **kwargs)
-        for name in names:
+        for index, name in enumerate(names):
             path = paths[name]
-            held = path.with_name(f"{path.name}.{name}.held")
+            # Keep the injected sibling name compact.  In particular, the
+            # 64-hex attempt marker already sits below a deep pytest/ProgramData
+            # fixture path and appending its original leaf can cross legacy
+            # Win32 MAX_PATH even though the production artifact is valid.
+            held = path.with_name(f".swap-held-{index}")
             path.rename(held)
             path.write_bytes(
                 held.read_bytes() if same_bytes else b"{malicious-path-json"
