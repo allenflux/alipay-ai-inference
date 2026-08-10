@@ -117,7 +117,7 @@ EXPECTED_RUN_ARTIFACT_PINS: dict[str, dict[str, int | str]] = {
     },
     "training_labels": {
         "size_bytes": 68944,
-        "sha256": "f5f0c26b20dba7e848a63d98b204e6125fd7e2c9f7f1dec5bff94a93ffa5123f",
+        "sha256": "f5f0c26b26dba7e848a63d98b204e6125fd7e2c9f71d1ec5bff94a93ffa5123f",
     },
     "training_recipe": {
         "size_bytes": 1213,

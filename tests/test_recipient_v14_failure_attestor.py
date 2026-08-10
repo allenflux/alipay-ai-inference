@@ -2038,7 +2038,7 @@ def test_real_failed_run_artifact_pins_are_exactly_frozen() -> None:
         },
         "training_labels": {
             "size_bytes": 68944,
-            "sha256": "f5f0c26b20dba7e848a63d98b204e6125fd7e2c9f7f1dec5bff94a93ffa5123f",
+            "sha256": "f5f0c26b26dba7e848a63d98b204e6125fd7e2c9f71d1ec5bff94a93ffa5123f",
         },
         "training_recipe": {
             "size_bytes": 1213,
@@ -2077,6 +2077,11 @@ def test_real_training_summary_pin_uses_windows_frozen_byte_length() -> None:
 @pytest.mark.parametrize(
     ("name", "windows_sha256", "transcription_typo"),
     [
+        (
+            "training_labels",
+            "f5f0c26b26dba7e848a63d98b204e6125fd7e2c9f71d1ec5bff94a93ffa5123f",
+            "f5f0c26b20dba7e848a63d98b204e6125fd7e2c9f7f1dec5bff94a93ffa5123f",
+        ),
         (
             "blind_contract",
             "bc103913e77e35a4a54ac302ea7ce3bc7bca688f50ab8e6e3bc090b488f0d4d0",
