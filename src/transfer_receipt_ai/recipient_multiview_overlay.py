@@ -30,6 +30,22 @@ from PIL import Image
 from .ocr_pseudolabels import _crop_digest
 from .ocr_unified_dataset import RECIPIENT_QUALITY_POLICY_VERSION
 from .recipient_blind_manifest import KIND as BLIND_CONTRACT_KIND
+from .recipient_fixed2_teacher_export import (
+    ADAPTER_MARKER as FIXED2_SOURCE_ADAPTER_MARKER,
+    ANALYSIS_CONTRACT_NAME as FIXED2_SOURCE_ANALYSIS_CONTRACT_NAME,
+    ANALYSIS_KIND as FIXED2_SOURCE_ANALYSIS_KIND,
+    ANALYSIS_PUBLICATION_AUTHORITY as FIXED2_SOURCE_ANALYSIS_PUBLICATION_AUTHORITY,
+    ANALYSIS_RECORD_KIND as FIXED2_SOURCE_ANALYSIS_RECORD_KIND,
+    CONTRACT_NAME as FIXED2_SOURCE_CONTRACT_NAME,
+    HARD_ATTESTATION_SCHEME as FIXED2_SOURCE_HARD_ATTESTATION_SCHEME,
+    KIND as FIXED2_SOURCE_KIND,
+    MANIFEST_NAME as FIXED2_SOURCE_MANIFEST_NAME,
+    PUBLICATION_AUTHORITY as FIXED2_SOURCE_PUBLICATION_AUTHORITY,
+    RECORD_KIND as FIXED2_SOURCE_RECORD_KIND,
+    VIEWS as FIXED2_SOURCE_VIEWS,
+    _verify_recipient_fixed2_teacher_analysis_test_only,
+    verify_recipient_fixed2_teacher,
+)
 from .recipient_multiview_teacher_export import (
     KIND as EXPORT_CONTRACT_KIND,
     RECORD_KIND as EXPORT_RECORD_KIND,
@@ -61,6 +77,8 @@ EXPECTED_ADAPTER_MARKER = "strict_recipient_multiview_overlay_loader_not_impleme
 _HEX = frozenset("0123456789abcdef")
 _CODE_ARTIFACT_FILES = {
     "consumer_code": "recipient_multiview_overlay.py",
+    "fixed2_producer_code": "recipient_fixed2_teacher_export.py",
+    "fixed2_attestation_code": "recipient_fixed2_teacher_attestation.py",
     "producer_code": "recipient_multiview_teacher_export.py",
     "geometry_helper_code": "geometry.py",
     "ocr_helper_code": "ocr.py",
@@ -85,6 +103,29 @@ _SEMANTIC_ARTIFACT_NAMES = _DATA_ARTIFACT_NAMES - {
     "composite_records",
     "composite_dataset_contract",
 }
+_SUBJECT_SEMANTIC_ARTIFACT_NAMES = _SEMANTIC_ARTIFACT_NAMES - {
+    # These two files are strict integrity artifacts, but their producer
+    # publication identity and PNG encoding are intentionally not semantic
+    # route identity.  The producer's path-free subject and manifest closure
+    # are bound separately below.
+    "multiview_export_contract",
+    "multiview_export_manifest",
+    "source_dataset_contract",
+}
+_SOURCE_DATASET_OPTIONAL_ABI_FIELDS = (
+    "architecture",
+    "recipient_target",
+    "recipient_charset",
+    "recipient_charset_sha256",
+    "recipient_oov_by_split",
+    "status_text_target",
+    "status_text_charset",
+    "status_text_charset_sha256",
+    "status_text_charset_source",
+    "status_text_source_counts",
+    "status_text_missing_reasons",
+    "status_text_oov_by_split",
+)
 _WINDOWS_FILE_SHARE_READ = 0x00000001
 _WINDOWS_FILE_SHARE_WRITE = 0x00000002
 _WINDOWS_FILE_SHARE_DELETE = 0x00000004
@@ -1471,6 +1512,116 @@ def _verify_source_dataset_contract(
     return contract
 
 
+def _source_dataset_contract_semantic_payload(
+    contract: Mapping[str, Any],
+) -> dict[str, object]:
+    """Normalize the path-free source ABI copied into the fixed2 dataset."""
+
+    required = {
+        "schema_version",
+        "kind",
+        "slot_order",
+        "status_classes",
+        "recipient_charset_source",
+        "recipient_quality_policy",
+    }
+    missing = sorted(required - set(contract))
+    if missing:
+        raise ValueError(
+            "source dataset contract lacks semantic ABI fields: "
+            + ",".join(missing)
+        )
+
+    def string_list(value: object, *, description: str) -> list[str]:
+        if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+            raise ValueError(f"{description} must be a string array")
+        normalized = list(value)
+        if any(not isinstance(item, str) or not item for item in normalized):
+            raise ValueError(f"{description} must contain non-empty strings")
+        if len(set(normalized)) != len(normalized):
+            raise ValueError(f"{description} contains duplicates")
+        return normalized
+
+    schema = contract.get("schema_version")
+    kind = contract.get("kind")
+    if isinstance(schema, bool) or not isinstance(schema, int):
+        raise ValueError("source dataset schema ABI must be an integer")
+    if not isinstance(kind, str) or kind not in SUPPORTED_UNIFIED_KINDS:
+        raise ValueError("source dataset kind ABI is unsupported")
+    recipient_source = contract.get("recipient_charset_source")
+    if recipient_source != "train_only_anchored_recipient_value":
+        raise ValueError("source dataset recipient charset authority changed")
+    quality = _mapping(
+        contract.get("recipient_quality_policy"),
+        description="source dataset recipient quality ABI",
+    )
+    if set(quality) != {
+        "version",
+        "requires_leading_recipient_label",
+        "target",
+    }:
+        raise ValueError("source dataset recipient quality ABI key set changed")
+    _expect(
+        quality.get("version"),
+        RECIPIENT_QUALITY_POLICY_VERSION,
+        description="source dataset recipient quality ABI version",
+    )
+    _expect(
+        quality.get("requires_leading_recipient_label"),
+        True,
+        description="source dataset recipient quality ABI anchor",
+    )
+    _expect(
+        quality.get("target"),
+        "anchored_recipient_value",
+        description="source dataset recipient quality ABI target",
+    )
+    optional: dict[str, object] = {}
+    for key in _SOURCE_DATASET_OPTIONAL_ABI_FIELDS:
+        if key not in contract:
+            continue
+        value = contract[key]
+        if key in {"recipient_charset", "status_text_charset"}:
+            optional[key] = string_list(value, description=f"source dataset {key}")
+        elif key in {"recipient_charset_sha256", "status_text_charset_sha256"}:
+            optional[key] = _require_sha(value, description=f"source dataset {key}")
+        elif key in {
+            "recipient_oov_by_split",
+            "status_text_source_counts",
+            "status_text_missing_reasons",
+            "status_text_oov_by_split",
+        }:
+            optional[key] = dict(
+                _mapping(value, description=f"source dataset {key}")
+            )
+        else:
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"source dataset {key} must be a non-empty string")
+            optional[key] = value
+    return {
+        "domain": "receipt-recipient-fixed2-source-dataset-abi-v1",
+        "schema_version": schema,
+        "kind": kind,
+        "slot_order": string_list(
+            contract.get("slot_order"), description="source dataset slot_order"
+        ),
+        "status_classes": string_list(
+            contract.get("status_classes"),
+            description="source dataset status_classes",
+        ),
+        "recipient_charset_source": recipient_source,
+        "recipient_quality_policy": dict(quality),
+        "present_optional_fields": sorted(optional),
+        "optional_fields": optional,
+    }
+
+
+def _source_dataset_contract_semantic_sha256(
+    contract: Mapping[str, Any],
+) -> str:
+    return _canonical_sha256(_source_dataset_contract_semantic_payload(contract))
+
+
 def _rounded_bbox(value: object, *, description: str) -> list[float]:
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes)) or len(value) != 4:
         raise ValueError(f"{description} must contain four coordinates")
@@ -1494,14 +1645,19 @@ def _verify_overlay_rows(
     export_root: Path,
     blind_sha256: str,
     recipients: Mapping[str, Mapping[str, object]],
+    expected_views: Sequence[str] = VIEWS,
+    expected_record_kind: str = EXPORT_RECORD_KIND,
 ) -> tuple[dict[str, dict[str, object]], list[dict[str, object]], list[str]]:
+    expected_views = tuple(expected_views)
+    if not expected_views or len(set(expected_views)) != len(expected_views):
+        raise ValueError("overlay expected view profile is invalid")
     by_source: dict[str, dict[str, Mapping[str, Any]]] = {}
     ids: set[str] = set()
     image_bindings: list[dict[str, object]] = []
     source_artifacts: dict[str, dict[str, object]] = {}
     generated_hash_owners: dict[str, _GeneratedViewOwner] = {}
     for row_number, row in enumerate(rows, start=1):
-        if row.get("schema_version") != SCHEMA_VERSION or row.get("kind") != EXPORT_RECORD_KIND:
+        if row.get("schema_version") != SCHEMA_VERSION or row.get("kind") != expected_record_kind:
             raise ValueError(f"overlay row {row_number} kind/schema changed")
         row_id = row.get("id")
         source_id = row.get("source_record_id")
@@ -1511,7 +1667,7 @@ def _verify_overlay_rows(
         ids.add(row_id)
         if not isinstance(source_id, str) or source_id not in recipients:
             raise ValueError(f"overlay row {row_number} is extra or is not a blind train recipient")
-        if view not in VIEWS:
+        if view not in expected_views:
             raise ValueError(f"overlay row {row_number} has an unsupported view")
         views = by_source.setdefault(source_id, {})
         if str(view) in views:
@@ -1527,7 +1683,7 @@ def _verify_overlay_rows(
             ("target_source_manifest_sha256", blind_sha256),
             ("optimizer_supervision_split_eligible", True),
             ("optimizer_consumable", False),
-            ("group_view_count", len(VIEWS)),
+            ("group_view_count", len(expected_views)),
             ("paddle_crop_pixel_sha256", blind["crop_pixel_sha256"]),
             ("source_sha256", blind["source_sha256"]),
             ("result_json_sha256", blind["result_json_sha256"]),
@@ -1618,10 +1774,13 @@ def _verify_overlay_rows(
     }
     for source_id in sorted(recipients):
         views = by_source[source_id]
-        if set(views) != set(VIEWS):
-            raise ValueError(f"overlay recipient {source_id!r} does not have exactly four views")
+        if set(views) != set(expected_views):
+            raise ValueError(
+                f"overlay recipient {source_id!r} does not have exactly "
+                f"{len(expected_views)} expected views"
+            )
         blind = recipients[source_id]
-        ordered = [views[view] for view in VIEWS]
+        ordered = [views[view] for view in expected_views]
         closure_payload = {
             "source_record_id": source_id,
             "source_group_id": blind["group_id"],
@@ -1636,7 +1795,7 @@ def _verify_overlay_rows(
                     "pixel_sha256": image_by_key[(source_id, view)]["pixel_sha256"],
                     "file_sha256": image_by_key[(source_id, view)]["file_sha256"],
                 }
-                for view in VIEWS
+                for view in expected_views
             ],
         }
         closure = _canonical_sha256(closure_payload)
@@ -1662,14 +1821,19 @@ def _verify_overlay_rows(
                     "width": image_by_key[(source_id, view)]["width"],
                     "height": image_by_key[(source_id, view)]["height"],
                 }
-                for view in VIEWS
+                for view in expected_views
             },
         }
     source_binding_rows = [
         {"source_record_id": source_id, **source_artifacts[source_id]}
         for source_id in sorted(source_artifacts)
     ]
-    image_bindings.sort(key=lambda item: (str(item["source_record_id"]), VIEWS.index(str(item["view"]))))
+    image_bindings.sort(
+        key=lambda item: (
+            str(item["source_record_id"]),
+            expected_views.index(str(item["view"])),
+        )
+    )
     return attachments, image_bindings + source_binding_rows, closure_ids
 
 
@@ -1786,6 +1950,251 @@ def verify_recipient_multiview_overlay(
         "post_training_full_reverification_required": True,
     }
     return RecipientMultiviewOverlayVerification(policy=policy, attachments=attachments)
+
+
+def _verify_fixed2_teacher_overlay_source(
+    *,
+    blind_manifest: Path,
+    blind_contract: Path,
+    export_root: Path,
+    dataset_root: Path,
+    formal_windows_source: bool,
+) -> RecipientMultiviewOverlayVerification:
+    """Independently reopen the dedicated two-view producer for fixed2 only.
+
+    The legacy four-view verifier above remains available for diagnostics, but
+    is deliberately not an accepted input to the canonical fixed2
+    materializer.  Formal overlay publication accepts only the formal Windows
+    producer profile; the private analysis fixture accepts only the producer's
+    analysis profile.
+    """
+
+    blind_manifest = _existing(
+        blind_manifest, directory=False, description="fixed2 blind manifest"
+    )
+    blind_contract = _existing(
+        blind_contract, directory=False, description="fixed2 blind contract"
+    )
+    export_root = _existing(
+        export_root, directory=True, description="fixed2 teacher export root"
+    )
+    dataset_root = _existing(
+        dataset_root, directory=True, description="fixed2 base dataset root"
+    )
+    export_contract = (
+        verify_recipient_fixed2_teacher(export_root=export_root)
+        if formal_windows_source
+        else _verify_recipient_fixed2_teacher_analysis_test_only(
+            export_root=export_root
+        )
+    )
+    expected_kind = FIXED2_SOURCE_KIND if formal_windows_source else FIXED2_SOURCE_ANALYSIS_KIND
+    expected_record_kind = (
+        FIXED2_SOURCE_RECORD_KIND
+        if formal_windows_source
+        else FIXED2_SOURCE_ANALYSIS_RECORD_KIND
+    )
+    expected_contract_marker = (
+        FIXED2_SOURCE_CONTRACT_NAME
+        if formal_windows_source
+        else FIXED2_SOURCE_ANALYSIS_CONTRACT_NAME
+    )
+    expected_authority = (
+        FIXED2_SOURCE_PUBLICATION_AUTHORITY
+        if formal_windows_source
+        else FIXED2_SOURCE_ANALYSIS_PUBLICATION_AUTHORITY
+    )
+    for key, expected in (
+        ("schema_version", SCHEMA_VERSION),
+        ("kind", expected_kind),
+        ("record_kind", expected_record_kind),
+        ("publication_authority", expected_authority),
+        (
+            "hard_attestation_scheme",
+            FIXED2_SOURCE_HARD_ATTESTATION_SCHEME
+            if formal_windows_source
+            else None,
+        ),
+        (
+            "public_verification_requires_hard_attestation",
+            formal_windows_source,
+        ),
+        ("optimizer_input_ready", False),
+        ("records_role", "recipient_fixed2_overlay_source_only"),
+        ("optimizer_adapter_required", FIXED2_SOURCE_ADAPTER_MARKER),
+        ("view_order", list(FIXED2_SOURCE_VIEWS)),
+        ("train_manifest", FIXED2_SOURCE_MANIFEST_NAME),
+        ("commit_marker", expected_contract_marker),
+        ("publication_complete", True),
+        ("production_route_authorized", False),
+        ("held_out_target_values_used", False),
+        ("held_out_target_values_validated", False),
+        ("held_out_target_values_emitted", False),
+    ):
+        _expect(
+            export_contract.get(key),
+            expected,
+            description=f"fixed2 teacher contract {key}",
+        )
+    bound_manifest = _absolute_file(
+        export_contract.get("source_manifest"),
+        description="fixed2 teacher source blind manifest",
+    )
+    _samefile(
+        bound_manifest,
+        blind_manifest,
+        description="fixed2 teacher source blind manifest",
+    )
+    _expect(
+        export_contract.get("source_manifest_sha256"),
+        _sha256(blind_manifest),
+        description="fixed2 teacher source blind manifest SHA-256",
+    )
+    bound_root = _existing(
+        Path(str(export_contract.get("source_dataset_root"))),
+        directory=True,
+        description="fixed2 teacher source dataset root",
+    )
+    _samefile(bound_root, dataset_root, description="fixed2 teacher dataset root")
+    source_dataset_contract = _absolute_file(
+        export_contract.get("source_dataset_contract"),
+        description="fixed2 teacher source dataset contract",
+    )
+    source_contract = _verify_source_dataset_contract(
+        source_dataset_contract,
+        expected_kind=export_contract.get("source_dataset_kind"),
+        expected_dataset_root=dataset_root,
+    )
+    source_dataset_contract_semantic_sha256 = (
+        _source_dataset_contract_semantic_sha256(source_contract)
+    )
+    recipients, split_counts, recipient_counts, base_bindings = _blind_recipient_rows(
+        blind_manifest=blind_manifest,
+        dataset_root=dataset_root,
+    )
+    _blind, full_manifest = _verify_blind_contract(
+        blind_manifest=blind_manifest,
+        blind_contract=blind_contract,
+        split_counts=split_counts,
+    )
+    source_counts = _mapping(
+        export_contract.get("source_manifest_split_counts"),
+        description="fixed2 teacher source split counts",
+    )
+    recipient_source_counts = _mapping(
+        export_contract.get("source_split_counts"),
+        description="fixed2 teacher recipient split counts",
+    )
+    for split in ("train", "val"):
+        _expect(
+            source_counts.get(split),
+            int(split_counts[split]),
+            description=f"fixed2 teacher {split} source count",
+        )
+        _expect(
+            recipient_source_counts.get(split),
+            int(recipient_counts[split]),
+            description=f"fixed2 teacher {split} recipient count",
+        )
+    for split in ("test", "formal"):
+        _expect(
+            source_counts.get(split),
+            0,
+            description=f"fixed2 teacher excluded {split} source count",
+        )
+        _expect(
+            recipient_source_counts.get(split),
+            0,
+            description=f"fixed2 teacher excluded {split} recipient count",
+        )
+    _expect(
+        export_contract.get("source_train_recipient_records"),
+        len(recipients),
+        description="fixed2 teacher train recipient count",
+    )
+    _expect(
+        export_contract.get("output_records"),
+        len(recipients) * len(FIXED2_SOURCE_VIEWS),
+        description="fixed2 teacher output count",
+    )
+    view_counts = _mapping(
+        export_contract.get("view_counts"),
+        description="fixed2 teacher view counts",
+    )
+    for view in FIXED2_SOURCE_VIEWS:
+        _expect(
+            view_counts.get(view),
+            len(recipients),
+            description=f"fixed2 teacher {view} count",
+        )
+    export_manifest = _existing(
+        export_root / FIXED2_SOURCE_MANIFEST_NAME,
+        directory=False,
+        description="fixed2 teacher manifest",
+    )
+    rows = _strict_jsonl(export_manifest)
+    # This is a second, consumer-owned decoded-pixel -> blind-owner closure.
+    # It does not trust the producer's zero-conflict summary or subject seal.
+    attachments, overlay_bindings, closure_ids = _verify_overlay_rows(
+        rows=rows,
+        export_root=export_root,
+        blind_sha256=_sha256(blind_manifest),
+        recipients=recipients,
+        expected_views=FIXED2_SOURCE_VIEWS,
+        expected_record_kind=expected_record_kind,
+    )
+    bindings = {
+        "blind_manifest": _binding(blind_manifest),
+        "blind_contract": _binding(blind_contract),
+        "full_manifest": _binding(full_manifest),
+        "export_contract": _binding(export_root / expected_contract_marker),
+        "export_manifest": _binding(export_manifest),
+        "source_dataset_contract": _binding(source_dataset_contract),
+    }
+    policy: dict[str, object] = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": CONSUMER_KIND,
+        "analysis_only": True,
+        "production_route_authorized": False,
+        "producer_kind": expected_kind,
+        "producer_publication_authority": expected_authority,
+        "producer_optimizer_input_ready": False,
+        "consumer_optimizer_input_ready": True,
+        "producer_adapter_marker": FIXED2_SOURCE_ADAPTER_MARKER,
+        "optimizer_supervision_splits": ["train"],
+        "validation_records_modified": False,
+        "train_records_expanded": False,
+        "recipient_value_left_trim": 0.0,
+        "bindings": bindings,
+        "dataset_root": str(dataset_root),
+        "source_dataset_kind": source_contract["kind"],
+        "source_dataset_contract_semantic_sha256": (
+            source_dataset_contract_semantic_sha256
+        ),
+        "producer_subject_id": export_contract["producer_subject_id"],
+        "producer_manifest_semantic_sha256": export_contract[
+            "source_manifest_semantic_sha256"
+        ],
+        "counts": {
+            "blind_train_records": int(split_counts["train"]),
+            "blind_val_records": int(split_counts["val"]),
+            "blind_train_recipient_records": len(recipients),
+            "overlay_records": len(rows),
+            "views_per_train_recipient": len(FIXED2_SOURCE_VIEWS),
+            "attached_train_records": len(attachments),
+            "attached_val_records": 0,
+        },
+        "view_order": list(FIXED2_SOURCE_VIEWS),
+        "view_counts": {view: len(recipients) for view in FIXED2_SOURCE_VIEWS},
+        "base_recipient_bindings_sha256": _canonical_sha256(base_bindings),
+        "overlay_artifact_bindings_sha256": _canonical_sha256(overlay_bindings),
+        "group_closure_set_sha256": _canonical_sha256(sorted(closure_ids)),
+        "post_training_full_reverification_required": True,
+    }
+    return RecipientMultiviewOverlayVerification(
+        policy=policy,
+        attachments=attachments,
+    )
 
 
 def attach_recipient_multiview_overlay(
@@ -2532,6 +2941,9 @@ def _fixed2_contract_payload(
     composite_records_path: Path,
     composite_dataset_contract_path: Path,
     composite_dataset_root: Path,
+    producer_subject_id: str,
+    producer_manifest_semantic_sha256: str,
+    source_dataset_contract_semantic_sha256: str,
     selector_evidence: Mapping[str, object],
     selected_composite_bindings: Sequence[Mapping[str, object]],
     validation_pixel_bindings: Sequence[Mapping[str, object]],
@@ -2555,7 +2967,7 @@ def _fixed2_contract_payload(
         raise ValueError("fixed2 contract artifact closure is incomplete")
     semantic_artifacts = {
         name: _binding_identity(artifacts[name])
-        for name in sorted(_SEMANTIC_ARTIFACT_NAMES)
+        for name in sorted(_SUBJECT_SEMANTIC_ARTIFACT_NAMES)
     }
     code_artifacts = {
         name: _binding_identity(artifacts[name])
@@ -2568,6 +2980,22 @@ def _fixed2_contract_payload(
         validation_pixel_bindings
     )
     selected_composite_closure_sha256 = _canonical_sha256(selected_bindings)
+    selected_composite_semantic = [
+        {
+            "record_id": binding["record_id"],
+            "group_id": binding["group_id"],
+            "split": binding["split"],
+            "target_sha256": hashlib.sha256(
+                str(binding["target"]).encode("utf-8")
+            ).hexdigest(),
+            "view": binding["view"],
+            "pixel_sha256": binding["pixel_sha256"],
+        }
+        for binding in selected_bindings
+    ]
+    selected_composite_semantic_closure_sha256 = _canonical_sha256(
+        selected_composite_semantic
+    )
     validation_pixel_semantic = [
         {
             "record_id": binding["record_id"],
@@ -2581,13 +3009,40 @@ def _fixed2_contract_payload(
     validation_pixel_semantic_sha256 = _canonical_sha256(
         validation_pixel_semantic
     )
+    producer_subject_id = _require_sha(
+        producer_subject_id,
+        description="fixed2 producer semantic subject",
+    )
+    producer_manifest_semantic_sha256 = _require_sha(
+        producer_manifest_semantic_sha256,
+        description="fixed2 producer manifest semantic closure",
+    )
+    source_dataset_contract_semantic_sha256 = _require_sha(
+        source_dataset_contract_semantic_sha256,
+        description="fixed2 source dataset semantic ABI closure",
+    )
+    # The raw blind-manifest digest remains sealed in selector evidence and
+    # artifacts for integrity.  Subject identity binds the path-free selector
+    # result instead, so relocating/re-publishing equal producer semantics
+    # cannot mint another route or one-shot attempt.
+    selector_subject = {
+        key: value
+        for key, value in selector_evidence.items()
+        if key != "bound_blind_manifest_sha256"
+    }
     subject_material = {
         "domain": "receipt-recipient-fixed2-overlay-subject-v1",
-        "kind": contract_kind,
         "selected_views": list(FIXED2_VIEWS),
-        "selector": dict(selector_evidence),
+        "selector": selector_subject,
+        "producer_subject_id": producer_subject_id,
+        "producer_manifest_semantic_sha256": producer_manifest_semantic_sha256,
+        "source_dataset_contract_semantic_sha256": (
+            source_dataset_contract_semantic_sha256
+        ),
         "semantic_artifacts": semantic_artifacts,
-        "selected_composite_closure_sha256": selected_composite_closure_sha256,
+        "selected_composite_semantic_closure_sha256": (
+            selected_composite_semantic_closure_sha256
+        ),
         "validation_pixel_semantic_sha256": validation_pixel_semantic_sha256,
     }
     overlay_subject_id = _canonical_sha256(subject_material)
@@ -2614,14 +3069,22 @@ def _fixed2_contract_payload(
         "composite_dataset_contract": str(composite_dataset_contract_path),
         "composite_dataset_root": str(composite_dataset_root),
         "overlay_subject_id": overlay_subject_id,
+        "producer_subject_id": producer_subject_id,
+        "producer_manifest_semantic_sha256": producer_manifest_semantic_sha256,
+        "source_dataset_contract_semantic_sha256": (
+            source_dataset_contract_semantic_sha256
+        ),
         "selected_composite_bindings": selected_bindings,
         "selected_composite_closure_sha256": selected_composite_closure_sha256,
+        "selected_composite_semantic_closure_sha256": (
+            selected_composite_semantic_closure_sha256
+        ),
         "validation_pixel_bindings": validation_bindings,
         "validation_pixel_semantic_sha256": validation_pixel_semantic_sha256,
         "validation_file_integrity_sha256": _canonical_sha256(validation_bindings),
         "validation_slot_count": len(validation_bindings),
         "test_physical_files_opened": 0,
-        "semantic_artifact_names": sorted(_SEMANTIC_ARTIFACT_NAMES),
+        "semantic_artifact_names": sorted(_SUBJECT_SEMANTIC_ARTIFACT_NAMES),
         "code_artifact_names": sorted(_CODE_ARTIFACT_FILES),
         "code_closure_sha256": _canonical_sha256(code_artifacts),
         "artifacts": {name: dict(binding) for name, binding in artifacts.items()},
@@ -2684,12 +3147,12 @@ def _materialize_fixed2_overlay_impl(
     )
     if composite_dataset_root == Path(composite_dataset_root.anchor):
         raise ValueError("common composite dataset root must not be a filesystem root")
-    verification = verify_recipient_multiview_overlay(
+    verification = _verify_fixed2_teacher_overlay_source(
         blind_manifest=blind_records,
         blind_contract=blind_contract,
         export_root=multiview_root,
         dataset_root=original_dataset_root,
-        seed=0,
+        formal_windows_source=formal_windows_publication,
     )
     bound_full = Path(
         str(_mapping(verification.policy["bindings"], description="overlay bindings")["full_manifest"]["path"])
@@ -2804,7 +3267,11 @@ def _materialize_fixed2_overlay_impl(
         ):
             raise ValueError("fixed2 dataset contract changed after anchored write")
         require_parent("after_composite_dataset_contract_snapshot")
-        export_contract_path = multiview_root / "dataset.contract.json"
+        export_contract_path = multiview_root / (
+            FIXED2_SOURCE_CONTRACT_NAME
+            if formal_windows_publication
+            else FIXED2_SOURCE_ANALYSIS_CONTRACT_NAME
+        )
         export_manifest_path = multiview_root / "multiview_train.jsonl"
         artifacts: dict[str, dict[str, object]] = {
             "full_records": _binding(full_records),
@@ -2846,6 +3313,17 @@ def _materialize_fixed2_overlay_impl(
             composite_records_path=final_records,
             composite_dataset_contract_path=final_dataset_contract,
             composite_dataset_root=composite_dataset_root,
+            producer_subject_id=str(
+                verification.policy["producer_subject_id"]
+            ),
+            producer_manifest_semantic_sha256=str(
+                verification.policy["producer_manifest_semantic_sha256"]
+            ),
+            source_dataset_contract_semantic_sha256=str(
+                verification.policy[
+                    "source_dataset_contract_semantic_sha256"
+                ]
+            ),
             selector_evidence=selector_evidence,
             selected_composite_bindings=selected_composite_bindings,
             validation_pixel_bindings=validation_pixel_bindings,
@@ -3135,12 +3613,12 @@ def _verify_fixed2_overlay_payload(
         description="recomputed common dataset root",
     )
     _samefile(common_root, recomputed_common, description="fixed2 common dataset root")
-    verification = verify_recipient_multiview_overlay(
+    verification = _verify_fixed2_teacher_overlay_source(
         blind_manifest=blind_records,
         blind_contract=blind_contract,
         export_root=multiview_root,
         dataset_root=bound_original_root,
-        seed=0,
+        formal_windows_source=formal_publication,
     )
     bindings = _mapping(verification.policy["bindings"], description="verified overlay bindings")
     bound_full = _absolute_file(
@@ -3225,11 +3703,16 @@ def _verify_fixed2_overlay_payload(
     )
     if composite_dataset_contract.read_bytes() != _json_bytes(expected_dataset_contract):
         raise ValueError("fixed2 composite dataset contract changed")
+    producer_contract_name = (
+        FIXED2_SOURCE_CONTRACT_NAME
+        if formal_publication
+        else FIXED2_SOURCE_ANALYSIS_CONTRACT_NAME
+    )
     expected_paths = {
         "full_records": bound_full,
         "blind_records": blind_records,
         "blind_contract": blind_contract,
-        "multiview_export_contract": multiview_root / "dataset.contract.json",
+        "multiview_export_contract": multiview_root / producer_contract_name,
         "multiview_export_manifest": multiview_root / "multiview_train.jsonl",
         "source_dataset_contract": source_contract_path,
         "composite_records": declared_composite_records,
@@ -3276,6 +3759,13 @@ def _verify_fixed2_overlay_payload(
         composite_records_path=declared_composite_records,
         composite_dataset_contract_path=declared_dataset_contract,
         composite_dataset_root=common_root,
+        producer_subject_id=str(verification.policy["producer_subject_id"]),
+        producer_manifest_semantic_sha256=str(
+            verification.policy["producer_manifest_semantic_sha256"]
+        ),
+        source_dataset_contract_semantic_sha256=str(
+            verification.policy["source_dataset_contract_semantic_sha256"]
+        ),
         selector_evidence=selector_evidence,
         selected_composite_bindings=selected_composite_bindings,
         validation_pixel_bindings=validation_pixel_bindings,

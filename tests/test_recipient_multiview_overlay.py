@@ -24,7 +24,14 @@ from transfer_receipt_ai.ocr_unified_dataset import (
 )
 from transfer_receipt_ai.pipeline import crop_field_with_margin
 from transfer_receipt_ai.recipient_blind_manifest import build_blind_manifest
+from transfer_receipt_ai.recipient_fixed2_teacher_export import (
+    _materialize_recipient_fixed2_teacher_analysis_test_only,
+    inspect_recipient_fixed2_teacher_attestation_candidate,
+    materialize_recipient_fixed2_teacher,
+)
+import transfer_receipt_ai.recipient_fixed2_teacher_attestation as fixed2_attestation
 import transfer_receipt_ai.recipient_multiview_overlay as overlay_module
+import transfer_receipt_ai.recipient_multiview_exact8 as exact8_module
 from transfer_receipt_ai.recipient_multiview_overlay import (
     FIXED2_ANALYSIS_CONTRACT_KIND,
     FIXED2_ANALYSIS_MARKER_NAME,
@@ -218,7 +225,9 @@ def _fixture(
                 "architecture": "v12",
                 "recipient_target": "anchored_recipient_value_with_dedicated_high_resolution_value_view",
                 "recipient_charset": sorted(set("商户甲乙验证")),
-                "recipient_charset_sha256": "unused-by-loader",
+                "recipient_charset_sha256": hashlib.sha256(
+                    "".join(sorted(set("商户甲乙验证"))).encode("utf-8")
+                ).hexdigest(),
                 "recipient_charset_source": "train_only_anchored_recipient_value",
                 "recipient_quality_policy": {
                     "version": RECIPIENT_QUALITY_POLICY_VERSION,
@@ -239,11 +248,12 @@ def _fixture(
         contract=blind_contract,
     )
     multiview_root = tmp_path / "overlay-data" / "multiview"
-    export_recipient_multiview_teacher(
+    multiview_root.parent.mkdir(parents=True)
+    _materialize_recipient_fixed2_teacher_analysis_test_only(
         manifest=blind_records,
         dataset_contract=source_contract,
         dataset_root=dataset_root,
-        output_dir=multiview_root,
+        output_root=multiview_root,
     )
     return {
         "dataset_root": dataset_root,
@@ -306,6 +316,56 @@ def _materialize_formal_windows_mock(
         "create_anchored_stage_directory",
         simulated_windows_atomic_create,
     )
+    analysis_source = (
+        overlay_module._verify_recipient_fixed2_teacher_analysis_test_only(
+            export_root=fixture["multiview_root"]
+        )
+    )
+    source_root = Path(fixture["multiview_root"])
+    source_manifest = source_root / overlay_module.FIXED2_SOURCE_MANIFEST_NAME
+    source_rows = [
+        json.loads(line)
+        for line in source_manifest.read_text(encoding="utf-8").splitlines()
+    ]
+    for row in source_rows:
+        row["kind"] = overlay_module.FIXED2_SOURCE_RECORD_KIND
+    source_manifest.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in source_rows),
+        encoding="utf-8",
+    )
+    simulated_formal_source = {
+        **analysis_source,
+        "kind": overlay_module.FIXED2_SOURCE_KIND,
+        "record_kind": overlay_module.FIXED2_SOURCE_RECORD_KIND,
+        "publication_profile": "formal_windows_canonical_v1",
+        "formal_windows_publication": True,
+        "analysis_fixture": False,
+        "publication_authority": overlay_module.FIXED2_SOURCE_PUBLICATION_AUTHORITY,
+        "hard_attestation_scheme": (
+            overlay_module.FIXED2_SOURCE_HARD_ATTESTATION_SCHEME
+        ),
+        "public_verification_requires_hard_attestation": True,
+        "commit_marker": overlay_module.FIXED2_SOURCE_CONTRACT_NAME,
+        "train_manifest_sha256": hashlib.sha256(
+            source_manifest.read_bytes()
+        ).hexdigest(),
+    }
+    (source_root / overlay_module.FIXED2_SOURCE_CONTRACT_NAME).write_text(
+        json.dumps(simulated_formal_source, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    def simulated_formal_source_verify(**_kwargs: object) -> dict[str, object]:
+        # This only lets the overlay publisher's POSIX test harness reach its
+        # own formal branch.  The public producer verifier remains Windows-only
+        # and is covered by a real-kernel Windows nodeid.
+        return dict(simulated_formal_source)
+
+    monkeypatch.setattr(
+        overlay_module,
+        "verify_recipient_fixed2_teacher",
+        simulated_formal_source_verify,
+    )
     contract = _formal_materialize_fixed2_overlay(
         multiview_root=fixture["multiview_root"],
         full_records=fixture["full_records"],
@@ -343,6 +403,13 @@ def _rebuild_payload(
             str(contract["composite_dataset_contract"])
         ),
         composite_dataset_root=Path(str(contract["composite_dataset_root"])),
+        producer_subject_id=str(contract["producer_subject_id"]),
+        producer_manifest_semantic_sha256=str(
+            contract["producer_manifest_semantic_sha256"]
+        ),
+        source_dataset_contract_semantic_sha256=str(
+            contract["source_dataset_contract_semantic_sha256"]
+        ),
         selector_evidence=(
             selector
             if selector is not None
@@ -418,7 +485,7 @@ def _reseal_multiview_cross_owner_pixel_collision(
                 "pixel_sha256": current_rows[view]["view_pixel_sha256"],
                 "file_sha256": current_rows[view]["view_file_sha256"],
             }
-            for view in overlay_module.VIEWS
+            for view in overlay_module.FIXED2_VIEWS
         ],
     }
     closure_sha256 = overlay_module._canonical_sha256(closure_payload)
@@ -428,7 +495,7 @@ def _reseal_multiview_cross_owner_pixel_collision(
         "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
         encoding="utf-8",
     )
-    contract_path = multiview_root / "dataset.contract.json"
+    contract_path = multiview_root / overlay_module.FIXED2_SOURCE_ANALYSIS_CONTRACT_NAME
     contract = json.loads(contract_path.read_text(encoding="utf-8"))
     contract["train_manifest_sha256"] = hashlib.sha256(manifest.read_bytes()).hexdigest()
     contract_path.write_text(json.dumps(contract, ensure_ascii=False), encoding="utf-8")
@@ -463,23 +530,32 @@ def test_fixed2_consumer_rejects_resealed_pixel_owner_conflict_on_each_axis(
     )
     prior, current = _reseal_multiview_cross_owner_pixel_collision(fixture)
     export_contract = json.loads(
-        (Path(fixture["multiview_root"]) / "dataset.contract.json").read_text(
+        (
+            Path(fixture["multiview_root"])
+            / overlay_module.FIXED2_SOURCE_ANALYSIS_CONTRACT_NAME
+        ).read_text(
             encoding="utf-8"
         )
     )
-    assert export_contract["group_hash_closure"][
-        "generated_view_target_or_group_conflicts"
-    ] == 0
-    output = tmp_path / "fixed2-resealed-conflict"
+    assert export_contract["selected_view_hash_closure"]["cross_group_conflicts"] == 0
+    recipients, _split_counts, _recipient_counts, _base = (
+        overlay_module._blind_recipient_rows(
+            blind_manifest=fixture["blind_records"],
+            dataset_root=fixture["dataset_root"],
+        )
+    )
+    rows = overlay_module._strict_jsonl(
+        Path(fixture["multiview_root"]) / "multiview_train.jsonl"
+    )
 
     with pytest.raises(ValueError) as caught:
-        materialize_fixed2_overlay(
-            multiview_root=fixture["multiview_root"],
-            full_records=fixture["full_records"],
-            blind_records=fixture["blind_records"],
-            blind_contract=fixture["blind_contract"],
-            original_dataset_root=fixture["dataset_root"],
-            output_root=output,
+        overlay_module._verify_overlay_rows(
+            rows=rows,
+            export_root=fixture["multiview_root"],
+            blind_sha256=hashlib.sha256(fixture["blind_records"].read_bytes()).hexdigest(),
+            recipients=recipients,
+            expected_views=overlay_module.FIXED2_VIEWS,
+            expected_record_kind=overlay_module.FIXED2_SOURCE_ANALYSIS_RECORD_KIND,
         )
 
     message = str(caught.value)
@@ -491,7 +567,6 @@ def test_fixed2_consumer_rejects_resealed_pixel_owner_conflict_on_each_axis(
     assert "target_sha256=" + str(current["target_sha256"]) in message
     assert str(prior["text"]) not in message
     assert str(current["text"]) not in message
-    assert not output.exists()
     assert not list(tmp_path.glob(".fixed2-resealed-conflict.*.tmp"))
 
 
@@ -587,9 +662,6 @@ def test_fixed2_materializer_is_schema_compatible_balanced_and_val_unchanged(
         "full_records",
         "blind_records",
         "blind_contract",
-        "multiview_export_contract",
-        "multiview_export_manifest",
-        "source_dataset_contract",
     }
     assert contract["selector"]["selected_view_counts"] == {
         "standard": 1,
@@ -652,7 +724,132 @@ def test_fixed2_semantic_subject_is_independent_of_output_root(tmp_path: Path) -
     )
 
 
-def test_fixed2_semantic_subject_survives_export_tree_relocation_and_both_verify(
+def test_fresh_equal_producer_publications_keep_overlay_route_and_attempt_identity(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+    first_source = Path(fixture["multiview_root"])
+    second_source = tmp_path / "overlay-data" / "multiview-republished"
+    second_contract = tmp_path / "source-data" / "manifest-copy" / "dataset.contract.json"
+    second_contract.parent.mkdir(parents=True)
+    source_contract_payload = json.loads(
+        Path(fixture["source_contract"]).read_text(encoding="utf-8")
+    )
+    second_contract.write_text(
+        json.dumps(
+            source_contract_payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+    assert hashlib.sha256(Path(fixture["source_contract"]).read_bytes()).hexdigest() != (
+        hashlib.sha256(second_contract.read_bytes()).hexdigest()
+    )
+    _materialize_recipient_fixed2_teacher_analysis_test_only(
+        manifest=fixture["blind_records"],
+        dataset_contract=second_contract,
+        dataset_root=fixture["dataset_root"],
+        output_root=second_source,
+    )
+    first_marker = first_source / overlay_module.FIXED2_SOURCE_ANALYSIS_CONTRACT_NAME
+    second_marker = second_source / overlay_module.FIXED2_SOURCE_ANALYSIS_CONTRACT_NAME
+    # The source contract's raw bytes/path and therefore the producer marker's
+    # strict artifact binding differ, while both semantic closures are equal.
+    assert hashlib.sha256(first_marker.read_bytes()).hexdigest() != hashlib.sha256(
+        second_marker.read_bytes()
+    ).hexdigest()
+    first_producer = overlay_module._verify_recipient_fixed2_teacher_analysis_test_only(
+        export_root=first_source
+    )
+    second_producer = overlay_module._verify_recipient_fixed2_teacher_analysis_test_only(
+        export_root=second_source
+    )
+    assert first_producer["producer_subject_id"] == second_producer["producer_subject_id"]
+
+    first_overlay = materialize_fixed2_overlay(
+        multiview_root=first_source,
+        full_records=fixture["full_records"],
+        blind_records=fixture["blind_records"],
+        blind_contract=fixture["blind_contract"],
+        original_dataset_root=fixture["dataset_root"],
+        output_root=tmp_path / "fixed2-overlay-first",
+    )
+    second_overlay = materialize_fixed2_overlay(
+        multiview_root=second_source,
+        full_records=fixture["full_records"],
+        blind_records=fixture["blind_records"],
+        blind_contract=fixture["blind_contract"],
+        original_dataset_root=fixture["dataset_root"],
+        output_root=tmp_path / "fixed2-overlay-second",
+    )
+    assert first_overlay["overlay_subject_id"] == second_overlay["overlay_subject_id"]
+    assert (
+        first_overlay["source_dataset_contract_semantic_sha256"]
+        == second_overlay["source_dataset_contract_semantic_sha256"]
+    )
+    assert (
+        first_overlay["artifacts"]["source_dataset_contract"]["sha256"]
+        != second_overlay["artifacts"]["source_dataset_contract"]["sha256"]
+    )
+    first_material, first_route = exact8_module._fixed2_route_identity(
+        source_subject_id=exact8_module.ATTESTED_SOURCE_SUBJECT_ID,
+        candidate_pilot_subject_id=exact8_module.ATTESTED_A8_SUBJECT_ID,
+        failure_subject_id="f" * 64,
+        overlay_subject_id=str(first_overlay["overlay_subject_id"]),
+    )
+    second_material, second_route = exact8_module._fixed2_route_identity(
+        source_subject_id=exact8_module.ATTESTED_SOURCE_SUBJECT_ID,
+        candidate_pilot_subject_id=exact8_module.ATTESTED_A8_SUBJECT_ID,
+        failure_subject_id="f" * 64,
+        overlay_subject_id=str(second_overlay["overlay_subject_id"]),
+    )
+    assert first_material == second_material
+    assert first_route == second_route
+    first_attempt_id = first_route
+    second_attempt_id = second_route
+    assert first_attempt_id == second_attempt_id
+
+    changed_contract = (
+        tmp_path / "source-data" / "manifest-semantic-change" / "dataset.contract.json"
+    )
+    changed_contract.parent.mkdir(parents=True)
+    changed_payload = dict(source_contract_payload)
+    changed_payload["architecture"] = "v12-semantic-change"
+    changed_contract.write_text(
+        json.dumps(changed_payload, ensure_ascii=False, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    changed_source = tmp_path / "overlay-data" / "multiview-semantic-change"
+    _materialize_recipient_fixed2_teacher_analysis_test_only(
+        manifest=fixture["blind_records"],
+        dataset_contract=changed_contract,
+        dataset_root=fixture["dataset_root"],
+        output_root=changed_source,
+    )
+    changed_overlay = materialize_fixed2_overlay(
+        multiview_root=changed_source,
+        full_records=fixture["full_records"],
+        blind_records=fixture["blind_records"],
+        blind_contract=fixture["blind_contract"],
+        original_dataset_root=fixture["dataset_root"],
+        output_root=tmp_path / "fixed2-overlay-semantic-change",
+    )
+    assert (
+        changed_overlay["source_dataset_contract_semantic_sha256"]
+        != first_overlay["source_dataset_contract_semantic_sha256"]
+    )
+    assert changed_overlay["overlay_subject_id"] != first_overlay["overlay_subject_id"]
+    _changed_material, changed_route = exact8_module._fixed2_route_identity(
+        source_subject_id=exact8_module.ATTESTED_SOURCE_SUBJECT_ID,
+        candidate_pilot_subject_id=exact8_module.ATTESTED_A8_SUBJECT_ID,
+        failure_subject_id="f" * 64,
+        overlay_subject_id=str(changed_overlay["overlay_subject_id"]),
+    )
+    assert changed_route != first_route
+
+
+def test_fixed2_copied_producer_tree_is_rejected_by_nominal_binding(
     tmp_path: Path,
 ) -> None:
     fixture = _fixture(tmp_path)
@@ -666,36 +863,30 @@ def test_fixed2_semantic_subject_survives_export_tree_relocation_and_both_verify
         original_dataset_root=fixture["dataset_root"],
         output_root=tmp_path / "fixed2-original-export",
     )
-    second = materialize_fixed2_overlay(
-        multiview_root=relocated_multiview,
-        full_records=fixture["full_records"],
-        blind_records=fixture["blind_records"],
-        blind_contract=fixture["blind_contract"],
-        original_dataset_root=fixture["dataset_root"],
-        output_root=tmp_path / "fixed2-relocated-export",
-    )
-    assert first["overlay_subject_id"] == second["overlay_subject_id"]
-    assert first["artifacts"]["composite_records"]["sha256"] != (
-        second["artifacts"]["composite_records"]["sha256"]
-    )
-    assert first["artifacts"]["multiview_export_manifest"]["sha256"] == (
-        second["artifacts"]["multiview_export_manifest"]["sha256"]
-    )
-    for contract, multiview in (
-        (first, fixture["multiview_root"]),
-        (second, relocated_multiview),
-    ):
-        contract_path = Path(str(contract["composite_records_path"])).parent / (
-            FIXED2_ANALYSIS_MARKER_NAME
-        )
-        assert verify_fixed2_overlay_contract(
-            contract_path,
+    relocated_output = tmp_path / "fixed2-relocated-export"
+    with pytest.raises(ValueError, match="nominal output root"):
+        materialize_fixed2_overlay(
+            multiview_root=relocated_multiview,
+            full_records=fixture["full_records"],
             blind_records=fixture["blind_records"],
             blind_contract=fixture["blind_contract"],
-            multiview_root=multiview,
-            expected_full_records=fixture["full_records"],
             original_dataset_root=fixture["dataset_root"],
-        ) == contract
+            output_root=relocated_output,
+        )
+    assert not relocated_output.exists()
+    assert not list(tmp_path.glob(".fixed2-relocated-export.*"))
+
+    contract_path = Path(str(first["composite_records_path"])).parent / (
+        FIXED2_ANALYSIS_MARKER_NAME
+    )
+    assert verify_fixed2_overlay_contract(
+        contract_path,
+        blind_records=fixture["blind_records"],
+        blind_contract=fixture["blind_contract"],
+        multiview_root=fixture["multiview_root"],
+        expected_full_records=fixture["full_records"],
+        original_dataset_root=fixture["dataset_root"],
+    ) == first
 
 
 def test_fixed2_semantic_subject_changes_for_selected_pixels_target_group_or_selector(
@@ -870,6 +1061,57 @@ def test_fixed2_public_materializer_fails_closed_off_windows(tmp_path: Path) -> 
     assert not (tmp_path / "unused-output").exists()
 
 
+def test_fixed2_analysis_materializer_rejects_legacy_four_view_source(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+    legacy_root = tmp_path / "overlay-data" / "legacy-four-view"
+    export_recipient_multiview_teacher(
+        manifest=fixture["blind_records"],
+        dataset_contract=fixture["source_contract"],
+        dataset_root=fixture["dataset_root"],
+        output_dir=legacy_root,
+    )
+    output = tmp_path / "legacy-must-not-enter-fixed2"
+    with pytest.raises(ValueError, match="analysis fixed2 teacher commit marker"):
+        materialize_fixed2_overlay(
+            multiview_root=legacy_root,
+            full_records=fixture["full_records"],
+            blind_records=fixture["blind_records"],
+            blind_contract=fixture["blind_contract"],
+            original_dataset_root=fixture["dataset_root"],
+            output_root=output,
+        )
+    assert not output.exists()
+
+
+def test_fixed2_analysis_materializer_rejects_resealed_formal_source_profile(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+    contract_path = (
+        Path(fixture["multiview_root"])
+        / overlay_module.FIXED2_SOURCE_ANALYSIS_CONTRACT_NAME
+    )
+    contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    contract["kind"] = overlay_module.FIXED2_SOURCE_KIND
+    contract["publication_authority"] = overlay_module.FIXED2_SOURCE_PUBLICATION_AUTHORITY
+    payload = {key: value for key, value in contract.items() if key != "integrity_sha256"}
+    contract["integrity_sha256"] = overlay_module._canonical_sha256(payload)
+    contract_path.write_text(json.dumps(contract), encoding="utf-8")
+    output = tmp_path / "formal-source-must-not-enter-analysis"
+    with pytest.raises(ValueError, match="kind mismatch"):
+        materialize_fixed2_overlay(
+            multiview_root=fixture["multiview_root"],
+            full_records=fixture["full_records"],
+            blind_records=fixture["blind_records"],
+            blind_contract=fixture["blind_contract"],
+            original_dataset_root=fixture["dataset_root"],
+            output_root=output,
+        )
+    assert not output.exists()
+
+
 def test_fixed2_analysis_marker_and_naive_canonical_copy_both_fail_formal_verify(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -958,6 +1200,61 @@ def test_fixed2_windows_public_materializer_mock_dispatch_produces_formal_author
         original_dataset_root=fixture["dataset_root"],
     )
     assert verified == contract
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires real Windows fixed2 source and overlay publication")
+def test_windows_formal_fixed2_source_to_overlay_real_kernel(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _fixture(tmp_path)
+    formal_source_parent = tmp_path / "formal-source-parent"
+    formal_source_parent.mkdir()
+    formal_source = formal_source_parent / "fixed2-source"
+    materialize_recipient_fixed2_teacher(
+        manifest=fixture["blind_records"],
+        dataset_contract=fixture["source_contract"],
+        dataset_root=fixture["dataset_root"],
+        output_root=formal_source,
+    )
+    candidate = inspect_recipient_fixed2_teacher_attestation_candidate(
+        export_root=formal_source
+    )
+    monkeypatch.setattr(
+        fixed2_attestation,
+        "ATTESTED_FIXED2_CONTRACT_SHA256",
+        candidate["contract_sha256"],
+    )
+    monkeypatch.setattr(
+        fixed2_attestation,
+        "ATTESTED_FIXED2_CONTRACT_SIZE_BYTES",
+        candidate["contract_size_bytes"],
+    )
+    monkeypatch.setattr(
+        fixed2_attestation,
+        "ATTESTED_FIXED2_PRODUCER_SUBJECT_ID",
+        candidate["producer_subject_id"],
+    )
+    output = tmp_path / "formal-overlay"
+    contract = _formal_materialize_fixed2_overlay(
+        multiview_root=formal_source,
+        full_records=fixture["full_records"],
+        blind_records=fixture["blind_records"],
+        blind_contract=fixture["blind_contract"],
+        original_dataset_root=fixture["dataset_root"],
+        output_root=output,
+    )
+    assert contract["kind"] == FIXED2_CONTRACT_KIND
+    assert contract["consumer_optimizer_input_ready"] is True
+    assert contract["selected_views"] == ["standard", "fixed_value"]
+    assert _formal_verify_fixed2_overlay_contract(
+        output / FIXED2_CANONICAL_CONTRACT_NAME,
+        blind_records=fixture["blind_records"],
+        blind_contract=fixture["blind_contract"],
+        full_records=fixture["full_records"],
+        original_dataset_root=fixture["dataset_root"],
+        multiview_root=formal_source,
+    ) == contract
 
 
 @pytest.mark.skipif(os.name == "nt", reason="unpatched POSIX mint boundary")
@@ -1198,9 +1495,11 @@ def test_fixed2_verify_rebuilds_every_binding_and_supports_full_records_alias(
         "multiview_export_manifest",
         "source_dataset_contract",
         "composite_records",
-        "composite_dataset_contract",
-        "consumer_code",
-        "producer_code",
+            "composite_dataset_contract",
+            "consumer_code",
+            "fixed2_attestation_code",
+            "fixed2_producer_code",
+            "producer_code",
         "geometry_helper_code",
         "ocr_helper_code",
         "pseudolabel_helper_code",

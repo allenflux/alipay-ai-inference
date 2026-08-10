@@ -144,6 +144,7 @@ foreach ($inputPath in @(
 Require-FreshOutput $OutputRoot
 
 $focusedTests = @(
+    (Join-Path $repoRoot "tests\test_recipient_fixed2_teacher_export.py"),
     (Join-Path $repoRoot "tests\test_recipient_multiview_exact8.py"),
     (Join-Path $repoRoot "tests\test_recipient_multiview_overlay.py"),
     (Join-Path $repoRoot "tests\test_recipient_v14_failure_attestor.py"),

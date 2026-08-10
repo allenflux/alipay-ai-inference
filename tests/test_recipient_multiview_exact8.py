@@ -1231,6 +1231,17 @@ def test_fixed_recipe_is_exactly_two_views_one_train_copy_and_eight_epochs(
     assert recipe["code"] == inspection["code"]
 
 
+def test_exact8_code_closure_includes_dedicated_fixed2_producer_and_registry_is_stable() -> None:
+    code = exact8._code_paths()
+    assert code["code_fixed2_producer"].name == "recipient_fixed2_teacher_export.py"
+    assert code["code_fixed2_producer"].is_file()
+    assert code["code_fixed2_attestation"].name == (
+        "recipient_fixed2_teacher_attestation.py"
+    )
+    assert code["code_fixed2_attestation"].is_file()
+    assert exact8.ATTEMPT_REGISTRY_NAME == "recipient-v14-multiview-fixed2-training-v1"
+
+
 def test_analysis_overlay_fixture_cannot_be_promoted_to_exact8_authority(
     tmp_path: Path,
 ) -> None:

@@ -791,6 +791,8 @@ def _code_paths() -> dict[str, Path]:
     return {
         "code_exact8": Path(__file__).resolve(),
         "code_overlay": package / "recipient_multiview_overlay.py",
+        "code_fixed2_producer": package / "recipient_fixed2_teacher_export.py",
+        "code_fixed2_attestation": package / "recipient_fixed2_teacher_attestation.py",
         "code_multiview_exporter": package / "recipient_multiview_teacher_export.py",
         "code_failure_attestor": package / "recipient_v14_failure_attestor.py",
         "code_candidate_source": package / "recipient_full_crop_candidate_source.py",
@@ -1204,6 +1206,34 @@ def _target_config(source_checkpoint: Path, *, torch: Any) -> UnifiedReaderConfi
     return target
 
 
+def _fixed2_route_identity(
+    *,
+    source_subject_id: str,
+    candidate_pilot_subject_id: str,
+    failure_subject_id: str,
+    overlay_subject_id: str,
+) -> tuple[dict[str, object], str]:
+    """Return the one-shot route identity from semantic subjects only."""
+
+    material: dict[str, object] = {
+        "domain": ROUTE_DOMAIN,
+        "source_subject_id": _require_hex(source_subject_id, "source subject id"),
+        "candidate_pilot_subject_id": _require_hex(
+            candidate_pilot_subject_id, "A8 subject id"
+        ),
+        "b8_fixed_source_subject_id": FIXED_SOURCE_SUBJECT_ID,
+        "failure_subject_id": _require_hex(
+            failure_subject_id, "failure subject id"
+        ),
+        "overlay_subject_id": _require_hex(
+            overlay_subject_id, "overlay subject id"
+        ),
+        "selector_mode": SELECTOR_MODE,
+        "selected_views": SELECTED_VIEWS,
+    }
+    return material, _canonical_sha256(material)
+
+
 def inspect_exact8_subject(
     *,
     full_records: Path,
@@ -1380,17 +1410,12 @@ def inspect_exact8_subject(
     baseline = _a8_baseline(a8, torch=torch)
     target = _target_config(source_checkpoint, torch=torch)
 
-    route_material = {
-        "domain": ROUTE_DOMAIN,
-        "source_subject_id": source_subject,
-        "candidate_pilot_subject_id": a8_subject,
-        "b8_fixed_source_subject_id": FIXED_SOURCE_SUBJECT_ID,
-        "failure_subject_id": failure_subject,
-        "overlay_subject_id": overlay_subject,
-        "selector_mode": SELECTOR_MODE,
-        "selected_views": SELECTED_VIEWS,
-    }
-    route_subject_id = _canonical_sha256(route_material)
+    route_material, route_subject_id = _fixed2_route_identity(
+        source_subject_id=source_subject,
+        candidate_pilot_subject_id=a8_subject,
+        failure_subject_id=failure_subject,
+        overlay_subject_id=overlay_subject,
+    )
     code = {
         name: _binding(path, description=name) for name, path in _code_paths().items()
     }
