@@ -13,6 +13,7 @@ from typing import Any
 
 import pytest
 
+import transfer_receipt_ai.recipient_fixed2_teacher_export as fixed2_export_module
 import transfer_receipt_ai.recipient_multiview_exact8 as exact8
 import transfer_receipt_ai.recipient_multiview_overlay as overlay_module
 from transfer_receipt_ai.ocr_unified import (
@@ -1351,7 +1352,13 @@ def test_lineage_attempt_changes_for_each_upstream_authority_subject(
 
 def test_analysis_overlay_fixture_cannot_be_promoted_to_exact8_authority(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(
+        fixed2_export_module,
+        "_running_on_windows",
+        lambda: False,
+    )
     helpers = runpy.run_path(
         str(Path(__file__).with_name("test_recipient_multiview_overlay.py"))
     )

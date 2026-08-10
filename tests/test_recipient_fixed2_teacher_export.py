@@ -23,6 +23,26 @@ import transfer_receipt_ai.recipient_fixed2_teacher_attestation as fixed2_attest
 import transfer_receipt_ai.recipient_multiview_teacher_export as four_view
 
 
+_REAL_WINDOWS_KERNEL_TESTS = frozenset(
+    {
+        "test_windows_formal_materialize_and_verify_real_kernel",
+        "test_windows_formal_leases_deny_parent_and_stage_replacement_real_kernel",
+    }
+)
+
+
+@pytest.fixture(autouse=True)
+def _analysis_fixture_uses_posix_policy(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep private analysis fixtures runnable without weakening formal tests."""
+
+    if request.node.name in _REAL_WINDOWS_KERNEL_TESTS:
+        return
+    monkeypatch.setattr(fixed2, "_running_on_windows", lambda: False)
+
+
 def _write_png(path: Path, pixels: np.ndarray) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     Image.fromarray(pixels, mode="RGB").save(path)

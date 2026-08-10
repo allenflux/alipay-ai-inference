@@ -24,6 +24,7 @@ from transfer_receipt_ai.ocr_unified_dataset import (
 )
 from transfer_receipt_ai.pipeline import crop_field_with_margin
 from transfer_receipt_ai.recipient_blind_manifest import build_blind_manifest
+import transfer_receipt_ai.recipient_fixed2_teacher_export as fixed2_export_module
 from transfer_receipt_ai.recipient_fixed2_teacher_export import (
     _materialize_recipient_fixed2_teacher_analysis_test_only,
     inspect_recipient_fixed2_teacher_attestation_candidate,
@@ -59,6 +60,26 @@ materialize_fixed2_overlay = (
 verify_fixed2_overlay_contract = (
     overlay_module._verify_fixed2_overlay_analysis_test_only
 )
+
+
+_REAL_WINDOWS_KERNEL_TESTS = frozenset(
+    {
+        "test_windows_formal_fixed2_source_to_overlay_real_kernel",
+        "test_windows_anchored_rename_real_kernel_success_and_no_clobber",
+    }
+)
+
+
+@pytest.fixture(autouse=True)
+def _analysis_source_fixture_uses_posix_policy(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Allow analysis-only source fixtures while preserving real NT coverage."""
+
+    if request.node.name in _REAL_WINDOWS_KERNEL_TESTS:
+        return
+    monkeypatch.setattr(fixed2_export_module, "_running_on_windows", lambda: False)
 
 
 def _write_png(path: Path, pixels: np.ndarray) -> None:
