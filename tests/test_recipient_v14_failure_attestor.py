@@ -1595,6 +1595,31 @@ def test_nested_json_checkpoint_redirect_is_rejected_before_deserialization(
     assert calls == 0
 
 
+def test_candidate_pilot_must_bind_the_frozen_source_authority_identity(
+    failure_fixture: SimpleNamespace,
+    tmp_path: Path,
+) -> None:
+    copied_source = tmp_path / "byte-identical-source-copy.json"
+    copied_source.write_bytes(failure_fixture.source_contract.read_bytes())
+    evidence = json.loads(
+        failure_fixture.candidate_pilot_evidence.read_text(encoding="utf-8")
+    )
+    unsigned = {
+        key: value for key, value in evidence.items() if key != "integrity_sha256"
+    }
+    unsigned["artifacts"]["source_contract"] = _binding(copied_source)
+    _write_json(failure_fixture.candidate_pilot_evidence, _sealed(unsigned))
+    _refresh_authority_pin(
+        "candidate_pilot_evidence", failure_fixture.candidate_pilot_evidence
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="source contract binding is not the frozen source authority file",
+    ):
+        _attest(failure_fixture, tmp_path / "cross-binding.failure.json")
+
+
 def test_binds_attestor_and_runner_code_hashes(
     failure_fixture: SimpleNamespace,
     tmp_path: Path,
@@ -1990,8 +2015,8 @@ def test_real_failed_run_artifact_pins_are_exactly_frozen() -> None:
     )
     assert failure_attestor.EXPECTED_AUTHORITY_DOCUMENT_PINS == {
         "source_contract": {
-            "size_bytes": 9007,
-            "sha256": "5f1c5eebd72e215ad4e4f7be265b0d37be98b3de7a86e2d2e909437756153246",
+            "size_bytes": 9067,
+            "sha256": "61fc5eebd72e215ad4e4f7be265b0d37be98b3de7a86e2d2e909437756153246",
         },
         "candidate_pilot_evidence": {
             "size_bytes": 7627,

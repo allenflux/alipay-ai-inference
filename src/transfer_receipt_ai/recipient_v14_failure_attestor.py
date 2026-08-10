@@ -90,8 +90,8 @@ EXPECTED_CANDIDATE_PILOT_SUBJECT_ID = (
 )
 EXPECTED_AUTHORITY_DOCUMENT_PINS: dict[str, dict[str, int | str]] = {
     "source_contract": {
-        "size_bytes": 9007,
-        "sha256": "5f1c5eebd72e215ad4e4f7be265b0d37be98b3de7a86e2d2e909437756153246",
+        "size_bytes": 9067,
+        "sha256": "61fc5eebd72e215ad4e4f7be265b0d37be98b3de7a86e2d2e909437756153246",
     },
     "candidate_pilot_evidence": {
         "size_bytes": 7627,
@@ -936,6 +936,48 @@ def _validate_frozen_authority_document(
         "size_bytes": observed_size,
         "bytes": raw_bytes,
     }
+
+
+def _validate_candidate_pilot_source_cross_binding(
+    pilot_document: Mapping[str, Any],
+    *,
+    frozen_source: Mapping[str, object],
+) -> None:
+    artifacts = _mapping(
+        pilot_document.get("artifacts"),
+        "frozen candidate-pilot artifacts",
+    )
+    binding = _mapping(
+        artifacts.get("source_contract"),
+        "frozen candidate-pilot source contract binding",
+    )
+    bound_sha, bound_size = _validated_expected_pin(
+        binding,
+        description="frozen candidate-pilot source contract binding",
+    )
+    if (
+        bound_sha != frozen_source.get("sha256")
+        or bound_size != frozen_source.get("size_bytes")
+    ):
+        raise ValueError(
+            "frozen candidate-pilot source contract binding does not match "
+            "the frozen source authority"
+        )
+    raw_path = binding.get("path")
+    if not isinstance(raw_path, str) or not raw_path:
+        raise ValueError(
+            "frozen candidate-pilot source contract binding has no path"
+        )
+    bound_path = _existing_non_reparse(
+        Path(raw_path),
+        directory=False,
+        description="frozen candidate-pilot source contract binding",
+    )
+    if not _same_frozen_identity(bound_path, frozen_source):
+        raise ValueError(
+            "frozen candidate-pilot source contract binding is not the "
+            "frozen source authority file"
+        )
 
 
 def _freeze_fixed_run_artifact(path: Path, *, name: str) -> dict[str, object]:
@@ -2566,6 +2608,10 @@ def _build_payload(
     )
     pilot_document, frozen_pilot_document = _validate_frozen_authority_document(
         pilot_file, name="candidate_pilot_evidence"
+    )
+    _validate_candidate_pilot_source_cross_binding(
+        pilot_document,
+        frozen_source=frozen_source_document,
     )
     _require_equal(
         source_document.get("source_subject_id"),
