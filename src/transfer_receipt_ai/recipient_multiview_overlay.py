@@ -35,6 +35,8 @@ from .recipient_multiview_teacher_export import (
     RECORD_KIND as EXPORT_RECORD_KIND,
     SUPPORTED_UNIFIED_KINDS,
     VIEWS,
+    _GeneratedViewOwner,
+    _register_generated_view_owner,
 )
 
 
@@ -1497,6 +1499,7 @@ def _verify_overlay_rows(
     ids: set[str] = set()
     image_bindings: list[dict[str, object]] = []
     source_artifacts: dict[str, dict[str, object]] = {}
+    generated_hash_owners: dict[str, _GeneratedViewOwner] = {}
     for row_number, row in enumerate(rows, start=1):
         if row.get("schema_version") != SCHEMA_VERSION or row.get("kind") != EXPORT_RECORD_KIND:
             raise ValueError(f"overlay row {row_number} kind/schema changed")
@@ -1567,6 +1570,21 @@ def _verify_overlay_rows(
         _expect(height, int(pixels.shape[0]), description=f"overlay height {source_id}/{view}")
         pixel_sha = _crop_digest(pixels)
         _expect(row.get("view_pixel_sha256"), pixel_sha, description=f"overlay pixel SHA {source_id}/{view}")
+        # The producer's zero-conflict contract field is evidence, not
+        # authority.  Rebuild the global pixel/group/target closure from the
+        # decoded images and blind-manifest owners before accepting any row.
+        _register_generated_view_owner(
+            generated_hash_owners,
+            pixel_sha256=pixel_sha,
+            owner=_GeneratedViewOwner(
+                line_number=row_number,
+                record_id=row_id,
+                view=str(view),
+                group_id=str(blind["group_id"]),
+                target_sha256=str(blind["target_sha256"]),
+                shape=tuple(int(size) for size in pixels.shape),
+            ),
+        )
         image_bindings.append(
             {
                 "source_record_id": source_id,

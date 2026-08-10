@@ -36,6 +36,7 @@ import stat
 import unicodedata
 from collections import Counter
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -79,6 +80,45 @@ _HEX_DIGITS = frozenset("0123456789abcdef")
 
 FileIdentity = tuple[int, int, int, str]
 DirectoryIdentity = tuple[int, int]
+
+
+@dataclass(frozen=True)
+class _GeneratedViewOwner:
+    line_number: int
+    record_id: str
+    view: str
+    group_id: str
+    target_sha256: str
+    shape: tuple[int, ...]
+
+
+def _register_generated_view_owner(
+    owners: dict[str, _GeneratedViewOwner],
+    *,
+    pixel_sha256: str,
+    owner: _GeneratedViewOwner,
+) -> None:
+    """Reject one generated pixel identity spanning a group or target boundary."""
+
+    prior = owners.setdefault(pixel_sha256, owner)
+    group_conflict = prior.group_id != owner.group_id
+    target_conflict = prior.target_sha256 != owner.target_sha256
+    if not group_conflict and not target_conflict:
+        return
+
+    def describe(value: _GeneratedViewOwner) -> str:
+        return (
+            f"line={value.line_number} record_id={value.record_id!r} "
+            f"view={value.view!r} group_id={value.group_id!r} "
+            f"target_sha256={value.target_sha256} shape={value.shape!r}"
+        )
+
+    raise ValueError(
+        f"generated view hash {pixel_sha256} conflict: "
+        f"group_conflict={str(group_conflict).lower()} "
+        f"target_conflict={str(target_conflict).lower()}; "
+        f"prior({describe(prior)}); current({describe(owner)})"
+    )
 
 
 def _sha256(path: Path) -> str:
@@ -542,7 +582,7 @@ def export_recipient_multiview_teacher(
     ids: set[str] = set()
     train_rows: list[tuple[int, dict[str, object], str, dict[str, object]]] = []
     records: list[dict[str, object]] = []
-    generated_hash_owners: dict[str, tuple[str, str]] = {}
+    generated_hash_owners: dict[str, _GeneratedViewOwner] = {}
 
     try:
         # This pass intentionally touches held-out rows only for identifiers,
@@ -708,6 +748,7 @@ def export_recipient_multiview_teacher(
                 "left_context": _production_left_context_view(rectified, bbox),
                 "right_value": _production_right_value_view(rectified, bbox),
             }
+            target_sha256 = hashlib.sha256(target.encode("utf-8")).hexdigest()
             record_key = hashlib.sha256(record_id.encode("utf-8")).hexdigest()[:24]
             view_payloads: list[dict[str, object]] = []
             for view_name in VIEWS:
@@ -719,14 +760,18 @@ def export_recipient_multiview_teacher(
                         f"generated train view hash {view_pixel_sha256} crosses "
                         f"the declared {declared_split} recipient crop boundary"
                     )
-                owner = generated_hash_owners.setdefault(
-                    view_pixel_sha256,
-                    (group_id, target),
+                _register_generated_view_owner(
+                    generated_hash_owners,
+                    pixel_sha256=view_pixel_sha256,
+                    owner=_GeneratedViewOwner(
+                        line_number=line_number,
+                        record_id=record_id,
+                        view=view_name,
+                        group_id=group_id,
+                        target_sha256=target_sha256,
+                        shape=tuple(int(size) for size in view.shape),
+                    ),
                 )
-                if owner != (group_id, target):
-                    raise ValueError(
-                        f"generated view hash {view_pixel_sha256} has conflicting group or target"
-                    )
                 relative_image = Path("images") / f"{record_key}-{view_name.replace('_', '-')}.png"
                 image_path = stage / relative_image
                 _write_rgb_png(image_path, view)
@@ -746,7 +791,6 @@ def export_recipient_multiview_teacher(
                     }
                 )
 
-            target_sha256 = hashlib.sha256(target.encode("utf-8")).hexdigest()
             group_closure_payload = {
                 "source_record_id": record_id,
                 "source_group_id": group_id,

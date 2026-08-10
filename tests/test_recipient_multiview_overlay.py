@@ -126,12 +126,19 @@ def _train_row(
     }
 
 
-def _fixture(tmp_path: Path) -> dict[str, object]:
+def _fixture(
+    tmp_path: Path,
+    *,
+    second_target: str = "商户乙",
+    second_group_id: str | None = None,
+) -> dict[str, object]:
     dataset_root = tmp_path / "source-data" / "paddle-dataset"
     rows = [
         _train_row(tmp_path, dataset_root, index=0, target="商户甲"),
-        _train_row(tmp_path, dataset_root, index=1, target="商户乙"),
+        _train_row(tmp_path, dataset_root, index=1, target=second_target),
     ]
+    if second_group_id is not None:
+        rows[1]["group_id"] = second_group_id
     val_crops: dict[str, Path] = {}
     val_slots: dict[str, dict[str, object]] = {}
     val_fields = (
@@ -364,6 +371,128 @@ def _mutate_png_pixels(path: Path) -> None:
         pixels = np.asarray(opened.convert("RGB")).copy()
     pixels[0, 0, 0] = np.uint8(int(pixels[0, 0, 0]) ^ 0xFF)
     _write_png(path, pixels)
+
+
+def _reseal_multiview_cross_owner_pixel_collision(
+    fixture: dict[str, object],
+) -> tuple[dict[str, object], dict[str, object]]:
+    multiview_root = Path(fixture["multiview_root"])
+    manifest = multiview_root / "multiview_train.jsonl"
+    rows = [json.loads(line) for line in manifest.read_text(encoding="utf-8").splitlines()]
+    prior = next(
+        row
+        for row in rows
+        if row["source_record_id"] == "receipt-train-0" and row["view"] == "standard"
+    )
+    current = next(
+        row
+        for row in rows
+        if row["source_record_id"] == "receipt-train-1" and row["view"] == "standard"
+    )
+    prior_image = multiview_root / str(prior["image"])
+    current_image = multiview_root / str(current["image"])
+    shutil.copyfile(prior_image, current_image)
+    with Image.open(current_image) as opened:
+        pixels = np.asarray(opened.convert("RGB"))
+    current["view_pixel_sha256"] = _crop_digest(pixels)
+    current["view_file_sha256"] = hashlib.sha256(current_image.read_bytes()).hexdigest()
+    current["view_width"] = int(pixels.shape[1])
+    current["view_height"] = int(pixels.shape[0])
+
+    current_rows = {
+        str(row["view"]): row
+        for row in rows
+        if row["source_record_id"] == current["source_record_id"]
+    }
+    closure_payload = {
+        "source_record_id": current["source_record_id"],
+        "source_group_id": current["group_id"],
+        "source_manifest_sha256": current["target_source_manifest_sha256"],
+        "target_sha256": current["target_sha256"],
+        "source_sha256": current["source_sha256"],
+        "result_json_sha256": current["result_json_sha256"],
+        "paddle_crop_pixel_sha256": current["paddle_crop_pixel_sha256"],
+        "views": [
+            {
+                "view": view,
+                "pixel_sha256": current_rows[view]["view_pixel_sha256"],
+                "file_sha256": current_rows[view]["view_file_sha256"],
+            }
+            for view in overlay_module.VIEWS
+        ],
+    }
+    closure_sha256 = overlay_module._canonical_sha256(closure_payload)
+    for row in current_rows.values():
+        row["group_closure_sha256"] = closure_sha256
+    manifest.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    contract_path = multiview_root / "dataset.contract.json"
+    contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    contract["train_manifest_sha256"] = hashlib.sha256(manifest.read_bytes()).hexdigest()
+    contract_path.write_text(json.dumps(contract, ensure_ascii=False), encoding="utf-8")
+    return prior, current
+
+
+@pytest.mark.parametrize(
+    ("second_target", "second_group_id", "expected_flags"),
+    [
+        (
+            "商户甲",
+            "receipt:train:1",
+            "group_conflict=true target_conflict=false",
+        ),
+        (
+            "商户乙",
+            "receipt:train:0",
+            "group_conflict=false target_conflict=true",
+        ),
+    ],
+)
+def test_fixed2_consumer_rejects_resealed_pixel_owner_conflict_on_each_axis(
+    tmp_path: Path,
+    second_target: str,
+    second_group_id: str,
+    expected_flags: str,
+) -> None:
+    fixture = _fixture(
+        tmp_path,
+        second_target=second_target,
+        second_group_id=second_group_id,
+    )
+    prior, current = _reseal_multiview_cross_owner_pixel_collision(fixture)
+    export_contract = json.loads(
+        (Path(fixture["multiview_root"]) / "dataset.contract.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert export_contract["group_hash_closure"][
+        "generated_view_target_or_group_conflicts"
+    ] == 0
+    output = tmp_path / "fixed2-resealed-conflict"
+
+    with pytest.raises(ValueError) as caught:
+        materialize_fixed2_overlay(
+            multiview_root=fixture["multiview_root"],
+            full_records=fixture["full_records"],
+            blind_records=fixture["blind_records"],
+            blind_contract=fixture["blind_contract"],
+            original_dataset_root=fixture["dataset_root"],
+            output_root=output,
+        )
+
+    message = str(caught.value)
+    assert expected_flags in message
+    assert f"record_id={prior['id']!r}" in message
+    assert f"record_id={current['id']!r}" in message
+    assert "view='standard'" in message
+    assert "target_sha256=" + str(prior["target_sha256"]) in message
+    assert "target_sha256=" + str(current["target_sha256"]) in message
+    assert str(prior["text"]) not in message
+    assert str(current["text"]) not in message
+    assert not output.exists()
+    assert not list(tmp_path.glob(".fixed2-resealed-conflict.*.tmp"))
 
 
 def test_fixed2_materializer_is_schema_compatible_balanced_and_val_unchanged(

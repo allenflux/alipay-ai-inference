@@ -18,10 +18,12 @@ from transfer_receipt_ai.pipeline import crop_field_with_margin
 from transfer_receipt_ai.recipient_multiview_teacher_export import (
     KIND,
     VIEWS,
+    _GeneratedViewOwner,
     _fixed_value_view,
     _production_left_context_view,
     _production_right_value_view,
     _production_standard_view,
+    _register_generated_view_owner,
     build_parser,
     export_recipient_multiview_teacher,
 )
@@ -376,6 +378,116 @@ def test_generated_train_view_hash_cannot_cross_heldout_crop_boundary(tmp_path: 
             output_dir=tmp_path / "out",
         )
     assert not (tmp_path / "out").exists()
+
+
+@pytest.mark.parametrize(
+    ("current_group", "current_target_sha256", "expected_flags"),
+    [
+        ("receipt:prior", "a" * 64, None),
+        (
+            "receipt:current",
+            "a" * 64,
+            "group_conflict=true target_conflict=false",
+        ),
+        (
+            "receipt:prior",
+            "b" * 64,
+            "group_conflict=false target_conflict=true",
+        ),
+        (
+            "receipt:current",
+            "b" * 64,
+            "group_conflict=true target_conflict=true",
+        ),
+    ],
+)
+def test_generated_view_owner_decision_matrix_is_fail_closed_and_redacted(
+    current_group: str,
+    current_target_sha256: str,
+    expected_flags: str | None,
+) -> None:
+    pixel_sha256 = "c" * 64
+    prior = _GeneratedViewOwner(
+        line_number=17,
+        record_id="receipt-prior",
+        view="standard",
+        group_id="receipt:prior",
+        target_sha256="a" * 64,
+        shape=(24, 70, 3),
+    )
+    current = _GeneratedViewOwner(
+        line_number=29,
+        record_id="receipt-current",
+        view="fixed_value",
+        group_id=current_group,
+        target_sha256=current_target_sha256,
+        shape=(24, 49, 3),
+    )
+    owners = {pixel_sha256: prior}
+
+    if expected_flags is None:
+        _register_generated_view_owner(
+            owners,
+            pixel_sha256=pixel_sha256,
+            owner=current,
+        )
+        assert owners == {pixel_sha256: prior}
+        return
+
+    with pytest.raises(ValueError) as caught:
+        _register_generated_view_owner(
+            owners,
+            pixel_sha256=pixel_sha256,
+            owner=current,
+        )
+    message = str(caught.value)
+    assert expected_flags in message
+    assert "line=17" in message and "line=29" in message
+    assert "record_id='receipt-prior'" in message
+    assert "record_id='receipt-current'" in message
+    assert "view='standard'" in message and "view='fixed_value'" in message
+    assert "group_id='receipt:prior'" in message
+    assert f"group_id={current_group!r}" in message
+    assert "target_sha256=" + "a" * 64 in message
+    assert "target_sha256=" + current_target_sha256 in message
+    assert "shape=(24, 70, 3)" in message and "shape=(24, 49, 3)" in message
+    assert "sensitive target" not in message
+
+
+def test_generated_view_group_conflict_leaves_no_partial_publication(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+    manifest = Path(fixture["manifest"])
+    records = [json.loads(line) for line in manifest.read_text(encoding="utf-8").splitlines()]
+    duplicate = json.loads(json.dumps(records[0], ensure_ascii=False))
+    duplicate["id"] = "receipt-train-same-pixels-different-group"
+    duplicate["group_id"] = "receipt:other-group"
+    records.append(duplicate)
+    manifest.write_text(
+        "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records),
+        encoding="utf-8",
+    )
+    output = tmp_path / "collision-output"
+
+    with pytest.raises(ValueError) as caught:
+        export_recipient_multiview_teacher(
+            manifest=manifest,
+            dataset_contract=fixture["contract"],
+            dataset_root=fixture["dataset_root"],
+            output_dir=output,
+        )
+
+    message = str(caught.value)
+    assert "group_conflict=true target_conflict=false" in message
+    assert "line=1" in message and "line=4" in message
+    assert "record_id='receipt-train'" in message
+    assert "record_id='receipt-train-same-pixels-different-group'" in message
+    assert "view='fixed_value'" in message
+    assert "target_sha256=" + hashlib.sha256("商户甲".encode("utf-8")).hexdigest() in message
+    assert "商户甲" not in message
+    assert not output.exists()
+    assert not list(tmp_path.glob(".collision-output.*.tmp"))
 
 
 def test_export_rejects_crop_pixels_that_do_not_close_to_manifest_hash(tmp_path: Path) -> None:
