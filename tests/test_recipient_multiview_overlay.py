@@ -1534,6 +1534,7 @@ def test_windows_directory_lease_access_and_share_constants_are_fail_closed() ->
     assert overlay_module._WINDOWS_FILE_CREATE == 2
     assert overlay_module._WINDOWS_FILE_OPEN == 1
     assert overlay_module._WINDOWS_FILE_DIRECTORY_FILE == 0x00000001
+    assert overlay_module._WINDOWS_FILE_SYNCHRONOUS_IO_NONALERT == 0x00000020
     assert overlay_module._WINDOWS_FILE_OPEN_REPARSE_POINT == 0x00200000
     assert overlay_module._WINDOWS_DIRECTORY_LEASE_ACCESS & (
         overlay_module._WINDOWS_FILE_TRAVERSE
@@ -1652,6 +1653,7 @@ def test_windows_ntcreatefile_abi_uses_full_width_parent_handle_and_relative_nam
         "create_disposition": overlay_module._WINDOWS_FILE_CREATE,
         "create_options": (
             overlay_module._WINDOWS_FILE_DIRECTORY_FILE
+            | overlay_module._WINDOWS_FILE_SYNCHRONOUS_IO_NONALERT
             | overlay_module._WINDOWS_FILE_OPEN_REPARSE_POINT
         ),
         "extended_attributes": None,
@@ -1823,7 +1825,7 @@ def test_windows_atomic_stage_creation_binds_created_handle_to_parent_entry(
     assert closed == [603, 602]
 
 
-def test_windows_anchored_rename_reports_complete_file_rename_info_buffer(
+def test_windows_anchored_rename_uses_native_complete_file_rename_info_buffer(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1844,26 +1846,44 @@ def test_windows_anchored_rename_reports_complete_file_rename_info_buffer(
         windows_rename_capable=True,
         windows_identity=stage_identity,
     )
-    calls: list[tuple[ctypes.c_void_p, int, bytes, int]] = []
+    calls: list[tuple[ctypes.c_void_p, bytes, int, int]] = []
 
-    class _FakeSetFileInformationByHandle:
+    class _FakeNtSetInformationFile:
         argtypes: object = None
         restype: object = None
 
         def __call__(
             self,
             handle: ctypes.c_void_p,
-            information_class: int,
+            io_status: object,
             information: object,
             size: int,
+            information_class: int,
         ) -> int:
+            del io_status
             calls.append(
-                (handle, information_class, ctypes.string_at(information, size), size)
+                (
+                    handle,
+                    ctypes.string_at(information, size),
+                    size,
+                    information_class,
+                )
             )
-            return 1
+            return 0
 
-    class _FakeKernel32:
-        SetFileInformationByHandle = _FakeSetFileInformationByHandle()
+    class _FakeRtlNtStatusToDosError:
+        argtypes: object = None
+        restype: object = None
+
+        def __call__(self, status: int) -> int:
+            raise AssertionError(f"unexpected failed NTSTATUS: {status}")
+
+    fake_nt_set_information = _FakeNtSetInformationFile()
+    fake_rtl_error = _FakeRtlNtStatusToDosError()
+
+    class _FakeNtdll:
+        NtSetInformationFile = fake_nt_set_information
+        RtlNtStatusToDosError = fake_rtl_error
 
     identity_calls: list[int] = []
 
@@ -1879,7 +1899,7 @@ def test_windows_anchored_rename_reports_complete_file_rename_info_buffer(
     monkeypatch.setattr(
         overlay_module.ctypes,
         "WinDLL",
-        lambda *args, **kwargs: _FakeKernel32(),
+        lambda name, **kwargs: _FakeNtdll() if name == "ntdll" else None,
         raising=False,
     )
 
@@ -1891,10 +1911,12 @@ def test_windows_anchored_rename_reports_complete_file_rename_info_buffer(
     )
 
     assert len(calls) == 1
-    handle, information_class, raw, reported_size = calls[0]
+    handle, raw, reported_size, information_class = calls[0]
     assert handle.value == 612
-    assert information_class == 3  # FileRenameInfo
+    assert information_class == 10  # FileRenameInformation
     assert identity_calls == [611, 612]
+    assert fake_nt_set_information.restype is ctypes.c_int32
+    assert len(fake_nt_set_information.argtypes) == 5
 
     class _FileRenameInfoPrefix(ctypes.Structure):
         _fields_ = (
@@ -1908,12 +1930,94 @@ def test_windows_anchored_rename_reports_complete_file_rename_info_buffer(
     assert reported_size == ctypes.sizeof(_FileRenameInfoPrefix) + len(encoded_name)
     information = _FileRenameInfoPrefix.from_buffer_copy(raw)
     assert information.flags == 0  # ReplaceIfExists == FALSE: no clobber.
-    # A NULL root plus one simple name is the documented same-parent form.  It
-    # keeps resolution relative to the leased stage handle's current parent.
-    assert information.root_directory is None
+    assert information.root_directory == 611
     assert information.file_name_length == len(encoded_name)
     name_offset = _FileRenameInfoPrefix.file_name.offset
     assert raw[name_offset : name_offset + len(encoded_name)] == encoded_name
+
+
+@pytest.mark.parametrize(
+    ("returned_status", "completion_status", "translated_error", "error_type"),
+    (
+        (0x00000103, 0, 997, OSError),  # STATUS_PENDING / ERROR_IO_PENDING
+        (0, -1073741771, 183, FileExistsError),  # STATUS_OBJECT_NAME_COLLISION
+    ),
+)
+def test_windows_anchored_rename_fails_closed_on_any_nonzero_ntstatus(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    returned_status: int,
+    completion_status: int,
+    translated_error: int,
+    error_type: type[OSError],
+) -> None:
+    parent_identity = (19, 51, 0x10)
+    stage_identity = (19, 52, 0x10)
+    parent = overlay_module._DirectoryLease(
+        path=tmp_path,
+        identity=parent_identity,
+        windows_handle=621,
+        windows_identity=parent_identity,
+    )
+    source = tmp_path / ".stage-status"
+    stage = overlay_module._DirectoryLease(
+        path=source,
+        identity=stage_identity,
+        windows_handle=622,
+        windows_rename_capable=True,
+        windows_identity=stage_identity,
+    )
+    translated: list[int] = []
+
+    class _FakeNtSetInformationFile:
+        argtypes: object = None
+        restype: object = None
+
+        def __call__(
+            self,
+            handle: object,
+            io_status: object,
+            information: object,
+            size: int,
+            information_class: int,
+        ) -> int:
+            del handle, information, size, information_class
+            io_status._obj.status_or_pointer.status = completion_status  # type: ignore[attr-defined]
+            return returned_status
+
+    class _FakeRtlNtStatusToDosError:
+        argtypes: object = None
+        restype: object = None
+
+        def __call__(self, status: int) -> int:
+            translated.append(status)
+            return translated_error
+
+    class _FakeNtdll:
+        NtSetInformationFile = _FakeNtSetInformationFile()
+        RtlNtStatusToDosError = _FakeRtlNtStatusToDosError()
+
+    monkeypatch.setattr(
+        overlay_module,
+        "_windows_directory_handle_identity",
+        lambda handle: {621: parent_identity, 622: stage_identity}[handle],
+    )
+    monkeypatch.setattr(
+        overlay_module.ctypes,
+        "WinDLL",
+        lambda name, **kwargs: _FakeNtdll() if name == "ntdll" else None,
+        raising=False,
+    )
+
+    with pytest.raises(error_type) as captured:
+        overlay_module._rename_directory_no_replace_anchored(
+            parent,
+            stage,
+            source=source,
+            destination=tmp_path / "published-status",
+        )
+    assert captured.value.errno == translated_error
+    assert translated == [returned_status or completion_status]
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires the real Windows file API")

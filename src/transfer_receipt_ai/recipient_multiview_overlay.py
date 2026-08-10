@@ -95,6 +95,7 @@ _WINDOWS_OPEN_EXISTING = 3
 _WINDOWS_FILE_CREATE = 2
 _WINDOWS_FILE_OPEN = 1
 _WINDOWS_FILE_DIRECTORY_FILE = 0x00000001
+_WINDOWS_FILE_SYNCHRONOUS_IO_NONALERT = 0x00000020
 _WINDOWS_FILE_OPEN_REPARSE_POINT = 0x00200000
 _WINDOWS_FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
 _WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
@@ -621,6 +622,12 @@ def _windows_nt_directory_handle(
         ctypes.c_uint32,
     )
     nt_create_file.restype = ctypes.c_int32
+    create_options = _WINDOWS_FILE_DIRECTORY_FILE | _WINDOWS_FILE_OPEN_REPARSE_POINT
+    if desired_access & _WINDOWS_SYNCHRONIZE:
+        # NtSetInformationFile must complete before publication validation.
+        # A synchronous stage handle prevents STATUS_PENDING; NtCreateFile
+        # requires SYNCHRONIZE access when this option is present.
+        create_options |= _WINDOWS_FILE_SYNCHRONOUS_IO_NONALERT
     status = int(
         nt_create_file(
             ctypes.byref(handle),
@@ -631,7 +638,7 @@ def _windows_nt_directory_handle(
             0,
             share_access,
             create_disposition,
-            _WINDOWS_FILE_DIRECTORY_FILE | _WINDOWS_FILE_OPEN_REPARSE_POINT,
+            create_options,
             None,
             0,
         )
@@ -1011,7 +1018,7 @@ def _rename_directory_no_replace_anchored(
         _require_directory_lease_identity(parent)
         _require_directory_lease_identity(source_lease)
 
-        class _FileRenameInfoPrefix(ctypes.Structure):
+        class _FileRenameInformationPrefix(ctypes.Structure):
             _fields_ = (
                 ("flags", ctypes.c_uint32),
                 ("root_directory", ctypes.c_void_p),
@@ -1019,48 +1026,64 @@ def _rename_directory_no_replace_anchored(
                 ("file_name", ctypes.c_uint16 * 1),
             )
 
+        class _IoStatusUnion(ctypes.Union):
+            _fields_ = (
+                ("status", ctypes.c_int32),
+                ("pointer", ctypes.c_void_p),
+            )
+
+        class _IoStatusBlock(ctypes.Structure):
+            _fields_ = (
+                ("status_or_pointer", _IoStatusUnion),
+                ("information", ctypes.c_size_t),
+            )
+
         encoded_name = destination.name.encode("utf-16-le")
-        name_offset = _FileRenameInfoPrefix.file_name.offset
-        # Windows requires the reported FILE_RENAME_INFO buffer length to
+        name_offset = _FileRenameInformationPrefix.file_name.offset
+        # Windows requires the reported FILE_RENAME_INFORMATION buffer length to
         # include the complete fixed structure *and* FileNameLength bytes.
         # On 64-bit Windows sizeof(FILE_RENAME_INFO) is 24 while FileName is at
         # offset 20, so using offsetof(FileName) here under-reports the buffer
         # by four bytes and SetFileInformationByHandle fails with
         # ERROR_INVALID_PARAMETER.
-        buffer_size = ctypes.sizeof(_FileRenameInfoPrefix) + len(encoded_name)
+        buffer_size = ctypes.sizeof(_FileRenameInformationPrefix) + len(encoded_name)
         buffer = ctypes.create_string_buffer(buffer_size)
-        information = _FileRenameInfoPrefix.from_buffer(buffer)
-        information.flags = 0  # FileRenameInfo: ReplaceIfExists == FALSE.
-        # This is a same-directory rename, so use the documented simple-name
-        # form: RootDirectory == NULL and FileName contains one simple name.
-        # The rename is still anchored by the already-validated source handle;
-        # its no-FILE_SHARE_DELETE lease prevents it from leaving the leased
-        # parent before this call, while the parent lease prevents substitution
-        # of that directory.  SetFileInformationByHandle rejects the otherwise
-        # equivalent non-NULL RootDirectory form on the target Windows host.
-        information.root_directory = None
+        information = _FileRenameInformationPrefix.from_buffer(buffer)
+        information.flags = 0  # FileRenameInformation: ReplaceIfExists == FALSE.
+        information.root_directory = parent.windows_handle
         information.file_name_length = len(encoded_name)
         ctypes.memmove(
             ctypes.addressof(buffer) + name_offset,
             encoded_name,
             len(encoded_name),
         )
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        set_information = kernel32.SetFileInformationByHandle
+        io_status = _IoStatusBlock()
+        ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
+        set_information = ntdll.NtSetInformationFile
         set_information.argtypes = (
             ctypes.c_void_p,
-            ctypes.c_int,
+            ctypes.POINTER(_IoStatusBlock),
             ctypes.c_void_p,
             ctypes.c_uint32,
+            ctypes.c_int,
         )
-        set_information.restype = ctypes.c_int
-        if not set_information(
-            ctypes.c_void_p(source_lease.windows_handle),
-            3,  # FileRenameInfo
-            ctypes.byref(buffer),
-            buffer_size,
-        ):
-            error_number = ctypes.get_last_error()
+        set_information.restype = ctypes.c_int32
+        status = int(
+            set_information(
+                ctypes.c_void_p(source_lease.windows_handle),
+                ctypes.byref(io_status),
+                ctypes.byref(buffer),
+                buffer_size,
+                10,  # FileRenameInformation
+            )
+        )
+        completion_status = int(io_status.status_or_pointer.status)
+        failed_status = status if status != 0 else completion_status
+        if failed_status != 0:
+            rtl_error = ntdll.RtlNtStatusToDosError
+            rtl_error.argtypes = (ctypes.c_int32,)
+            rtl_error.restype = ctypes.c_uint32
+            error_number = int(rtl_error(failed_status))
             if error_number in {80, 183}:  # ERROR_FILE_EXISTS / ERROR_ALREADY_EXISTS
                 raise FileExistsError(
                     error_number,
