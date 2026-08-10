@@ -104,7 +104,7 @@ EXPECTED_AUTHORITY_DOCUMENT_PINS: dict[str, dict[str, int | str]] = {
 # same headline metrics is not a valid historical failure.
 EXPECTED_RUN_ARTIFACT_PINS: dict[str, dict[str, int | str]] = {
     "training_summary": {
-        "size_bytes": 230694,
+        "size_bytes": 236694,
         "sha256": "2f582138f6751fda4392e12b6398745c89b176ce3afe6ec25875b337376cb9b4",
     },
     "best_checkpoint": {
@@ -129,11 +129,11 @@ EXPECTED_RUN_ARTIFACT_PINS: dict[str, dict[str, int | str]] = {
     },
     "blind_contract": {
         "size_bytes": 1011,
-        "sha256": "bc103913e77e35a4a54ac302ea7ce3bc7bca688f50ab8e6e3bc090b488f0d440",
+        "sha256": "bc103913e77e35a4a54ac302ea7ce3bc7bca688f50ab8e6e3bc090b488f0d4d0",
     },
     "training_attempt": {
         "size_bytes": 844,
-        "sha256": "9e6916c91073cf2ca8037f2cde593e5151d8315c630074991e4e682701ef5e24",
+        "sha256": "9e6916c91073cf2cad837f2cde593e5151d8315c630074991e4e682701ef5e24",
     },
 }
 

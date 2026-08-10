@@ -2025,7 +2025,7 @@ def test_real_failed_run_artifact_pins_are_exactly_frozen() -> None:
     }
     assert failure_attestor.EXPECTED_RUN_ARTIFACT_PINS == {
         "training_summary": {
-            "size_bytes": 230694,
+            "size_bytes": 236694,
             "sha256": "2f582138f6751fda4392e12b6398745c89b176ce3afe6ec25875b337376cb9b4",
         },
         "best_checkpoint": {
@@ -2050,10 +2050,55 @@ def test_real_failed_run_artifact_pins_are_exactly_frozen() -> None:
         },
         "blind_contract": {
             "size_bytes": 1011,
-            "sha256": "bc103913e77e35a4a54ac302ea7ce3bc7bca688f50ab8e6e3bc090b488f0d440",
+            "sha256": "bc103913e77e35a4a54ac302ea7ce3bc7bca688f50ab8e6e3bc090b488f0d4d0",
         },
         "training_attempt": {
             "size_bytes": 844,
-            "sha256": "9e6916c91073cf2ca8037f2cde593e5151d8315c630074991e4e682701ef5e24",
+            "sha256": "9e6916c91073cf2cad837f2cde593e5151d8315c630074991e4e682701ef5e24",
         },
     }
+
+
+def test_real_training_summary_pin_uses_windows_frozen_byte_length() -> None:
+    snapshot = {
+        name: (str(pin["sha256"]), int(pin["size_bytes"]))
+        for name, pin in failure_attestor.EXPECTED_RUN_ARTIFACT_PINS.items()
+    }
+    failure_attestor._validate_fixed_run_pins(snapshot)
+
+    snapshot["training_summary"] = (
+        "2f582138f6751fda4392e12b6398745c89b176ce3afe6ec25875b337376cb9b4",
+        230694,
+    )
+    with pytest.raises(ValueError, match="fixed training_summary pin mismatch"):
+        failure_attestor._validate_fixed_run_pins(snapshot)
+
+
+@pytest.mark.parametrize(
+    ("name", "windows_sha256", "transcription_typo"),
+    [
+        (
+            "blind_contract",
+            "bc103913e77e35a4a54ac302ea7ce3bc7bca688f50ab8e6e3bc090b488f0d4d0",
+            "bc103913e77e35a4a54ac302ea7ce3bc7bca688f50ab8e6e3bc090b488f0d440",
+        ),
+        (
+            "training_attempt",
+            "9e6916c91073cf2cad837f2cde593e5151d8315c630074991e4e682701ef5e24",
+            "9e6916c91073cf2ca8037f2cde593e5151d8315c630074991e4e682701ef5e24",
+        ),
+    ],
+)
+def test_real_windows_sha_pins_reject_transcription_typos(
+    name: str, windows_sha256: str, transcription_typo: str
+) -> None:
+    snapshot = {
+        artifact_name: (str(pin["sha256"]), int(pin["size_bytes"]))
+        for artifact_name, pin in failure_attestor.EXPECTED_RUN_ARTIFACT_PINS.items()
+    }
+    assert snapshot[name][0] == windows_sha256
+    failure_attestor._validate_fixed_run_pins(snapshot)
+
+    snapshot[name] = (transcription_typo, snapshot[name][1])
+    with pytest.raises(ValueError, match=rf"fixed {name} pin mismatch"):
+        failure_attestor._validate_fixed_run_pins(snapshot)
