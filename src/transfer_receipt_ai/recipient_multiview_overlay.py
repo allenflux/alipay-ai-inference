@@ -1031,7 +1031,14 @@ def _rename_directory_no_replace_anchored(
         buffer = ctypes.create_string_buffer(buffer_size)
         information = _FileRenameInfoPrefix.from_buffer(buffer)
         information.flags = 0  # FileRenameInfo: ReplaceIfExists == FALSE.
-        information.root_directory = parent.windows_handle
+        # This is a same-directory rename, so use the documented simple-name
+        # form: RootDirectory == NULL and FileName contains one simple name.
+        # The rename is still anchored by the already-validated source handle;
+        # its no-FILE_SHARE_DELETE lease prevents it from leaving the leased
+        # parent before this call, while the parent lease prevents substitution
+        # of that directory.  SetFileInformationByHandle rejects the otherwise
+        # equivalent non-NULL RootDirectory form on the target Windows host.
+        information.root_directory = None
         information.file_name_length = len(encoded_name)
         ctypes.memmove(
             ctypes.addressof(buffer) + name_offset,

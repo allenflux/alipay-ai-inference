@@ -1865,10 +1865,16 @@ def test_windows_anchored_rename_reports_complete_file_rename_info_buffer(
     class _FakeKernel32:
         SetFileInformationByHandle = _FakeSetFileInformationByHandle()
 
+    identity_calls: list[int] = []
+
+    def handle_identity(handle: int) -> tuple[int, int, int]:
+        identity_calls.append(handle)
+        return {611: parent_identity, 612: stage_identity}[handle]
+
     monkeypatch.setattr(
         overlay_module,
         "_windows_directory_handle_identity",
-        lambda handle: {611: parent_identity, 612: stage_identity}[handle],
+        handle_identity,
     )
     monkeypatch.setattr(
         overlay_module.ctypes,
@@ -1888,6 +1894,7 @@ def test_windows_anchored_rename_reports_complete_file_rename_info_buffer(
     handle, information_class, raw, reported_size = calls[0]
     assert handle.value == 612
     assert information_class == 3  # FileRenameInfo
+    assert identity_calls == [611, 612]
 
     class _FileRenameInfoPrefix(ctypes.Structure):
         _fields_ = (
@@ -1901,10 +1908,70 @@ def test_windows_anchored_rename_reports_complete_file_rename_info_buffer(
     assert reported_size == ctypes.sizeof(_FileRenameInfoPrefix) + len(encoded_name)
     information = _FileRenameInfoPrefix.from_buffer_copy(raw)
     assert information.flags == 0  # ReplaceIfExists == FALSE: no clobber.
-    assert information.root_directory == 611
+    # A NULL root plus one simple name is the documented same-parent form.  It
+    # keeps resolution relative to the leased stage handle's current parent.
+    assert information.root_directory is None
     assert information.file_name_length == len(encoded_name)
     name_offset = _FileRenameInfoPrefix.file_name.offset
     assert raw[name_offset : name_offset + len(encoded_name)] == encoded_name
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires the real Windows file API")
+def test_windows_anchored_rename_real_kernel_success_and_no_clobber(
+    tmp_path: Path,
+) -> None:
+    parent = overlay_module._open_directory_lease(
+        tmp_path,
+        expected=overlay_module._directory_identity(tmp_path),
+    )
+    successful_stage: overlay_module._DirectoryLease | None = None
+    colliding_stage: overlay_module._DirectoryLease | None = None
+    try:
+        successful_stage = overlay_module.create_anchored_stage_directory(
+            parent,
+            name=".stage-real-success",
+        )
+        published = tmp_path / "published-real-success"
+        overlay_module._rename_directory_no_replace_anchored(
+            parent,
+            successful_stage,
+            source=successful_stage.path,
+            destination=published,
+        )
+        assert not os.path.lexists(tmp_path / ".stage-real-success")
+        assert overlay_module._same_anchored_directory_entry(
+            parent,
+            name=published.name,
+            expected=successful_stage.identity,
+        )
+
+        occupied = tmp_path / "published-real-occupied"
+        occupied.mkdir()
+        foreign = occupied / "foreign.txt"
+        foreign.write_bytes(b"must-survive")
+        colliding_stage = overlay_module.create_anchored_stage_directory(
+            parent,
+            name=".stage-real-collision",
+        )
+        with pytest.raises(FileExistsError):
+            overlay_module._rename_directory_no_replace_anchored(
+                parent,
+                colliding_stage,
+                source=colliding_stage.path,
+                destination=occupied,
+            )
+        assert foreign.read_bytes() == b"must-survive"
+        assert overlay_module._same_anchored_directory_entry(
+            parent,
+            name=colliding_stage.path.name,
+            expected=colliding_stage.identity,
+        )
+    finally:
+        if colliding_stage is not None:
+            colliding_stage.close()
+        if successful_stage is not None:
+            successful_stage.close()
+        parent.close()
 
 
 def test_windows_atomic_stage_creation_rejects_postcreate_entry_substitution(
