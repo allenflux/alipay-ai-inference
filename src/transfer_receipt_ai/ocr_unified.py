@@ -109,6 +109,7 @@ INIT_CHECKPOINT_MODE_RECIPIENT_OPEN_TEXT_ADAPTER = "recipient_open_text_adapter"
 INIT_CHECKPOINT_MODE_RECIPIENT_VISUAL_CONTEXT_REINIT = "recipient_visual_context_reinit"
 INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_WARMSTART = "recipient_full_crop_warmstart"
 INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_CONTINUATION = "recipient_full_crop_continuation"
+INIT_CHECKPOINT_MODE_RECIPIENT_DOMAIN_ADAPT = "recipient_domain_adapt"
 FULL_CROP_CONTINUATION_AUTHORITY_KEY = "full_crop_continuation_authority"
 INIT_CHECKPOINT_MODES = frozenset(
     (
@@ -120,6 +121,7 @@ INIT_CHECKPOINT_MODES = frozenset(
         INIT_CHECKPOINT_MODE_RECIPIENT_VISUAL_CONTEXT_REINIT,
         INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_WARMSTART,
         INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_CONTINUATION,
+        INIT_CHECKPOINT_MODE_RECIPIENT_DOMAIN_ADAPT,
     )
 )
 RECIPIENT_ONLY_INIT_CHECKPOINT_MODES = frozenset(
@@ -131,6 +133,7 @@ RECIPIENT_ONLY_INIT_CHECKPOINT_MODES = frozenset(
         INIT_CHECKPOINT_MODE_RECIPIENT_VISUAL_CONTEXT_REINIT,
         INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_WARMSTART,
         INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_CONTINUATION,
+        INIT_CHECKPOINT_MODE_RECIPIENT_DOMAIN_ADAPT,
     )
 )
 V13_PRIVATE_RECIPIENT_INIT_CHECKPOINT_MODES = frozenset(
@@ -138,6 +141,7 @@ V13_PRIVATE_RECIPIENT_INIT_CHECKPOINT_MODES = frozenset(
         INIT_CHECKPOINT_MODE_RECIPIENT_VISUAL_CONTEXT_REINIT,
         INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_WARMSTART,
         INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_CONTINUATION,
+        INIT_CHECKPOINT_MODE_RECIPIENT_DOMAIN_ADAPT,
     )
 )
 
@@ -1402,7 +1406,7 @@ def _recipient_train_split_policy(splits: Sequence[str]) -> dict[str, object]:
 
 
 def _require_manifest_without_test_rows(path: Path) -> None:
-    """Reject a full-crop training input before the model loader sees test labels."""
+    """Reject a train-only adaptation input before model code sees test labels."""
 
     source = Path(path).expanduser().resolve()
     if not source.is_file():
@@ -1421,7 +1425,7 @@ def _require_manifest_without_test_rows(path: Path) -> None:
             if split not in {"train", "val"}:
                 if split == "test":
                     raise ValueError(
-                        "recipient_full_crop_warmstart requires a manifest that physically excludes test rows"
+                        "train-only recipient adaptation requires a manifest that physically excludes test rows"
                     )
                 raise ValueError(f"{source}:{line_number}: invalid split {split!r}")
 
@@ -6034,6 +6038,34 @@ def _validate_recipient_full_crop_continuation_config(
         )
 
 
+def _validate_recipient_domain_adapt_config(
+    source_config: UnifiedReaderConfig,
+    target_config: UnifiedReaderConfig,
+) -> None:
+    """Require an ordinary v13 seed with an identical model topology.
+
+    Domain adaptation changes recipient training pixels and labels, not the
+    ONNX ABI, preprocessing geometry, shared trunk, or any decoder capacity.
+    Keeping this separate from ``strict`` permits a train-only recipient
+    Unicode extension while rejecting every topology/configuration change.
+    """
+
+    if not (_is_v13(source_config) and _is_v13(target_config)):
+        raise ValueError("recipient_domain_adapt requires v13 source and target configs")
+    source_values = asdict(source_config)
+    target_values = asdict(target_config)
+    if source_values != target_values:
+        changed = [
+            key
+            for key in sorted(source_values)
+            if source_values[key] != target_values.get(key)
+        ]
+        raise ValueError(
+            "recipient_domain_adapt requires an exact v13 source/target config match; "
+            f"incompatible config fields: {', '.join(changed)}"
+        )
+
+
 def _validate_recipient_full_crop_continuation_policy(
     payload: Mapping[str, object], *, torch: Any | None = None
 ) -> Mapping[str, object]:
@@ -6093,7 +6125,7 @@ def _recipient_only_expansion_label_override(
     torch: Any,
     init_checkpoint_mode: str = INIT_CHECKPOINT_MODE_RECIPIENT_ONLY_EXPANSION,
 ) -> tuple[list[str], list[str], list[str], dict[str, object]]:
-    """Lock financial label semantics to a v12 seed for a recipient-only run.
+    """Lock financial label semantics to a v12/v13 seed for a recipient-only run.
 
     A receipt manifest can gain/reorder payment text or bank-prefix labels
     between r2 and r3.  Rebuilding those output maps would reinterpret frozen
@@ -6105,14 +6137,14 @@ def _recipient_only_expansion_label_override(
     persisted Unicode-map ordering remains valid.
     """
     if init_checkpoint_mode not in RECIPIENT_ONLY_INIT_CHECKPOINT_MODES:
-        raise ValueError("recipient label override requires a recipient-only expansion init mode")
+        raise ValueError("recipient label override requires a recipient-only init mode")
     v13_recipient_private_mode = (
         _is_v13(config)
         and init_checkpoint_mode in V13_PRIVATE_RECIPIENT_INIT_CHECKPOINT_MODES
     )
     if not (_is_v12(config) or v13_recipient_private_mode):
         raise ValueError(
-            "recipient-only expansion is supported by architecture v12, or by an audited v13 private-recipient mode"
+            "recipient-only initialization is supported by architecture v12, or by a guarded v13 private-recipient mode"
         )
     if recipient_characters is None or payment_bank_prefix_classes is None:
         raise ValueError("recipient_only_expansion requires v12 recipient and payment bank label maps")
@@ -6148,6 +6180,8 @@ def _recipient_only_expansion_label_override(
         _validate_recipient_full_crop_warmstart_config(source_config, config)
     elif init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_CONTINUATION:
         _validate_recipient_full_crop_continuation_config(source_config, config)
+    elif init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_DOMAIN_ADAPT:
+        _validate_recipient_domain_adapt_config(source_config, config)
     elif source_config != config:
         raise ValueError(
             "init checkpoint model config does not match the requested training config; "
@@ -6229,7 +6263,12 @@ def _recipient_only_expansion_label_override(
                                     "checkpoint_all_label_maps_recipient_full_crop_continuation_v1"
                                     if init_checkpoint_mode
                                     == INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_CONTINUATION
-                                    else "checkpoint_financial_label_maps_v1"
+                                    else (
+                                        "checkpoint_financial_label_maps_recipient_domain_adapt_v1"
+                                        if init_checkpoint_mode
+                                        == INIT_CHECKPOINT_MODE_RECIPIENT_DOMAIN_ADAPT
+                                        else "checkpoint_financial_label_maps_v1"
+                                    )
                                 )
                             )
                         )
@@ -6468,6 +6507,123 @@ def _recipient_classifier_unicode_expansion_state(
     }
 
 
+def _recipient_domain_adapt_state(
+    *,
+    source_state_dict: Mapping[str, object],
+    target_state_dict: Mapping[str, object],
+    source_recipient_characters: Sequence[str],
+    target_recipient_characters: Sequence[str],
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Copy an identical v13 model, permitting only recipient Unicode rows.
+
+    Every source tensor must have the exact target key, dtype, and compatible
+    shape.  The sole permitted shape change is the leading vocabulary axis of
+    ``recipient_classifier.{weight,bias}``; existing rows are copied by their
+    Unicode code point and genuinely new rows keep deterministic target init.
+    """
+
+    source_keys = set(source_state_dict)
+    target_keys = set(target_state_dict)
+    if not all(isinstance(key, str) and key for key in source_keys | target_keys):
+        raise ValueError("recipient_domain_adapt state keys must be non-empty strings")
+    if source_keys != target_keys:
+        raise ValueError(
+            "recipient_domain_adapt requires an exact all-state key match; "
+            f"missing={sorted(target_keys - source_keys)}, "
+            f"unexpected={sorted(source_keys - target_keys)}"
+        )
+    classifier_keys = {
+        "recipient_classifier.weight",
+        "recipient_classifier.bias",
+    }
+    if not classifier_keys.issubset(source_keys):
+        raise ValueError("recipient_domain_adapt source has no complete recipient classifier")
+    if (
+        len(set(source_recipient_characters)) != len(source_recipient_characters)
+        or len(set(target_recipient_characters)) != len(target_recipient_characters)
+    ):
+        raise ValueError("recipient_domain_adapt recipient character maps contain duplicates")
+    missing_source_characters = sorted(
+        set(source_recipient_characters) - set(target_recipient_characters)
+    )
+    if missing_source_characters:
+        raise ValueError(
+            "recipient_domain_adapt cannot discard source recipient characters; "
+            f"missing={''.join(missing_source_characters)!r}"
+        )
+
+    for key in sorted(source_keys):
+        source_value = source_state_dict[key]
+        target_value = target_state_dict[key]
+        if not hasattr(source_value, "detach") or not hasattr(target_value, "detach"):
+            raise ValueError(f"recipient_domain_adapt state entry {key!r} is not a tensor")
+        source_shape = tuple(getattr(source_value, "shape", ()))
+        target_shape = tuple(getattr(target_value, "shape", ()))
+        source_dtype = str(getattr(source_value, "dtype", None))
+        target_dtype = str(getattr(target_value, "dtype", None))
+        if source_dtype != target_dtype:
+            raise ValueError(
+                "recipient_domain_adapt changed a state tensor dtype: "
+                f"{key} source={source_dtype}, target={target_dtype}"
+            )
+        if key in classifier_keys:
+            if (
+                not source_shape
+                or not target_shape
+                or source_shape[0] != len(source_recipient_characters) + 1
+                or target_shape[0] != len(target_recipient_characters) + 1
+                or source_shape[1:] != target_shape[1:]
+            ):
+                raise ValueError(
+                    "recipient_domain_adapt changed recipient classifier topology: "
+                    f"{key} source={source_shape}, target={target_shape}"
+                )
+            continue
+        if source_shape != target_shape:
+            raise ValueError(
+                "recipient_domain_adapt changed a non-classifier tensor shape: "
+                f"{key} source={source_shape}, target={target_shape}"
+            )
+
+    exact_charset = list(source_recipient_characters) == list(
+        target_recipient_characters
+    )
+    if exact_charset:
+        adapted = dict(source_state_dict)
+        row_mapping: dict[str, object] = {
+            "blank_row_copied": True,
+            "shared_character_rows_copied": len(source_recipient_characters),
+            "new_target_character_rows_kept_at_seed": 0,
+            "checkpoint_character_count": len(source_recipient_characters),
+            "target_character_count": len(target_recipient_characters),
+            "checkpoint_charset_sha256": _label_map_sha256(
+                source_recipient_characters
+            ),
+            "target_charset_sha256": _label_map_sha256(
+                target_recipient_characters
+            ),
+        }
+    else:
+        adapted, row_mapping = _recipient_classifier_unicode_expansion_state(
+            source_state_dict=source_state_dict,
+            target_state_dict=target_state_dict,
+            source_recipient_characters=source_recipient_characters,
+            target_recipient_characters=target_recipient_characters,
+        )
+    return adapted, {
+        "all_state_key_set_exact": True,
+        "all_non_classifier_dtype_shape_exact": True,
+        "source_tensor_count": len(source_keys),
+        "recipient_charset_exact": exact_charset,
+        "recipient_classifier_row_mapping": row_mapping,
+        "source_value_copy": (
+            "all_state_exact"
+            if exact_charset
+            else "all_source_tensors_and_shared_recipient_classifier_rows_exact"
+        ),
+    }
+
+
 def _recipient_capacity_reinit_state(
     *,
     source_state_dict: Mapping[str, object],
@@ -6643,7 +6799,7 @@ def _parameter_only_initialization(
         )
     if init_checkpoint is None:
         if init_checkpoint_mode != INIT_CHECKPOINT_MODE_STRICT:
-            raise ValueError("recipient-only expansion init modes require a compatible --init-checkpoint")
+            raise ValueError("non-strict init modes require a compatible --init-checkpoint")
         return None, {
             "mode": "random",
             "optimizer_restored": False,
@@ -6686,6 +6842,8 @@ def _parameter_only_initialization(
         _validate_recipient_full_crop_warmstart_config(source_config, config)
     elif init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_CONTINUATION:
         _validate_recipient_full_crop_continuation_config(source_config, config)
+    elif init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_DOMAIN_ADAPT:
+        _validate_recipient_domain_adapt_config(source_config, config)
     elif v12_status_text_expansion:
         source_values = asdict(source_config)
         target_values = asdict(config)
@@ -6837,12 +6995,12 @@ def _parameter_only_initialization(
     )
     if not (_is_v12(config) or v13_recipient_private_mode):
         raise ValueError(
-            "recipient-only expansion init modes require architecture v12, or an audited v13 private-recipient mode"
+            "recipient-only init modes require architecture v12, or a guarded v13 private-recipient mode"
         )
     if source_recipient_characters is None or recipient_characters is None:
         raise ValueError("init checkpoint recipient character map does not match the current training data")
     if target_state_dict is None:
-        raise ValueError("recipient-only expansion init modes require a freshly initialised target state")
+        raise ValueError("recipient-only init modes require a freshly initialised target state")
     source_status_text_characters = _checkpoint_status_text_characters(
         payload, config=source_config
     )
@@ -6890,6 +7048,21 @@ def _parameter_only_initialization(
             }
         )
         return state_dict, initialization
+    if init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_DOMAIN_ADAPT:
+        remapped_state, domain_mapping = _recipient_domain_adapt_state(
+            source_state_dict=state_dict,
+            target_state_dict=target_state_dict,
+            source_recipient_characters=source_recipient_characters,
+            target_recipient_characters=recipient_characters,
+        )
+        initialization.update(
+            {
+                "mode": "parameter_only_recipient_domain_adapt",
+                "init_checkpoint_mode": init_checkpoint_mode,
+                "recipient_domain_adapt_mapping": domain_mapping,
+            }
+        )
+        return remapped_state, initialization
     if init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_VISUAL_CONTEXT_REINIT:
         remapped_state, visual_context_mapping = _recipient_visual_context_reinit_state(
             source_state_dict=state_dict,
@@ -7125,6 +7298,31 @@ def _is_full_validation_epoch(*, epoch: int, epochs: int, validation_every: int)
     return epoch == 1 or epoch == epochs or epoch % validation_every == 0
 
 
+def _requires_non_recipient_parameter_byte_guard(
+    *, validation_every: int, init_checkpoint_mode: str
+) -> bool:
+    """Return whether recipient training must snapshot its frozen state.
+
+    Domain adaptation always guards the frozen side, including the default
+    validate-every-epoch schedule.  Legacy recipient modes retain their
+    existing sparse-validation requirement, while the two full-crop modes
+    keep their stronger always-on audit.
+    """
+
+    return (
+        init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_DOMAIN_ADAPT
+        or (
+            validation_every > 1
+            and init_checkpoint_mode in RECIPIENT_ONLY_INIT_CHECKPOINT_MODES
+        )
+        or init_checkpoint_mode
+        in {
+            INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_WARMSTART,
+            INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_CONTINUATION,
+        }
+    )
+
+
 def _full_validation_epoch_reason(*, epoch: int, epochs: int, validation_every: int) -> str:
     """Return an audit-friendly reason for a planned full validation."""
     if not _is_full_validation_epoch(epoch=epoch, epochs=epochs, validation_every=validation_every):
@@ -7312,10 +7510,13 @@ def train_unified_reader(
         init_checkpoint_mode in {
             INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_WARMSTART,
             INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_CONTINUATION,
+            INIT_CHECKPOINT_MODE_RECIPIENT_DOMAIN_ADAPT,
         }
         and recipient_train_split_policy["mode"] != "standard_train_only"
     ):
-        raise ValueError("full-crop recipient init modes permit train-split supervision only")
+        raise ValueError(
+            "full-crop and recipient_domain_adapt init modes permit train-split supervision only"
+        )
     if recipient_only_fine_tune:
         if not _uses_v12_recipient_topology(config):
             raise ValueError("recipient_only_fine_tune is supported only by architecture v12 or v13")
@@ -7337,12 +7538,17 @@ def train_unified_reader(
             f"{', '.join(sorted(INIT_CHECKPOINT_MODES))}"
         )
     if (
+        init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_DOMAIN_ADAPT
+        and not _is_v13(config)
+    ):
+        raise ValueError("recipient_domain_adapt requires architecture v13")
+    if (
         recipient_only_fine_tune
         and _is_v13(config)
         and init_checkpoint_mode not in V13_PRIVATE_RECIPIENT_INIT_CHECKPOINT_MODES
     ):
         raise ValueError(
-            "v13 recipient_only_fine_tune requires an audited private-recipient init mode: "
+            "v13 recipient_only_fine_tune requires a guarded private-recipient init mode: "
             f"{', '.join(sorted(V13_PRIVATE_RECIPIENT_INIT_CHECKPOINT_MODES))}"
         )
     if init_checkpoint_mode in RECIPIENT_ONLY_INIT_CHECKPOINT_MODES:
@@ -7352,11 +7558,11 @@ def train_unified_reader(
         )
         if not recipient_only_fine_tune or not (_is_v12(config) or v13_recipient_private_mode):
             raise ValueError(
-                "recipient-only expansion init modes require v12 recipient_only_fine_tune, "
+                "recipient-only init modes require v12 recipient_only_fine_tune, "
                 "or a compatible v13 private-recipient warm start"
             )
         if init_checkpoint is None:
-            raise ValueError("recipient-only expansion init modes require a compatible --init-checkpoint")
+            raise ValueError("recipient-only init modes require a compatible --init-checkpoint")
     if init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_CONTINUATION:
         fixed_recipe_matches = (
             recipient_only_fine_tune
@@ -7560,6 +7766,7 @@ def train_unified_reader(
     if init_checkpoint_mode in {
         INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_WARMSTART,
         INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_CONTINUATION,
+        INIT_CHECKPOINT_MODE_RECIPIENT_DOMAIN_ADAPT,
     }:
         _require_manifest_without_test_rows(records_path)
     records = load_records(records_path, dataset_root=dataset_root, config=config)
@@ -7903,7 +8110,10 @@ def train_unified_reader(
         # This is intentionally strict: equal tensor shapes are insufficient
         # when a CTC character or classifier-class ordering has changed.
         model.load_state_dict(initialization_state, strict=True)
-        if init_checkpoint_mode == INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_CONTINUATION:
+        if init_checkpoint_mode in {
+            INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_CONTINUATION,
+            INIT_CHECKPOINT_MODE_RECIPIENT_DOMAIN_ADAPT,
+        }:
             _assert_state_dict_exact_copy(model.state_dict(), initialization_state)
     if financial_label_policy is not None:
         initialization = {
@@ -7987,16 +8197,9 @@ def train_unified_reader(
     )
     frozen_non_recipient_parameter_snapshot: dict[str, bytes] | None = None
     frozen_non_status_text_parameter_snapshot: dict[str, bytes] | None = None
-    if (
-        (
-            validation_every > 1
-            and init_checkpoint_mode in RECIPIENT_ONLY_INIT_CHECKPOINT_MODES
-        )
-        or init_checkpoint_mode
-        in {
-            INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_WARMSTART,
-            INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_CONTINUATION,
-        }
+    if _requires_non_recipient_parameter_byte_guard(
+        validation_every=validation_every,
+        init_checkpoint_mode=init_checkpoint_mode,
     ):
         frozen_non_recipient_parameter_snapshot = _non_recipient_parameter_bytes(model)
         fine_tune_policy = {
@@ -8011,7 +8214,10 @@ def train_unified_reader(
                     "before_epoch_zero_validation"
                 }
                 if init_checkpoint_mode
-                == INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_CONTINUATION
+                in {
+                    INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_CONTINUATION,
+                    INIT_CHECKPOINT_MODE_RECIPIENT_DOMAIN_ADAPT,
+                }
                 else {}
             ),
         }
@@ -8102,6 +8308,7 @@ def train_unified_reader(
         INIT_CHECKPOINT_MODE_RECIPIENT_OPEN_TEXT_ADAPTER,
         INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_WARMSTART,
         INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_CONTINUATION,
+        INIT_CHECKPOINT_MODE_RECIPIENT_DOMAIN_ADAPT,
     }:
         # Measure and persist the exact transplanted model as epoch zero so a
         # pilot cannot silently return a checkpoint worse than its own safe
@@ -8113,7 +8320,10 @@ def train_unified_reader(
         initialization_started = perf_counter()
         if (
             init_checkpoint_mode
-            == INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_CONTINUATION
+            in {
+                INIT_CHECKPOINT_MODE_RECIPIENT_FULL_CROP_CONTINUATION,
+                INIT_CHECKPOINT_MODE_RECIPIENT_DOMAIN_ADAPT,
+            }
             and frozen_non_recipient_parameter_snapshot is not None
         ):
             _assert_non_recipient_parameter_bytes(
@@ -11827,16 +12037,17 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("train", "val", "test"),
         default=["train"],
         help=(
-            "v12 recipient-only fine-tune only: manifest splits allowed to supervise recipient CTC. "
-            "Default train preserves an independent val metric; adding val is a Paddle-fit/transductive recipe."
+            "v12/v13 recipient-only fine-tune: manifest splits allowed to supervise recipient CTC. "
+            "Default train preserves an independent val metric; adding val is a Paddle-fit/transductive recipe. "
+            "recipient_domain_adapt and full-crop modes reject every non-train supervision split."
         ),
     )
     train.add_argument(
         "--recipient-only-fine-tune",
         action="store_true",
         help=(
-            "v12 only: require a compatible warm checkpoint, freeze every non-recipient parameter, and optimize "
-            "only the private recipient branch. Whole-receipt oversampling is rejected."
+            "v12/v13 only: require a compatible warm checkpoint, freeze every non-recipient parameter, and "
+            "optimize only the private recipient branch. Whole-receipt oversampling is rejected."
         ),
     )
     train.add_argument(
@@ -11861,8 +12072,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=1,
         help=(
             "Run full five-field validation every N epochs, always including epoch 1 and the final epoch. "
-            "Values above 1 are restricted to the guarded v12 recipient-only expansion or v13 "
-            "status-text-only warm start."
+            "Values above 1 are restricted to guarded v12/v13 recipient-only or v13 status-text-only "
+            "warm starts."
         ),
     )
     train.add_argument(
@@ -11918,6 +12129,8 @@ def build_parser() -> argparse.ArgumentParser:
             "every non-recipient tensor from a v13 seed and freshly trains the residual visual + direct "
             "positional Transformer CTC recipient branch. recipient_full_crop_warmstart is v13-only: it "
             "copies the compatible seed and permits exactly recipient_value_left_trim 0.30 -> 0.0. "
+            "recipient_domain_adapt is v13-only: it requires an identical topology, copies every source "
+            "parameter exactly, and permits only train-derived recipient Unicode classifier-row additions. "
             "recipient_full_crop_continuation requires a content-bound v13 legacy trim-zero authority, "
             "exact config/maps/all-state copy, and fresh training state."
         ),
