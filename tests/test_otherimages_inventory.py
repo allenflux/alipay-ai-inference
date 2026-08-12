@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import ctypes
 import hashlib
+import inspect
 import json
 import shutil
 import subprocess
@@ -334,7 +336,9 @@ def test_source_change_during_closure_is_fatal_and_never_publishes(
 
     assert mutated
     assert not output.exists()
-    assert not list(tmp_path.glob(".must-not-publish.inventory-building-*"))
+    failed_stages = list(tmp_path.glob(".must-not-publish.inventory-building-*"))
+    assert len(failed_stages) == 1
+    assert (failed_stages[0] / "images.jsonl").is_file()
 
 
 def test_phash_candidate_cap_fails_instead_of_truncating_leakage_evidence(tmp_path: Path) -> None:
@@ -389,9 +393,20 @@ def test_atomic_no_replace_publication_refuses_destination_created_at_race(
     output = tmp_path / "raced-output"
     original_publish = inventory_module._rename_directory_no_replace
 
-    def create_competitor_then_publish(stage: Path, destination: Path) -> None:
+    def create_competitor_then_publish(
+        stage: Path,
+        destination: Path,
+        *,
+        expected_parent_identity: tuple[int, int] | None = None,
+        expected_stage_identity: tuple[int, int] | None = None,
+    ) -> None:
         destination.mkdir()
-        original_publish(stage, destination)
+        original_publish(
+            stage,
+            destination,
+            expected_parent_identity=expected_parent_identity,
+            expected_stage_identity=expected_stage_identity,
+        )
 
     monkeypatch.setattr(inventory_module, "_rename_directory_no_replace", create_competitor_then_publish)
     with pytest.raises(FileExistsError, match="replace existing|File exists"):
@@ -399,7 +414,221 @@ def test_atomic_no_replace_publication_refuses_destination_created_at_race(
 
     assert output.is_dir()
     assert list(output.iterdir()) == []
-    assert not list(tmp_path.glob(".raced-output.inventory-building-*"))
+    failed_stages = list(tmp_path.glob(".raced-output.inventory-building-*"))
+    assert len(failed_stages) == 1
+    assert (failed_stages[0] / "inventory.contract.json").is_file()
+
+
+def test_inventory_publish_parent_swap_preserves_original_stage_and_unrelated_imposter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "OtherImages"
+    source.mkdir()
+    _write_receipt(source / "valid.png")
+    output_parent = tmp_path / "inventory-publication-parent"
+    output_parent.mkdir()
+    moved_parent = tmp_path / "inventory-publication-parent-before-swap"
+    output = output_parent / "inventory"
+    original_publish = inventory_module._rename_directory_no_replace
+    stage_name: str | None = None
+
+    def swap_parent_then_publish(
+        stage: Path,
+        destination: Path,
+        *,
+        expected_parent_identity: tuple[int, int] | None = None,
+        expected_stage_identity: tuple[int, int] | None = None,
+    ) -> None:
+        nonlocal stage_name
+        stage_name = stage.name
+        output_parent.rename(moved_parent)
+        output_parent.mkdir()
+        imposter = output_parent / stage.name
+        imposter.mkdir()
+        (imposter / "unrelated.txt").write_text("preserve me", encoding="utf-8")
+        original_publish(
+            stage,
+            destination,
+            expected_parent_identity=expected_parent_identity,
+            expected_stage_identity=expected_stage_identity,
+        )
+
+    monkeypatch.setattr(inventory_module, "_rename_directory_no_replace", swap_parent_then_publish)
+    with pytest.raises(inventory_module.SourceChangedError, match="output parent identity changed"):
+        build_otherimages_inventory(input_dir=source, output_dir=output, layout_sample_size=1)
+
+    assert stage_name is not None
+    assert (moved_parent / stage_name / "inventory.contract.json").is_file()
+    assert (output_parent / stage_name / "unrelated.txt").read_text(encoding="utf-8") == "preserve me"
+    assert not output.exists()
+
+
+def test_inventory_refuses_same_parent_stage_replacement_and_preserves_both_trees(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "OtherImages"
+    source.mkdir()
+    _write_receipt(source / "valid.png")
+    output = tmp_path / "inventory"
+    original_publish = inventory_module._rename_directory_no_replace
+    original_stage: Path | None = None
+    replacement_stage: Path | None = None
+
+    def replace_stage_then_publish(
+        stage: Path,
+        destination: Path,
+        *,
+        expected_parent_identity: tuple[int, int] | None = None,
+        expected_stage_identity: tuple[int, int] | None = None,
+    ) -> None:
+        nonlocal original_stage, replacement_stage
+        original_stage = stage.with_name(stage.name + "-bound-original")
+        stage.rename(original_stage)
+        stage.mkdir()
+        replacement_stage = stage
+        (stage / "attacker.txt").write_text("not the bound stage", encoding="utf-8")
+        original_publish(
+            stage,
+            destination,
+            expected_parent_identity=expected_parent_identity,
+            expected_stage_identity=expected_stage_identity,
+        )
+
+    monkeypatch.setattr(inventory_module, "_rename_directory_no_replace", replace_stage_then_publish)
+    with pytest.raises(inventory_module.SourceChangedError, match="stage identity changed"):
+        build_otherimages_inventory(input_dir=source, output_dir=output, layout_sample_size=1)
+
+    assert original_stage is not None and (original_stage / "inventory.contract.json").is_file()
+    assert replacement_stage is not None
+    assert (replacement_stage / "attacker.txt").read_text(encoding="utf-8") == "not the bound stage"
+    assert not output.exists()
+
+
+def test_windows_publication_uses_source_handle_relative_rename_not_string_rename() -> None:
+    implementation = inspect.getsource(inventory_module._rename_directory_no_replace)
+
+    assert "SetFileInformationByHandle" in implementation
+    assert "root_directory" in implementation
+    assert "source.rename" not in implementation
+
+
+def test_windows_publication_passes_frozen_parent_handle_and_bound_source_to_file_rename_info(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = tmp_path / "windows-publication"
+    parent.mkdir()
+    source = parent / "stage"
+    source.mkdir()
+    destination = parent / "final"
+    real_parent_identity = inventory_module._bind_stage_identity(parent, directory=True)
+    real_stage_identity = inventory_module._bind_stage_identity(source, directory=True)
+    next_handle = 100
+    handle_information: dict[int, tuple[tuple[int, int], int]] = {}
+    opened: list[tuple[Path, int, int, int]] = []
+    closed: list[int] = []
+
+    def fake_open(path: Path, *, access: int, share: int) -> int:
+        nonlocal next_handle
+        next_handle += 1
+        handle = next_handle
+        identity = real_parent_identity if path == parent else real_stage_identity
+        attributes = 0x00000010  # FILE_ATTRIBUTE_DIRECTORY
+        handle_information[handle] = identity, attributes
+        opened.append((path, access, share, handle))
+        return handle
+
+    class FakeSetFileInformation:
+        argtypes: object = None
+        restype: object = None
+
+        def __init__(self) -> None:
+            self.calls: list[tuple[object, ...]] = []
+
+        def __call__(self, *arguments: object) -> int:
+            self.calls.append(arguments)
+            return 1
+
+    set_information = FakeSetFileInformation()
+    fake_kernel32 = type("FakeKernel32", (), {"SetFileInformationByHandle": set_information})()
+    monkeypatch.setattr(inventory_module, "_windows_open_path_handle", fake_open)
+    monkeypatch.setattr(
+        inventory_module,
+        "_windows_handle_information",
+        lambda handle: handle_information[int(handle)],
+    )
+    monkeypatch.setattr(inventory_module, "_windows_close_handle", lambda handle: closed.append(int(handle)))
+    monkeypatch.setattr(inventory_module.ctypes, "WinDLL", lambda *_args, **_kwargs: fake_kernel32, raising=False)
+    monkeypatch.setattr(inventory_module, "_WINDOWS", True)
+
+    inventory_module._rename_directory_no_replace(
+        source,
+        destination,
+        expected_parent_identity=real_parent_identity,
+        expected_stage_identity=real_stage_identity,
+    )
+
+    assert len(set_information.calls) == 1
+    source_handle, information_class, information_pointer, _buffer_size = set_information.calls[0]
+    information = information_pointer._obj
+    publication_parent_handle = opened[-2][3]
+    assert source_handle == opened[-1][3]
+    assert information_class == 3
+    assert information.flags == 0
+    assert information.root_directory == publication_parent_handle
+    assert information.file_name_length == len(destination.name.encode("utf-16-le"))
+    assert set(closed) == {item[3] for item in opened}
+
+
+def test_windows_publication_closes_parent_handle_if_source_handle_open_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = tmp_path / "windows-open-failure"
+    parent.mkdir()
+    source = parent / "stage"
+    source.mkdir()
+    destination = parent / "final"
+    parent_identity = inventory_module._bind_stage_identity(parent, directory=True)
+    stage_identity = inventory_module._bind_stage_identity(source, directory=True)
+    closed: list[int] = []
+    opens = 0
+
+    def fake_open(_path: Path, *, access: int, share: int) -> int:
+        del access, share
+        nonlocal opens
+        opens += 1
+        if opens < 4:
+            return opens
+        raise OSError("source handle failure")
+
+    identities = {
+        1: (parent_identity, 0x00000010),
+        2: (stage_identity, 0x00000010),
+        3: (parent_identity, 0x00000010),
+    }
+    monkeypatch.setattr(inventory_module, "_windows_open_path_handle", fake_open)
+    monkeypatch.setattr(inventory_module, "_windows_handle_information", lambda handle: identities[int(handle)])
+    monkeypatch.setattr(inventory_module, "_windows_close_handle", lambda handle: closed.append(int(handle)))
+    monkeypatch.setattr(
+        inventory_module.ctypes,
+        "WinDLL",
+        lambda *_args, **_kwargs: object(),
+        raising=False,
+    )
+    monkeypatch.setattr(inventory_module, "_WINDOWS", True)
+
+    with pytest.raises(OSError, match="source handle failure"):
+        inventory_module._rename_directory_no_replace(
+            source,
+            destination,
+            expected_parent_identity=parent_identity,
+            expected_stage_identity=stage_identity,
+        )
+
+    assert closed == [1, 2, 3]
 
 
 def test_layout_sample_and_split_recommendations_are_deterministic(tmp_path: Path) -> None:

@@ -21,7 +21,6 @@ import hashlib
 import json
 import math
 import os
-import shutil
 import stat
 import tempfile
 import sys
@@ -52,6 +51,7 @@ DEFAULT_LAYOUT_SAMPLE_SIZE = 64
 DEFAULT_SPLIT_SEED = "otherimages-split-v1"
 DEFAULT_LAYOUT_SAMPLE_SEED = "otherimages-layout-sample-v1"
 DEFAULT_MAX_PHASH_CANDIDATES = 100_000
+_WINDOWS = os.name == "nt"
 
 KNOWN_IMAGE_SUFFIXES = frozenset(
     {
@@ -307,56 +307,258 @@ def _paths_overlap(left: Path, right: Path) -> bool:
     return common == left_text or common == right_text
 
 
-def _rename_directory_no_replace(source: Path, destination: Path) -> None:
+def _filesystem_identity(status: os.stat_result) -> tuple[int, int]:
+    return int(getattr(status, "st_dev", 0)), int(getattr(status, "st_ino", 0))
+
+
+def _windows_open_path_handle(path: Path, *, access: int, share: int) -> object:
+    from ctypes import wintypes
+
+    create_file = ctypes.WinDLL("kernel32", use_last_error=True).CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+    handle = create_file(
+        os.fspath(path),
+        access,
+        share,
+        None,
+        3,  # OPEN_EXISTING
+        0x02000000 | 0x00200000,  # BACKUP_SEMANTICS | OPEN_REPARSE_POINT
+        None,
+    )
+    if handle == ctypes.c_void_p(-1).value:
+        error_number = ctypes.get_last_error()
+        raise OSError(error_number, ctypes.FormatError(error_number), os.fspath(path))
+    return handle
+
+
+def _windows_close_handle(handle: object) -> None:
+    from ctypes import wintypes
+
+    close_handle = ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+    close_handle(handle)
+
+
+def _windows_handle_information(handle: object) -> tuple[tuple[int, int], int]:
+    from ctypes import wintypes
+
+    class ByHandleFileInformation(ctypes.Structure):
+        _fields_ = (
+            ("file_attributes", wintypes.DWORD),
+            ("creation_time", wintypes.FILETIME),
+            ("last_access_time", wintypes.FILETIME),
+            ("last_write_time", wintypes.FILETIME),
+            ("volume_serial_number", wintypes.DWORD),
+            ("file_size_high", wintypes.DWORD),
+            ("file_size_low", wintypes.DWORD),
+            ("number_of_links", wintypes.DWORD),
+            ("file_index_high", wintypes.DWORD),
+            ("file_index_low", wintypes.DWORD),
+        )
+
+    information = ByHandleFileInformation()
+    get_information = ctypes.WinDLL("kernel32", use_last_error=True).GetFileInformationByHandle
+    get_information.argtypes = (wintypes.HANDLE, ctypes.POINTER(ByHandleFileInformation))
+    get_information.restype = wintypes.BOOL
+    if not get_information(handle, ctypes.byref(information)):
+        error_number = ctypes.get_last_error()
+        raise OSError(error_number, ctypes.FormatError(error_number))
+    identity = (
+        int(information.volume_serial_number),
+        (int(information.file_index_high) << 32) | int(information.file_index_low),
+    )
+    return identity, int(information.file_attributes)
+
+
+def _bind_stage_identity(path: Path, *, directory: bool) -> tuple[int, int]:
+    if _WINDOWS:
+        handle = _windows_open_path_handle(
+            path,
+            access=0x0080,  # FILE_READ_ATTRIBUTES
+            share=0x00000001 | 0x00000002 | 0x00000004,
+        )
+        try:
+            identity, attributes = _windows_handle_information(handle)
+        finally:
+            _windows_close_handle(handle)
+        if attributes & 0x00000400:
+            raise SourceChangedError(f"stage became a symlink/junction/reparse point: {path}")
+        if directory != bool(attributes & 0x00000010):
+            expected = "directory" if directory else "regular file"
+            raise SourceChangedError(f"stage is not a {expected}: {path}")
+        return identity
+    status = path.lstat()
+    if _is_reparse(path):
+        raise SourceChangedError(f"stage became a symlink/junction/reparse point: {path}")
+    if directory and not stat.S_ISDIR(status.st_mode):
+        raise SourceChangedError(f"stage is not a directory: {path}")
+    if not directory and not stat.S_ISREG(status.st_mode):
+        raise SourceChangedError(f"stage is not a regular file: {path}")
+    return _filesystem_identity(status)
+
+
+def _rename_directory_no_replace(
+    source: Path,
+    destination: Path,
+    *,
+    expected_parent_identity: tuple[int, int] | None = None,
+    expected_stage_identity: tuple[int, int] | None = None,
+) -> None:
     """Atomically publish a directory while refusing an existing destination."""
     if source.parent != destination.parent:
         raise ValueError("no-replace publication must stay within one parent directory")
-    parent_before = source.parent.stat()
-    parent_identity = (
-        int(getattr(parent_before, "st_dev", 0)),
-        int(getattr(parent_before, "st_ino", 0)),
-    )
+    parent_before = _bind_stage_identity(source.parent, directory=True)
+    parent_identity = expected_parent_identity or parent_before
+    if parent_before != parent_identity:
+        raise SourceChangedError("output parent identity changed before no-replace publication")
+    source_is_directory = source.is_dir()
+    source_before = _bind_stage_identity(source, directory=source_is_directory)
+    stage_identity = expected_stage_identity or source_before
+    if source_before != stage_identity:
+        raise SourceChangedError("publication stage identity changed before no-replace publication")
     if destination.exists():
         raise FileExistsError(f"refusing to replace existing publication directory: {destination}")
-    parent_immediately_before = source.parent.stat()
-    if (
-        int(getattr(parent_immediately_before, "st_dev", 0)),
-        int(getattr(parent_immediately_before, "st_ino", 0)),
-    ) != parent_identity:
+    if _bind_stage_identity(source.parent, directory=True) != parent_identity:
         raise SourceChangedError("output parent identity changed before no-replace publication")
-    if os.name == "nt":
-        source.rename(destination)  # Windows rename refuses an existing destination.
+    if _WINDOWS:
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        parent_handle = _windows_open_path_handle(
+            source.parent,
+            access=0x00000001 | 0x00000020 | 0x00000080,
+            share=0x00000001 | 0x00000002,
+        )
+        try:
+            source_handle = _windows_open_path_handle(
+                source,
+                access=0x00010000 | 0x00000080,  # DELETE | FILE_READ_ATTRIBUTES
+                share=0x00000001 | 0x00000002 | 0x00000004,
+            )
+        except BaseException:
+            _windows_close_handle(parent_handle)
+            raise
+        try:
+            observed_parent, parent_attributes = _windows_handle_information(parent_handle)
+            observed_source, source_attributes = _windows_handle_information(source_handle)
+            if observed_parent != parent_identity or not parent_attributes & 0x00000010:
+                raise SourceChangedError("output parent handle identity changed before Windows rename")
+            if parent_attributes & 0x00000400:
+                raise SourceChangedError("output parent became a reparse point before Windows rename")
+            if observed_source != stage_identity or source_attributes & 0x00000400:
+                raise SourceChangedError("publication stage handle identity changed before Windows rename")
+
+            destination_name = destination.name
+
+            class FileRenameInfo(ctypes.Structure):
+                _fields_ = (
+                    ("flags", wintypes.DWORD),
+                    ("root_directory", wintypes.HANDLE),
+                    ("file_name_length", wintypes.DWORD),
+                    ("file_name", wintypes.WCHAR * len(destination_name)),
+                )
+
+            information = FileRenameInfo()
+            information.flags = 0
+            information.root_directory = parent_handle
+            information.file_name_length = len(destination_name.encode("utf-16-le"))
+            information.file_name = destination_name
+            set_information = kernel32.SetFileInformationByHandle
+            set_information.argtypes = (
+                wintypes.HANDLE,
+                ctypes.c_int,
+                wintypes.LPVOID,
+                wintypes.DWORD,
+            )
+            set_information.restype = wintypes.BOOL
+            if not set_information(
+                source_handle,
+                3,  # FileRenameInfo
+                ctypes.byref(information),
+                ctypes.sizeof(information),
+            ):
+                error_number = ctypes.get_last_error()
+                if error_number in {80, 183}:
+                    raise FileExistsError(error_number, ctypes.FormatError(error_number), os.fspath(destination))
+                raise OSError(error_number, ctypes.FormatError(error_number), os.fspath(destination))
+            renamed_identity, _renamed_attributes = _windows_handle_information(source_handle)
+            if renamed_identity != stage_identity:
+                raise SourceChangedError("published Windows handle identity differs from bound stage")
+        finally:
+            _windows_close_handle(source_handle)
+            _windows_close_handle(parent_handle)
     else:
         library = ctypes.CDLL(None, use_errno=True)
-        source_bytes = os.fsencode(source)
-        destination_bytes = os.fsencode(destination)
-        if sys.platform == "darwin":
-            function = library.renamex_np
-            function.argtypes = (ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint)
-            function.restype = ctypes.c_int
-            result = function(source_bytes, destination_bytes, 0x00000004)  # RENAME_EXCL
-        elif sys.platform.startswith("linux") and hasattr(library, "renameat2"):
-            function = library.renameat2
-            function.argtypes = (
-                ctypes.c_int,
-                ctypes.c_char_p,
-                ctypes.c_int,
-                ctypes.c_char_p,
-                ctypes.c_uint,
-            )
-            function.restype = ctypes.c_int
-            result = function(-100, source_bytes, -100, destination_bytes, 0x00000001)  # RENAME_NOREPLACE
-        else:
-            raise OSError(
-                errno.ENOTSUP,
-                "atomic no-replace directory publication is unavailable",
-                os.fspath(destination),
-            )
-        if result != 0:
-            error_number = ctypes.get_errno()
-            if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
-                raise FileExistsError(error_number, os.strerror(error_number), os.fspath(destination))
-            raise OSError(error_number, os.strerror(error_number), os.fspath(destination))
+        open_flags = os.O_RDONLY | int(getattr(os, "O_DIRECTORY", 0))
+        parent_fd = os.open(source.parent, open_flags)
+        try:
+            if _filesystem_identity(os.fstat(parent_fd)) != parent_identity:
+                raise SourceChangedError("output parent identity changed before anchored no-replace rename")
+            source_status = os.stat(source.name, dir_fd=parent_fd, follow_symlinks=False)
+            if _filesystem_identity(source_status) != stage_identity:
+                raise SourceChangedError("publication stage identity changed before anchored rename")
+            source_bytes = os.fsencode(source.name)
+            destination_bytes = os.fsencode(destination.name)
+            if sys.platform == "darwin":
+                function = library.renameatx_np
+                function.argtypes = (
+                    ctypes.c_int,
+                    ctypes.c_char_p,
+                    ctypes.c_int,
+                    ctypes.c_char_p,
+                    ctypes.c_uint,
+                )
+                function.restype = ctypes.c_int
+                result = function(
+                    parent_fd,
+                    source_bytes,
+                    parent_fd,
+                    destination_bytes,
+                    0x00000004,
+                )  # RENAME_EXCL
+            elif sys.platform.startswith("linux") and hasattr(library, "renameat2"):
+                function = library.renameat2
+                function.argtypes = (
+                    ctypes.c_int,
+                    ctypes.c_char_p,
+                    ctypes.c_int,
+                    ctypes.c_char_p,
+                    ctypes.c_uint,
+                )
+                function.restype = ctypes.c_int
+                result = function(
+                    parent_fd,
+                    source_bytes,
+                    parent_fd,
+                    destination_bytes,
+                    0x00000001,
+                )  # RENAME_NOREPLACE
+            else:
+                raise OSError(
+                    errno.ENOTSUP,
+                    "atomic no-replace directory publication is unavailable",
+                    os.fspath(destination),
+                )
+            if result != 0:
+                error_number = ctypes.get_errno()
+                if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
+                    raise FileExistsError(error_number, os.strerror(error_number), os.fspath(destination))
+                raise OSError(error_number, os.strerror(error_number), os.fspath(destination))
+            destination_status = os.stat(destination.name, dir_fd=parent_fd, follow_symlinks=False)
+            if _filesystem_identity(destination_status) != stage_identity:
+                raise SourceChangedError("published destination identity differs from bound stage")
+        finally:
+            os.close(parent_fd)
 
 
 def _stat_signature(status: os.stat_result) -> tuple[int, int, int, int]:
@@ -1098,6 +1300,7 @@ def build_otherimages_inventory(
         raise FileExistsError(f"output directory must be brand-new: {output}")
     if not output.parent.is_dir():
         raise NotADirectoryError(f"output parent directory must already exist: {output.parent}")
+    output_parent_identity = _bind_stage_identity(output.parent, directory=True)
     if _paths_overlap(source_root, output):
         raise ValueError("input and output directories must not overlap")
 
@@ -1115,7 +1318,10 @@ def build_otherimages_inventory(
                 f"{previous!r} and {relative_path!r}"
             )
 
+    if _bind_stage_identity(output.parent, directory=True) != output_parent_identity:
+        raise SourceChangedError("output parent identity changed before inventory staging")
     stage = Path(tempfile.mkdtemp(prefix=f".{output.name}.inventory-building-", dir=output.parent))
+    stage_identity = _bind_stage_identity(stage, directory=True)
     published = False
     try:
         records: list[dict[str, object]] = []
@@ -1286,15 +1492,39 @@ def build_otherimages_inventory(
             "artifacts": [_artifact_binding(stage / name) for name in OUTPUT_FILENAMES],
         }
         _write_json(stage / "inventory.contract.json", contract)
+        contract_binding = _artifact_binding(stage / "inventory.contract.json")
         _assert_source_closure(source_root, original_files, observations)
         if output.exists():
             raise FileExistsError(f"output directory appeared during inventory build: {output}")
-        _rename_directory_no_replace(stage, output)
+        _rename_directory_no_replace(
+            stage,
+            output,
+            expected_parent_identity=output_parent_identity,
+            expected_stage_identity=stage_identity,
+        )
+        if _bind_stage_identity(output.parent, directory=True) != output_parent_identity:
+            raise SourceChangedError("inventory output parent changed after publication")
+        if _bind_stage_identity(output, directory=True) != stage_identity:
+            raise SourceChangedError("published inventory directory differs from bound stage")
+        expected_members = {*OUTPUT_FILENAMES, "inventory.contract.json"}
+        if {path.name for path in output.iterdir()} != expected_members:
+            raise SourceChangedError("published inventory directory membership differs after publication")
+        for expected in contract["artifacts"]:
+            if not isinstance(expected, Mapping) or _artifact_binding(output / str(expected["path"])) != expected:
+                raise SourceChangedError("published inventory artifact failed exact readback")
+        if _artifact_binding(output / "inventory.contract.json") != contract_binding:
+            raise SourceChangedError("published inventory contract failed exact readback")
+        if _bind_stage_identity(output.parent, directory=True) != output_parent_identity:
+            raise SourceChangedError("inventory output parent changed during publication readback")
+        if _bind_stage_identity(output, directory=True) != stage_identity:
+            raise SourceChangedError("published inventory identity changed during readback")
         published = True
         return contract
     finally:
         if not published:
-            shutil.rmtree(stage, ignore_errors=True)
+            # Failure stages are evidence.  Never recursively delete through a
+            # pathname that another process could have replaced.
+            pass
 
 
 def build_parser() -> argparse.ArgumentParser:
