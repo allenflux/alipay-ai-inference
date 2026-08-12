@@ -37,6 +37,49 @@ Python pipeline:
 - Not included: automatic receipt screen/quad detection. Perspective photos
   still need an externally rectified input.
 
+## 统一蓝图/白图 CPU 入口（首版安全路由）
+
+同一个 `ReceiptMlNet.Cli` 入口现在接受 `--document-type blue|white|auto`：
+
+- 不传该参数时仍是原来的 `blue` 路由，检测器、OCR、JSON 和标注行为不变。
+- `white` 是显式、纯 CPU 的首版白图路由。它先在 EXIF-upright 原图顶部运行与蓝图
+  共用的状态栏设备模型，再用已验哈希的 PP-OCR ONNX `DB + CLS + REC` 对整张图识别。
+- `auto` 当前会明确失败。仓库尚未交付经过校准的蓝/白分类器，因此不能静默把白图
+  当成蓝图处理；调用方必须显式选择 `blue` 或 `white`。
+
+白图首版只输出逐行 `text`、`confidence`、`passes_drop_score` 和原图坐标系四点 `quad`，并固定
+标记 `review_required=true`、`delivery_policy=review_only`。它不会把整图文字猜成蓝图的
+金额、时间、状态、收款人、付款方式五字段；`student_model_status=not_integrated` 和
+`field_mapping_status=not_calibrated` 是后续学生模型/字段映射的明确替换点。Paddle 教师
+一致性也不能被描述为独立人工真值准确率。
+
+白图 CPU 单图示例（无需蓝图 detector）：
+
+```powershell
+$package = "D:\alipay-ai-data\delivery\ReceiptMlNet-unified-cpu"
+$input = "D:\download2\OtherImages\one-white.png"
+$output = "D:\output\one-white-result"
+
+& "$package\app\ReceiptMlNet.Cli.exe" `
+  --document-type white `
+  --device-model "$package\models\statusbar_device_v1.onnx" `
+  --ocr onnx `
+  --ocr-bundle "$package\models\paddle-ocr" `
+  --input $input `
+  --output $output `
+  --device cpu `
+  --rectification none `
+  --annotate none
+```
+
+白图路由强制 `--device cpu`，不加载 Python/Paddle 运行时、不联网，也不运行蓝图检测器。
+状态栏 ONNX、PP-OCR det/cls/rec 与字典均从同一次验哈希的私有字节快照消费；创建
+Session 或 CTC 字符表时不会再次打开可被替换的模型路径。JSON 证据固定写入
+`runtime_source=immutable_verified_bytes` 与 `reopened_paths_after_verification=false`。
+如果统一 wrapper 为所有请求都传了 `--detector`，白图路由会明确记录该 detector 未加载；
+蓝图命令仍按原有方式要求 `--detector`。白图 `inference_summary.json` 单独给出加载、状态栏
+设备识别、整图 PP-OCR、结果组装以及总推理的 CPU 延迟。
+
 ## 当前三模型交付（Windows x64，CPU 正式生产）
 
 完整的 unified v12 交付由 **3 个神经网络 ONNX** 组成，不是每个字段各放一个

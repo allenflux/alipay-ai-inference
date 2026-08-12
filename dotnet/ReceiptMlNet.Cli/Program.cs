@@ -16,7 +16,7 @@ using SixLabors.ImageSharp.Processing;
 
 return await ReceiptMlNetProgram.RunAsync(args);
 
-internal static class ReceiptMlNetProgram
+internal static partial class ReceiptMlNetProgram
 {
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -49,8 +49,19 @@ internal static class ReceiptMlNetProgram
 
     private static void Run(CliOptions options)
     {
+        DocumentRoutePolicy.RequireRunnable(options.DocumentType);
+        if (options.DocumentType == DocumentRoutePolicy.White)
+        {
+            RunWhiteDocumentRoute(options);
+            return;
+        }
+        RunBlueReceiptRoute(options);
+    }
+
+    private static void RunBlueReceiptRoute(CliOptions options)
+    {
         var totalStopwatch = Stopwatch.StartNew();
-        var detectorContract = ModelContract.LoadAndVerify(options.DetectorPath, "receipt_lrcnn_v1");
+        var detectorContract = ModelContract.LoadAndVerify(options.DetectorPath!, "receipt_lrcnn_v1");
         ModelContract? deviceContract = options.DeviceModelPath is null
             ? null
             : ModelContract.LoadAndVerify(options.DeviceModelPath, "statusbar_device_v1");
@@ -112,7 +123,7 @@ internal static class ReceiptMlNetProgram
         // share this buffer across workers.
         var detectorInputBuffer = new float[ImagePipeline.DetectorTensorLength];
         using var detector = new DetectorModel(
-            options.DetectorPath,
+            options.DetectorPath!,
             device,
             options.DetectorIntraOpThreads,
             detectorInputBuffer);
@@ -1307,11 +1318,20 @@ internal sealed class DeviceModel
 
     public DeviceResult Classify(Image<Rgb24> source)
     {
+        return ClassifyCore(source, PredictPIos);
+    }
+
+    internal static DeviceResult ClassifyCore(
+        Image<Rgb24> source,
+        Func<Image<Rgb24>, float> predictPIos)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        ArgumentNullException.ThrowIfNull(predictPIos);
         var resolutionPlatform = ResolutionPlatform(source.Width, source.Height);
         if (resolutionPlatform is "ios" or "android")
         {
             var result = new DeviceResult(resolutionPlatform, DeviceCn[resolutionPlatform], "resolution", 0.99f, false, null, null, null);
-            var pIos = PredictPIos(source);
+            var pIos = predictPIos(source);
             var cnnPlatform = pIos > 0.5f ? "ios" : "android";
             var cnnConfidence = Math.Max(pIos, 1.0f - pIos);
             if (cnnPlatform != resolutionPlatform && cnnConfidence >= 0.8f)
@@ -1327,7 +1347,7 @@ internal sealed class DeviceModel
             return result;
         }
 
-        var probability = PredictPIos(source);
+        var probability = predictPIos(source);
         var confidence = Math.Max(probability, 1.0f - probability);
         var platform = confidence < 0.75f ? "uncertain" : (probability > 0.5f ? "ios" : "android");
         return new DeviceResult(
@@ -1671,7 +1691,7 @@ internal sealed record ModelContract(string FileName, string ModelSha256, string
 }
 
 internal sealed record CliOptions(
-    string DetectorPath,
+    string? DetectorPath,
     string? DeviceModelPath,
     string OcrMode,
     string? OcrBundlePath,
@@ -1687,12 +1707,14 @@ internal sealed record CliOptions(
     bool ContinueOnError,
     bool SkipExisting,
     int? DetectorIntraOpThreads,
-    int? Limit)
+    int? Limit,
+    string DocumentType)
 {
     public const string Usage = """
 Usage:
   dotnet run --project dotnet/ReceiptMlNet.Cli/ReceiptMlNet.Cli.csproj -- \
-    --detector <receipt_lrcnn_v1.onnx> \
+    [--document-type blue|white|auto] \
+    [--detector <receipt_lrcnn_v1.onnx>] \
     [--device-model <statusbar_device_v1.onnx>] \
     [--ocr none|onnx|unified|hybrid-recipient] \
     [--ocr-bundle <paddle-ocr-delivery-directory>] \
@@ -1702,6 +1724,12 @@ Usage:
     [--rectification none|max-side-1600] \
     [--detector-intra-op-threads <positive-integer>] \
     [--require-complete] [--continue-on-error] [--skip-existing] [--limit 100]
+
+Omitting --document-type preserves the legacy blue receipt route. The white
+route requires --document-type white, --device cpu, --device-model, --ocr onnx,
+--ocr-bundle, and emits review-only full-image OCR lines without fabricated
+receipt fields. --document-type auto fails closed because no calibrated
+blue/white router is delivered yet.
 
 This .NET CLI runs the receipt/device ONNX models and can optionally run a
 verified PP-OCR delivery bundle (--ocr onnx), a v12/v13 unified five-field
@@ -1719,6 +1747,7 @@ perspective photos still require an externally rectified input.
     public static CliOptions Parse(string[] args)
     {
         string? detector = null;
+        var documentType = DocumentRoutePolicy.Blue;
         string? deviceModel = null;
         var ocrMode = "none";
         string? ocrBundle = null;
@@ -1733,6 +1762,7 @@ perspective photos still require an externally rectified input.
         var requireComplete = false;
         var continueOnError = false;
         var skipExisting = false;
+        var annotationSpecified = false;
         int? detectorIntraOpThreads = null;
         int? limit = null;
 
@@ -1740,6 +1770,7 @@ perspective photos still require an externally rectified input.
         {
             switch (args[index])
             {
+                case "--document-type": documentType = DocumentRoutePolicy.Parse(NextValue(args, ref index)); break;
                 case "--detector": detector = NextValue(args, ref index); break;
                 case "--device-model": deviceModel = NextValue(args, ref index); break;
                 case "--ocr": ocrMode = ParseOcrMode(NextValue(args, ref index)); break;
@@ -1749,7 +1780,10 @@ perspective photos still require an externally rectified input.
                 case "--input-list": inputList = NextValue(args, ref index); break;
                 case "--output": output = NextValue(args, ref index); break;
                 case "--device": device = NextValue(args, ref index); break;
-                case "--annotate": annotationMode = ParseAnnotationMode(NextValue(args, ref index)); break;
+                case "--annotate":
+                    annotationMode = ParseAnnotationMode(NextValue(args, ref index));
+                    annotationSpecified = true;
+                    break;
                 case "--rectification": rectification = ParseRectification(NextValue(args, ref index)); break;
                 case "--score-threshold":
                     if (!float.TryParse(NextValue(args, ref index), NumberStyles.Float, CultureInfo.InvariantCulture, out scoreThreshold) || scoreThreshold is < 0.0f or > 1.0f)
@@ -1778,9 +1812,15 @@ perspective photos still require an externally rectified input.
                 default: throw new UsageException($"Unknown argument: {args[index]}");
             }
         }
-        if (string.IsNullOrWhiteSpace(detector) || string.IsNullOrWhiteSpace(output))
+        if (documentType == DocumentRoutePolicy.Blue
+            && (string.IsNullOrWhiteSpace(detector) || string.IsNullOrWhiteSpace(output)))
         {
+            // Preserve the legacy blue-route validation and error text.
             throw new UsageException("--detector and --output are required");
+        }
+        if (string.IsNullOrWhiteSpace(output))
+        {
+            throw new UsageException("--output is required");
         }
         var hasInput = !string.IsNullOrWhiteSpace(input);
         var hasInputList = !string.IsNullOrWhiteSpace(inputList);
@@ -1805,11 +1845,61 @@ perspective photos still require an externally rectified input.
             throw new UsageException("--ocr-model requires --ocr unified or hybrid-recipient");
         }
         var parsedDevice = DeviceSetting.Parse(device);
+        if (documentType == DocumentRoutePolicy.White)
+        {
+            if (parsedDevice.Requested != "cpu")
+            {
+                throw new UsageException("--document-type white requires --device cpu");
+            }
+            if (string.IsNullOrWhiteSpace(deviceModel))
+            {
+                throw new UsageException("--document-type white requires --device-model so status-bar classification runs before OCR");
+            }
+            if (ocrMode != "onnx")
+            {
+                throw new UsageException("--document-type white requires --ocr onnx and a verified PP-OCR delivery bundle");
+            }
+            if (rectification != ReceiptRectifier.NoneMode)
+            {
+                throw new UsageException("--document-type white currently requires --rectification none so line quads remain in EXIF-upright source coordinates");
+            }
+            if (annotationSpecified && annotationMode != "none")
+            {
+                throw new UsageException("--document-type white supports JSON line evidence only; use --annotate none");
+            }
+            annotationMode = "none";
+            if (requireComplete)
+            {
+                throw new UsageException("--require-complete is unavailable for review-only white documents because no five-field mapping is calibrated");
+            }
+            if (detectorIntraOpThreads is not null)
+            {
+                throw new UsageException("--detector-intra-op-threads is unavailable for the white route because it does not run the blue receipt detector");
+            }
+        }
         if (detectorIntraOpThreads is not null && parsedDevice.Requested != "cpu")
         {
             throw new UsageException("--detector-intra-op-threads requires --device cpu");
         }
-        return new CliOptions(detector, deviceModel, ocrMode, ocrBundle, ocrModel, input, inputList, output, device, scoreThreshold, annotationMode, rectification, requireComplete, continueOnError, skipExisting, detectorIntraOpThreads, limit);
+        return new CliOptions(
+            detector,
+            deviceModel,
+            ocrMode,
+            ocrBundle,
+            ocrModel,
+            input,
+            inputList,
+            output,
+            device,
+            scoreThreshold,
+            annotationMode,
+            rectification,
+            requireComplete,
+            continueOnError,
+            skipExisting,
+            detectorIntraOpThreads,
+            limit,
+            documentType);
     }
 
     private static string ParseOcrMode(string value)

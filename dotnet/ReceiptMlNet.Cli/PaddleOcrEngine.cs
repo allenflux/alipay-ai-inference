@@ -88,6 +88,82 @@ internal sealed class PaddleOcrCpuModelSnapshot
 }
 
 /// <summary>
+/// Closed CPU runtime input for PP-OCR. Every model and dictionary file is
+/// opened once, checked against the already parsed delivery contract, cloned,
+/// and then consumed from memory. Subsequent path replacement cannot change
+/// the sessions or CTC vocabulary used by this snapshot.
+/// </summary>
+internal sealed class PaddleOcrCpuRuntimeSnapshot
+{
+    private PaddleOcrCpuRuntimeSnapshot(
+        PaddleOcrCpuModelSnapshot models,
+        byte[] dictionary)
+    {
+        Models = models;
+        _dictionary = dictionary;
+    }
+
+    private readonly byte[] _dictionary;
+    internal PaddleOcrCpuModelSnapshot Models { get; }
+    internal long DictionarySizeBytes => _dictionary.LongLength;
+    internal string DictionarySha256 => Convert.ToHexString(SHA256.HashData(_dictionary)).ToLowerInvariant();
+
+    public static PaddleOcrCpuRuntimeSnapshot LoadAndVerify(PaddleOcrDeliveryBundle bundle)
+    {
+        ArgumentNullException.ThrowIfNull(bundle);
+        return Create(
+            bundle,
+            File.ReadAllBytes(bundle.DetModel.FullPath),
+            File.ReadAllBytes(bundle.ClsModel.FullPath),
+            File.ReadAllBytes(bundle.RecModel.FullPath),
+            File.ReadAllBytes(bundle.Dictionary.FullPath));
+    }
+
+    internal static PaddleOcrCpuRuntimeSnapshot Create(
+        PaddleOcrDeliveryBundle bundle,
+        byte[] detector,
+        byte[] classifier,
+        byte[] recognizer,
+        byte[] dictionary)
+    {
+        ArgumentNullException.ThrowIfNull(bundle);
+        var models = PaddleOcrCpuModelSnapshot.Create(bundle, detector, classifier, recognizer);
+        var closedDictionary = VerifyDictionaryAndClone(
+            dictionary,
+            bundle.Dictionary,
+            bundle.Settings.UseSpaceChar,
+            bundle.RecognitionCharacters,
+            bundle.CtcCharacters);
+        return new PaddleOcrCpuRuntimeSnapshot(models, closedDictionary);
+    }
+
+    internal static byte[] VerifyDictionaryAndClone(
+        byte[] bytes,
+        PaddleOcrFileRecord expected,
+        bool useSpaceCharacter,
+        IReadOnlyList<string> expectedRecognitionCharacters,
+        IReadOnlyList<string> expectedCtcCharacters)
+    {
+        ArgumentNullException.ThrowIfNull(bytes);
+        ArgumentNullException.ThrowIfNull(expected);
+        ArgumentNullException.ThrowIfNull(expectedRecognitionCharacters);
+        ArgumentNullException.ThrowIfNull(expectedCtcCharacters);
+        var clone = PaddleOcrCpuModelSnapshot.VerifyAndClone(bytes, expected, "dictionary");
+        var parsed = PaddleOcrDeliveryBundle.ReadCharset(
+            clone,
+            useSpaceCharacter,
+            expected.RelativePath);
+        if (!parsed.RecognitionCharacters.SequenceEqual(expectedRecognitionCharacters, StringComparer.Ordinal)
+            || !parsed.CtcCharacters.SequenceEqual(expectedCtcCharacters, StringComparer.Ordinal))
+        {
+            throw new InvalidOperationException(
+                "Paddle OCR dictionary byte snapshot differs from the verified in-memory vocabulary");
+        }
+        return clone;
+    }
+}
+
+/// <summary>
 /// Direct ONNX Runtime implementation of the frozen PaddleOCR v2 pipeline:
 /// DB text detection, perspective crop, angle classification and CTC text
 /// recognition.  It owns exactly three sessions for the lifetime of a batch.

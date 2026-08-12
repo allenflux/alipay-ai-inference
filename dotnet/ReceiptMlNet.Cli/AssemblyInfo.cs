@@ -7,3 +7,4 @@ using System.Runtime.CompilerServices;
 [assembly: InternalsVisibleTo("ReceiptMlNet.Cli.LayoutShadowContractTests")]
 [assembly: InternalsVisibleTo("ReceiptMlNet.Cli.RecipientDerivedCropShadow")]
 [assembly: InternalsVisibleTo("ReceiptMlNet.Cli.RecipientDerivedCropShadowContractTests")]
+[assembly: InternalsVisibleTo("ReceiptMlNet.Cli.WhiteDocumentContractTests")]

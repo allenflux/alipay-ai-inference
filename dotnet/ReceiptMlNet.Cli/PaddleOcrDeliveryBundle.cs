@@ -93,11 +93,15 @@ internal sealed class PaddleOcrDeliveryBundle
         {
             throw new UsageException($"Paddle OCR delivery contract does not exist: {contractPath}");
         }
-        var contractSha256 = Sha256(contractPath);
+        // Parse and identify the exact same contract bytes. Hashing the path
+        // and then reopening it for parsing leaves a swap window between the
+        // two operations.
+        var contractBytes = File.ReadAllBytes(contractPath);
+        var contractSha256 = Sha256(contractBytes);
 
         try
         {
-            using var document = JsonDocument.Parse(File.ReadAllBytes(contractPath));
+            using var document = JsonDocument.Parse(contractBytes);
             var contract = document.RootElement;
             RequireObject(contract, "Paddle OCR delivery contract");
             if (ReadRequiredInt(contract, "schema_version", "delivery contract") != SchemaVersion)
@@ -485,11 +489,34 @@ internal sealed class PaddleOcrDeliveryBundle
         string charsetPath,
         bool useSpaceCharacter)
     {
+        return ReadCharset(File.ReadAllBytes(charsetPath), useSpaceCharacter, charsetPath);
+    }
+
+    internal static (IReadOnlyList<string> RecognitionCharacters, IReadOnlyList<string> CtcCharacters) ReadCharset(
+        byte[] charsetBytes,
+        bool useSpaceCharacter,
+        string description)
+    {
+        ArgumentNullException.ThrowIfNull(charsetBytes);
         var encoding = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
-        var characters = File.ReadAllLines(charsetPath, encoding).ToList();
+        var characters = new List<string>();
+        using (var stream = new MemoryStream(charsetBytes, writable: false))
+        using (var reader = new StreamReader(
+            stream,
+            encoding,
+            detectEncodingFromByteOrderMarks: true,
+            bufferSize: 1024,
+            leaveOpen: false))
+        {
+            string? line;
+            while ((line = reader.ReadLine()) is not null)
+            {
+                characters.Add(line);
+            }
+        }
         if (characters.Count == 0)
         {
-            throw new UsageException($"Paddle OCR character dictionary is empty: {charsetPath}");
+            throw new UsageException($"Paddle OCR character dictionary is empty: {description}");
         }
         if (useSpaceCharacter)
         {
@@ -569,6 +596,11 @@ internal sealed class PaddleOcrDeliveryBundle
         using var stream = File.OpenRead(path);
         using var algorithm = SHA256.Create();
         return Convert.ToHexString(algorithm.ComputeHash(stream)).ToLowerInvariant();
+    }
+
+    private static string Sha256(byte[] bytes)
+    {
+        return Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();
     }
 
     internal static JsonElement RequireProperty(JsonElement element, string property, string description)
