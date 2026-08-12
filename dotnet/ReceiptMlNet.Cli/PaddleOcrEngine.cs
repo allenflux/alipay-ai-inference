@@ -23,7 +23,8 @@ internal sealed record PaddleOcrLayoutLine(
     string Text,
     float Confidence,
     IReadOnlyList<PaddleOcrLayoutPoint> Quad,
-    bool PassesDropScore);
+    bool PassesDropScore,
+    WhiteLineStudentRead? Student = null);
 
 /// <summary>
 /// Raw diagnostic layout plus the exact accepted-line projection used by the
@@ -311,13 +312,34 @@ internal sealed class PaddleOcrEngine : IDisposable
     public PaddleOcrLayoutReadResult RecognizeLayoutDiagnostic(Image<Rgb24> image)
     {
         using var rgb = PaddleOcrImageOps.ToRgbMat(image);
-        return RecognizeLayoutDiagnostic(rgb);
+        return RecognizeLayoutDiagnosticCore(rgb, null);
+    }
+
+    /// <summary>
+    /// Run Paddle DB/CLS once, then feed the exact same angle-corrected line
+    /// crop to both Paddle REC and the optional CPU student. This is the only
+    /// white-student entry point, preventing a second crop/angle pipeline.
+    /// </summary>
+    public PaddleOcrLayoutReadResult RecognizeLayoutWithStudentDiagnostic(
+        Image<Rgb24> image,
+        WhiteLineStudentEngine student)
+    {
+        ArgumentNullException.ThrowIfNull(student);
+        using var rgb = PaddleOcrImageOps.ToRgbMat(image);
+        return RecognizeLayoutDiagnosticCore(rgb, student);
     }
 
     /// <summary>
     /// Mat overload for diagnostic tools that already own an RGB OpenCV image.
     /// </summary>
     public PaddleOcrLayoutReadResult RecognizeLayoutDiagnostic(Mat rgb)
+    {
+        return RecognizeLayoutDiagnosticCore(rgb, null);
+    }
+
+    private PaddleOcrLayoutReadResult RecognizeLayoutDiagnosticCore(
+        Mat rgb,
+        WhiteLineStudentEngine? student)
     {
         if (rgb.Empty())
         {
@@ -353,10 +375,16 @@ internal sealed class PaddleOcrEngine : IDisposable
                     throw;
                 }
             }
+            var studentLines = student is null
+                ? null
+                : orientedCrops
+                    .Select(crop => (WhiteLineStudentRead?)student.Recognize(crop))
+                    .ToArray();
             return AssembleLayoutDiagnostic(
                 boxes,
                 RecognizeLines(orientedCrops),
-                _bundle.Settings.DropScore);
+                _bundle.Settings.DropScore,
+                studentLines);
         }
         finally
         {
@@ -375,7 +403,8 @@ internal sealed class PaddleOcrEngine : IDisposable
     internal static PaddleOcrLayoutReadResult AssembleLayoutDiagnostic(
         IReadOnlyList<Point2f[]> boxes,
         IReadOnlyList<PaddleOcrLine?> recognizedLines,
-        float dropScore)
+        float dropScore,
+        IReadOnlyList<WhiteLineStudentRead?>? studentLines = null)
     {
         ArgumentNullException.ThrowIfNull(boxes);
         ArgumentNullException.ThrowIfNull(recognizedLines);
@@ -387,6 +416,11 @@ internal sealed class PaddleOcrEngine : IDisposable
         {
             throw new InvalidOperationException(
                 $"Paddle OCR diagnostic box/line count differs: boxes={boxes.Count} lines={recognizedLines.Count}");
+        }
+        if (studentLines is not null && boxes.Count != studentLines.Count)
+        {
+            throw new InvalidOperationException(
+                $"Paddle OCR diagnostic box/student count differs: boxes={boxes.Count} students={studentLines.Count}");
         }
 
         var layoutLines = new List<PaddleOcrLayoutLine>(boxes.Count);
@@ -413,7 +447,8 @@ internal sealed class PaddleOcrEngine : IDisposable
                 line.Text,
                 line.Confidence,
                 quad,
-                passesDropScore));
+                passesDropScore,
+                studentLines?[index]));
             if (passesDropScore)
             {
                 acceptedLines.Add(line);

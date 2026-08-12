@@ -17,6 +17,7 @@ from transfer_receipt_ai.ocr_evaluate import (
     semantic_value,
 )
 from transfer_receipt_ai.ocr_train import RecognizerConfig, export_onnx, train_recognizer
+from transfer_receipt_ai.ocr_train import GENERIC_TEXT_LINE_FIELD
 
 
 @pytest.mark.parametrize(
@@ -34,6 +35,25 @@ def test_levenshtein_distance_counts_unicode_characters(reference: str, candidat
 def test_semantic_value_reuses_current_recipient_extraction() -> None:
     assert semantic_value("recipient_field", "收款方 张三(**)") == "张三(**)"
     assert semantic_value("amount", "¥12.30") == "¥12.30"
+    assert semantic_value(GENERIC_TEXT_LINE_FIELD, "任意整行文本") is None
+
+
+def test_generic_line_acceptance_rejects_semantic_gate_as_not_applicable() -> None:
+    metrics = {
+        GENERIC_TEXT_LINE_FIELD: {
+            "raw_exact_match": 1.0,
+            "semantic_exact_match": None,
+            "micro_cer": 0.0,
+            "oov_reference_rate": 0.0,
+        }
+    }
+    assert _acceptance_failures(
+        metrics,
+        min_raw_exact_match=0.99,
+        min_semantic_exact_match=0.99,
+        max_micro_cer=0.01,
+        max_oov_reference_rate=0.0,
+    ) == [f"{GENERIC_TEXT_LINE_FIELD}: semantic_exact_match is not applicable"]
 
 
 def test_cuda_session_preloads_dlls_before_constructing_onnx_session(tmp_path: Path) -> None:
@@ -79,6 +99,16 @@ def test_acceptance_can_require_zero_oov_reference_characters() -> None:
         max_micro_cer=0.005,
         max_oov_reference_rate=0.0,
     ) == ["recipient_field: oov_reference_rate=0.2500 > 0.0000"]
+
+
+def test_validation_split_is_never_a_formal_acceptance_gate() -> None:
+    source = (Path(__file__).resolve().parents[1] / "src" / "transfer_receipt_ai" / "ocr_evaluate.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'diagnostic_only = split != "test"' in source
+    assert '"passed": not failures and not diagnostic_only' in source
+    assert "formal acceptance requires the frozen test split" in source
 
 
 def test_onnx_evaluation_runs_on_a_group_held_out_split_when_dependencies_are_installed(tmp_path: Path) -> None:

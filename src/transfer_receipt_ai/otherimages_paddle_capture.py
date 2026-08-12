@@ -54,12 +54,23 @@ from .otherimages_paddle_teacher import (
 )
 
 
+CAPTURE_RECEIPT_KIND = "otherimages_paddle_layout_capture_receipt_v2"
+THREE_VIEW_CAPTURE_RECEIPT_KIND = "otherimages_paddle_three_view_capture_receipt_v2"
+
+
 @dataclass(frozen=True)
 class PaddleCapturedLine:
     """One DB box with its CLS-corrected REC text and confidence."""
 
     text: str
     confidence: float
+    orientation_degrees: int
+    transformed_quad_pixels: tuple[
+        tuple[float, float],
+        tuple[float, float],
+        tuple[float, float],
+        tuple[float, float],
+    ]
     quad_normalized: tuple[
         tuple[float, float],
         tuple[float, float],
@@ -223,6 +234,23 @@ def _capture_lines(
         if not isinstance(raw_line.text, str):
             raise TypeError(f"adapter line {index} text must be a string")
         confidence = _finite_confidence(raw_line.confidence)
+        orientation_degrees = raw_line.orientation_degrees
+        if (
+            isinstance(orientation_degrees, bool)
+            or not isinstance(orientation_degrees, int)
+            or orientation_degrees not in {0, 180}
+        ):
+            raise ValueError(f"adapter line {index} orientation_degrees must be 0 or 180")
+        if len(raw_line.transformed_quad_pixels) != 4:
+            raise ValueError(f"adapter line {index} transformed_quad_pixels must contain four points")
+        transformed_quad_pixels: list[list[float]] = []
+        for point_index, point in enumerate(raw_line.transformed_quad_pixels):
+            if len(point) != 2:
+                raise ValueError(f"adapter line {index} transformed point {point_index} must be [x,y]")
+            x, y = float(point[0]), float(point[1])
+            if not math.isfinite(x) or not math.isfinite(y) or x < 0.0 or y < 0.0:
+                raise ValueError(f"adapter line {index} transformed point {point_index} is invalid")
+            transformed_quad_pixels.append([x, y])
         if len(raw_line.quad_normalized) != 4:
             raise ValueError(f"adapter line {index} quad must contain four points")
         quad: list[list[float]] = []
@@ -233,12 +261,30 @@ def _capture_lines(
             if not math.isfinite(x) or not math.isfinite(y) or not 0.0 <= x <= 1.0 or not 0.0 <= y <= 1.0:
                 raise ValueError(f"adapter line {index} point {point_index} is outside source-normalized [0,1]")
             quad.append([x, y])
+        transformed_height, transformed_width = immutable_rgb.shape[:2]
+        for point_index, (transformed_point, normalized_point) in enumerate(
+            zip(transformed_quad_pixels, quad)
+        ):
+            transformed_x, transformed_y = transformed_point
+            if transformed_x > transformed_width - 1 or transformed_y > transformed_height - 1:
+                raise ValueError(f"adapter line {index} transformed point {point_index} is outside chosen view")
+            expected_x = transformed_x / max(1, transformed_width - 1)
+            expected_y = transformed_y / max(1, transformed_height - 1)
+            if not (
+                math.isclose(normalized_point[0], expected_x, rel_tol=0.0, abs_tol=1e-7)
+                and math.isclose(normalized_point[1], expected_y, rel_tol=0.0, abs_tol=1e-7)
+            ):
+                raise ValueError(
+                    f"adapter line {index} point {point_index} normalized geometry differs from transformed pixels"
+                )
         rows.append(
             {
                 "index": index,
                 "text": raw_line.text,
                 "confidence": confidence,
                 "passes_drop_score": confidence >= drop_score,
+                "orientation_degrees": orientation_degrees,
+                "transformed_quad_pixels": transformed_quad_pixels,
                 "quad_normalized": quad,
             }
         )
@@ -551,7 +597,7 @@ def capture_paddle_view(
     )
     return {
         "schema_version": SCHEMA_VERSION,
-        "kind": "otherimages_paddle_layout_capture_receipt_v1",
+        "kind": CAPTURE_RECEIPT_KIND,
         "view_id": view_id,
         "view_contract_sha256": view_sha256,
         "adapter": adapter_evidence,
@@ -659,7 +705,7 @@ def capture_paddle_three_views(
         published = True
         return {
             "schema_version": SCHEMA_VERSION,
-            "kind": "otherimages_paddle_three_view_capture_receipt_v1",
+            "kind": THREE_VIEW_CAPTURE_RECEIPT_KIND,
             "views": outputs,
             "adapter": prepared.adapter_evidence,
             "records_per_view": receipts[0]["records"],
@@ -731,7 +777,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         raise SystemExit(f"OtherImages Paddle view capture failed:\n{error}") from None
     if arguments.json:
         print(json.dumps(receipt, ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False))
-    elif receipt["kind"] == "otherimages_paddle_three_view_capture_receipt_v1":
+    elif receipt["kind"] == THREE_VIEW_CAPTURE_RECEIPT_KIND:
         print(
             f"Captured three canonical Paddle views for {receipt['records_per_view']} record(s); "
             f"errors={receipt['capture_errors']}; output={receipt['output_directory']}"

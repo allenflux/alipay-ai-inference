@@ -37,10 +37,13 @@ from .otherimages_inventory import (
 SCHEMA_VERSION = 1
 INVENTORY_CONTRACT_KIND = "otherimages_read_only_inventory_v1"
 INVENTORY_PENDING_KIND = "otherimages_paddle_teacher_pending_v1"
-CAPTURE_KIND = "otherimages_paddle_layout_capture_v1"
+CAPTURE_KIND = "otherimages_paddle_layout_capture_v2"
 VIEW_CONTRACT_KIND = "otherimages_paddle_view_contract_v1"
-ADAPTER_EVIDENCE_KIND = "paddle_db_cls_rec_adapter_evidence_v1"
-PINNED_ADAPTER_IMPLEMENTATION = "pinned_paddleocr_2.10.0_raw_db_cls_rec_v1"
+ADAPTER_EVIDENCE_KIND = "paddle_db_cls_rec_adapter_evidence_v2"
+PINNED_ADAPTER_IMPLEMENTATION = "pinned_paddleocr_2.10.0_raw_db_cls_rec_v2"
+PADDLE_COLOR_CONTRACT_KIND = "otherimages_paddle_rgb_byte_order_contract_v1"
+PADDLE_INPUT_COLOR_ORDER = "RGB_passthrough_to_paddle_v2"
+PADDLE_LINE_CROP_COLOR_ORDER = "RGB_passthrough_through_db_crop_cls_rec_v1"
 PINNED_PADDLEOCR_VERSION = "2.10.0"
 PINNED_ALBUMENTATIONS_VERSION = "1.4.10"
 PINNED_ALBUCORE_VERSION = "0.0.13"
@@ -172,6 +175,24 @@ def _canonical_sha256(payload: object) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def canonical_paddle_color_contract() -> dict[str, object]:
+    """Return the one byte-order contract shared by teacher and CPU runtime.
+
+    OpenCV's conventional name for a three-channel ``Mat`` is BGR, but neither
+    the frozen native/ONNX delivery nor the .NET adapter swaps the three byte
+    planes.  Byte 0 is therefore R from source decode through DB, perspective
+    crop, CLS and REC.  Keeping this as a canonical nested object makes any
+    earlier RGB-to-BGR capture evidence structurally incompatible.
+    """
+    return {
+        "kind": PADDLE_COLOR_CONTRACT_KIND,
+        "input_color_order": PADDLE_INPUT_COLOR_ORDER,
+        "line_crop_color_order": PADDLE_LINE_CROP_COLOR_ORDER,
+        "pixel_layout": "HxWx3_uint8_byte0_R_byte1_G_byte2_B",
+        "channel_conversion": "none",
+    }
+
+
 def canonical_view_contract(view_id: str) -> dict[str, object]:
     operations = CANONICAL_VIEW_OPERATIONS.get(view_id)
     if operations is None:
@@ -186,6 +207,7 @@ def canonical_view_contract(view_id: str) -> dict[str, object]:
         "quad_coordinate_space": "exif_upright_source_normalized",
         "line_order": "top_to_bottom_left_to_right_v1",
         "transform_implementation": "otherimages_paddle_capture_core_v1",
+        "paddle_color_contract": canonical_paddle_color_contract(),
     }
 
 
@@ -565,8 +587,9 @@ def _validate_adapter_evidence(value: object, *, location: str) -> dict[str, obj
         raise TeacherContractError(f"adapter drop_score must be finite and in [0, 1] at {location}")
     if value.get("raw_db_lines_preserved_before_drop_filter") is not True:
         raise TeacherContractError(f"adapter must preserve every raw DB line before drop filtering at {location}")
-    if value.get("adapter_input_color_bridge") != "opencv_rgb8_to_bgr8_v1":
-        raise TeacherContractError(f"adapter must bind the canonical RGB-to-BGR Paddle bridge at {location}")
+    color_contract_value = value.get("paddle_color_contract")
+    if not isinstance(color_contract_value, Mapping) or dict(color_contract_value) != canonical_paddle_color_contract():
+        raise TeacherContractError(f"adapter must bind the canonical RGB byte-order contract at {location}")
     execution_device = _require_nonempty_string(
         value.get("execution_device"),
         description=f"execution_device at {location}",
@@ -699,7 +722,7 @@ def _validate_adapter_evidence(value: object, *, location: str) -> dict[str, obj
         "effective_paddle_args": effective_args,
         "model_assets": assets,
         "raw_db_lines_preserved_before_drop_filter": True,
-        "adapter_input_color_bridge": "opencv_rgb8_to_bgr8_v1",
+        "paddle_color_contract": canonical_paddle_color_contract(),
     }
     model_identity_payload = {
         "adapter_implementation": implementation,
@@ -709,7 +732,7 @@ def _validate_adapter_evidence(value: object, *, location: str) -> dict[str, obj
         "device": execution_device,
         "drop_score": drop_score,
         "assets": assets,
-        "adapter_input_color_bridge": "opencv_rgb8_to_bgr8_v1",
+        "paddle_color_contract": canonical_paddle_color_contract(),
     }
     if _canonical_sha256(model_identity_payload) != model_sha:
         raise TeacherContractError(f"adapter model_contract_sha256 does not bind runtime/assets at {location}")
@@ -1022,6 +1045,8 @@ def _evaluate_view(
     view_id = str(row["view_id"])
     diagnostic: dict[str, object] = {
         "view_id": view_id,
+        "view_contract_sha256": row["view_contract_sha256"],
+        "transform_receipt": dict(row["transform_receipt"]),
         "capture_state": row["capture_state"],
         "eligible": False,
         "reasons": [],
@@ -1096,6 +1121,61 @@ def _evaluate_view(
             if raw_error is not None:
                 raise CandidateGateError("semantic_invalid", raw_error)
             confidence = _finite_unit_score(raw_line.get("confidence"), description=f"line {index} confidence")
+            orientation_degrees = raw_line.get("orientation_degrees")
+            if (
+                isinstance(orientation_degrees, bool)
+                or not isinstance(orientation_degrees, int)
+                or orientation_degrees not in {0, 180}
+            ):
+                raise CandidateGateError(
+                    "invalid_geometry",
+                    f"line {index} orientation_degrees must bind the applied Paddle CLS decision as 0 or 180",
+                )
+            transformed_quad_value = raw_line.get("transformed_quad_pixels")
+            if not isinstance(transformed_quad_value, list) or len(transformed_quad_value) != 4:
+                raise CandidateGateError(
+                    "invalid_geometry", f"line {index} transformed_quad_pixels must contain four points"
+                )
+            transformed_quad_pixels: list[list[float]] = []
+            for point_index, raw_point in enumerate(transformed_quad_value):
+                if not isinstance(raw_point, list) or len(raw_point) != 2:
+                    raise CandidateGateError(
+                        "invalid_geometry", f"line {index} transformed point {point_index} must be [x,y]"
+                    )
+                try:
+                    transformed_x, transformed_y = float(raw_point[0]), float(raw_point[1])
+                except (TypeError, ValueError):
+                    raise CandidateGateError(
+                        "invalid_geometry", f"line {index} transformed point {point_index} must be numeric"
+                    ) from None
+                if (
+                    not math.isfinite(transformed_x)
+                    or not math.isfinite(transformed_y)
+                    or transformed_x < 0.0
+                    or transformed_y < 0.0
+                ):
+                    raise CandidateGateError(
+                        "invalid_geometry", f"line {index} transformed point {point_index} is invalid"
+                    )
+                transformed_quad_pixels.append([transformed_x, transformed_y])
+            transform_receipt = row.get("transform_receipt")
+            assert isinstance(transform_receipt, Mapping)
+            transformed_width = int(transform_receipt["transformed_width"])
+            transformed_height = int(transform_receipt["transformed_height"])
+            if any(
+                point[0] > transformed_width - 1 or point[1] > transformed_height - 1
+                for point in transformed_quad_pixels
+            ):
+                raise CandidateGateError(
+                    "invalid_geometry", f"line {index} transformed_quad_pixels are outside chosen view pixels"
+                )
+            transformed_area_twice = sum(
+                transformed_quad_pixels[point_index][0] * transformed_quad_pixels[(point_index + 1) % 4][1]
+                - transformed_quad_pixels[(point_index + 1) % 4][0] * transformed_quad_pixels[point_index][1]
+                for point_index in range(4)
+            )
+            if abs(transformed_area_twice) <= 1e-6:
+                raise CandidateGateError("invalid_geometry", f"line {index} transformed_quad_pixels have zero area")
             passes = raw_line.get("passes_drop_score")
             if not isinstance(passes, bool):
                 raise CandidateGateError("invalid_confidence", f"line {index} passes_drop_score must be boolean")
@@ -1127,12 +1207,36 @@ def _evaluate_view(
                 description=f"line {index} quad_normalized",
                 minimum_area=minimum_quad_area,
             )
+            # _parse_quad canonicalizes polygon order for consensus; the raw
+            # transformed quad must retain Paddle's DB order for REC cropping.
+            # Bind the same four points without destroying either ordering.
+            expected_points = sorted(
+                (
+                    transformed_point[0] / max(1, transformed_width - 1),
+                    transformed_point[1] / max(1, transformed_height - 1),
+                )
+                for transformed_point in transformed_quad_pixels
+            )
+            normalized_points = sorted((float(point[0]), float(point[1])) for point in quad)
+            for point_index, ((expected_x, expected_y), normalized_point) in enumerate(
+                zip(expected_points, normalized_points)
+            ):
+                if not (
+                    math.isclose(float(normalized_point[0]), expected_x, rel_tol=0.0, abs_tol=1e-7)
+                    and math.isclose(float(normalized_point[1]), expected_y, rel_tol=0.0, abs_tol=1e-7)
+                ):
+                    raise CandidateGateError(
+                        "invalid_geometry",
+                        f"line {index} normalized point set differs from transformed pixels at point {point_index}",
+                    )
             accepted.append(
                 {
                     "index": index,
                     "raw_text": raw_text,
                     "text": normalized_text,
                     "confidence": confidence,
+                    "orientation_degrees": orientation_degrees,
+                    "transformed_quad_pixels": transformed_quad_pixels,
                     "quad_normalized": quad,
                     "bbox_normalized": list(bbox),
                     "quad_area_normalized": area,
@@ -1506,6 +1610,11 @@ def _consensus_record(
             "index": index,
             "text": line["text"],
             "confidence": round(float(line["confidence"]), 8),
+            "orientation_degrees": int(line["orientation_degrees"]),
+            "transformed_quad_pixels": [
+                [round(float(point[0]), 8), round(float(point[1]), 8)]
+                for point in line["transformed_quad_pixels"]
+            ],
             "quad_normalized": [
                 [round(float(point[0]), 8), round(float(point[1]), 8)]
                 for point in line["quad_normalized"]
@@ -1532,6 +1641,7 @@ def _consensus_record(
         "text_normalization": "NFKC_then_collapse_line_whitespace_v1",
         "lines": output_lines,
         "label_source": "paddle_db_cls_rec_three_view_consensus",
+        "paddle_color_contract": canonical_paddle_color_contract(),
         "consensus": {
             "dominant_text_votes": len(voters),
             "dominant_view_ids": dominant_view_ids,
@@ -1541,6 +1651,16 @@ def _consensus_record(
             "chosen_geometry_view_id": chosen["view_id"],
             "minimum_pairwise_line_quad_iou": round(minimum_observed_iou, 8),
             "support_confidences": support_confidences,
+        },
+        "chosen_view": {
+            "view_id": chosen["view_id"],
+            "view_contract_sha256": chosen["view_contract_sha256"],
+            "transformed_pixel_sha256": dict(chosen["transform_receipt"])["transformed_pixel_sha256"],
+            "source_width": dict(chosen["transform_receipt"])["source_width"],
+            "source_height": dict(chosen["transform_receipt"])["source_height"],
+            "transformed_width": dict(chosen["transform_receipt"])["transformed_width"],
+            "transformed_height": dict(chosen["transform_receipt"])["transformed_height"],
+            "coordinate_mapping": dict(chosen["transform_receipt"])["coordinate_mapping"],
         },
         "training_eligible": training_eligible,
         "evaluation_only": not training_eligible,
@@ -1870,6 +1990,7 @@ def build_paddle_teacher_consensus(
             "maximum_document_characters": maximum_document_characters,
             "text_normalization": "NFKC_then_collapse_line_whitespace_v1",
             "consensus": "unique_dominant_exact_normalized_text_with_two_or_three_geometry_compatible_views_v1",
+            "paddle_color_contract": canonical_paddle_color_contract(),
         }
         inputs = {
             "inventory_manifest": _public_binding(inventory_observations[0]),

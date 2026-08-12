@@ -9,7 +9,12 @@ import numpy as np
 import pytest
 
 from transfer_receipt_ai import otherimages_paddle_v2_adapter as adapter_module
-from transfer_receipt_ai.otherimages_paddle_teacher import PADDLE_EFFECTIVE_ARG_KEYS, _validate_adapter_evidence
+from transfer_receipt_ai.otherimages_paddle_teacher import (
+    PADDLE_EFFECTIVE_ARG_KEYS,
+    PADDLE_INPUT_COLOR_ORDER,
+    _validate_adapter_evidence,
+    canonical_paddle_color_contract,
+)
 from transfer_receipt_ai.otherimages_paddle_v2_adapter import PinnedPaddleOcrV2Adapter, _capture_with_engine
 
 
@@ -22,6 +27,7 @@ class _FakeRawPaddleEngine:
         self.recognitions = recognitions
         self.calls: list[str] = []
         self.detector_pixel: tuple[int, int, int] | None = None
+        self.args = types.SimpleNamespace(cls_thresh=0.9)
 
     def text_detector(self, image: np.ndarray) -> tuple[list[np.ndarray], float]:
         assert image.shape == (100, 100, 3)
@@ -31,7 +37,7 @@ class _FakeRawPaddleEngine:
 
     def text_classifier(self, crops: list[np.ndarray]) -> tuple[list[np.ndarray], list[object], float]:
         self.calls.append("cls")
-        return crops, [None] * len(crops), 0.01
+        return crops, [("0", 0.99)] * len(crops), 0.01
 
     def text_recognizer(self, crops: list[np.ndarray]) -> tuple[list[tuple[str, float]], float]:
         assert len(crops) == 2
@@ -51,13 +57,15 @@ def test_raw_adapter_calls_db_cls_rec_and_preserves_low_score_lines_before_filte
     batch = _capture_with_engine(engine, pixels, cropper=_cropper, use_angle_cls=True)
 
     assert engine.calls == ["db", "cls", "rec"]
-    assert engine.detector_pixel == (33, 22, 11)
+    assert engine.detector_pixel == (11, 22, 33)
     assert batch.raw_detected_line_count == 2
     assert batch.recognition_attempted_line_count == 2
     assert batch.recognition_rejected_line_count == 0
     assert [line.text for line in batch.lines] == ["顶部", "低置信底部"]
     assert [line.confidence for line in batch.lines] == [0.99, 0.20]
+    assert [line.orientation_degrees for line in batch.lines] == [0, 0]
     assert batch.lines[0].quad_normalized[0] == (10.0 / 99.0, 10.0 / 99.0)
+    assert canonical_paddle_color_contract()["input_color_order"] == PADDLE_INPUT_COLOR_ORDER
 
 
 def test_raw_adapter_keeps_db_geometry_and_explicitly_counts_missing_recognition() -> None:
@@ -72,6 +80,41 @@ def test_raw_adapter_keeps_db_geometry_and_explicitly_counts_missing_recognition
     assert len(batch.lines) == 2
     assert batch.lines[1].text == ""
     assert batch.lines[1].confidence == 0.0
+
+
+def test_raw_adapter_records_only_the_cls_rotation_paddle_actually_applies() -> None:
+    engine = _FakeRawPaddleEngine([("顶部", 0.99), ("底部", 0.98)])
+
+    def classify(crops: list[np.ndarray]) -> tuple[list[np.ndarray], list[object], float]:
+        engine.calls.append("cls")
+        # Paddle rotates only when score is strictly greater than cls_thresh.
+        return crops, [("180", 0.91), ("180", 0.90)], 0.01
+
+    engine.text_classifier = classify  # type: ignore[method-assign]
+    batch = _capture_with_engine(
+        engine,
+        np.zeros((100, 100, 3), dtype=np.uint8),
+        cropper=_cropper,
+        use_angle_cls=True,
+    )
+
+    assert [line.orientation_degrees for line in batch.lines] == [180, 0]
+
+
+def test_raw_adapter_fails_closed_on_unbound_cls_results() -> None:
+    engine = _FakeRawPaddleEngine([("顶部", 0.99), ("底部", 0.98)])
+
+    def classify(crops: list[np.ndarray]) -> tuple[list[np.ndarray], list[object], float]:
+        return crops, [("90", 0.99), ("0", 0.99)], 0.01
+
+    engine.text_classifier = classify  # type: ignore[method-assign]
+    with pytest.raises(ValueError, match="label 0/180"):
+        _capture_with_engine(
+            engine,
+            np.zeros((100, 100, 3), dtype=np.uint8),
+            cropper=_cropper,
+            use_angle_cls=True,
+        )
 
 
 def test_raw_adapter_rejects_recognition_results_without_a_db_box() -> None:

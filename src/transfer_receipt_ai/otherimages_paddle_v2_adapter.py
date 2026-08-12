@@ -24,6 +24,7 @@ from .otherimages_paddle_teacher import (
     ADAPTER_EVIDENCE_KIND,
     PADDLE_EFFECTIVE_ARG_KEYS,
     PINNED_ADAPTER_IMPLEMENTATION,
+    canonical_paddle_color_contract,
     _canonical_sha256,
     _is_reparse,
     _require_no_reparse_ancestors,
@@ -123,9 +124,11 @@ def _capture_with_engine(
         raise TypeError("PaddleOCR v2 engine must expose raw text_detector/text_recognizer stages")
 
     height, width = transformed_rgb.shape[:2]
-    # PaddleOCR v2's raw TextSystem follows its cv2.imread examples and expects
-    # BGR input.  The capture core owns an RGB contract, so bridge explicitly.
-    source = cv2.cvtColor(np.ascontiguousarray(transformed_rgb), cv2.COLOR_RGB2BGR)
+    # The repository's frozen native/ONNX parity contract feeds Pillow-decoded
+    # RGB byte planes straight into PaddleOCR v2, and the .NET CPU adapter does
+    # the same.  Make a private writable copy so raw Paddle stages cannot
+    # mutate the capture core's immutable pixels, but never exchange R and B.
+    source = np.array(transformed_rgb, dtype=np.uint8, order="C", copy=True)
     dt_boxes, _detector_elapsed = text_detector(source)
     if dt_boxes is None or len(dt_boxes) == 0:
         return PaddleCaptureBatch((), 0, 0, 0)
@@ -135,10 +138,39 @@ def _capture_with_engine(
             raise ValueError(f"Paddle DB line {line_index} must be a finite 4x2 quad")
     boxes.sort(key=lambda box: (float(np.mean(box[:, 1])), float(np.mean(box[:, 0]))))
     crops = [cropper(source, box.copy()) for box in boxes]
+    orientations = [0] * len(crops)
     if use_angle_cls:
         if not callable(text_classifier):
             raise TypeError("PaddleOCR v2 angle classifier stage is unavailable")
-        crops, _angles, _classifier_elapsed = text_classifier(crops)
+        crops, angles, _classifier_elapsed = text_classifier(crops)
+        if not isinstance(angles, (list, tuple)) or len(angles) != len(crops):
+            raise ValueError("Paddle angle classifier must return one result per DB crop")
+        args = _engine_args(engine)
+        threshold_value = args.get("cls_thresh")
+        if isinstance(threshold_value, bool):
+            raise ValueError("Paddle angle classifier threshold must be numeric")
+        try:
+            threshold = float(threshold_value)
+        except (TypeError, ValueError):
+            raise ValueError("Paddle angle classifier threshold must be numeric") from None
+        if not math.isfinite(threshold) or not 0.0 <= threshold <= 1.0:
+            raise ValueError("Paddle angle classifier threshold must be finite and in [0,1]")
+        for index, result in enumerate(angles):
+            if not isinstance(result, (list, tuple)) or len(result) < 2:
+                raise ValueError(f"Paddle angle result {index} must contain label/confidence")
+            label = result[0]
+            score_value = result[1]
+            if label not in {"0", "180"} or isinstance(score_value, bool):
+                raise ValueError(f"Paddle angle result {index} must have label 0/180 and numeric confidence")
+            try:
+                score = float(score_value)
+            except (TypeError, ValueError):
+                raise ValueError(f"Paddle angle result {index} confidence must be numeric") from None
+            if not math.isfinite(score) or not 0.0 <= score <= 1.0:
+                raise ValueError(f"Paddle angle result {index} confidence must be finite and in [0,1]")
+            # Paddle's TextClassifier rotates only this exact decision.  Record
+            # the applied transform rather than the unthresholded class label.
+            orientations[index] = 180 if label == "180" and score > threshold else 0
     recognitions, _recognizer_elapsed = text_recognizer(crops)
     if not isinstance(recognitions, (list, tuple)):
         raise TypeError("PaddleOCR v2 recognizer result must be a list")
@@ -160,6 +192,7 @@ def _capture_with_engine(
             if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
                 raise ValueError(f"Paddle line {line_index} confidence is invalid")
         normalized_quad: list[tuple[float, float]] = []
+        transformed_quad_pixels: list[tuple[float, float]] = []
         for point_index, raw_point in enumerate(quad_raw):
             x, y = _point(raw_point, line_index=line_index, point_index=point_index)
             x_normalized = x / max(1, width - 1)
@@ -167,10 +200,13 @@ def _capture_with_engine(
             if not 0.0 <= x_normalized <= 1.0 or not 0.0 <= y_normalized <= 1.0:
                 raise ValueError(f"Paddle line {line_index} quad is outside transformed image")
             normalized_quad.append((x_normalized, y_normalized))
+            transformed_quad_pixels.append((x, y))
         captured.append(
             PaddleCapturedLine(
                 text=text,
                 confidence=confidence,
+                orientation_degrees=orientations[line_index],
+                transformed_quad_pixels=tuple(transformed_quad_pixels),  # type: ignore[arg-type]
                 quad_normalized=tuple(normalized_quad),  # type: ignore[arg-type]
             )
         )
@@ -287,7 +323,7 @@ class PinnedPaddleOcrV2Adapter:
             "device": self._device,
             "drop_score": self._drop_score,
             "assets": self._assets,
-            "adapter_input_color_bridge": "opencv_rgb8_to_bgr8_v1",
+            "paddle_color_contract": canonical_paddle_color_contract(),
         }
         self._model_contract_sha256 = _canonical_sha256(model_identity_payload)
 
@@ -304,7 +340,7 @@ class PinnedPaddleOcrV2Adapter:
             "effective_paddle_args": self._effective_args,
             "model_assets": self._assets,
             "raw_db_lines_preserved_before_drop_filter": True,
-            "adapter_input_color_bridge": "opencv_rgb8_to_bgr8_v1",
+            "paddle_color_contract": canonical_paddle_color_contract(),
         }
 
     def capture(self, transformed_rgb: np.ndarray, view: PaddleViewContract) -> PaddleCaptureBatch:

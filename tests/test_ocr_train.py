@@ -10,6 +10,7 @@ from PIL import Image
 torch = pytest.importorskip("torch")
 
 from transfer_receipt_ai.ocr_train import (
+    GENERIC_TEXT_LINE_FIELD,
     RecognizerConfig,
     build_train_parser,
     build_ctc_recognizer,
@@ -63,6 +64,24 @@ def test_tiny_ctc_training_writes_a_checkpoint(tmp_path: Path) -> None:
 def test_training_defaults_include_recipient_field() -> None:
     args = build_train_parser().parse_args(["--records", "records.jsonl", "--output", "out"])
     assert "recipient_field" in args.fields
+
+
+def test_training_parser_accepts_generic_line_only_and_rejects_mixed_mode() -> None:
+    args = build_train_parser().parse_args(
+        ["--records", "generic_text_lines.jsonl", "--output", "out", "--fields", GENERIC_TEXT_LINE_FIELD]
+    )
+    assert args.fields == (GENERIC_TEXT_LINE_FIELD,)
+    with pytest.raises(SystemExit):
+        build_train_parser().parse_args(
+            [
+                "--records",
+                "generic_text_lines.jsonl",
+                "--output",
+                "out",
+                "--fields",
+                f"amount,{GENERIC_TEXT_LINE_FIELD}",
+            ]
+        )
 
 
 def test_ctc_decoder_collapses_repeats_and_blanks() -> None:

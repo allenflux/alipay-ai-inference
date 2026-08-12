@@ -14,6 +14,11 @@ using SixLabors.ImageSharp.PixelFormats;
 /// </summary>
 internal static class PaddleOcrImageOps
 {
+    // This exact token is also sealed by the Python delivery and white-teacher
+    // contracts.  OpenCV's conventional Mat naming must never cause an R/B
+    // exchange: byte 0 is R from ImageSharp decode through DB/crop/CLS/REC.
+    public const string InputColorOrderContract = "RGB_passthrough_to_paddle_v2";
+
     public static Mat ToRgbMat(Image<Rgb24> image)
     {
         var bytes = new byte[checked(image.Width * image.Height * 3)];

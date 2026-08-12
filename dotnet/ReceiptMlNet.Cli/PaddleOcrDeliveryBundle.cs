@@ -231,7 +231,11 @@ internal sealed class PaddleOcrDeliveryBundle
     {
         RequireObject(element, "adapter_contract");
         RequireExactString(element, "adapter_version", "paddle_ocr_dotnet_adapter_v1", "adapter_contract");
-        RequireExactString(element, "input_color_order", "RGB_passthrough_to_paddle_v2", "adapter_contract");
+        RequireExactString(
+            element,
+            "input_color_order",
+            PaddleOcrImageOps.InputColorOrderContract,
+            "adapter_contract");
         RequireExactString(
             element,
             "hardware_note",

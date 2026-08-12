@@ -1,6 +1,8 @@
 using System.Security.Cryptography;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
+using OpenCvSharp;
 
 internal static class Program
 {
@@ -11,14 +13,34 @@ internal static class Program
             VerifyDocumentRoutingContract();
             VerifyWhiteDocumentOutputContract();
             VerifyWhiteRuntimeByteClosure();
+            VerifyWhiteStudentBundleContract();
+            VerifyWhiteStudentPreprocessContract();
+            VerifyWhiteOutputFreshnessContract();
             Console.WriteLine(
-                "PASS: blue/white routing, review-only JSON, and immutable device/PP-OCR byte-closure contracts.");
+                "PASS: blue/white routing, review-only Paddle/student JSON, shared crop ordering, and immutable device/PP-OCR/student byte-closure contracts.");
             return 0;
         }
         catch (Exception error)
         {
             Console.Error.WriteLine(error);
             return 1;
+        }
+    }
+
+    private static void VerifyWhiteOutputFreshnessContract()
+    {
+        var root = Path.Combine(Path.GetTempPath(), $"white-output-freshness-{Guid.NewGuid():N}");
+        ReceiptMlNetProgram.RequireFreshWhiteOutput(root);
+        Directory.CreateDirectory(root);
+        try
+        {
+            ExpectUsage(
+                () => ReceiptMlNetProgram.RequireFreshWhiteOutput(root),
+                "brand-new output directory");
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
         }
     }
 
@@ -31,12 +53,14 @@ internal static class Program
         ]);
         Assert(legacy.DocumentType == DocumentRoutePolicy.Blue, "legacy CLI must remain on the blue route");
         Assert(legacy.DetectorPath == "receipt.onnx", "legacy blue detector option changed");
+        Assert(legacy.WhiteStudentBundlePath is null, "legacy blue route must not activate the white student");
 
         var white = CliOptions.Parse([
             "--document-type", "white",
             "--device-model", "device.onnx",
             "--ocr", "onnx",
             "--ocr-bundle", "bundle",
+            "--white-student-bundle", "student",
             "--input", "white.png",
             "--output", "output",
             "--device", "cpu",
@@ -44,6 +68,7 @@ internal static class Program
         Assert(white.DocumentType == DocumentRoutePolicy.White, "white document route was not parsed");
         Assert(white.DetectorPath is null, "white route must not require a blue receipt detector");
         Assert(white.AnnotationMode == "none", "white route must default to JSON-only evidence");
+        Assert(white.WhiteStudentBundlePath == "student", "white student bundle was not parsed");
         DocumentRoutePolicy.RequireRunnable(white.DocumentType);
 
         var auto = CliOptions.Parse([
@@ -77,6 +102,14 @@ internal static class Program
                 "--annotate", "all",
             ]),
             "use --annotate none");
+        ExpectUsage(
+            () => CliOptions.Parse([
+                "--detector", "receipt.onnx",
+                "--input", "receipt.png",
+                "--output", "output",
+                "--white-student-bundle", "student",
+            ]),
+            "requires --document-type white");
     }
 
     private static void VerifyWhiteDocumentOutputContract()
@@ -93,7 +126,8 @@ internal static class Program
                     accepted.Text,
                     accepted.Confidence,
                     Quad(1.12345f, 2.23456f),
-                    true),
+                    true,
+                    new WhiteLineStudentRead("到账成功", 0.81234565f)),
                 new PaddleOcrLayoutLine(
                     rejected.Text,
                     rejected.Confidence,
@@ -105,6 +139,36 @@ internal static class Program
         Assert(lines[0].PassesDropScore, "accepted white OCR line lost its threshold state");
         Assert(!lines[1].PassesDropScore, "below-threshold white OCR line must remain diagnostic only");
         Assert(lines[0].Quad.Count == 4, "white OCR quadrilateral must retain four points");
+        Assert(lines[0].Student is not null, "white student comparison was not projected");
+        Assert(
+            lines[0].Student!.NormalizedExactMatch,
+            "identical Paddle/student text must be marked normalized-exact");
+        Assert(
+            lines[0].Student!.CropSource == WhiteDocumentOutputContract.StudentCropSource,
+            "white student crop source contract changed");
+        Assert(
+            WhiteDocumentOutputContract.NormalizedExactMatch("Ａ\tB", "A B"),
+            "white Paddle/student comparison must use NFKC and collapsed whitespace");
+
+        var assembled = PaddleOcrEngine.AssembleLayoutDiagnostic(
+            [
+                [new Point2f(0, 0), new Point2f(4, 0), new Point2f(4, 2), new Point2f(0, 2)],
+                [new Point2f(0, 3), new Point2f(4, 3), new Point2f(4, 5), new Point2f(0, 5)],
+            ],
+            [accepted, rejected],
+            0.5f,
+            [new WhiteLineStudentRead("student-0", 0.8f), new WhiteLineStudentRead("student-1", 0.7f)]);
+        Assert(
+            assembled.Lines[0].Student?.Text == "student-0"
+                && assembled.Lines[1].Student?.Text == "student-1",
+            "student reads must remain bound to DB/CLS/Paddle REC line order");
+        ExpectInvalidOperation(
+            () => PaddleOcrEngine.AssembleLayoutDiagnostic(
+                [[new Point2f(0, 0), new Point2f(4, 0), new Point2f(4, 2), new Point2f(0, 2)]],
+                [accepted],
+                0.5f,
+                Array.Empty<WhiteLineStudentRead?>()),
+            "box/student count differs");
 
         var result = new WhiteDocumentResult(
             WhiteDocumentOutputContract.SchemaVersion,
@@ -119,12 +183,16 @@ internal static class Program
                 "ppocr_db_cls_rec",
                 "cpu",
                 WhiteDocumentOutputContract.DeliveryPolicy,
-                "not_integrated",
+                "integrated_review_only",
                 "not_calibrated",
                 read.Text,
                 read.Confidence,
                 1,
-                2),
+                2,
+                "cpu",
+                1,
+                1,
+                WhiteDocumentOutputContract.StudentCropSource),
             lines,
             new DeviceResult("ios", "苹果", "cnn", 0.9f, false, 0.9f, null, null),
             new WhiteDocumentContractReferences(
@@ -157,6 +225,14 @@ internal static class Program
         Assert(
             root.GetProperty("lines")[0].GetProperty("passes_drop_score").GetBoolean(),
             "white JSON must expose threshold state without implying delivery");
+        Assert(
+            root.GetProperty("lines")[0].GetProperty("student").GetProperty("delivery_policy").GetString()
+                == "review_only",
+            "white student comparison must remain review-only");
+        Assert(
+            root.GetProperty("lines")[0].GetProperty("student").GetProperty("crop_source").GetString()
+                == WhiteDocumentOutputContract.StudentCropSource,
+            "white JSON must bind student to the shared DB/CLS crop");
         AssertEqual(
             4,
             root.GetProperty("lines")[0].GetProperty("quad").GetArrayLength(),
@@ -268,6 +344,157 @@ internal static class Program
         {
             Directory.Delete(root, recursive: true);
         }
+    }
+
+    private static void VerifyWhiteStudentBundleContract()
+    {
+        var root = Path.Combine(Path.GetTempPath(), $"white-student-closure-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(root);
+        try
+        {
+            var modelBytes = Encoding.UTF8.GetBytes("closed-white-student-onnx-fixture");
+            var charset = new
+            {
+                schema_version = 1,
+                blank_index = 0,
+                characters = new[] { "到", "账", "A" },
+                sha256 = Sha256(Encoding.UTF8.GetBytes("到账A")),
+            };
+            var charsetBytes = new UTF8Encoding(false).GetBytes(JsonSerializer.Serialize(charset));
+            var modelPath = Path.Combine(root, "generic_text_line.onnx");
+            var charsetPath = Path.Combine(root, "generic_text_line.charset.json");
+            var contractPath = Path.Combine(root, "generic_text_line.contract.json");
+            File.WriteAllBytes(modelPath, modelBytes);
+            File.WriteAllBytes(charsetPath, charsetBytes);
+            File.WriteAllText(
+                contractPath,
+                JsonSerializer.Serialize(new
+                {
+                    schema_version = 1,
+                    kind = WhiteLineStudentBundle.ContractKind,
+                    onnx_file = Path.GetFileName(modelPath),
+                    onnx_sha256 = Sha256(modelBytes),
+                    charset_file = Path.GetFileName(charsetPath),
+                    charset_sha256 = Sha256(charsetBytes),
+                    fields = new[] { WhiteLineStudentBundle.FieldKind },
+                    input = new
+                    {
+                        name = WhiteLineStudentBundle.InputName,
+                        dtype = "float32",
+                        shape = new[] { 1, 1, 32, 160 },
+                        preprocess = WhiteLineStudentBundle.Preprocess,
+                    },
+                    output = new
+                    {
+                        name = WhiteLineStudentBundle.OutputName,
+                        shape = new[] { 40, 1, 4 },
+                        layout = "[time,batch,class]",
+                        decoder = "ctc_greedy",
+                        blank_index = 0,
+                    },
+                }));
+            var bundle = WhiteLineStudentBundle.LoadAndVerify(root);
+            var modelHash = bundle.ModelSha256;
+            var charsetHash = bundle.CharsetSha256;
+            var contractHash = bundle.ContractSha256;
+            File.WriteAllText(modelPath, "attacker-model");
+            File.WriteAllText(charsetPath, "attacker-charset");
+            File.WriteAllText(contractPath, "attacker-contract");
+            Assert(bundle.ModelSha256 == modelHash, "student model snapshot reopened its source path");
+            Assert(bundle.CharsetSha256 == charsetHash, "student charset snapshot reopened its source path");
+            Assert(bundle.ContractSha256 == contractHash, "student contract snapshot reopened its source path");
+            Assert(bundle.ImageHeight == 32 && bundle.ImageWidth == 160, "student input shape changed");
+            Assert(bundle.Characters.SequenceEqual(["到", "账", "A"]), "student charset ordering changed");
+
+            var changed = modelBytes.ToArray();
+            changed[0] ^= 0x01;
+            ExpectInvalidOperation(
+                () => WhiteLineStudentBundle.VerifyAndClone(
+                    changed,
+                    modelBytes.LongLength,
+                    modelHash,
+                    "model fixture"),
+                "differs from its verified contract");
+
+            File.WriteAllBytes(modelPath, modelBytes);
+            File.WriteAllBytes(charsetPath, charsetBytes);
+            File.WriteAllText(
+                contractPath,
+                JsonSerializer.Serialize(new
+                {
+                    schema_version = 1,
+                    kind = WhiteLineStudentBundle.ContractKind,
+                    onnx_file = Path.GetFileName(modelPath),
+                    onnx_sha256 = Sha256(modelBytes),
+                    charset_file = Path.GetFileName(charsetPath),
+                    charset_sha256 = Sha256(charsetBytes),
+                    fields = new[] { "amount" },
+                    input = new { name = "image", dtype = "float32", shape = new[] { 1, 1, 32, 160 }, preprocess = WhiteLineStudentBundle.Preprocess },
+                    output = new { name = "logits", shape = new[] { 40, 1, 4 }, layout = "[time,batch,class]", decoder = "ctc_greedy", blank_index = 0 },
+                }));
+            ExpectUsage(
+                () => WhiteLineStudentBundle.LoadAndVerify(root),
+                "fields must equal [generic_text_line]");
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    private static void VerifyWhiteStudentPreprocessContract()
+    {
+        var pixels = new byte[3, 5, 3]
+        {
+            { { 0, 0, 0 }, { 255, 0, 0 }, { 0, 255, 0 }, { 0, 0, 255 }, { 255, 255, 255 } },
+            { { 12, 34, 56 }, { 78, 90, 123 }, { 200, 10, 30 }, { 4, 250, 128 }, { 33, 66, 99 } },
+            { { 250, 128, 4 }, { 17, 222, 19 }, { 90, 45, 180 }, { 1, 2, 3 }, { 127, 127, 127 } },
+        };
+        var expectedGray = new byte[,]
+        {
+            { 0, 76, 150, 29, 255 },
+            { 30, 90, 69, 163, 60 },
+            { 150, 138, 74, 2, 127 },
+        };
+        for (var y = 0; y < 3; y++)
+        {
+            for (var x = 0; x < 5; x++)
+            {
+                Assert(
+                    WhiteLineStudentEngine.RgbToGray(
+                        pixels[y, x, 0],
+                        pixels[y, x, 1],
+                        pixels[y, x, 2]) == expectedGray[y, x],
+                    $"generic text line RGB->gray parity changed at ({x},{y})");
+            }
+        }
+
+        if (!OperatingSystem.IsWindows())
+        {
+            // The delivery project intentionally ships only the Windows x64
+            // OpenCvSharp native runtime. The same test runs the full resize
+            // and tensor hash on the supported delivery OS.
+            return;
+        }
+
+        using var rgb = new Mat(3, 5, MatType.CV_8UC3);
+        for (var y = 0; y < 3; y++)
+        {
+            for (var x = 0; x < 5; x++)
+            {
+                rgb.Set(
+                    y,
+                    x,
+                    new Vec3b(pixels[y, x, 0], pixels[y, x, 1], pixels[y, x, 2]));
+            }
+        }
+        var tensor = WhiteLineStudentEngine.PrepareInput(rgb, 7, 11);
+        var tensorBytes = MemoryMarshal.AsBytes(tensor.AsSpan()).ToArray();
+        // Independent Python reference: cv2.INTER_LINEAR_EXACT over the same
+        // 3x5 RGB fixture, integer gray formula, 7x11 white canvas, float32 /255.
+        Assert(
+            Sha256(tensorBytes) == "ee1b0457871cc38344a994509057a99aebc96cc3820c678838240ecddf185c7f",
+            "generic text line C#/Python final float32 NCHW parity hash changed");
     }
 
     private static IReadOnlyList<PaddleOcrLayoutPoint> Quad(float x, float y)

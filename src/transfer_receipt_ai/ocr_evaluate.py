@@ -20,7 +20,6 @@ from typing import Any
 
 import numpy as np
 
-from .labels import DETECTION_CLASSES
 from .ocr import (
     clean_text,
     extract_field_value,
@@ -30,7 +29,17 @@ from .ocr import (
     normalize_time,
 )
 from .onnx_runtime import _preload_cuda_dlls, onnx_providers
-from .ocr_train import RecognizerConfig, decode_ctc_logits, load_records, preprocess_image
+from .ocr_train import (
+    GENERIC_TEXT_LINE_FIELD,
+    RECOGNIZER_FIELDS,
+    _preprocess_contract,
+    RecognizerConfig,
+    _validate_recognizer_field_mode,
+    decode_ctc_logits,
+    load_records,
+    preprocess_image,
+)
+from .labels import DETECTION_CLASSES
 
 
 EVALUATION_SCHEMA_VERSION = 1
@@ -72,12 +81,13 @@ def _load_json(path: Path) -> Mapping[str, Any]:
 
 def _parse_fields(value: str) -> tuple[str, ...]:
     fields = tuple(dict.fromkeys(part.strip() for part in value.split(",") if part.strip()))
-    invalid = sorted(set(fields) - set(DETECTION_CLASSES))
-    if not fields or invalid:
+    try:
+        return _validate_recognizer_field_mode(fields)
+    except ValueError:
         raise argparse.ArgumentTypeError(
-            f"fields must be a non-empty subset of: {','.join(DETECTION_CLASSES)}"
-        )
-    return fields
+            "fields must select receipt detector fields or the independent "
+            f"{GENERIC_TEXT_LINE_FIELD} recognizer; supported={','.join(RECOGNIZER_FIELDS)}"
+        ) from None
 
 
 def _parse_splits(value: str) -> tuple[str, ...]:
@@ -149,6 +159,13 @@ def _load_artifacts(model_path: Path) -> tuple[RecognizerConfig, list[str], Mapp
     expected_input_shape = [1, 1, config.image_height, config.image_width]
     if raw_input.get("name") != "image" or raw_input.get("shape") != expected_input_shape:
         raise ValueError("OCR ONNX contract input must be fixed image [1,1,H,W]")
+    contract_fields = contract.get("fields")
+    if not isinstance(contract_fields, list) or not all(isinstance(field, str) for field in contract_fields):
+        raise ValueError("OCR ONNX contract fields are invalid")
+    selected_fields = _validate_recognizer_field_mode(contract_fields)
+    expected_preprocess = _preprocess_contract(selected_fields)
+    if raw_input.get("preprocess") != expected_preprocess:
+        raise ValueError("OCR ONNX contract preprocess does not match its declared recognizer fields")
     if raw_output.get("name") != "logits" or raw_output.get("layout") != "[time,batch,class]":
         raise ValueError("OCR ONNX contract output must be logits [time,batch,class]")
     return config, characters, contract, str(raw_input["name"]), str(raw_output["name"])
@@ -189,6 +206,10 @@ def levenshtein_distance(reference: str, candidate: str) -> int:
 def semantic_value(field: str, text: str) -> str | None:
     """Apply the same production field extraction rules to a candidate OCR string."""
     text = clean_text(text)
+    if field == GENERIC_TEXT_LINE_FIELD:
+        # A generic line has no receipt-field schema.  Raw exact/CER are the
+        # only meaningful teacher-parity metrics at this boundary.
+        return None
     if field == "amount":
         amount = normalize_amount(text)
         return str(amount["normalized"]) if amount is not None else None
@@ -224,8 +245,9 @@ def _metrics(comparisons: Sequence[Mapping[str, object]]) -> dict[str, object]:
     if not count:
         raise ValueError("No evaluation records")
     raw_exact = sum(bool(record["raw_exact"]) for record in comparisons)
-    semantic_exact = sum(bool(record["semantic_exact"]) for record in comparisons)
-    semantic_valid = sum(record["candidate_semantic"] is not None for record in comparisons)
+    semantic_records = [record for record in comparisons if record.get("semantic_applicable") is True]
+    semantic_exact = sum(bool(record["semantic_exact"]) for record in semantic_records)
+    semantic_valid = sum(record["candidate_semantic"] is not None for record in semantic_records)
     empty = sum(not str(record["candidate_text"]) for record in comparisons)
     oov = sum(bool(record["reference_has_oov_character"]) for record in comparisons)
     seen_text = sum(bool(record["reference_text_seen_in_model_train"]) for record in comparisons)
@@ -241,9 +263,10 @@ def _metrics(comparisons: Sequence[Mapping[str, object]]) -> dict[str, object]:
         "raw_exact_matches": raw_exact,
         "raw_exact_match": raw_exact / count,
         "semantic_exact_matches": semantic_exact,
-        "semantic_exact_match": semantic_exact / count,
+        "semantic_applicable_records": len(semantic_records),
+        "semantic_exact_match": semantic_exact / len(semantic_records) if semantic_records else None,
         "candidate_semantic_valid_records": semantic_valid,
-        "candidate_semantic_valid_rate": semantic_valid / count,
+        "candidate_semantic_valid_rate": semantic_valid / len(semantic_records) if semantic_records else None,
         "empty_records": empty,
         "empty_rate": empty / count,
         "oov_reference_records": oov,
@@ -269,13 +292,19 @@ def _acceptance_failures(
     failures: list[str] = []
     for field, metrics in metrics_by_field.items():
         raw_exact = float(metrics["raw_exact_match"])
-        semantic_exact = float(metrics["semantic_exact_match"])
+        semantic_exact_value = metrics["semantic_exact_match"]
         micro_cer = float(metrics["micro_cer"])
         oov_rate = float(metrics["oov_reference_rate"])
         if min_raw_exact_match is not None and raw_exact < min_raw_exact_match:
             failures.append(f"{field}: raw_exact_match={raw_exact:.4f} < {min_raw_exact_match:.4f}")
-        if min_semantic_exact_match is not None and semantic_exact < min_semantic_exact_match:
-            failures.append(f"{field}: semantic_exact_match={semantic_exact:.4f} < {min_semantic_exact_match:.4f}")
+        if min_semantic_exact_match is not None:
+            if semantic_exact_value is None:
+                failures.append(f"{field}: semantic_exact_match is not applicable")
+            elif float(semantic_exact_value) < min_semantic_exact_match:
+                failures.append(
+                    f"{field}: semantic_exact_match={float(semantic_exact_value):.4f} "
+                    f"< {min_semantic_exact_match:.4f}"
+                )
         if max_micro_cer is not None and micro_cer > max_micro_cer:
             failures.append(f"{field}: micro_cer={micro_cer:.4f} > {max_micro_cer:.4f}")
         if max_oov_reference_rate is not None and oov_rate > max_oov_reference_rate:
@@ -303,10 +332,7 @@ def evaluate_onnx(
     """Run a fixed-shape OCR ONNX model against held-out Paddle pseudo labels."""
     if split not in {"val", "test"}:
         raise ValueError("split must be val or test; train evaluation would not be an independent parity check")
-    fields = tuple(dict.fromkeys(fields))
-    invalid_fields = sorted(set(fields) - set(DETECTION_CLASSES))
-    if not fields or invalid_fields:
-        raise ValueError(f"fields must be a non-empty subset of: {','.join(DETECTION_CLASSES)}")
+    fields = _validate_recognizer_field_mode(fields)
     training_splits = tuple(dict.fromkeys(training_splits))
     if split in training_splits:
         raise ValueError("evaluation split must not also be a training split")
@@ -314,6 +340,8 @@ def evaluate_onnx(
     _finite_probability(min_semantic_exact_match, name="min_semantic_exact_match")
     _finite_probability(max_micro_cer, name="max_micro_cer")
     _finite_probability(max_oov_reference_rate, name="max_oov_reference_rate")
+    if fields == (GENERIC_TEXT_LINE_FIELD,) and min_semantic_exact_match is not None:
+        raise ValueError("semantic exact-match is not applicable to generic_text_line teacher parity")
     output_dir = output_dir.resolve()
     if output_dir.exists() and any(output_dir.iterdir()):
         raise ValueError(f"evaluation output already contains files: {output_dir}. Choose a new empty directory.")
@@ -358,11 +386,18 @@ def evaluate_onnx(
         started = perf_counter()
         logits = session.run(
             [output_name],
-            {input_name: preprocess_image(Path(record["image_path"]), config=config)},
+            {
+                input_name: preprocess_image(
+                    Path(record["image_path"]),
+                    config=config,
+                    field=str(record["field"]),
+                )
+            },
         )[0]
         latency_ms = (perf_counter() - started) * 1000.0
         candidate_text = clean_text(decode_ctc_logits(np.asarray(logits), characters=characters)[0])
         reference_text = str(record["text"])
+        semantic_applicable = str(record["field"]) != GENERIC_TEXT_LINE_FIELD
         reference_semantic = semantic_value(str(record["field"]), reference_text)
         candidate_semantic = semantic_value(str(record["field"]), candidate_text)
         edits = levenshtein_distance(reference_text, candidate_text)
@@ -384,10 +419,15 @@ def evaluate_onnx(
                 "reference_text": reference_text,
                 "candidate_text": candidate_text,
                 "raw_exact": candidate_text == reference_text,
+                "semantic_applicable": semantic_applicable,
                 "reference_semantic": reference_semantic,
                 "candidate_semantic": candidate_semantic,
-                "semantic_exact": reference_semantic is not None and reference_semantic == candidate_semantic,
-                "candidate_semantic_valid": candidate_semantic is not None,
+                "semantic_exact": (
+                    reference_semantic is not None and reference_semantic == candidate_semantic
+                    if semantic_applicable
+                    else None
+                ),
+                "candidate_semantic_valid": candidate_semantic is not None if semantic_applicable else None,
                 "cer_edits": edits,
                 "reference_characters": len(reference_text),
                 "reference_has_oov_character": bool(set(reference_text) - character_set),
@@ -408,9 +448,16 @@ def evaluate_onnx(
     )
     label_sources = sorted({str(record.get("label_source", "unspecified")) for record in evaluation_records})
     transaction_truth = label_sources == ["transaction_truth"]
+    diagnostic_only = split != "test"
+    if diagnostic_only:
+        failures.append("validation split is diagnostic-only; formal acceptance requires the frozen test split")
     summary: dict[str, object] = {
         "schema_version": EVALUATION_SCHEMA_VERSION,
-        "kind": "receipt_ocr_ctc_truth_evaluation_v1" if transaction_truth else "receipt_ocr_ctc_pseudo_label_evaluation_v1",
+        "kind": (
+            "generic_text_line_ctc_teacher_parity_evaluation_v1"
+            if fields == (GENERIC_TEXT_LINE_FIELD,)
+            else ("receipt_ocr_ctc_truth_evaluation_v1" if transaction_truth else "receipt_ocr_ctc_pseudo_label_evaluation_v1")
+        ),
         "model": model_path.as_posix(),
         "model_sha256": _sha256(model_path),
         "records": records_path.resolve().as_posix(),
@@ -426,7 +473,8 @@ def evaluate_onnx(
             "min_semantic_exact_match": min_semantic_exact_match,
             "max_micro_cer": max_micro_cer,
             "max_oov_reference_rate": max_oov_reference_rate,
-            "passed": not failures,
+            "diagnostic_only": diagnostic_only,
+            "passed": not failures and not diagnostic_only,
             "failures": failures,
         },
         "warning": (
@@ -434,14 +482,19 @@ def evaluate_onnx(
             "audit set before treating it as production accuracy."
             if transaction_truth
             else "This compares ONNX output to held-out pseudo labels, not to independent business truth. "
-            "Use an independently reviewed holdout before making production-accuracy claims."
+            "Exact match and CER are teacher-parity metrics only; do not make production-accuracy claims."
         ),
     }
     output_dir.mkdir(parents=True, exist_ok=True)
     _atomic_write_jsonl(output_dir / "comparisons.jsonl", comparisons)
     _atomic_write_jsonl(
         output_dir / "disagreements.jsonl",
-        [record for record in comparisons if not bool(record["raw_exact"]) or not bool(record["semantic_exact"])],
+        [
+            record
+            for record in comparisons
+            if not bool(record["raw_exact"])
+            or (record.get("semantic_applicable") is True and not bool(record["semantic_exact"]))
+        ],
     )
     _atomic_write_json(output_dir / "summary.json", summary)
     return summary, failures

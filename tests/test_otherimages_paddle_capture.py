@@ -14,6 +14,7 @@ from transfer_receipt_ai import otherimages_paddle_capture as capture_module
 from transfer_receipt_ai import otherimages_paddle_teacher as teacher_module
 from transfer_receipt_ai.otherimages_inventory import build_otherimages_inventory
 from transfer_receipt_ai.otherimages_paddle_capture import (
+    THREE_VIEW_CAPTURE_RECEIPT_KIND,
     PaddleCaptureBatch,
     PaddleCapturedLine,
     PaddleViewContract,
@@ -23,6 +24,7 @@ from transfer_receipt_ai.otherimages_paddle_capture import (
 from transfer_receipt_ai.otherimages_paddle_teacher import (
     ADAPTER_EVIDENCE_KIND,
     PINNED_ADAPTER_IMPLEMENTATION,
+    canonical_paddle_color_contract,
     TeacherContractError,
     build_paddle_teacher_consensus,
 )
@@ -128,7 +130,7 @@ def _adapter_evidence(tmp_path: Path) -> dict[str, object]:
         "device": "cpu",
         "drop_score": 0.5,
         "assets": assets,
-        "adapter_input_color_bridge": "opencv_rgb8_to_bgr8_v1",
+        "paddle_color_contract": canonical_paddle_color_contract(),
     }
     return {
         "kind": ADAPTER_EVIDENCE_KIND,
@@ -142,8 +144,19 @@ def _adapter_evidence(tmp_path: Path) -> dict[str, object]:
         "effective_paddle_args": effective_args,
         "model_assets": assets,
         "raw_db_lines_preserved_before_drop_filter": True,
-        "adapter_input_color_bridge": "opencv_rgb8_to_bgr8_v1",
+        "paddle_color_contract": canonical_paddle_color_contract(),
     }
+
+
+def test_adapter_evidence_rejects_the_legacy_rgb_to_bgr_bridge(tmp_path: Path) -> None:
+    # Keep every runtime/model field valid so this specifically proves that
+    # old BGR-swapped capture evidence cannot enter a new teacher publication.
+    evidence = _adapter_evidence(tmp_path)
+    evidence.pop("paddle_color_contract")
+    evidence["adapter_input_color_bridge"] = "opencv_rgb8_to_bgr8_v1"
+
+    with pytest.raises(ValueError, match="canonical RGB byte-order contract"):
+        teacher_module._validate_adapter_evidence(evidence, location="legacy BGR fixture")
 
 
 class _FakeAdapter:
@@ -157,9 +170,17 @@ class _FakeAdapter:
         assert transformed_rgb.dtype == np.uint8
         assert not transformed_rgb.flags.writeable
         assert view.operations
+        height, width = transformed_rgb.shape[:2]
         line = PaddleCapturedLine(
                 text="ＡＢＣ １２３",
                 confidence=0.99,
+                orientation_degrees=0,
+                transformed_quad_pixels=(
+                    (0.1 * (width - 1), 0.1 * (height - 1)),
+                    (0.8 * (width - 1), 0.1 * (height - 1)),
+                    (0.8 * (width - 1), 0.2 * (height - 1)),
+                    (0.1 * (width - 1), 0.2 * (height - 1)),
+                ),
                 quad_normalized=((0.1, 0.1), (0.8, 0.1), (0.8, 0.2), (0.1, 0.2)),
             )
         return PaddleCaptureBatch((line,), 1, 1, 0)
@@ -213,7 +234,7 @@ def test_batch_capture_uses_one_adapter_instance_and_publishes_all_three_views(t
         adapter=adapter,
     )
 
-    assert receipt["kind"] == "otherimages_paddle_three_view_capture_receipt_v1"
+    assert receipt["kind"] == THREE_VIEW_CAPTURE_RECEIPT_KIND
     assert receipt["records_per_view"] == 1
     assert receipt["capture_errors"] == 0
     assert {path.name for path in output.iterdir()} == {
@@ -315,15 +336,30 @@ def test_adapter_cannot_mutate_core_transformed_pixels_and_error_is_captured(tmp
 
 class _ReverseOrderAdapter(_FakeAdapter):
     def capture(self, transformed_rgb: np.ndarray, view: PaddleViewContract) -> PaddleCaptureBatch:
-        del transformed_rgb, view
+        del view
+        height, width = transformed_rgb.shape[:2]
         bottom = PaddleCapturedLine(
             text="底部",
             confidence=0.99,
+            orientation_degrees=0,
+            transformed_quad_pixels=(
+                (0.1 * (width - 1), 0.7 * (height - 1)),
+                (0.8 * (width - 1), 0.7 * (height - 1)),
+                (0.8 * (width - 1), 0.8 * (height - 1)),
+                (0.1 * (width - 1), 0.8 * (height - 1)),
+            ),
             quad_normalized=((0.1, 0.7), (0.8, 0.7), (0.8, 0.8), (0.1, 0.8)),
         )
         top = PaddleCapturedLine(
             text="顶部",
             confidence=0.99,
+            orientation_degrees=0,
+            transformed_quad_pixels=(
+                (0.1 * (width - 1), 0.1 * (height - 1)),
+                (0.8 * (width - 1), 0.1 * (height - 1)),
+                (0.8 * (width - 1), 0.2 * (height - 1)),
+                (0.1 * (width - 1), 0.2 * (height - 1)),
+            ),
             quad_normalized=((0.1, 0.1), (0.8, 0.1), (0.8, 0.2), (0.1, 0.2)),
         )
         return PaddleCaptureBatch((bottom, top), 2, 2, 0)

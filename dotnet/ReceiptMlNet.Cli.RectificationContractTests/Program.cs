@@ -28,6 +28,10 @@ internal static class Program
 
     private static void VerifyRgbMatByteOrder()
     {
+        AssertEqual(
+            "RGB_passthrough_to_paddle_v2",
+            PaddleOcrImageOps.InputColorOrderContract,
+            "Paddle RGB byte-order contract token");
         using var source = new Image<Rgb24>(2, 2);
         source[0, 0] = new Rgb24(1, 2, 3);
         source[1, 0] = new Rgb24(4, 5, 6);

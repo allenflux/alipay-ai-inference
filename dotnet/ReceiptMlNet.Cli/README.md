@@ -47,11 +47,15 @@ Python pipeline:
 - `auto` 当前会明确失败。仓库尚未交付经过校准的蓝/白分类器，因此不能静默把白图
   当成蓝图处理；调用方必须显式选择 `blue` 或 `white`。
 
-白图首版只输出逐行 `text`、`confidence`、`passes_drop_score` 和原图坐标系四点 `quad`，并固定
-标记 `review_required=true`、`delivery_policy=review_only`。它不会把整图文字猜成蓝图的
-金额、时间、状态、收款人、付款方式五字段；`student_model_status=not_integrated` 和
-`field_mapping_status=not_calibrated` 是后续学生模型/字段映射的明确替换点。Paddle 教师
-一致性也不能被描述为独立人工真值准确率。
+白图输出逐行 Paddle `text`、`confidence`、`passes_drop_score` 和原图坐标系四点 `quad`，并固定
+标记 `review_required=true`、`delivery_policy=review_only`。可选的
+`--white-student-bundle` 加载独立 `generic_text_line` CTC 三件套，在 Paddle DB 检出且 CLS
+定向后的同一行 crop 上运行 CPU student；逐行 `student` 节点给出 student 文本、置信度、
+规范化精确一致标记以及 `crop_source=same_paddle_db_cls_oriented_crop`。它不会再次裁图或旋转，
+也不会把整图文字猜成蓝图的金额、时间、状态、收款人、付款方式五字段。student 未配置时
+`student_model_status=not_configured`，配置时为 `integrated_review_only`；无论一致率多高都不会
+晋级为业务真值。`field_mapping_status=not_calibrated` 仍然 fail closed，Paddle 教师一致性也
+不能被描述为独立人工真值准确率。
 
 白图 CPU 单图示例（无需蓝图 detector）：
 
@@ -59,12 +63,14 @@ Python pipeline:
 $package = "D:\alipay-ai-data\delivery\ReceiptMlNet-unified-cpu"
 $input = "D:\download2\OtherImages\one-white.png"
 $output = "D:\output\one-white-result"
+$student = "D:\alipay-ai-data\delivery\white-generic-text-line"
 
 & "$package\app\ReceiptMlNet.Cli.exe" `
   --document-type white `
   --device-model "$package\models\statusbar_device_v1.onnx" `
   --ocr onnx `
   --ocr-bundle "$package\models\paddle-ocr" `
+  --white-student-bundle $student `
   --input $input `
   --output $output `
   --device cpu `
@@ -73,7 +79,10 @@ $output = "D:\output\one-white-result"
 ```
 
 白图路由强制 `--device cpu`，不加载 Python/Paddle 运行时、不联网，也不运行蓝图检测器。
-状态栏 ONNX、PP-OCR det/cls/rec 与字典均从同一次验哈希的私有字节快照消费；创建
+student 目录必须且只能有一个 `*.contract.json`，并绑定 `*.onnx` 与 `*.charset.json`；契约
+必须为 `receipt_ocr_ctc_v1`、`fields=["generic_text_line"]`、固定 `image -> logits` ABI 与
+`opencv_exact_rgb_gray_letterbox_v1` 预处理。状态栏 ONNX、PP-OCR det/cls/rec、字典及可选
+student 三件套均从同一次验哈希的私有字节快照消费；创建
 Session 或 CTC 字符表时不会再次打开可被替换的模型路径。JSON 证据固定写入
 `runtime_source=immutable_verified_bytes` 与 `reopened_paths_after_verification=false`。
 如果统一 wrapper 为所有请求都传了 `--detector`，白图路由会明确记录该 detector 未加载；

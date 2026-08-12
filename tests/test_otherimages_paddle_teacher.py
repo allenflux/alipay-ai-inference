@@ -29,6 +29,7 @@ from transfer_receipt_ai.otherimages_paddle_teacher import (
     TeacherContractError,
     build_paddle_teacher_consensus,
     canonical_view_contract,
+    canonical_paddle_color_contract,
 )
 
 
@@ -155,7 +156,7 @@ def _adapter(tmp_path: Path) -> dict[str, object]:
         "device": "cpu",
         "drop_score": drop_score,
         "assets": assets,
-        "adapter_input_color_bridge": "opencv_rgb8_to_bgr8_v1",
+        "paddle_color_contract": canonical_paddle_color_contract(),
     }
     return {
         "kind": ADAPTER_EVIDENCE_KIND,
@@ -169,7 +170,7 @@ def _adapter(tmp_path: Path) -> dict[str, object]:
         "effective_paddle_args": effective_args,
         "model_assets": assets,
         "raw_db_lines_preserved_before_drop_filter": True,
-        "adapter_input_color_bridge": "opencv_rgb8_to_bgr8_v1",
+        "paddle_color_contract": canonical_paddle_color_contract(),
     }
 
 
@@ -179,12 +180,15 @@ def _line(
     confidence: float = 0.99,
     quad: list[list[float]] | None = None,
     index: int = 0,
+    transformed_quad: list[list[float]] | None = None,
 ) -> dict[str, object]:
     return {
         "index": index,
         "text": text,
         "confidence": confidence,
         "passes_drop_score": confidence >= 0.5,
+        "orientation_degrees": 0,
+        "transformed_quad_pixels": transformed_quad or [[20.0, 32.0], [159.0, 32.0], [159.0, 64.0], [20.0, 64.0]],
         "quad_normalized": quad or [[0.1, 0.1], [0.8, 0.1], [0.8, 0.2], [0.1, 0.2]],
     }
 
@@ -260,6 +264,7 @@ def _write_three_views(
     confidences: tuple[float, float, float] = (0.99, 0.98, 0.97),
     quads: tuple[list[list[float]], list[list[float]], list[list[float]]] | None = None,
     states: tuple[str, str, str] = ("ok", "ok", "ok"),
+    orientations: tuple[int, int, int] = (0, 0, 0),
 ) -> list[Path]:
     capture_directory = tmp_path / "captured-views"
     capture_directory.mkdir(exist_ok=True)
@@ -292,7 +297,19 @@ def _write_three_views(
                         texts[view_index],
                         confidence=confidences[view_index],
                         quad=quads[view_index],
+                        transformed_quad=(
+                            [
+                                [point[0] * 399.0, point[1] * 639.0]
+                                for point in quads[view_index]
+                            ]
+                            if view_index == 2
+                            else [
+                                [point[0] * 199.0, point[1] * 319.0]
+                                for point in quads[view_index]
+                            ]
+                        ),
                     )
+                    | {"orientation_degrees": orientations[view_index]}
                 ],
             )
             for inventory in pending_only
@@ -348,6 +365,7 @@ def test_three_of_three_nfkc_consensus_publishes_sealed_teacher_and_hash_closure
     assert teacher["consensus"]["agreement"] == "3_of_3"
     assert teacher["consensus"]["dominant_text_votes"] == 3
     assert teacher["training_eligible"] is True
+    assert teacher["lines"][0]["orientation_degrees"] == 0
     assert teacher["manual_review_required"] is False
     assert "independent human ground truth" in teacher["limitations"][0]
     assert _read_jsonl(output / "reject_manifest.jsonl") == []
@@ -371,6 +389,18 @@ def test_three_of_three_nfkc_consensus_publishes_sealed_teacher_and_hash_closure
         "artifacts": contract["artifacts"],
     }
     assert contract["closure_sha256"] == teacher_module._canonical_sha256(closure_payload)
+
+
+def test_teacher_binds_cls_orientation_from_the_chosen_geometry_view(tmp_path: Path) -> None:
+    inventory, pending = _build_inventory(tmp_path)
+    views = _write_three_views(tmp_path, pending, orientations=(180, 0, 0))
+
+    output, _contract = _build_teacher(tmp_path, inventory, views)
+
+    teacher = _read_jsonl(output / "teacher_manifest.jsonl")[0]
+    # original_rgb has the highest confidence and is the chosen geometry view.
+    assert teacher["consensus"]["chosen_geometry_view_id"] == "original_rgb"
+    assert teacher["lines"][0]["orientation_degrees"] == 180
 
 
 def test_unique_two_of_three_dominant_text_is_accepted_without_using_conflicting_view(tmp_path: Path) -> None:

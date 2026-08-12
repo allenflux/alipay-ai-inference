@@ -250,8 +250,9 @@ internal sealed class ClosedCpuDeviceModel : IDisposable
 internal static class WhiteDocumentOutputContract
 {
     public const int SchemaVersion = 1;
-    public const string SemanticsVersion = "white_document_paddle_layout_review_v1";
+    public const string SemanticsVersion = "white_document_paddle_student_layout_review_v2";
     public const string DeliveryPolicy = "review_only";
+    public const string StudentCropSource = "same_paddle_db_cls_oriented_crop";
 
     public static IReadOnlyList<WhiteDocumentLine> ProjectLines(PaddleOcrLayoutReadResult read)
     {
@@ -266,13 +267,57 @@ internal static class WhiteDocumentOutputContract
                     .Select(point => new WhiteDocumentPoint(
                         MathF.Round(point.X, 4),
                         MathF.Round(point.Y, 4)))
-                    .ToArray()))
+                    .ToArray(),
+                line.Student is null
+                    ? null
+                    : new WhiteDocumentStudentLineEvidence(
+                        line.Student.Text,
+                        MathF.Round(line.Student.Confidence, 6),
+                        NormalizedExactMatch(line.Text, line.Student.Text),
+                        "cpu",
+                        DeliveryPolicy,
+                        StudentCropSource)))
             .ToArray();
+    }
+
+    internal static bool NormalizedExactMatch(string teacher, string student) =>
+        string.Equals(NormalizeComparison(teacher), NormalizeComparison(student), StringComparison.Ordinal);
+
+    private static string NormalizeComparison(string value)
+    {
+        var normalized = (value ?? string.Empty).Normalize(NormalizationForm.FormKC);
+        var output = new StringBuilder(normalized.Length);
+        var pendingSpace = false;
+        foreach (var character in normalized)
+        {
+            if (char.IsWhiteSpace(character))
+            {
+                pendingSpace = output.Length > 0;
+                continue;
+            }
+            if (pendingSpace)
+            {
+                output.Append(' ');
+                pendingSpace = false;
+            }
+            output.Append(character);
+        }
+        return output.ToString();
     }
 }
 
 internal static partial class ReceiptMlNetProgram
 {
+    internal static void RequireFreshWhiteOutput(string outputDirectory)
+    {
+        if (Directory.Exists(outputDirectory) || File.Exists(outputDirectory))
+        {
+            throw new UsageException(
+                $"White document output already exists: {outputDirectory}. " +
+                "Use a brand-new output directory so review evidence cannot be overwritten.");
+        }
+    }
+
     private static void RunWhiteDocumentRoute(CliOptions options)
     {
         var totalStopwatch = Stopwatch.StartNew();
@@ -280,6 +325,9 @@ internal static partial class ReceiptMlNetProgram
         var deviceContract = deviceSnapshot.Contract;
         var ocrBundle = PaddleOcrDeliveryBundle.LoadAndVerify(options.OcrBundlePath!);
         var ocrSnapshot = PaddleOcrCpuRuntimeSnapshot.LoadAndVerify(ocrBundle);
+        var studentBundle = string.IsNullOrWhiteSpace(options.WhiteStudentBundlePath)
+            ? null
+            : WhiteLineStudentBundle.LoadAndVerify(options.WhiteStudentBundlePath);
         var inputFiles = options.InputListPath is null
             ? EnumerateInputFiles(options.InputPath!).ToList()
             : ReadInputList(options.InputListPath).ToList();
@@ -293,6 +341,7 @@ internal static partial class ReceiptMlNetProgram
             inputFiles = inputFiles.Take(options.Limit.Value).ToList();
         }
 
+        RequireFreshWhiteOutput(options.OutputDirectory);
         Directory.CreateDirectory(options.OutputDirectory);
         var sourceRoot = options.InputPath is null
             ? null
@@ -323,6 +372,9 @@ internal static partial class ReceiptMlNetProgram
 
         using var deviceClassifier = new ClosedCpuDeviceModel(deviceSnapshot);
         using var ocrEngine = new PaddleOcrEngine(ocrBundle, ocrSnapshot.Models);
+        using var studentEngine = studentBundle is null
+            ? null
+            : new WhiteLineStudentEngine(studentBundle);
         if (!string.Equals(ocrEngine.ExecutionProvider, "cpu", StringComparison.Ordinal))
         {
             throw new InvalidOperationException(
@@ -331,6 +383,9 @@ internal static partial class ReceiptMlNetProgram
         Console.WriteLine("Document route: explicit white (review-only full-image line OCR; no five-field mapping)");
         Console.WriteLine("Status-bar device classification runs before white document OCR");
         Console.WriteLine($"OCR ONNX execution provider: {ocrEngine.ExecutionProvider} (det/cls/rec)");
+        Console.WriteLine(studentEngine is null
+            ? "White line student: not configured (Paddle review evidence only)"
+            : "White line student: CPU comparison enabled on the same Paddle DB/CLS-oriented crops (review-only)");
         if (!string.IsNullOrWhiteSpace(options.DetectorPath))
         {
             Console.WriteLine("The supplied blue receipt detector is intentionally not loaded by the explicit white route");
@@ -341,7 +396,8 @@ internal static partial class ReceiptMlNetProgram
             if (options.SkipExisting && ExistingWhiteDocumentResultSatisfiesRequestedMode(
                     workItem.Output,
                     deviceContract,
-                    ocrBundle))
+                    ocrBundle,
+                    studentBundle))
             {
                 manifest.Add(new WhiteDocumentManifestRecord(
                     Path.GetFullPath(workItem.Source),
@@ -357,9 +413,11 @@ internal static partial class ReceiptMlNetProgram
                     workItem.Source,
                     deviceClassifier,
                     ocrEngine,
+                    studentEngine,
                     deviceContract,
                     ocrBundle,
                     ocrSnapshot,
+                    studentBundle,
                     out var stageLatency);
                 inferenceStopwatch.Stop();
                 var inferenceMs = Math.Round(inferenceStopwatch.Elapsed.TotalMilliseconds, 4);
@@ -410,7 +468,8 @@ internal static partial class ReceiptMlNetProgram
                 SummarizeLatencies(stageLatencies.Select(item => item.ImageLoad).ToArray()),
                 SummarizeLatencies(stageLatencies.Select(item => item.Device).ToArray()),
                 SummarizeLatencies(stageLatencies.Select(item => item.PaddleOcr).ToArray()),
-                SummarizeLatencies(stageLatencies.Select(item => item.ResultAssembly).ToArray())));
+                SummarizeLatencies(stageLatencies.Select(item => item.ResultAssembly).ToArray())),
+            studentEngine?.ExecutionProvider);
         WriteJsonAtomic(Path.Combine(options.OutputDirectory, "inference_summary.json"), summary);
         if (fatalException is not null)
         {
@@ -423,9 +482,11 @@ internal static partial class ReceiptMlNetProgram
         string inputFile,
         ClosedCpuDeviceModel deviceClassifier,
         PaddleOcrEngine ocrEngine,
+        WhiteLineStudentEngine? studentEngine,
         ModelContract deviceContract,
         PaddleOcrDeliveryBundle ocrBundle,
         PaddleOcrCpuRuntimeSnapshot ocrSnapshot,
+        WhiteLineStudentBundle? studentBundle,
         out WhiteDocumentStageLatency stageLatency)
     {
         var stageStopwatch = Stopwatch.StartNew();
@@ -439,7 +500,9 @@ internal static partial class ReceiptMlNetProgram
         var deviceMs = StopAndReadMilliseconds(stageStopwatch);
 
         stageStopwatch.Restart();
-        var layout = ocrEngine.RecognizeLayoutDiagnostic(source);
+        var layout = studentEngine is null
+            ? ocrEngine.RecognizeLayoutDiagnostic(source)
+            : ocrEngine.RecognizeLayoutWithStudentDiagnostic(source, studentEngine);
         var paddleOcrMs = StopAndReadMilliseconds(stageStopwatch);
 
         stageStopwatch.Restart();
@@ -470,12 +533,16 @@ internal static partial class ReceiptMlNetProgram
                 "ppocr_db_cls_rec",
                 ocrEngine.ExecutionProvider,
                 WhiteDocumentOutputContract.DeliveryPolicy,
-                "not_integrated",
+                studentEngine is null ? "not_configured" : "integrated_review_only",
                 "not_calibrated",
                 layout.Text,
                 layout.Confidence is null ? null : MathF.Round(layout.Confidence.Value, 6),
                 lines.Count(line => line.PassesDropScore),
-                lines.Count),
+                lines.Count,
+                studentEngine?.ExecutionProvider,
+                lines.Count(line => line.Student is not null),
+                lines.Count(line => line.Student?.NormalizedExactMatch == true),
+                studentEngine is null ? null : WhiteDocumentOutputContract.StudentCropSource),
             lines,
             device,
             new WhiteDocumentContractReferences(
@@ -496,12 +563,24 @@ internal static partial class ReceiptMlNetProgram
                 "immutable_verified_bytes",
                 false,
                 ocrSnapshot.DictionarySizeBytes,
-                ocrSnapshot.DictionarySha256),
+                ocrSnapshot.DictionarySha256,
+                studentBundle?.ModelFileName,
+                studentBundle?.ModelSha256,
+                studentBundle?.ModelSizeBytes,
+                studentBundle?.CharsetFileName,
+                studentBundle?.CharsetSha256,
+                studentBundle?.CharsetSizeBytes,
+                studentBundle?.ContractFileName,
+                studentBundle?.ContractSha256,
+                studentBundle?.ContractSizeBytes,
+                studentBundle is null ? null : "immutable_verified_bytes",
+                studentBundle is null ? null : false),
             stageLatency,
             [
                 "EXIF orientation is applied before status-bar classification and full-image OCR.",
-                "White output is line-level Paddle teacher evidence only; it does not fabricate the blue receipt five-field schema.",
-                "All OCR lines remain review-only, including lines above the delivery bundle drop score.",
+                "White output is line-level Paddle teacher evidence with an optional CPU student comparison; it does not fabricate the blue receipt five-field schema.",
+                "The optional student receives the exact DB crop after Paddle CLS orientation used by Paddle REC; it does not run a second crop or angle pipeline.",
+                "All Paddle and student OCR lines remain review-only, including lines above the delivery bundle drop score.",
                 "Status-bar and PP-OCR sessions consume hash-verified immutable byte snapshots; model and dictionary paths are not reopened after closure.",
                 "Teacher agreement is not independent human ground truth.",
                 "Automatic blue/white routing remains unavailable until a separately calibrated router is delivered.",
@@ -511,7 +590,8 @@ internal static partial class ReceiptMlNetProgram
     private static bool ExistingWhiteDocumentResultSatisfiesRequestedMode(
         string outputPath,
         ModelContract deviceContract,
-        PaddleOcrDeliveryBundle ocrBundle)
+        PaddleOcrDeliveryBundle ocrBundle,
+        WhiteLineStudentBundle? studentBundle)
     {
         if (!File.Exists(outputPath))
         {
@@ -534,6 +614,10 @@ internal static partial class ReceiptMlNetProgram
                 || !root.TryGetProperty("ocr", out var ocr)
                 || !HasJsonString(ocr, "provider", "cpu")
                 || !HasJsonString(ocr, "delivery_policy", WhiteDocumentOutputContract.DeliveryPolicy)
+                || !HasJsonString(
+                    ocr,
+                    "student_model_status",
+                    studentBundle is null ? "not_configured" : "integrated_review_only")
                 || !root.TryGetProperty("lines", out var lines)
                 || lines.ValueKind != JsonValueKind.Array
                 || !root.TryGetProperty("model_contracts", out var contracts))
@@ -558,7 +642,51 @@ internal static partial class ReceiptMlNetProgram
                 && HasJsonString(
                     contracts,
                     "ocr_dictionary_snapshot_sha256",
-                    ocrBundle.Dictionary.Sha256);
+                    ocrBundle.Dictionary.Sha256)
+                && HasOptionalJsonString(
+                    contracts,
+                    "white_student_model",
+                    studentBundle?.ModelFileName)
+                && HasOptionalJsonString(
+                    contracts,
+                    "white_student_model_sha256",
+                    studentBundle?.ModelSha256)
+                && HasOptionalJsonLong(
+                    contracts,
+                    "white_student_model_snapshot_size_bytes",
+                    studentBundle?.ModelSizeBytes)
+                && HasOptionalJsonString(
+                    contracts,
+                    "white_student_charset",
+                    studentBundle?.CharsetFileName)
+                && HasOptionalJsonString(
+                    contracts,
+                    "white_student_charset_sha256",
+                    studentBundle?.CharsetSha256)
+                && HasOptionalJsonLong(
+                    contracts,
+                    "white_student_charset_snapshot_size_bytes",
+                    studentBundle?.CharsetSizeBytes)
+                && HasOptionalJsonString(
+                    contracts,
+                    "white_student_contract",
+                    studentBundle?.ContractFileName)
+                && HasOptionalJsonString(
+                    contracts,
+                    "white_student_contract_sha256",
+                    studentBundle?.ContractSha256)
+                && HasOptionalJsonLong(
+                    contracts,
+                    "white_student_contract_snapshot_size_bytes",
+                    studentBundle?.ContractSizeBytes)
+                && HasOptionalJsonString(
+                    contracts,
+                    "white_student_runtime_source",
+                    studentBundle is null ? null : "immutable_verified_bytes")
+                && HasOptionalJsonBool(
+                    contracts,
+                    "white_student_reopened_paths_after_verification",
+                    studentBundle is null ? null : false);
         }
         catch (JsonException)
         {
@@ -585,6 +713,26 @@ internal static partial class ReceiptMlNetProgram
         return source.TryGetProperty(propertyName, out var property)
             && property.TryGetInt64(out var actual)
             && actual == expected;
+    }
+
+    private static bool HasOptionalJsonLong(JsonElement source, string propertyName, long? expected)
+    {
+        if (expected is null)
+        {
+            return !source.TryGetProperty(propertyName, out var property)
+                || property.ValueKind == JsonValueKind.Null;
+        }
+        return HasJsonLong(source, propertyName, expected.Value);
+    }
+
+    private static bool HasOptionalJsonBool(JsonElement source, string propertyName, bool? expected)
+    {
+        if (expected is null)
+        {
+            return !source.TryGetProperty(propertyName, out var property)
+                || property.ValueKind == JsonValueKind.Null;
+        }
+        return HasJsonBool(source, propertyName, expected.Value);
     }
 }
 
@@ -621,7 +769,11 @@ internal sealed record WhiteDocumentOcrEvidence(
     string AggregateText,
     float? AggregateConfidence,
     int PassesDropScoreLineCount,
-    int TotalLineCount);
+    int TotalLineCount,
+    string? StudentProvider = null,
+    int StudentComparisonLineCount = 0,
+    int StudentNormalizedExactMatchLineCount = 0,
+    string? StudentCropSource = null);
 
 internal sealed record WhiteDocumentPoint(float X, float Y);
 
@@ -630,7 +782,16 @@ internal sealed record WhiteDocumentLine(
     string Text,
     float Confidence,
     bool PassesDropScore,
-    IReadOnlyList<WhiteDocumentPoint> Quad);
+    IReadOnlyList<WhiteDocumentPoint> Quad,
+    WhiteDocumentStudentLineEvidence? Student = null);
+
+internal sealed record WhiteDocumentStudentLineEvidence(
+    string Text,
+    float Confidence,
+    bool NormalizedExactMatch,
+    string Provider,
+    string DeliveryPolicy,
+    string CropSource);
 
 internal sealed record WhiteDocumentContractReferences(
     string Device,
@@ -650,7 +811,18 @@ internal sealed record WhiteDocumentContractReferences(
     string RuntimeSource,
     bool ReopenedPathsAfterVerification,
     long OcrDictionarySnapshotSizeBytes,
-    string OcrDictionarySnapshotSha256);
+    string OcrDictionarySnapshotSha256,
+    string? WhiteStudentModel = null,
+    string? WhiteStudentModelSha256 = null,
+    long? WhiteStudentModelSnapshotSizeBytes = null,
+    string? WhiteStudentCharset = null,
+    string? WhiteStudentCharsetSha256 = null,
+    long? WhiteStudentCharsetSnapshotSizeBytes = null,
+    string? WhiteStudentContract = null,
+    string? WhiteStudentContractSha256 = null,
+    long? WhiteStudentContractSnapshotSizeBytes = null,
+    string? WhiteStudentRuntimeSource = null,
+    bool? WhiteStudentReopenedPathsAfterVerification = null);
 
 internal sealed record WhiteDocumentManifestRecord(
     string Source,
@@ -669,7 +841,8 @@ internal sealed record WhiteDocumentInferenceSummary(
     int Errors,
     double TotalSeconds,
     LatencySummary InferenceLatencyMs,
-    WhiteDocumentStageLatencySummary StageLatencyMs);
+    WhiteDocumentStageLatencySummary StageLatencyMs,
+    string? WhiteStudentProvider = null);
 
 internal sealed record WhiteDocumentStageLatency(
     double ImageLoad,

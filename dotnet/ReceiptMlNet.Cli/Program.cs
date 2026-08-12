@@ -1708,7 +1708,8 @@ internal sealed record CliOptions(
     bool SkipExisting,
     int? DetectorIntraOpThreads,
     int? Limit,
-    string DocumentType)
+    string DocumentType,
+    string? WhiteStudentBundlePath)
 {
     public const string Usage = """
 Usage:
@@ -1718,6 +1719,7 @@ Usage:
     [--device-model <statusbar_device_v1.onnx>] \
     [--ocr none|onnx|unified|hybrid-recipient] \
     [--ocr-bundle <paddle-ocr-delivery-directory>] \
+    [--white-student-bundle <receipt-ocr-ctc-v1-directory>] \
     [--ocr-model <receipt_unified_field_reader_v12_or_v13.onnx>] \
     (--input <image-or-directory> | --input-list <txt>) --output <directory> \
     [--device auto|cpu|cuda:0] [--score-threshold 0.50] [--annotate all|flagged|none] \
@@ -1728,7 +1730,9 @@ Usage:
 Omitting --document-type preserves the legacy blue receipt route. The white
 route requires --document-type white, --device cpu, --device-model, --ocr onnx,
 --ocr-bundle, and emits review-only full-image OCR lines without fabricated
-receipt fields. --document-type auto fails closed because no calibrated
+receipt fields. An optional --white-student-bundle adds CPU CTC comparison
+reads from the exact PP-OCR DB/CLS-oriented crops; these remain review-only.
+--document-type auto fails closed because no calibrated
 blue/white router is delivered yet.
 
 This .NET CLI runs the receipt/device ONNX models and can optionally run a
@@ -1751,6 +1755,7 @@ perspective photos still require an externally rectified input.
         string? deviceModel = null;
         var ocrMode = "none";
         string? ocrBundle = null;
+        string? whiteStudentBundle = null;
         string? ocrModel = null;
         string? input = null;
         string? inputList = null;
@@ -1775,6 +1780,7 @@ perspective photos still require an externally rectified input.
                 case "--device-model": deviceModel = NextValue(args, ref index); break;
                 case "--ocr": ocrMode = ParseOcrMode(NextValue(args, ref index)); break;
                 case "--ocr-bundle": ocrBundle = NextValue(args, ref index); break;
+                case "--white-student-bundle": whiteStudentBundle = NextValue(args, ref index); break;
                 case "--ocr-model": ocrModel = NextValue(args, ref index); break;
                 case "--input": input = NextValue(args, ref index); break;
                 case "--input-list": inputList = NextValue(args, ref index); break;
@@ -1877,6 +1883,10 @@ perspective photos still require an externally rectified input.
                 throw new UsageException("--detector-intra-op-threads is unavailable for the white route because it does not run the blue receipt detector");
             }
         }
+        else if (!string.IsNullOrWhiteSpace(whiteStudentBundle))
+        {
+            throw new UsageException("--white-student-bundle requires --document-type white");
+        }
         if (detectorIntraOpThreads is not null && parsedDevice.Requested != "cpu")
         {
             throw new UsageException("--detector-intra-op-threads requires --device cpu");
@@ -1899,7 +1909,8 @@ perspective photos still require an externally rectified input.
             skipExisting,
             detectorIntraOpThreads,
             limit,
-            documentType);
+            documentType,
+            whiteStudentBundle);
     }
 
     private static string ParseOcrMode(string value)

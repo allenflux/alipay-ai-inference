@@ -20,14 +20,50 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import cv2
 from PIL import Image
 
 from .labels import DETECTION_CLASSES
+from .otherimages_paddle_teacher import canonical_paddle_color_contract
 
 
 RECOGNIZER_SCHEMA_VERSION = 1
 DEFAULT_IMAGE_HEIGHT = 48
 DEFAULT_IMAGE_WIDTH = 768
+GENERIC_TEXT_LINE_FIELD = "generic_text_line"
+GENERIC_TEXT_LINE_RECORD_KIND = "otherimages_generic_text_line_record_v1"
+GENERIC_TEXT_LINE_MANIFEST_NAME = "generic_text_lines.jsonl"
+GENERIC_TEXT_LINE_CONTRACT_KIND = "otherimages_generic_text_line_dataset_contract_v1"
+GENERIC_TEXT_LINE_RECEIPT_KIND = "otherimages_generic_text_line_dataset_receipt_v1"
+SOURCE_TEACHER_CONTRACT_KIND = "otherimages_paddle_teacher_contract_v1"
+SOURCE_TEACHER_RECEIPT_KIND = "otherimages_paddle_teacher_receipt_v1"
+LEGACY_RECEIPT_PREPROCESS = (
+    "RGB crop -> grayscale -> aspect-preserving resize -> white letterbox -> divide by 255.0"
+)
+GENERIC_TEXT_LINE_PREPROCESS = "opencv_exact_rgb_gray_letterbox_v1"
+GENERIC_TEXT_LINE_PADDLE_COLOR_CONTRACT = canonical_paddle_color_contract()
+# This is a recognizer-only vocabulary.  DETECTION_CLASSES is the detector ABI
+# and must never grow a synthetic whole-document line class.
+RECOGNIZER_FIELDS = (*DETECTION_CLASSES, GENERIC_TEXT_LINE_FIELD)
+
+
+def _validate_recognizer_field_mode(fields: Sequence[str]) -> tuple[str, ...]:
+    selected = tuple(dict.fromkeys(fields))
+    invalid = sorted(set(selected) - set(RECOGNIZER_FIELDS))
+    if not selected or invalid:
+        raise ValueError(f"fields must be a non-empty subset of: {','.join(RECOGNIZER_FIELDS)}")
+    if GENERIC_TEXT_LINE_FIELD in selected and selected != (GENERIC_TEXT_LINE_FIELD,):
+        raise ValueError("generic_text_line must be trained and exported as an independent recognizer")
+    return selected
+
+
+def _preprocess_contract(fields: Sequence[str]) -> str:
+    selected = _validate_recognizer_field_mode(fields)
+    return (
+        GENERIC_TEXT_LINE_PREPROCESS
+        if selected == (GENERIC_TEXT_LINE_FIELD,)
+        else LEGACY_RECEIPT_PREPROCESS
+    )
 
 
 @dataclass(frozen=True)
@@ -62,6 +98,264 @@ def _sha256(path: Path) -> str:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _canonical_sha256(payload: object) -> str:
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+
+
+def _file_binding(path: Path) -> dict[str, object]:
+    data = path.read_bytes()
+    return {
+        "path": path.name,
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "size_bytes": len(data),
+        "line_count": data.count(b"\n"),
+    }
+
+
+def _binding_matches(path: Path, value: object, *, expected_name: str) -> bool:
+    return (
+        isinstance(value, Mapping)
+        and value.get("path") == expected_name
+        and _file_binding(path) == {
+            "path": value.get("path"),
+            "sha256": value.get("sha256"),
+            "size_bytes": value.get("size_bytes"),
+            "line_count": value.get("line_count"),
+        }
+    )
+
+
+def _json_object(path: Path) -> dict[str, object]:
+    def reject_constant(value: str) -> None:
+        raise ValueError(f"non-standard JSON constant {value!r} is forbidden")
+
+    def object_without_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        output: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in output:
+                raise ValueError(f"duplicate JSON key {key!r}")
+            output[key] = value
+        return output
+
+    try:
+        text = path.read_bytes().decode("utf-8")
+        if text.startswith("\ufeff"):
+            raise ValueError("UTF-8 BOM is forbidden")
+        value = json.loads(
+            text,
+            parse_constant=reject_constant,
+            object_pairs_hook=object_without_duplicates,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+        raise ValueError(f"{path}: invalid strict UTF-8 JSON: {error}") from None
+    if not isinstance(value, dict):
+        raise ValueError(f"{path}: expected a JSON object")
+    return value
+
+
+def _pixel_sha256(rgb: np.ndarray) -> str:
+    pixels = np.ascontiguousarray(rgb, dtype=np.uint8)
+    digest = hashlib.sha256()
+    digest.update(str(pixels.shape).encode("ascii"))
+    digest.update(pixels.tobytes(order="C"))
+    return digest.hexdigest()
+
+
+def _verify_generic_line_dataset(
+    *,
+    records_path: Path,
+    dataset_root: Path,
+    records: Sequence[Mapping[str, object]],
+) -> None:
+    """Verify the sealed materializer closure before generic-line training/eval."""
+    if records_path.name != GENERIC_TEXT_LINE_MANIFEST_NAME:
+        raise ValueError(
+            f"{GENERIC_TEXT_LINE_FIELD} requires records basename {GENERIC_TEXT_LINE_MANIFEST_NAME}"
+        )
+    publication = records_path.parent
+    if dataset_root != publication:
+        raise ValueError(f"{GENERIC_TEXT_LINE_FIELD} dataset_root must be the sealed manifest directory")
+    contract_path = publication / "dataset.contract.json"
+    receipt_path = publication / "dataset.receipt.json"
+    if not contract_path.is_file() or not receipt_path.is_file():
+        raise ValueError("generic_text_line requires sibling dataset.contract.json and dataset.receipt.json")
+    contract = _json_object(contract_path)
+    receipt = _json_object(receipt_path)
+    if (
+        contract.get("schema_version") != RECOGNIZER_SCHEMA_VERSION
+        or contract.get("kind") != GENERIC_TEXT_LINE_CONTRACT_KIND
+        or contract.get("sealed") is not True
+        or contract.get("field") != GENERIC_TEXT_LINE_FIELD
+        or contract.get("records") != GENERIC_TEXT_LINE_MANIFEST_NAME
+        or contract.get("training_authorization") is not True
+        or contract.get("training_authorization_source") != "explicit_materializer_flag"
+    ):
+        raise ValueError("generic_text_line dataset contract is unsupported, unsealed, or unauthorized")
+    raw_output = contract.get("output_directory")
+    if not isinstance(raw_output, str) or Path(raw_output).expanduser().resolve(strict=True) != publication:
+        raise ValueError("generic_text_line dataset contract output_directory differs from the publication")
+    if contract.get("truth_semantics") != "teacher_parity_only_not_independent_business_truth":
+        raise ValueError("generic_text_line dataset contract truth semantics are invalid")
+    crop_recipe = contract.get("crop_recipe")
+    if (
+        not isinstance(crop_recipe, Mapping)
+        or crop_recipe.get("paddle_color_contract") != GENERIC_TEXT_LINE_PADDLE_COLOR_CONTRACT
+    ):
+        raise ValueError(
+            "generic_text_line dataset does not bind the canonical RGB byte-order contract"
+        )
+
+    artifacts = contract.get("artifacts")
+    if not isinstance(artifacts, Mapping):
+        raise ValueError("generic_text_line dataset artifacts must be an object")
+    manifest_bytes = records_path.read_bytes()
+    if (
+        manifest_bytes.startswith(b"\xef\xbb\xbf")
+        or (manifest_bytes and not manifest_bytes.endswith(b"\n"))
+        or b"\n\n" in manifest_bytes
+    ):
+        raise ValueError("generic_text_line manifest must be canonical UTF-8 JSONL without BOM/blank lines")
+    manifest_binding = artifacts.get("manifest")
+    if not _binding_matches(
+        records_path,
+        manifest_binding,
+        expected_name=GENERIC_TEXT_LINE_MANIFEST_NAME,
+    ):
+        raise ValueError("generic_text_line manifest differs from its sealed contract binding")
+    counts = contract.get("counts")
+    if not isinstance(counts, Mapping) or counts.get("line_records") != len(records):
+        raise ValueError("generic_text_line manifest record count differs from its sealed contract")
+    by_split = Counter(str(record["split"]) for record in records)
+    if counts.get("by_split") != {name: int(by_split[name]) for name in ("train", "val", "test")}:
+        raise ValueError("generic_text_line split counts differ from its sealed contract")
+    if counts.get("training_eligible_lines") != by_split["train"] or counts.get(
+        "evaluation_only_lines"
+    ) != by_split["val"] + by_split["test"]:
+        raise ValueError("generic_text_line split-use counts differ from its sealed contract")
+
+    crop_bindings: list[dict[str, object]] = []
+    declared_images: set[str] = set()
+    for record in records:
+        split = str(record["split"])
+        training = split == "train"
+        if (
+            record.get("kind") != GENERIC_TEXT_LINE_RECORD_KIND
+            or record.get("training_eligible") is not training
+            or record.get("evaluation_only") is not (not training)
+            or record.get("held_out") is not (not training)
+            or record.get("truth_semantics") != "paddle_teacher_parity_not_independent_truth"
+            or record.get("label_source") != "paddle_db_cls_rec_three_view_consensus"
+        ):
+            raise ValueError(f"generic_text_line record provenance/split flags are invalid: {record['id']}")
+        image_path = Path(record["image_path"])
+        image_relative = image_path.relative_to(publication).as_posix()
+        declared_images.add(image_relative)
+        data = image_path.read_bytes()
+        sha256 = hashlib.sha256(data).hexdigest()
+        size_bytes = len(data)
+        if sha256 != record.get("crop_sha256") or size_bytes != record.get("crop_size_bytes"):
+            raise ValueError(f"generic_text_line crop bytes differ from manifest: {record['id']}")
+        with Image.open(image_path) as image:
+            rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
+        if (
+            _pixel_sha256(rgb) != record.get("crop_pixel_sha256")
+            or int(rgb.shape[1]) != record.get("crop_width")
+            or int(rgb.shape[0]) != record.get("crop_height")
+        ):
+            raise ValueError(f"generic_text_line crop pixels differ from manifest: {record['id']}")
+        crop_bindings.append(
+            {
+                "path": image_relative,
+                "sha256": sha256,
+                "size_bytes": size_bytes,
+                "pixel_sha256": record["crop_pixel_sha256"],
+                "width": record["crop_width"],
+                "height": record["crop_height"],
+            }
+        )
+    crop_bindings.sort(key=lambda value: str(value["path"]))
+    crop_artifact = artifacts.get("crops")
+    if not isinstance(crop_artifact, Mapping) or crop_artifact != {
+        "count": len(crop_bindings),
+        "size_bytes": sum(int(value["size_bytes"]) for value in crop_bindings),
+        "closure_sha256": _canonical_sha256(crop_bindings),
+    }:
+        raise ValueError("generic_text_line crop closure differs from its sealed contract")
+    image_root = publication / "images"
+    observed_images = {
+        path.relative_to(publication).as_posix() for path in image_root.rglob("*") if path.is_file()
+    }
+    if observed_images != declared_images:
+        raise ValueError("generic_text_line images directory membership differs from its sealed manifest")
+
+    inputs = contract.get("inputs")
+    if not isinstance(inputs, Mapping):
+        raise ValueError("generic_text_line teacher inputs must be an object")
+    raw_teacher = inputs.get("teacher_directory")
+    if not isinstance(raw_teacher, str):
+        raise ValueError("generic_text_line teacher_directory is invalid")
+    teacher_root = Path(raw_teacher).expanduser().resolve(strict=True)
+    for key, name in (
+        ("teacher_manifest", "teacher_manifest.jsonl"),
+        ("teacher_contract", "teacher.contract.json"),
+        ("teacher_receipt", "teacher.receipt.json"),
+    ):
+        if not _binding_matches(teacher_root / name, inputs.get(key), expected_name=name):
+            raise ValueError(f"generic_text_line source teacher binding changed: {name}")
+    source_contract = _json_object(teacher_root / "teacher.contract.json")
+    source_receipt = _json_object(teacher_root / "teacher.receipt.json")
+    source_closure = inputs.get("teacher_contract_closure_sha256")
+    source_closure_payload = {
+        "schema_version": RECOGNIZER_SCHEMA_VERSION,
+        "inputs": source_contract.get("inputs"),
+        "configuration": source_contract.get("configuration"),
+        "counts": source_contract.get("counts"),
+        "split_use": source_contract.get("split_use"),
+        "artifacts": source_contract.get("artifacts"),
+    }
+    if (
+        source_contract.get("schema_version") != RECOGNIZER_SCHEMA_VERSION
+        or source_contract.get("kind") != SOURCE_TEACHER_CONTRACT_KIND
+        or source_contract.get("sealed") is not True
+        or source_contract.get("training_authorization") is not False
+        or source_contract.get("closure_sha256") != source_closure
+        or source_contract.get("closure_sha256") != _canonical_sha256(source_closure_payload)
+        or source_receipt.get("schema_version") != RECOGNIZER_SCHEMA_VERSION
+        or source_receipt.get("kind") != SOURCE_TEACHER_RECEIPT_KIND
+        or source_receipt.get("sealed") is not True
+        or source_receipt.get("contract_closure_sha256") != source_closure
+        or not _binding_matches(
+            teacher_root / "teacher.contract.json",
+            source_receipt.get("contract"),
+            expected_name="teacher.contract.json",
+        )
+    ):
+        raise ValueError("generic_text_line source teacher closure is invalid")
+
+    closure_payload = {
+        "schema_version": RECOGNIZER_SCHEMA_VERSION,
+        "inputs": inputs,
+        "crop_recipe": contract.get("crop_recipe"),
+        "counts": counts,
+        "split_use": contract.get("split_use"),
+        "artifacts": artifacts,
+    }
+    if contract.get("closure_sha256") != _canonical_sha256(closure_payload):
+        raise ValueError("generic_text_line dataset contract closure SHA-256 is invalid")
+    if (
+        receipt.get("schema_version") != RECOGNIZER_SCHEMA_VERSION
+        or receipt.get("kind") != GENERIC_TEXT_LINE_RECEIPT_KIND
+        or receipt.get("sealed") is not True
+        or receipt.get("contract_closure_sha256") != contract.get("closure_sha256")
+        or not _binding_matches(contract_path, receipt.get("contract"), expected_name="dataset.contract.json")
+    ):
+        raise ValueError("generic_text_line dataset receipt does not bind the sealed contract")
 
 
 def _require_torch() -> tuple[Any, Any]:
@@ -130,9 +424,24 @@ def build_ctc_recognizer(*, vocab_size: int, config: RecognizerConfig) -> Any:
 
 
 def _parse_record(line: str, *, records_path: Path, line_number: int, dataset_root: Path) -> dict[str, object]:
+    def reject_constant(value: str) -> None:
+        raise ValueError(f"non-standard JSON constant {value!r} is forbidden")
+
+    def object_without_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        output: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in output:
+                raise ValueError(f"duplicate JSON key {key!r}")
+            output[key] = value
+        return output
+
     try:
-        value: Any = json.loads(line)
-    except json.JSONDecodeError as error:
+        value: Any = json.loads(
+            line,
+            parse_constant=reject_constant,
+            object_pairs_hook=object_without_duplicates,
+        )
+    except (json.JSONDecodeError, ValueError) as error:
         raise ValueError(f"{records_path}:{line_number}: invalid JSON: {error}") from None
     if not isinstance(value, Mapping):
         raise ValueError(f"{records_path}:{line_number}: record must be an object")
@@ -145,7 +454,7 @@ def _parse_record(line: str, *, records_path: Path, line_number: int, dataset_ro
         raise ValueError(f"{records_path}:{line_number}: image must be a non-empty string")
     if not isinstance(text, str) or not text:
         raise ValueError(f"{records_path}:{line_number}: text must be a non-empty string")
-    if not isinstance(field, str) or field not in DETECTION_CLASSES:
+    if not isinstance(field, str) or field not in RECOGNIZER_FIELDS:
         raise ValueError(f"{records_path}:{line_number}: invalid field")
     if split not in {"train", "val", "test"}:
         raise ValueError(f"{records_path}:{line_number}: split must be train, val, or test")
@@ -172,6 +481,17 @@ def _parse_record(line: str, *, records_path: Path, line_number: int, dataset_ro
         "source": value.get("source") if isinstance(value.get("source"), str) else None,
         "result_json": value.get("result_json") if isinstance(value.get("result_json"), str) else None,
         "crop_sha256": value.get("crop_sha256") if isinstance(value.get("crop_sha256"), str) else None,
+        "kind": value.get("kind") if isinstance(value.get("kind"), str) else None,
+        "training_eligible": value.get("training_eligible"),
+        "evaluation_only": value.get("evaluation_only"),
+        "held_out": value.get("held_out"),
+        "truth_semantics": value.get("truth_semantics") if isinstance(value.get("truth_semantics"), str) else None,
+        "crop_pixel_sha256": (
+            value.get("crop_pixel_sha256") if isinstance(value.get("crop_pixel_sha256"), str) else None
+        ),
+        "crop_size_bytes": value.get("crop_size_bytes"),
+        "crop_width": value.get("crop_width"),
+        "crop_height": value.get("crop_height"),
     }
 
 
@@ -182,10 +502,7 @@ def load_records(
     dataset_root: Path | None = None,
 ) -> list[dict[str, object]]:
     """Read pseudo-label records without importing PyTorch."""
-    fields = tuple(fields)
-    invalid = sorted(set(fields) - set(DETECTION_CLASSES))
-    if not fields or invalid:
-        raise ValueError(f"fields must be a non-empty subset of: {','.join(DETECTION_CLASSES)}")
+    fields = _validate_recognizer_field_mode(fields)
     records_path = records_path.resolve()
     if not records_path.is_file():
         raise FileNotFoundError(records_path)
@@ -222,6 +539,12 @@ def load_records(
                 records.append(record)
     if not records:
         raise ValueError(f"No records for requested fields in {records_path}")
+    if fields == (GENERIC_TEXT_LINE_FIELD,):
+        _verify_generic_line_dataset(
+            records_path=records_path,
+            dataset_root=dataset_root,
+            records=records,
+        )
     return records
 
 
@@ -318,8 +641,55 @@ def _resolve_device(torch: Any, requested: str) -> str:
     raise ValueError("device must be auto, cpu, cuda, cuda:N, or mps")
 
 
-def preprocess_image(image_path: Path, *, config: RecognizerConfig) -> np.ndarray:
-    """Return the fixed NCHW float32 preprocessing declared in the ONNX contract."""
+def _opencv_exact_rgb_gray_letterbox(rgb: np.ndarray, *, config: RecognizerConfig) -> np.ndarray:
+    """Return the exact uint8 canvas used by the generic-line deployment ABI.
+
+    Keep this deliberately explicit rather than relying on OpenCV's color
+    conversion coefficients.  The integer Rec.601 coefficients, Python
+    ties-to-even ``round``, INTER_LINEAR_EXACT resize, and centering rule are
+    independently reproducible by the .NET CPU runtime.
+    """
+    pixels = np.ascontiguousarray(rgb, dtype=np.uint8)
+    if pixels.ndim != 3 or pixels.shape[2] != 3 or pixels.shape[0] <= 0 or pixels.shape[1] <= 0:
+        raise ValueError("generic text-line input must be a non-empty RGB8 image")
+    channels = pixels.astype(np.uint32)
+    gray = (
+        19_595 * channels[:, :, 0]
+        + 38_470 * channels[:, :, 1]
+        + 7_471 * channels[:, :, 2]
+        + 32_768
+    ) >> 16
+    gray_u8 = np.ascontiguousarray(gray, dtype=np.uint8)
+    source_height, source_width = gray_u8.shape
+    scale = min(config.image_width / source_width, config.image_height / source_height)
+    width = max(1, min(config.image_width, int(round(source_width * scale))))
+    height = max(1, min(config.image_height, int(round(source_height * scale))))
+    resized = cv2.resize(gray_u8, (width, height), interpolation=cv2.INTER_LINEAR_EXACT)
+    canvas = np.full((config.image_height, config.image_width), 255, dtype=np.uint8)
+    top = (config.image_height - height) // 2
+    left = (config.image_width - width) // 2
+    canvas[top : top + height, left : left + width] = resized
+    return canvas
+
+
+def preprocess_image(
+    image_path: Path,
+    *,
+    config: RecognizerConfig,
+    field: str | None = None,
+) -> np.ndarray:
+    """Return fixed NCHW float32 preprocessing declared in the ONNX contract.
+
+    Omitting ``field`` preserves the existing receipt-field Pillow ABI.  The
+    generic recognizer is isolated and uses its cross-runtime OpenCV-exact ABI.
+    """
+    if field is not None and field not in RECOGNIZER_FIELDS:
+        raise ValueError(f"unsupported recognizer field for preprocessing: {field}")
+    if field == GENERIC_TEXT_LINE_FIELD:
+        with Image.open(image_path) as image:
+            rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
+        canvas = _opencv_exact_rgb_gray_letterbox(rgb, config=config)
+        return (canvas.astype(np.float32) / 255.0)[np.newaxis, np.newaxis, :, :]
     with Image.open(image_path) as image:
         gray = image.convert("L")
         scale = min(config.image_width / gray.width, config.image_height / gray.height)
@@ -334,24 +704,61 @@ def preprocess_image(image_path: Path, *, config: RecognizerConfig) -> np.ndarra
     return (canvas.astype(np.float32) / 255.0)[np.newaxis, np.newaxis, :, :]
 
 
-def _resize_to_tensor(image_path: Path, *, config: RecognizerConfig, torch: Any) -> Any:
+def _resize_to_tensor(
+    image_path: Path,
+    *,
+    config: RecognizerConfig,
+    field: str,
+    torch: Any,
+) -> Any:
     """Torch wrapper for the shared train/ONNX image preprocessing."""
-    return torch.from_numpy(preprocess_image(image_path, config=config)[0])
+    return torch.from_numpy(preprocess_image(image_path, config=config, field=field)[0])
 
 
-def _make_dataset(records: Sequence[Mapping[str, object]], *, character_to_id: Mapping[str, int], config: RecognizerConfig, torch: Any) -> Any:
-    class ReceiptOcrDataset(torch.utils.data.Dataset):
-        def __len__(self) -> int:
-            return len(records)
+class _ReceiptOcrDataset:
+    """Pickle-safe dataset for Windows DataLoader spawn workers."""
 
-        def __getitem__(self, index: int) -> tuple[Any, Any, str, str]:
-            record = records[index]
-            text = str(record["text"])
-            targets = torch.tensor([character_to_id[character] for character in text], dtype=torch.long)
-            image = _resize_to_tensor(Path(record["image_path"]), config=config, torch=torch)
-            return image, targets, text, str(record["field"])
+    def __init__(
+        self,
+        records: Sequence[Mapping[str, object]],
+        *,
+        character_to_id: Mapping[str, int],
+        config: RecognizerConfig,
+    ) -> None:
+        self._records = tuple(dict(record) for record in records)
+        self._character_to_id = dict(character_to_id)
+        self._config = config
 
-    return ReceiptOcrDataset()
+    def __len__(self) -> int:
+        return len(self._records)
+
+    def __getitem__(self, index: int) -> tuple[Any, Any, str, str]:
+        torch, _ = _require_torch()
+        record = self._records[index]
+        text = str(record["text"])
+        targets = torch.tensor(
+            [self._character_to_id[character] for character in text],
+            dtype=torch.long,
+        )
+        field = str(record["field"])
+        image = _resize_to_tensor(
+            Path(record["image_path"]),
+            config=self._config,
+            field=field,
+            torch=torch,
+        )
+        return image, targets, text, field
+
+
+def _make_dataset(
+    records: Sequence[Mapping[str, object]],
+    *,
+    character_to_id: Mapping[str, int],
+    config: RecognizerConfig,
+    torch: Any,
+) -> Any:
+    del torch  # Preserve the internal call ABI while keeping the dataset pickle-safe.
+    return _ReceiptOcrDataset(records, character_to_id=character_to_id, config=config)
 
 
 def _collate_batch(
@@ -361,6 +768,13 @@ def _collate_batch(
     target_lengths = torch.tensor([item[1].numel() for item in batch], dtype=torch.long)
     targets = torch.cat([item[1] for item in batch])
     return images, targets, target_lengths, [item[2] for item in batch], [item[3] for item in batch]
+
+
+def _collate_batch_worker(
+    batch: Sequence[tuple[Any, Any, str, str]],
+) -> tuple[Any, Any, Any, list[str], list[str]]:
+    torch, _ = _require_torch()
+    return _collate_batch(batch, torch=torch)
 
 
 def decode_ctc_logits(logits: np.ndarray, *, characters: Sequence[str]) -> list[str]:
@@ -447,6 +861,13 @@ def _write_checkpoint(path: Path, payload: Mapping[str, object], *, torch: Any) 
     temporary.replace(path)
 
 
+def _validation_due(*, epoch: int, epochs: int, validation_every: int) -> bool:
+    """Validate on the requested cadence and unconditionally on the last epoch."""
+    if validation_every <= 0:
+        raise ValueError("validation_every must be positive")
+    return epoch == epochs or epoch % validation_every == 0
+
+
 def train_recognizer(
     *,
     records_path: Path,
@@ -461,6 +882,12 @@ def train_recognizer(
     weight_decay: float = 1e-4,
     seed: int = 42,
     num_workers: int = 0,
+    persistent_workers: bool = False,
+    prefetch_factor: int = 2,
+    cuda_tf32: bool = False,
+    cudnn_benchmark: bool = False,
+    validation_every: int = 1,
+    train_progress_every: int = 0,
 ) -> Path:
     """Train a field-crop recognizer and return the best checkpoint path."""
     config.validate()
@@ -470,7 +897,15 @@ def train_recognizer(
         raise ValueError("learning_rate must be positive and weight_decay cannot be negative")
     if num_workers < 0:
         raise ValueError("num_workers cannot be negative")
-    selected_fields = tuple(dict.fromkeys(fields))
+    if persistent_workers and num_workers <= 0:
+        raise ValueError("persistent_workers requires num_workers > 0")
+    if prefetch_factor <= 0:
+        raise ValueError("prefetch_factor must be positive")
+    if validation_every <= 0:
+        raise ValueError("validation_every must be positive")
+    if train_progress_every < 0:
+        raise ValueError("train_progress_every cannot be negative")
+    selected_fields = _validate_recognizer_field_mode(fields)
     output_dir = output_dir.resolve()
     if output_dir.exists() and any(output_dir.iterdir()):
         raise ValueError(f"training output already contains files: {output_dir}. Choose a new empty directory.")
@@ -499,25 +934,36 @@ def train_recognizer(
     torch.manual_seed(seed)
     if target_device.startswith("cuda"):
         torch.cuda.manual_seed_all(seed)
+        if cuda_tf32:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+        if cudnn_benchmark:
+            torch.backends.cudnn.benchmark = True
 
     train_dataset = _make_dataset(train_records, character_to_id=character_to_id, config=config, torch=torch)
     validation_dataset = _make_dataset(validation_records, character_to_id=character_to_id, config=config, torch=torch)
-    collate = lambda batch: _collate_batch(batch, torch=torch)
+    loader_worker_options = (
+        {"persistent_workers": persistent_workers, "prefetch_factor": prefetch_factor}
+        if num_workers > 0
+        else {}
+    )
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
-        collate_fn=collate,
+        collate_fn=_collate_batch_worker,
         pin_memory=target_device.startswith("cuda"),
+        **loader_worker_options,
     )
     validation_loader = torch.utils.data.DataLoader(
         validation_dataset,
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        collate_fn=collate,
+        collate_fn=_collate_batch_worker,
         pin_memory=target_device.startswith("cuda"),
+        **loader_worker_options,
     )
     model = build_ctc_recognizer(vocab_size=len(characters) + 1, config=config).to(target_device)
     # Capacity is pre-validated above.  Keep infinity visible if the model is
@@ -542,7 +988,10 @@ def train_recognizer(
         model.train()
         total_loss = 0.0
         total_items = 0
-        for images, targets, target_lengths, texts, _fields in train_loader:
+        for batch_index, (images, targets, target_lengths, texts, _fields) in enumerate(
+            train_loader,
+            start=1,
+        ):
             images = images.to(target_device)
             targets = targets.to(target_device)
             optimizer.zero_grad(set_to_none=True)
@@ -555,23 +1004,60 @@ def train_recognizer(
             optimizer.step()
             total_loss += float(loss.detach().cpu()) * len(texts)
             total_items += len(texts)
+            if train_progress_every and (
+                batch_index % train_progress_every == 0 or batch_index == len(train_loader)
+            ):
+                print(
+                    f"epoch {epoch}/{epochs} batch {batch_index}/{len(train_loader)}: "
+                    f"train_loss_so_far={total_loss / max(total_items, 1):.4f}"
+                )
         train_loss = total_loss / max(total_items, 1)
-        validation = _evaluate(
-            model,
-            validation_loader,
-            criterion=criterion,
-            device=target_device,
-            characters=characters,
-            torch=torch,
+        validation_ran = _validation_due(
+            epoch=epoch,
+            epochs=epochs,
+            validation_every=validation_every,
         )
-        epoch_record = {
+        validation = (
+            _evaluate(
+                model,
+                validation_loader,
+                criterion=criterion,
+                device=target_device,
+                characters=characters,
+                torch=torch,
+            )
+            if validation_ran
+            else None
+        )
+        epoch_record: dict[str, object] = {
             "epoch": epoch,
             "train_loss": train_loss,
-            "val_loss": validation["loss"],
-            "val_exact_match": validation["exact_match"],
-            "val_by_field": validation["by_field"],
+            "validation_ran": validation_ran,
         }
+        if validation is not None:
+            epoch_record.update(
+                {
+                    "val_loss": validation["loss"],
+                    "val_exact_match": validation["exact_match"],
+                    "val_by_field": validation["by_field"],
+                }
+            )
         history.append(epoch_record)
+        training_options = {
+            "seed": seed,
+            "device": target_device,
+            "epochs": epochs,
+            "batch_size": batch_size,
+            "learning_rate": learning_rate,
+            "weight_decay": weight_decay,
+            "num_workers": num_workers,
+            "persistent_workers": persistent_workers,
+            "prefetch_factor": prefetch_factor,
+            "cuda_tf32": cuda_tf32,
+            "cudnn_benchmark": cudnn_benchmark,
+            "validation_every": validation_every,
+            "train_progress_every": train_progress_every,
+        }
         checkpoint_payload = {
             "schema_version": RECOGNIZER_SCHEMA_VERSION,
             "kind": "receipt_ocr_ctc_v1",
@@ -582,10 +1068,11 @@ def train_recognizer(
             "field_counts": field_counts,
             "epoch": epoch,
             "metrics": epoch_record,
+            "training_options": training_options,
         }
         _write_checkpoint(output_dir / "last.pt", checkpoint_payload, torch=torch)
-        if validation["loss"] < best_loss:
-            best_loss = validation["loss"]
+        if validation is not None and float(validation["loss"]) < best_loss:
+            best_loss = float(validation["loss"])
             _write_checkpoint(best_path, checkpoint_payload, torch=torch)
         _atomic_write_json(
             output_dir / "training_history.json",
@@ -593,13 +1080,18 @@ def train_recognizer(
                 "schema_version": RECOGNIZER_SCHEMA_VERSION,
                 "records": history,
                 "field_counts": field_counts,
+                "training_options": training_options,
                 "warning": "Validation records are PaddleOCR pseudo labels unless you replace them with reviewed labels.",
             },
         )
-        print(
-            f"epoch {epoch}/{epochs}: train_loss={train_loss:.4f} "
-            f"val_loss={validation['loss']:.4f} val_exact_match={validation['exact_match']:.2%}"
-        )
+        if validation is None:
+            print(f"epoch {epoch}/{epochs}: train_loss={train_loss:.4f} validation=skipped")
+        else:
+            print(
+                f"epoch {epoch}/{epochs}: train_loss={train_loss:.4f} "
+                f"val_loss={float(validation['loss']):.4f} "
+                f"val_exact_match={float(validation['exact_match']):.2%}"
+            )
     return best_path
 
 
@@ -646,8 +1138,9 @@ def export_onnx(
         raise ValueError("OCR checkpoint is missing config, characters, fields, or field_counts")
     if not all(isinstance(character, str) and len(character) == 1 for character in characters):
         raise ValueError("OCR checkpoint characters must be single Unicode code points")
-    if not all(isinstance(field, str) and field in DETECTION_CLASSES for field in fields):
+    if not all(isinstance(field, str) and field in RECOGNIZER_FIELDS for field in fields):
         raise ValueError("OCR checkpoint fields are invalid")
+    _validate_recognizer_field_mode(fields)
     field_counts: dict[str, dict[str, int]] = {}
     for field in fields:
         raw_counts = raw_field_counts.get(field)
@@ -724,7 +1217,7 @@ def export_onnx(
                 "name": "image",
                 "dtype": "float32",
                 "shape": [1, 1, config.image_height, config.image_width],
-                "preprocess": "RGB crop -> grayscale -> aspect-preserving resize -> white letterbox -> divide by 255.0",
+                "preprocess": _preprocess_contract(fields),
             },
             "output": {
                 "name": "logits",
@@ -741,12 +1234,13 @@ def export_onnx(
 
 def _parse_fields(value: str) -> tuple[str, ...]:
     fields = tuple(part.strip() for part in value.split(",") if part.strip())
-    invalid = sorted(set(fields) - set(DETECTION_CLASSES))
-    if not fields or invalid:
+    try:
+        return _validate_recognizer_field_mode(fields)
+    except ValueError:
         raise argparse.ArgumentTypeError(
-            f"fields must be a non-empty subset of: {','.join(DETECTION_CLASSES)}"
-        )
-    return fields
+            "fields must select receipt detector fields or the independent "
+            f"{GENERIC_TEXT_LINE_FIELD} recognizer; supported={','.join(RECOGNIZER_FIELDS)}"
+        ) from None
 
 
 def build_train_parser() -> argparse.ArgumentParser:
@@ -776,6 +1270,22 @@ def build_train_parser() -> argparse.ArgumentParser:
         default=0,
         help="DataLoader workers; keep 0 on Windows unless your environment is configured for multiprocessing",
     )
+    parser.add_argument("--persistent-workers", action="store_true")
+    parser.add_argument("--prefetch-factor", type=int, default=2)
+    parser.add_argument("--cuda-tf32", action="store_true")
+    parser.add_argument("--cudnn-benchmark", action="store_true")
+    parser.add_argument(
+        "--validation-every",
+        type=int,
+        default=1,
+        help="Validate every N epochs; the final epoch is always validated (default: 1)",
+    )
+    parser.add_argument(
+        "--train-progress-every",
+        type=int,
+        default=0,
+        help="Print running train loss every N batches; 0 disables batch progress output",
+    )
     parser.add_argument("--onnx-output", type=Path, help="Optionally export the best checkpoint after training")
     return parser
 
@@ -803,6 +1313,12 @@ def train_main(argv: list[str] | None = None) -> None:
             weight_decay=args.weight_decay,
             seed=args.seed,
             num_workers=args.num_workers,
+            persistent_workers=args.persistent_workers,
+            prefetch_factor=args.prefetch_factor,
+            cuda_tf32=args.cuda_tf32,
+            cudnn_benchmark=args.cudnn_benchmark,
+            validation_every=args.validation_every,
+            train_progress_every=args.train_progress_every,
         )
         print(f"Best OCR checkpoint: {checkpoint}")
         if args.onnx_output is not None:
