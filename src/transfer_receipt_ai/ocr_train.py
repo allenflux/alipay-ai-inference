@@ -925,6 +925,12 @@ def train_recognizer(
         validation_records,
         train_characters=set(characters),
     )
+    if selected_fields == (GENERIC_TEXT_LINE_FIELD,):
+        test_records = [record for record in records if record["split"] == "test"]
+        _validate_non_train_characters(
+            test_records,
+            train_characters=set(characters),
+        )
     _validate_ctc_capacity((*train_records, *validation_records), config=config)
     character_to_id = {character: index for index, character in enumerate(characters, start=1)}
     torch, _ = _require_torch()

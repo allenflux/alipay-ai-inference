@@ -9,6 +9,7 @@ from PIL import Image
 
 torch = pytest.importorskip("torch")
 
+import transfer_receipt_ai.ocr_train as ocr_train_module
 from transfer_receipt_ai.ocr_train import (
     GENERIC_TEXT_LINE_FIELD,
     RecognizerConfig,
@@ -152,6 +153,28 @@ def test_training_keeps_test_characters_out_of_the_training_charset(tmp_path: Pa
     )
     payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
     assert payload["characters"] == ["1"]
+
+
+def test_generic_line_training_rejects_test_characters_not_seen_in_train(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    records = [
+        {"id": "train", "field": GENERIC_TEXT_LINE_FIELD, "text": "A1", "split": "train"},
+        {"id": "val", "field": GENERIC_TEXT_LINE_FIELD, "text": "A1", "split": "val"},
+        {"id": "test", "field": GENERIC_TEXT_LINE_FIELD, "text": "A2", "split": "test"},
+    ]
+    monkeypatch.setattr(ocr_train_module, "load_records", lambda *args, **kwargs: records)
+
+    with pytest.raises(ValueError, match="absent from the training charset.*id=test.*'2'"):
+        train_recognizer(
+            records_path=tmp_path / "generic_text_lines.jsonl",
+            output_dir=tmp_path / "run",
+            fields=(GENERIC_TEXT_LINE_FIELD,),
+            config=RecognizerConfig(image_height=32, image_width=64, hidden_size=16, lstm_layers=1),
+            device="cpu",
+            epochs=1,
+            batch_size=1,
+        )
 
 
 def test_training_rejects_ctc_targets_that_cannot_fit_time_axis(tmp_path: Path) -> None:
