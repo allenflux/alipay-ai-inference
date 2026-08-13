@@ -164,6 +164,8 @@ def test_suspended_root_is_assigned_before_resume_without_pid_based_kill_races()
     assert "UpdateProcThreadAttribute(attributeList,0,PROC_THREAD_ATTRIBUTE_HANDLE_LIST" in launch
     assert launch.index("UpdateProcThreadAttribute(attributeList") < launch.index("CreateProcessW(applicationName")
     assert "if (attributeListInitialized) DeleteProcThreadAttributeList(attributeList)" in launch
+    assert native.count("ExactSpelling=true") >= 3
+    assert "attributeBytes.ToUInt64()==0" in launch
     stage = source[source.index("function Invoke-PythonStage") : source.index("function Complete-Stage")]
     assert stage.index("StartSuspendedAssigned") < stage.index("while (-not $process.WaitForExit(1000))")
     assert "foreach ($environmentName in" in stage

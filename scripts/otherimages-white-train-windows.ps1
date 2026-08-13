@@ -228,7 +228,7 @@ public sealed class WhiteTrainNativeJobProcessV1 : IDisposable {
         public UIntPtr QuotaNonPagedPoolUsage; public UIntPtr PagefileUsage; public UIntPtr PeakPagefileUsage;
     }
 
-    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] private static extern IntPtr CreateJobObjectW(IntPtr attributes,string name);
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true, ExactSpelling=true)] private static extern IntPtr CreateJobObjectW(IntPtr attributes,string name);
     [DllImport("kernel32.dll", SetLastError=true)] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool SetInformationJobObject(IntPtr job,int infoClass,IntPtr info,uint length);
     [DllImport("kernel32.dll", SetLastError=true)] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool QueryInformationJobObject(IntPtr job,int infoClass,out JOBOBJECT_BASIC_ACCOUNTING_INFORMATION info,uint length,IntPtr returnLength);
     [DllImport("kernel32.dll", SetLastError=true)] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool AssignProcessToJobObject(IntPtr job,IntPtr process);
@@ -240,8 +240,8 @@ public sealed class WhiteTrainNativeJobProcessV1 : IDisposable {
     [DllImport("kernel32.dll", SetLastError=true)] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool GetProcessTimes(IntPtr process,out FILETIME creation,out FILETIME exit,out FILETIME kernel,out FILETIME user);
     [DllImport("psapi.dll", SetLastError=true)] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool GetProcessMemoryInfo(IntPtr process,out PROCESS_MEMORY_COUNTERS counters,uint size);
     [DllImport("kernel32.dll", SetLastError=true)] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool CloseHandle(IntPtr handle);
-    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] private static extern IntPtr CreateFileW(string path,uint access,uint share,ref SECURITY_ATTRIBUTES security,uint creation,uint flags,IntPtr template);
-    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true, ExactSpelling=true)] private static extern IntPtr CreateFileW(string path,uint access,uint share,ref SECURITY_ATTRIBUTES security,uint creation,uint flags,IntPtr template);
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true, ExactSpelling=true)]
     [return: MarshalAs(UnmanagedType.Bool)] private static extern bool CreateProcessW(string applicationName,StringBuilder commandLine,IntPtr processAttributes,IntPtr threadAttributes,[MarshalAs(UnmanagedType.Bool)] bool inheritHandles,uint flags,IntPtr environment,string currentDirectory,ref STARTUPINFOEX startupInfo,out PROCESS_INFORMATION processInformation);
     [DllImport("kernel32.dll", SetLastError=true)] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool InitializeProcThreadAttributeList(IntPtr attributeList,int attributeCount,uint flags,ref UIntPtr size);
     [DllImport("kernel32.dll", SetLastError=true)] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool UpdateProcThreadAttribute(IntPtr attributeList,uint flags,IntPtr attribute,IntPtr value,UIntPtr size,IntPtr previousValue,IntPtr returnSize);
@@ -325,10 +325,9 @@ public sealed class WhiteTrainNativeJobProcessV1 : IDisposable {
             stdoutHandle=CreateFileW(stdoutPath,GENERIC_WRITE,FILE_SHARE_READ,ref security,CREATE_NEW,FILE_ATTRIBUTE_NORMAL,IntPtr.Zero); if (IsInvalid(stdoutHandle)) throw LastError("CreateFileW(stdout) failed");
             stderrHandle=CreateFileW(stderrPath,GENERIC_WRITE,FILE_SHARE_READ,ref security,CREATE_NEW,FILE_ATTRIBUTE_NORMAL,IntPtr.Zero); if (IsInvalid(stderrHandle)) throw LastError("CreateFileW(stderr) failed");
             stdinHandle=CreateFileW("NUL",GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE,ref security,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,IntPtr.Zero); if (IsInvalid(stdinHandle)) throw LastError("CreateFileW(NUL) failed");
-            UIntPtr attributeBytes=UIntPtr.Zero; Marshal.SetLastWin32Error(0);
+            UIntPtr attributeBytes=UIntPtr.Zero;
             InitializeProcThreadAttributeList(IntPtr.Zero,1,0,ref attributeBytes);
-            int attributeSizingError=Marshal.GetLastWin32Error();
-            if (attributeBytes==UIntPtr.Zero || (attributeSizingError!=0 && attributeSizingError!=122)) throw new Win32Exception(attributeSizingError,"InitializeProcThreadAttributeList sizing failed");
+            if (attributeBytes.ToUInt64()==0) throw new InvalidOperationException("InitializeProcThreadAttributeList sizing returned zero bytes");
             attributeList=Marshal.AllocHGlobal(checked((int)attributeBytes.ToUInt64()));
             if (!InitializeProcThreadAttributeList(attributeList,1,0,ref attributeBytes)) throw LastError("InitializeProcThreadAttributeList failed");
             attributeListInitialized=true;
