@@ -22,6 +22,9 @@ def test_wrapper_is_winps51_fixed_commit_clean_tree_and_frozen_code() -> None:
     assert "C:\\f3-white-code-3080a69" in source
     assert "C:\\f3-white-pilot-21054be8b1eb-a" in source
     assert "C:\\f3-white-teacher-3080a69-pilot1000-a" in source
+    assert "D:\\alipay-ai-data\\alipay-ai-inference\\.venv-cu126\\Scripts\\python.exe" in source
+    assert "Join-Path $RepoRoot '.venv-cu126\\Scripts\\python.exe'" not in source
+    assert "PythonExe must be the fixed read-only CUDA environment on D:" in source
     assert "3080a692a37d7efb0f926cce46de831d17f0e4db" in source
     assert "fb7a21f99139edd15eb1bb10e311039ebe28ebf5" in source
     assert "status --porcelain=v1 --untracked-files=all" in source
@@ -42,6 +45,43 @@ def test_wrapper_is_winps51_fixed_commit_clean_tree_and_frozen_code() -> None:
     assert "??" not in source
     assert "-AsByteStream" not in source
     assert "ForEach-Object -Parallel" not in source
+
+
+def test_cuda_python_is_read_only_bound_each_stage_and_executes_c_source() -> None:
+    source = _source()
+    stage = source[source.index("function Invoke-PythonStage"):source.index("function Complete-Stage")]
+
+    assert "Assert-BindingUnchanged $PythonBinding 'fixed read-only CUDA Python executable before stage'" in stage
+    assert "Assert-BindingUnchanged $PythonBinding 'fixed read-only CUDA Python executable after stage'" in stage
+    assert "$info.FileName = $PythonExe" in stage
+    assert "$info.WorkingDirectory = $RepoRoot" in stage
+    assert "$info.EnvironmentVariables['PYTHONDONTWRITEBYTECODE'] = '1'" in stage
+    assert "$info.EnvironmentVariables['PYTHONNOUSERSITE'] = '1'" in stage
+    assert "$info.EnvironmentVariables['PYTHONPATH'] = Join-Path $RepoRoot 'src'" in stage
+    for name in ("PYTHONHOME", "PYTHONSTARTUP", "PYTHONINSPECT", "PYTEST_ADDOPTS", "PYTEST_PLUGINS"):
+        assert name in stage
+    assert "$info.EnvironmentVariables.Remove($inheritedPythonVariable)" in stage
+    assert "python_environment_read_only=$true" in source
+    assert "python_executable_sha_size_stable_each_stage=$true" in source
+    assert "python_working_directory_and_path_on_c_source=$true" in source
+
+
+def test_import_attestation_precedes_long_capture_and_binds_exact_c_modules() -> None:
+    source = _source()
+
+    attestation = source.index("Invoke-PythonStage 'import-attestation'")
+    capture = source.index("Invoke-PythonStage 'capture-three-view'")
+    assert attestation < capture
+    assert "otherimages_white_teacher_import_attestation_v1" in source
+    assert 'os.environ.get("PYTHONPATH", "")' in source
+    assert 'import attestation PYTHONPATH is not frozen C source/src' in source
+    assert 'import attestation sys.path omits frozen C source/src' in source
+    assert 'Path(module.__file__).resolve(strict=True)' in source
+    assert 'import authority escaped frozen C source' in source
+    assert 'import authority SHA differs' in source
+    assert "Import attestation stdout must be exactly one complete JSON value" in source
+    assert "exact_three_module_file_and_sha_authority=$true" in source
+    assert "stages=[ordered]@{ import_attestation=$importStageReceipt; capture=$captureStageReceipt" in source
 
 
 def test_pilot_receipt_inventory_and_bd1_projection_are_exact_gates() -> None:

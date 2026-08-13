@@ -7,14 +7,16 @@ Windows PowerShell 5.1 compatible.  This is a formal, no-resume wrapper for the
 already-published white pilot at C:\f3-white-pilot-21054be8b1eb-a and the
 independent source checkout pinned to commit 3080a69.  It performs one Paddle
 process with --view-id all on CUDA, followed by the offline consensus process.
-It never trains or exports a student model.
+It uses the already-installed CUDA Python environment read-only from D:, while
+the working directory, PYTHONPATH, logs, and publications remain on the frozen
+C: source/run roots.  It never trains or exports a student model.
 #>
 [CmdletBinding()]
 param(
     [string]$RepoRoot = 'C:\f3-white-code-3080a69',
     [string]$PilotRunRoot = 'C:\f3-white-pilot-21054be8b1eb-a',
     [string]$RunRoot = 'C:\f3-white-teacher-3080a69-pilot1000-a',
-    [string]$PythonExe
+    [string]$PythonExe = 'D:\alipay-ai-data\alipay-ai-inference\.venv-cu126\Scripts\python.exe'
 )
 
 Set-StrictMode -Version Latest
@@ -29,6 +31,7 @@ $PipelineStartedUtc = [DateTime]::UtcNow
 $RunRootOwned = $false
 $PipelineFailed = $null
 $GitExe = 'C:\Program Files\Git\cmd\git.exe'
+$RequiredPythonExe = 'D:\alipay-ai-data\alipay-ai-inference\.venv-cu126\Scripts\python.exe'
 
 $RequiredCode = [ordered]@{
     'scripts\otherimages-paddle-capture.py' = [ordered]@{ sha256='395ad109e260ba58f282023a75d439f93958b22e1159b476d98be0c4c3777308'; size_bytes=[int64]434 }
@@ -224,6 +227,7 @@ function ConvertTo-NativeCommandLine([string[]]$Arguments) {
 }
 
 function Invoke-PythonStage([string]$Name, [string[]]$Arguments, [hashtable]$Environment) {
+    Assert-BindingUnchanged $PythonBinding 'fixed read-only CUDA Python executable before stage'
     $stageRoot = Join-Path $LogsRoot $Name
     if (Test-Path -LiteralPath $stageRoot) { throw "Stage log root already exists: $stageRoot" }
     [IO.Directory]::CreateDirectory($stageRoot) | Out-Null
@@ -239,9 +243,14 @@ function Invoke-PythonStage([string]$Name, [string[]]$Arguments, [hashtable]$Env
     $info.CreateNoWindow = $true
     $info.RedirectStandardOutput = $true
     $info.RedirectStandardError = $true
+    foreach ($inheritedPythonVariable in @('PYTHONHOME','PYTHONSTARTUP','PYTHONINSPECT','PYTEST_ADDOPTS','PYTEST_PLUGINS')) {
+        [void]$info.EnvironmentVariables.Remove($inheritedPythonVariable)
+    }
     $info.EnvironmentVariables['PYTHONIOENCODING'] = 'utf-8:strict'
     $info.EnvironmentVariables['PYTHONUTF8'] = '1'
     $info.EnvironmentVariables['PYTHONDONTWRITEBYTECODE'] = '1'
+    $info.EnvironmentVariables['PYTHONNOUSERSITE'] = '1'
+    $info.EnvironmentVariables['PYTHONPATH'] = Join-Path $RepoRoot 'src'
     foreach ($key in $Environment.Keys) { $info.EnvironmentVariables[[string]$key] = [string]$Environment[$key] }
     $process = New-Object Diagnostics.Process
     $process.StartInfo = $info
@@ -329,6 +338,8 @@ function Invoke-PythonStage([string]$Name, [string[]]$Arguments, [hashtable]$Env
         }
         catch { if ($null -eq $cleanupError) { $cleanupError = $_ } }
         $process.Dispose()
+        try { Assert-BindingUnchanged $PythonBinding 'fixed read-only CUDA Python executable after stage' }
+        catch { if ($null -eq $cleanupError) { $cleanupError = $_ } }
     }
     if ($null -ne $stageError) { throw $stageError }
     if ($null -ne $cleanupError) { throw $cleanupError }
@@ -364,6 +375,48 @@ function Assert-ExactFileTree([string]$Root, [string[]]$Expected, [string]$Descr
         throw "$Description is not its exact closed file tree"
     }
 }
+
+$ImportAttestationSource = @'
+from __future__ import annotations
+import argparse, hashlib, importlib, json, os, sys
+from pathlib import Path
+
+MODULES = {
+    "transfer_receipt_ai.otherimages_paddle_capture": ("src/transfer_receipt_ai/otherimages_paddle_capture.py", "470c2753c7fba63e1bd0e2e24e0a04ef7a3f523638933838995567395eae5494"),
+    "transfer_receipt_ai.otherimages_paddle_teacher": ("src/transfer_receipt_ai/otherimages_paddle_teacher.py", "2155e7b1f49401ee49770241db2183a5ff7d02f34212afa9eb158f64132847c1"),
+    "transfer_receipt_ai.otherimages_paddle_v2_adapter": ("src/transfer_receipt_ai/otherimages_paddle_v2_adapter.py", "b193f20d4560643c89648019e151c39ecd0b53b42f29e55a7b4813df03e8202b"),
+}
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--repo-root", required=True)
+parser.add_argument("--python-exe", required=True)
+args = parser.parse_args()
+repo = Path(args.repo_root).resolve(strict=True)
+expected_python = Path(args.python_exe).resolve(strict=True)
+actual_python = Path(sys.executable).resolve(strict=True)
+if os.path.normcase(str(actual_python)) != os.path.normcase(str(expected_python)):
+    raise SystemExit("import attestation Python executable differs: expected=%s actual=%s" % (expected_python, actual_python))
+expected_python_path = (repo / "src").resolve(strict=True)
+environment_python_path = Path(os.environ.get("PYTHONPATH", "")).resolve(strict=True)
+if os.path.normcase(str(environment_python_path)) != os.path.normcase(str(expected_python_path)):
+    raise SystemExit("import attestation PYTHONPATH is not frozen C source/src")
+resolved_sys_path = [Path(item).resolve(strict=True) for item in sys.path if item]
+if not any(os.path.normcase(str(item)) == os.path.normcase(str(expected_python_path)) for item in resolved_sys_path):
+    raise SystemExit("import attestation sys.path omits frozen C source/src")
+observed = {}
+for module_name, (relative, expected_sha) in MODULES.items():
+    module = importlib.import_module(module_name)
+    actual = Path(module.__file__).resolve(strict=True)
+    expected = (repo / relative).resolve(strict=True)
+    if os.path.normcase(str(actual)) != os.path.normcase(str(expected)):
+        raise SystemExit("import authority escaped frozen C source: %s expected=%s actual=%s" % (module_name, expected, actual))
+    data = actual.read_bytes()
+    sha = hashlib.sha256(data).hexdigest()
+    if sha != expected_sha:
+        raise SystemExit("import authority SHA differs: %s" % module_name)
+    observed[module_name] = {"path": str(actual), "sha256": sha, "size_bytes": len(data)}
+print(json.dumps({"schema_version": 1, "kind": "otherimages_white_teacher_import_attestation_v1", "status": "complete", "python_executable": str(actual_python), "pythonpath": str(expected_python_path), "modules": observed}, sort_keys=True, separators=(",", ":"), allow_nan=False))
+'@
 
 $TeacherVerifierSource = @'
 from __future__ import annotations
@@ -499,9 +552,8 @@ try {
     $RepoRoot = Require-FixedPath $RepoRoot 'C:\f3-white-code-3080a69' 'source checkout'
     $PilotRunRoot = Require-FixedPath $PilotRunRoot 'C:\f3-white-pilot-21054be8b1eb-a' 'pilot run root'
     $RunRoot = Require-FixedPath $RunRoot 'C:\f3-white-teacher-3080a69-pilot1000-a' 'teacher run root'
-    if ([string]::IsNullOrWhiteSpace($PythonExe)) { $PythonExe = Join-Path $RepoRoot '.venv-cu126\Scripts\python.exe' }
     $PythonExe = [IO.Path]::GetFullPath($PythonExe)
-    if (-not $PythonExe.Equals((Join-Path $RepoRoot '.venv-cu126\Scripts\python.exe'),[StringComparison]::OrdinalIgnoreCase)) { throw 'PythonExe must be the fixed CUDA environment in the independent checkout' }
+    if (-not $PythonExe.Equals([IO.Path]::GetFullPath($RequiredPythonExe),[StringComparison]::OrdinalIgnoreCase)) { throw 'PythonExe must be the fixed read-only CUDA environment on D:' }
     foreach ($path in @($RepoRoot,$PilotRunRoot,$PythonExe,$GitExe,$PSCommandPath)) {
         if (-not (Test-Path -LiteralPath $path)) { throw "Missing required authority path: $path" }
         Assert-NoReparseChain $path 'white teacher authority path'
@@ -563,10 +615,30 @@ try {
     $TeacherVerifierPath = Join-Path $LogsRoot 'independent-teacher-closure.py'
     Write-TextNew $TeacherVerifierPath ($TeacherVerifierSource + "`n")
     $TeacherVerifierBinding = Get-Binding $TeacherVerifierPath
+    $ImportAttestationPath = Join-Path $LogsRoot 'import-attestation.py'
+    Write-TextNew $ImportAttestationPath ($ImportAttestationSource + "`n")
+    $ImportAttestationBinding = Get-Binding $ImportAttestationPath
     $CaptureOutput = Join-Path $PublicationsRoot 'paddle-three-view-capture'
     $TeacherOutput = Join-Path $PublicationsRoot 'paddle-teacher-consensus'
     if (Test-Path -LiteralPath $CaptureOutput) { throw 'Capture output must be brand-new' }
     if (Test-Path -LiteralPath $TeacherOutput) { throw 'Teacher output must be brand-new' }
+
+    $importStage = Invoke-PythonStage 'import-attestation' @(
+        $ImportAttestationPath,'--repo-root',$RepoRoot,'--python-exe',$PythonExe
+    ) @{}
+    [string[]]$importLines = @([IO.File]::ReadAllLines([string]$importStage.stdout.path,$Utf8NoBom) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($importLines.Count -ne 1) { throw 'Import attestation stdout must be exactly one complete JSON value' }
+    $importAttestation = $importLines[0] | ConvertFrom-Json
+    if ([string]$importAttestation.kind -cne 'otherimages_white_teacher_import_attestation_v1' -or [string]$importAttestation.status -cne 'complete') { throw 'Import attestation receipt kind/status failed' }
+    if (-not ([IO.Path]::GetFullPath([string]$importAttestation.python_executable)).Equals($PythonExe,[StringComparison]::OrdinalIgnoreCase)) { throw 'Import attestation Python executable path differs' }
+    if (-not ([IO.Path]::GetFullPath([string]$importAttestation.pythonpath)).Equals((Join-Path $RepoRoot 'src'),[StringComparison]::OrdinalIgnoreCase)) { throw 'Import attestation PYTHONPATH differs from frozen C source' }
+    foreach ($moduleName in @('transfer_receipt_ai.otherimages_paddle_capture','transfer_receipt_ai.otherimages_paddle_teacher','transfer_receipt_ai.otherimages_paddle_v2_adapter')) {
+        $observedModule = $importAttestation.modules.$moduleName
+        if ($null -eq $observedModule) { throw "Import attestation omitted module: $moduleName" }
+    }
+    $importReceiptPath = Join-Path (Split-Path -Parent $importStage.receipt_path) 'import.stdout.receipt.json'
+    Write-JsonNew $importReceiptPath $importAttestation
+    $importStageReceipt = Complete-Stage $importStage ([ordered]@{ fixed_d_python=$true; c_source_pythonpath=$true; no_user_site=$true; inherited_python_controls_cleared=$true; exact_three_module_file_and_sha_authority=$true; formal_receipt=Get-Binding $importReceiptPath; attestation_source=$ImportAttestationBinding })
 
     Assert-NoConflictingWork 'immediately-before-capture'
     $captureScript = Join-Path $RepoRoot 'scripts\otherimages-paddle-capture.py'
@@ -654,6 +726,7 @@ try {
     $PythonAfter = Get-Binding $PythonExe
     if ([string]$PythonAfter.sha256 -cne [string]$PythonBinding.sha256 -or [int64]$PythonAfter.size_bytes -ne [int64]$PythonBinding.size_bytes) { throw 'Python executable changed during teacher pipeline' }
     Assert-BindingUnchanged $TeacherVerifierBinding 'independent teacher verifier'
+    Assert-BindingUnchanged $ImportAttestationBinding 'import attestation source'
     foreach ($name in $PilotBindings.Keys) {
         $before = $PilotBindings[$name]
         $after = Get-Binding ([string]$before.path)
@@ -664,13 +737,13 @@ try {
     $pipelineReceiptPath = Join-Path $RunRoot 'pipeline.receipt.json'
     $pipelineReceipt = [ordered]@{
         schema_version=1; kind='otherimages_white_teacher_windows_pipeline_receipt_v1'; status='complete'
-        source=[ordered]@{ repo_root=$RepoRoot; head=$RequiredHead; tree=$RequiredTree; tracked_and_untracked_clean=$true; fixed_code=$CodeBindings; wrapper=$WrapperBinding; python=$PythonBinding; git=$GitBinding; independent_verifier=$TeacherVerifierBinding }
+        source=[ordered]@{ repo_root=$RepoRoot; head=$RequiredHead; tree=$RequiredTree; tracked_and_untracked_clean=$true; fixed_code=$CodeBindings; wrapper=$WrapperBinding; python=$PythonBinding; python_environment_read_only=$true; python_working_directory=$RepoRoot; python_path=(Join-Path $RepoRoot 'src'); git=$GitBinding; import_attestation=$ImportAttestationBinding; independent_verifier=$TeacherVerifierBinding }
         pilot=[ordered]@{ run_root=$PilotRunRoot; bindings=$PilotBindings; image_count=1000; suggested_splits=[ordered]@{train=912;val=52;test=36}; initial_teacher_states=[ordered]@{pending=999;quarantine=1}; portable_projection_sha256=$RequiredProjectionSha256 }
         execution=[ordered]@{ requested_device='cuda'; observed_device='gpu:0'; minimum_free_ram_bytes=[int64]17179869184; observed_free_ram_bytes=$FreeMemoryBytes; capture_processes=1; capture_view_id='all'; training_performed=$false }
         roots=[ordered]@{ run=$RunRoot; run_identity=$RunRootIdentity; parent=$RunParent; parent_identity=$RunParentIdentity; logs=$LogsRoot; capture=$CaptureOutput; teacher=$TeacherOutput }
-        stages=[ordered]@{ capture=$captureStageReceipt; teacher=$teacherStageReceipt; independent_teacher_closure=$independentStageReceipt }
+        stages=[ordered]@{ import_attestation=$importStageReceipt; capture=$captureStageReceipt; teacher=$teacherStageReceipt; independent_teacher_closure=$independentStageReceipt }
         counts=[ordered]@{ inventory=1000; pending=999; accepted=[int]$teacher.counts.accepted_teacher_records; quarantined=[int]$teacher.counts.quarantined_records; closure=1000 }
-        validation=[ordered]@{ source_head_tree_clean_sha_size_stable=$true; git_executable_sha_size_stable=$true; pilot_receipt_inventory_projection_stable=$true; no_concurrent_exact8_or_other_capture_at_start=$true; free_ram_at_least_16_gib=$true; explicit_cuda_gpu0=$true; single_process_three_view_capture=$true; every_stage_rc_zero=$true; every_stage_stderr_zero_bytes=$true; capture_errors_zero=$true; teacher_sealed=$true; teacher_closure_independently_recomputed=$true; no_training=$true; quarantine_never_guess=$true; fresh_no_clobber_publications=$true; run_root_identity_stable=$true }
+        validation=[ordered]@{ source_head_tree_clean_sha_size_stable=$true; git_executable_sha_size_stable=$true; python_executable_sha_size_stable_each_stage=$true; python_environment_read_only_on_d=$true; python_working_directory_and_path_on_c_source=$true; pilot_receipt_inventory_projection_stable=$true; no_concurrent_exact8_or_other_capture_at_start=$true; free_ram_at_least_16_gib=$true; explicit_cuda_gpu0=$true; single_process_three_view_capture=$true; every_stage_rc_zero=$true; every_stage_stderr_zero_bytes=$true; capture_errors_zero=$true; teacher_sealed=$true; teacher_closure_independently_recomputed=$true; no_training=$true; quarantine_never_guess=$true; fresh_no_clobber_publications=$true; run_root_identity_stable=$true }
         started_utc=$PipelineStartedUtc.ToString('o'); completed_utc=[DateTime]::UtcNow.ToString('o')
     }
     Write-JsonNew $pipelineReceiptPath $pipelineReceipt
