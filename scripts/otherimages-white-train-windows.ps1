@@ -148,6 +148,243 @@ public static class WhiteTrainNativeDirectoryV1 {
     Add-Type -TypeDefinition $source -Language CSharp | Out-Null
 }
 
+function Initialize-NativeJobType {
+    if ($null -ne ('WhiteTrainNativeJobProcessV1' -as [type])) { return }
+    $source = @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
+
+public sealed class WhiteTrainNativeJobProcessV1 : IDisposable {
+    private const uint CREATE_SUSPENDED = 0x00000004;
+    private const uint CREATE_UNICODE_ENVIRONMENT = 0x00000400;
+    private const uint CREATE_NO_WINDOW = 0x08000000;
+    private const uint EXTENDED_STARTUPINFO_PRESENT = 0x00080000;
+    private const uint STARTF_USESTDHANDLES = 0x00000100;
+    private static readonly IntPtr PROC_THREAD_ATTRIBUTE_HANDLE_LIST = new IntPtr(0x00020002);
+    private const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000;
+    private const uint GENERIC_READ = 0x80000000;
+    private const uint GENERIC_WRITE = 0x40000000;
+    private const uint FILE_SHARE_READ = 0x00000001;
+    private const uint FILE_SHARE_WRITE = 0x00000002;
+    private const uint CREATE_NEW = 1;
+    private const uint OPEN_EXISTING = 3;
+    private const uint FILE_ATTRIBUTE_NORMAL = 0x00000080;
+    private const uint WAIT_OBJECT_0 = 0;
+    private const uint WAIT_TIMEOUT = 258;
+    private const uint INFINITE = 0xffffffff;
+    private const int JobObjectBasicAccountingInformation = 1;
+    private const int JobObjectExtendedLimitInformation = 9;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct SECURITY_ATTRIBUTES {
+        public int nLength;
+        public IntPtr lpSecurityDescriptor;
+        [MarshalAs(UnmanagedType.Bool)] public bool bInheritHandle;
+    }
+    [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]
+    private struct STARTUPINFO {
+        public int cb; public string lpReserved; public string lpDesktop; public string lpTitle;
+        public uint dwX; public uint dwY; public uint dwXSize; public uint dwYSize;
+        public uint dwXCountChars; public uint dwYCountChars; public uint dwFillAttribute;
+        public uint dwFlags; public short wShowWindow; public short cbReserved2;
+        public IntPtr lpReserved2; public IntPtr hStdInput; public IntPtr hStdOutput; public IntPtr hStdError;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct STARTUPINFOEX { public STARTUPINFO StartupInfo; public IntPtr lpAttributeList; }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct PROCESS_INFORMATION {
+        public IntPtr hProcess; public IntPtr hThread; public uint dwProcessId; public uint dwThreadId;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct IO_COUNTERS {
+        public ulong ReadOperationCount; public ulong WriteOperationCount; public ulong OtherOperationCount;
+        public ulong ReadTransferCount; public ulong WriteTransferCount; public ulong OtherTransferCount;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct JOBOBJECT_BASIC_LIMIT_INFORMATION {
+        public long PerProcessUserTimeLimit; public long PerJobUserTimeLimit; public uint LimitFlags;
+        public UIntPtr MinimumWorkingSetSize; public UIntPtr MaximumWorkingSetSize; public uint ActiveProcessLimit;
+        public UIntPtr Affinity; public uint PriorityClass; public uint SchedulingClass;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
+        public JOBOBJECT_BASIC_LIMIT_INFORMATION BasicLimitInformation; public IO_COUNTERS IoInfo;
+        public UIntPtr ProcessMemoryLimit; public UIntPtr JobMemoryLimit; public UIntPtr PeakProcessMemoryUsed; public UIntPtr PeakJobMemoryUsed;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct JOBOBJECT_BASIC_ACCOUNTING_INFORMATION {
+        public long TotalUserTime; public long TotalKernelTime; public long ThisPeriodTotalUserTime; public long ThisPeriodTotalKernelTime;
+        public uint TotalPageFaultCount; public uint TotalProcesses; public uint ActiveProcesses; public uint TotalTerminatedProcesses;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct FILETIME { public uint dwLowDateTime; public uint dwHighDateTime; }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct PROCESS_MEMORY_COUNTERS {
+        public uint cb; public uint PageFaultCount; public UIntPtr PeakWorkingSetSize; public UIntPtr WorkingSetSize;
+        public UIntPtr QuotaPeakPagedPoolUsage; public UIntPtr QuotaPagedPoolUsage; public UIntPtr QuotaPeakNonPagedPoolUsage;
+        public UIntPtr QuotaNonPagedPoolUsage; public UIntPtr PagefileUsage; public UIntPtr PeakPagefileUsage;
+    }
+
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] private static extern IntPtr CreateJobObjectW(IntPtr attributes,string name);
+    [DllImport("kernel32.dll", SetLastError=true)] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool SetInformationJobObject(IntPtr job,int infoClass,IntPtr info,uint length);
+    [DllImport("kernel32.dll", SetLastError=true)] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool QueryInformationJobObject(IntPtr job,int infoClass,out JOBOBJECT_BASIC_ACCOUNTING_INFORMATION info,uint length,IntPtr returnLength);
+    [DllImport("kernel32.dll", SetLastError=true)] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool AssignProcessToJobObject(IntPtr job,IntPtr process);
+    [DllImport("kernel32.dll", SetLastError=true)] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool TerminateJobObject(IntPtr job,uint exitCode);
+    [DllImport("kernel32.dll", SetLastError=true)] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool TerminateProcess(IntPtr process,uint exitCode);
+    [DllImport("kernel32.dll", SetLastError=true)] private static extern uint ResumeThread(IntPtr thread);
+    [DllImport("kernel32.dll", SetLastError=true)] private static extern uint WaitForSingleObject(IntPtr handle,uint milliseconds);
+    [DllImport("kernel32.dll", SetLastError=true)] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool GetExitCodeProcess(IntPtr process,out uint exitCode);
+    [DllImport("kernel32.dll", SetLastError=true)] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool GetProcessTimes(IntPtr process,out FILETIME creation,out FILETIME exit,out FILETIME kernel,out FILETIME user);
+    [DllImport("psapi.dll", SetLastError=true)] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool GetProcessMemoryInfo(IntPtr process,out PROCESS_MEMORY_COUNTERS counters,uint size);
+    [DllImport("kernel32.dll", SetLastError=true)] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool CloseHandle(IntPtr handle);
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] private static extern IntPtr CreateFileW(string path,uint access,uint share,ref SECURITY_ATTRIBUTES security,uint creation,uint flags,IntPtr template);
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    [return: MarshalAs(UnmanagedType.Bool)] private static extern bool CreateProcessW(string applicationName,StringBuilder commandLine,IntPtr processAttributes,IntPtr threadAttributes,[MarshalAs(UnmanagedType.Bool)] bool inheritHandles,uint flags,IntPtr environment,string currentDirectory,ref STARTUPINFOEX startupInfo,out PROCESS_INFORMATION processInformation);
+    [DllImport("kernel32.dll", SetLastError=true)] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool InitializeProcThreadAttributeList(IntPtr attributeList,int attributeCount,uint flags,ref UIntPtr size);
+    [DllImport("kernel32.dll", SetLastError=true)] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool UpdateProcThreadAttribute(IntPtr attributeList,uint flags,IntPtr attribute,IntPtr value,UIntPtr size,IntPtr previousValue,IntPtr returnSize);
+    [DllImport("kernel32.dll")] private static extern void DeleteProcThreadAttributeList(IntPtr attributeList);
+
+    private IntPtr jobHandle;
+    private IntPtr processHandle;
+    private readonly int processId;
+    private bool disposed;
+
+    private WhiteTrainNativeJobProcessV1(IntPtr job,IntPtr process,int pid) { jobHandle=job; processHandle=process; processId=pid; }
+    public int Id { get { return processId; } }
+    public bool HasExited { get { return WaitForExit(0); } }
+    public int ExitCode {
+        get {
+            if (!HasExited) throw new InvalidOperationException("process has not exited");
+            uint code; if (!GetExitCodeProcess(processHandle,out code)) throw LastError("GetExitCodeProcess failed");
+            return unchecked((int)code);
+        }
+    }
+    public double CpuSeconds {
+        get {
+            FILETIME creation,exit,kernel,user;
+            if (!GetProcessTimes(processHandle,out creation,out exit,out kernel,out user)) throw LastError("GetProcessTimes failed");
+            return (ToLong(kernel)+ToLong(user))/10000000.0;
+        }
+    }
+    public long WorkingSetBytes {
+        get {
+            PROCESS_MEMORY_COUNTERS counters=new PROCESS_MEMORY_COUNTERS(); counters.cb=(uint)Marshal.SizeOf(typeof(PROCESS_MEMORY_COUNTERS));
+            if (!GetProcessMemoryInfo(processHandle,out counters,counters.cb)) throw LastError("GetProcessMemoryInfo failed");
+            return checked((long)counters.WorkingSetSize.ToUInt64());
+        }
+    }
+    public uint ActiveProcessCount {
+        get {
+            if (jobHandle==IntPtr.Zero) throw new ObjectDisposedException("job handle");
+            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION info;
+            if (!QueryInformationJobObject(jobHandle,JobObjectBasicAccountingInformation,out info,(uint)Marshal.SizeOf(typeof(JOBOBJECT_BASIC_ACCOUNTING_INFORMATION)),IntPtr.Zero)) throw LastError("QueryInformationJobObject failed");
+            return info.ActiveProcesses;
+        }
+    }
+    public bool WaitForExit(int milliseconds) {
+        uint value=WaitForSingleObject(processHandle,milliseconds<0?INFINITE:(uint)milliseconds);
+        if (value==WAIT_OBJECT_0) return true;
+        if (value==WAIT_TIMEOUT) return false;
+        throw LastError("WaitForSingleObject failed");
+    }
+    public void WaitForExit() { if (!WaitForExit(-1)) throw new InvalidOperationException("infinite process wait returned timeout"); }
+    public bool WaitForJobEmpty(int milliseconds) {
+        DateTime deadline=DateTime.UtcNow.AddMilliseconds(milliseconds);
+        do { if (ActiveProcessCount==0) return true; Thread.Sleep(50); } while (DateTime.UtcNow<deadline);
+        return ActiveProcessCount==0;
+    }
+    public void Terminate(uint exitCode) {
+        if (jobHandle==IntPtr.Zero) throw new ObjectDisposedException("job handle");
+        if (!TerminateJobObject(jobHandle,exitCode)) throw LastError("TerminateJobObject failed");
+    }
+    public void CloseJob() {
+        IntPtr handle=jobHandle;
+        if (handle!=IntPtr.Zero) { if (!CloseHandle(handle)) throw LastError("CloseHandle(job) failed"); jobHandle=IntPtr.Zero; }
+    }
+    public void Dispose() {
+        if (disposed) return; disposed=true;
+        try { CloseJob(); }
+        finally { IntPtr handle=processHandle; processHandle=IntPtr.Zero; if (handle!=IntPtr.Zero) CloseHandle(handle); }
+    }
+
+    public static WhiteTrainNativeJobProcessV1 StartSuspendedAssigned(string applicationName,string commandLine,string workingDirectory,string stdoutPath,string stderrPath,string[] environmentEntries) {
+        IntPtr job=IntPtr.Zero,stdoutHandle=IntPtr.Zero,stderrHandle=IntPtr.Zero,stdinHandle=IntPtr.Zero,environment=IntPtr.Zero,attributeList=IntPtr.Zero,handleList=IntPtr.Zero;
+        bool attributeListInitialized=false;
+        PROCESS_INFORMATION processInfo=new PROCESS_INFORMATION(); bool created=false;
+        try {
+            job=CreateJobObjectW(IntPtr.Zero,null); if (job==IntPtr.Zero) throw LastError("CreateJobObjectW failed");
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits=new JOBOBJECT_EXTENDED_LIMIT_INFORMATION();
+            limits.BasicLimitInformation.LimitFlags=JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            int limitSize=Marshal.SizeOf(typeof(JOBOBJECT_EXTENDED_LIMIT_INFORMATION)); IntPtr limitPointer=Marshal.AllocHGlobal(limitSize);
+            try { Marshal.StructureToPtr(limits,limitPointer,false); if (!SetInformationJobObject(job,JobObjectExtendedLimitInformation,limitPointer,(uint)limitSize)) throw LastError("SetInformationJobObject(KILL_ON_JOB_CLOSE) failed"); }
+            finally { Marshal.FreeHGlobal(limitPointer); }
+            SECURITY_ATTRIBUTES security=new SECURITY_ATTRIBUTES(); security.nLength=Marshal.SizeOf(typeof(SECURITY_ATTRIBUTES)); security.bInheritHandle=true;
+            stdoutHandle=CreateFileW(stdoutPath,GENERIC_WRITE,FILE_SHARE_READ,ref security,CREATE_NEW,FILE_ATTRIBUTE_NORMAL,IntPtr.Zero); if (IsInvalid(stdoutHandle)) throw LastError("CreateFileW(stdout) failed");
+            stderrHandle=CreateFileW(stderrPath,GENERIC_WRITE,FILE_SHARE_READ,ref security,CREATE_NEW,FILE_ATTRIBUTE_NORMAL,IntPtr.Zero); if (IsInvalid(stderrHandle)) throw LastError("CreateFileW(stderr) failed");
+            stdinHandle=CreateFileW("NUL",GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE,ref security,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,IntPtr.Zero); if (IsInvalid(stdinHandle)) throw LastError("CreateFileW(NUL) failed");
+            UIntPtr attributeBytes=UIntPtr.Zero; Marshal.SetLastWin32Error(0);
+            InitializeProcThreadAttributeList(IntPtr.Zero,1,0,ref attributeBytes);
+            int attributeSizingError=Marshal.GetLastWin32Error();
+            if (attributeBytes==UIntPtr.Zero || (attributeSizingError!=0 && attributeSizingError!=122)) throw new Win32Exception(attributeSizingError,"InitializeProcThreadAttributeList sizing failed");
+            attributeList=Marshal.AllocHGlobal(checked((int)attributeBytes.ToUInt64()));
+            if (!InitializeProcThreadAttributeList(attributeList,1,0,ref attributeBytes)) throw LastError("InitializeProcThreadAttributeList failed");
+            attributeListInitialized=true;
+            handleList=Marshal.AllocHGlobal(IntPtr.Size*3);
+            Marshal.WriteIntPtr(handleList,0*IntPtr.Size,stdinHandle); Marshal.WriteIntPtr(handleList,1*IntPtr.Size,stdoutHandle); Marshal.WriteIntPtr(handleList,2*IntPtr.Size,stderrHandle);
+            if (!UpdateProcThreadAttribute(attributeList,0,PROC_THREAD_ATTRIBUTE_HANDLE_LIST,handleList,new UIntPtr((uint)(IntPtr.Size*3)),IntPtr.Zero,IntPtr.Zero)) throw LastError("UpdateProcThreadAttribute(HANDLE_LIST) failed");
+            STARTUPINFOEX startup=new STARTUPINFOEX(); startup.StartupInfo.cb=Marshal.SizeOf(typeof(STARTUPINFOEX)); startup.StartupInfo.dwFlags=STARTF_USESTDHANDLES; startup.StartupInfo.hStdInput=stdinHandle; startup.StartupInfo.hStdOutput=stdoutHandle; startup.StartupInfo.hStdError=stderrHandle; startup.lpAttributeList=attributeList;
+            StringBuilder environmentBlock=new StringBuilder();
+            if (environmentEntries!=null) foreach (string entry in environmentEntries) { if (entry==null || entry.IndexOf('\0')>=0) throw new ArgumentException("invalid child environment entry"); environmentBlock.Append(entry); environmentBlock.Append('\0'); }
+            if (environmentBlock.Length==0) environmentBlock.Append('\0');
+            environmentBlock.Append('\0'); environment=Marshal.StringToHGlobalUni(environmentBlock.ToString());
+            StringBuilder mutableCommandLine=new StringBuilder(commandLine);
+            if (!CreateProcessW(applicationName,mutableCommandLine,IntPtr.Zero,IntPtr.Zero,true,CREATE_SUSPENDED|CREATE_UNICODE_ENVIRONMENT|CREATE_NO_WINDOW|EXTENDED_STARTUPINFO_PRESENT,environment,workingDirectory,ref startup,out processInfo)) throw LastError("CreateProcessW(CREATE_SUSPENDED) failed");
+            created=true;
+            if (!AssignProcessToJobObject(job,processInfo.hProcess)) throw LastError("AssignProcessToJobObject failed (nested job constraints may forbid safe containment)");
+            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION accounting;
+            if (!QueryInformationJobObject(job,JobObjectBasicAccountingInformation,out accounting,(uint)Marshal.SizeOf(typeof(JOBOBJECT_BASIC_ACCOUNTING_INFORMATION)),IntPtr.Zero)) throw LastError("Job assignment accounting query failed");
+            if (accounting.ActiveProcesses!=1) throw new InvalidOperationException("Job assignment accounting did not prove exactly one suspended root");
+            if (ResumeThread(processInfo.hThread)==0xffffffff) throw LastError("ResumeThread failed");
+            CloseHandle(processInfo.hThread); processInfo.hThread=IntPtr.Zero;
+            WhiteTrainNativeJobProcessV1 result=new WhiteTrainNativeJobProcessV1(job,processInfo.hProcess,checked((int)processInfo.dwProcessId));
+            job=IntPtr.Zero; processInfo.hProcess=IntPtr.Zero; return result;
+        }
+        catch (Exception launchError) {
+            if (created && processInfo.hProcess!=IntPtr.Zero) {
+                if (job!=IntPtr.Zero) TerminateJobObject(job,254);
+                bool terminated=TerminateProcess(processInfo.hProcess,254);
+                int terminateError=terminated ? 0 : Marshal.GetLastWin32Error();
+                uint waitResult=WaitForSingleObject(processInfo.hProcess,30000);
+                if (waitResult!=WAIT_OBJECT_0) {
+                    Exception containmentError=terminated ? (Exception)new TimeoutException("suspended root did not exit after TerminateProcess") : new Win32Exception(terminateError,"TerminateProcess failed for suspended root");
+                    throw new AggregateException("Safe suspended launch failed and root termination could not be proven",launchError,containmentError);
+                }
+            }
+            throw;
+        }
+        finally {
+            if (environment!=IntPtr.Zero) Marshal.FreeHGlobal(environment);
+            if (attributeListInitialized) DeleteProcThreadAttributeList(attributeList);
+            if (attributeList!=IntPtr.Zero) Marshal.FreeHGlobal(attributeList);
+            if (handleList!=IntPtr.Zero) Marshal.FreeHGlobal(handleList);
+            CloseIfValid(stdoutHandle); CloseIfValid(stderrHandle); CloseIfValid(stdinHandle);
+            if (processInfo.hThread!=IntPtr.Zero) CloseHandle(processInfo.hThread);
+            if (processInfo.hProcess!=IntPtr.Zero) CloseHandle(processInfo.hProcess);
+            if (job!=IntPtr.Zero) CloseHandle(job);
+        }
+    }
+    private static long ToLong(FILETIME value) { return ((long)value.dwHighDateTime<<32)|value.dwLowDateTime; }
+    private static bool IsInvalid(IntPtr handle) { return handle==IntPtr.Zero || handle==new IntPtr(-1); }
+    private static void CloseIfValid(IntPtr handle) { if (!IsInvalid(handle)) CloseHandle(handle); }
+    private static Win32Exception LastError(string message) { return new Win32Exception(Marshal.GetLastWin32Error(),message); }
+}
+'@
+    Add-Type -TypeDefinition $source -Language CSharp | Out-Null
+}
+
 function Get-DirectoryIdentity([string]$Path, [string]$Description) {
     Assert-NoReparseChain $Path $Description
     $item = Get-Item -LiteralPath $Path -Force
@@ -261,68 +498,58 @@ function ConvertTo-NativeCommandLine([string[]]$Arguments) {
     return $builder.ToString()
 }
 
-function Stop-ProcessTree([int]$RootPid) {
-    for ($attempt=0; $attempt -lt 3; $attempt++) {
-        $all = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
-        $pending = New-Object Collections.Generic.List[int]
-        $pending.Add($RootPid)
-        $descendants = New-Object Collections.Generic.List[int]
-        for ($index=0; $index -lt $pending.Count; $index++) {
-            $parent = $pending[$index]
-            foreach ($child in @($all | Where-Object { [int]$_.ParentProcessId -eq $parent })) {
-                $childPid = [int]$child.ProcessId
-                if (-not $pending.Contains($childPid)) { $pending.Add($childPid); $descendants.Add($childPid) }
-            }
-        }
-        [int[]]$targets = @($descendants.ToArray()); [array]::Reverse($targets)
-        foreach ($target in @($targets + $RootPid)) { Stop-Process -Id $target -Force -ErrorAction SilentlyContinue }
-        Start-Sleep -Milliseconds 250
+function Get-BindingOrNull([string]$Path) {
+    try {
+        if (Test-Path -LiteralPath $Path -PathType Leaf) { return Get-Binding $Path }
     }
+    catch { return $null }
+    return $null
 }
 
-function Add-ObservedDescendantPids([int]$RootPid, [Collections.Generic.HashSet[int]]$Observed) {
-    $all=@(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
-    $pending=New-Object Collections.Generic.List[int]; $pending.Add($RootPid)
-    for ($index=0; $index -lt $pending.Count; $index++) {
-        $parent=$pending[$index]
-        foreach ($child in @($all | Where-Object {[int]$_.ParentProcessId -eq $parent})) {
-            $childPid=[int]$child.ProcessId
-            if (-not $pending.Contains($childPid)) { $pending.Add($childPid); [void]$Observed.Add($childPid) }
-        }
+function Write-StageFailureEvidenceBestEffort(
+    [string]$StageRoot,
+    [string]$Stage,
+    [object]$PidValue,
+    [bool]$ProcessStarted,
+    [bool]$ForcedStop,
+    [object]$ExitCode,
+    [bool]$StderrNonEmpty,
+    [object]$JobInitialActiveProcesses,
+    [object]$JobActiveBeforeClose,
+    [bool]$JobEmptyProven,
+    [bool]$JobHandleClosed,
+    [object]$StageError,
+    [object]$CleanupError,
+    [object]$EvidenceError,
+    [string]$StdoutPath,
+    [string]$StderrPath,
+    [string]$RcPath
+) {
+    $failurePath = Join-Path $StageRoot 'stage.failure.json'
+    try {
+        Write-JsonNew $failurePath ([ordered]@{
+            schema_version=1; kind='otherimages_white_train_windows_stage_failure_v1'; status='failed'; stage=$Stage; pid=$PidValue
+            process_started=$ProcessStarted; forced_job_termination=$ForcedStop; exit_code=$ExitCode; stderr_nonempty=$StderrNonEmpty
+            job=[ordered]@{creation='CreateJobObjectW';limit='JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE';launch='CREATE_SUSPENDED_ASSIGN_RESUME';initial_active_processes=$JobInitialActiveProcesses;active_processes_before_close=$JobActiveBeforeClose;empty_proven=$JobEmptyProven;handle_closed=$JobHandleClosed}
+            stage_error=$(if ($null -eq $StageError) {$null} else {$StageError.Exception.Message})
+            cleanup_error=$(if ($null -eq $CleanupError) {$null} else {$CleanupError.Exception.Message})
+            evidence_error=$(if ($null -eq $EvidenceError) {$null} else {$EvidenceError.Exception.Message})
+            stdout=Get-BindingOrNull $StdoutPath; stderr=Get-BindingOrNull $StderrPath; rc_file=Get-BindingOrNull $RcPath
+            utc=[DateTime]::UtcNow.ToString('o')
+        })
+        return
     }
-}
-
-function Wait-ProcessIdsAbsent([int[]]$ProcessIds, [int]$TimeoutMilliseconds) {
-    $deadline=[DateTime]::UtcNow.AddMilliseconds($TimeoutMilliseconds)
-    do {
-        [int[]]$alive=@($ProcessIds | Where-Object {$null -ne (Get-Process -Id $_ -ErrorAction SilentlyContinue)})
-        if ($alive.Count -eq 0) { return $true }
-        Start-Sleep -Milliseconds 250
-    } while ([DateTime]::UtcNow -lt $deadline)
-    return $false
-}
-
-function Stop-ObservedProcessIds([int[]]$ProcessIds) {
-    foreach ($processId in $ProcessIds) { Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue }
-}
-
-function Assert-NoRetainedProcessTree([int]$RootPid, [string]$Stage) {
-    $all = @(Get-CimInstance Win32_Process -ErrorAction Stop)
-    $pending = New-Object Collections.Generic.List[int]
-    $pending.Add($RootPid)
-    $retained = New-Object Collections.Generic.List[object]
-    for ($index=0; $index -lt $pending.Count; $index++) {
-        $parent = $pending[$index]
-        foreach ($child in @($all | Where-Object { [int]$_.ParentProcessId -eq $parent })) {
-            $childPid = [int]$child.ProcessId
-            if (-not $pending.Contains($childPid)) { $pending.Add($childPid); $retained.Add($child) }
-        }
+    catch {
+        $primaryFailure = $_
     }
-    if ($retained.Count -ne 0) {
-        $summary=@($retained | ForEach-Object {([string]$_.ProcessId)+':'+([string]$_.Name)}) -join ','
-        Stop-ProcessTree $RootPid
-        throw "Python stage retained descendant processes after success: stage=$Stage descendants=$summary"
-    }
+    $fallbackPath = Join-Path $StageRoot 'stage.failure.fallback.txt'
+    $safeStage = ([string]$Stage).Replace("`r",' ').Replace("`n",' ')
+    $safeMessage = ([string]$primaryFailure.Exception.Message).Replace("`r",' ').Replace("`n",' ')
+    $fallbackText = "kind=otherimages_white_train_windows_stage_failure_fallback_v1 status=failed stage=$safeStage primary_failure=$safeMessage`r`n"
+    [byte[]]$bytes = [Text.Encoding]::UTF8.GetBytes($fallbackText)
+    $stream = New-Object IO.FileStream($fallbackPath,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+    try { $stream.Write($bytes,0,$bytes.Length); $stream.Flush() }
+    finally { $stream.Dispose() }
 }
 
 function Invoke-PythonStage([string]$Name, [string[]]$Arguments, [hashtable]$Environment) {
@@ -334,24 +561,24 @@ function Invoke-PythonStage([string]$Name, [string[]]$Arguments, [hashtable]$Env
     $info = New-Object Diagnostics.ProcessStartInfo
     $info.FileName=$PythonExe; $info.Arguments=ConvertTo-NativeCommandLine $Arguments; $info.WorkingDirectory=$RepoRoot
     $info.UseShellExecute=$false; $info.CreateNoWindow=$true; $info.RedirectStandardOutput=$true; $info.RedirectStandardError=$true
-    foreach ($name in @('PYTHONHOME','PYTHONSTARTUP','PYTHONINSPECT','PYTEST_ADDOPTS','PYTEST_PLUGINS')) { [void]$info.EnvironmentVariables.Remove($name) }
+    foreach ($environmentName in @('PYTHONHOME','PYTHONSTARTUP','PYTHONINSPECT','PYTEST_ADDOPTS','PYTEST_PLUGINS')) { [void]$info.EnvironmentVariables.Remove($environmentName) }
     $info.EnvironmentVariables['PYTHONIOENCODING']='utf-8:strict'; $info.EnvironmentVariables['PYTHONUTF8']='1'; $info.EnvironmentVariables['PYTHONDONTWRITEBYTECODE']='1'
     $info.EnvironmentVariables['PYTHONPATH']=(Join-Path $RepoRoot 'src'); $info.EnvironmentVariables['PYTHONNOUSERSITE']='1'
     foreach ($key in $Environment.Keys) { $info.EnvironmentVariables[[string]$key]=[string]$Environment[$key] }
-    $process=New-Object Diagnostics.Process; $process.StartInfo=$info
-    $started=[DateTime]::UtcNow; $startedProcess=$false; $pidValue=$null; $stdoutTask=$null; $stderrTask=$null; $exitCode=$null; $stageError=$null; $cleanupError=$null; $forcedStop=$false
-    $observedDescendantPids=New-Object 'Collections.Generic.HashSet[int]'; $descendantAbsenceProven=$false
+    [string[]]$environmentEntries=@($info.EnvironmentVariables.GetEnumerator() | ForEach-Object { ([string]$_.Key)+'='+([string]$_.Value) } | Sort-Object)
+    $commandLine='"'+$PythonExe+'"'
+    if (-not [string]::IsNullOrWhiteSpace($info.Arguments)) { $commandLine+=' '+$info.Arguments }
+    $process=$null
+    $started=[DateTime]::UtcNow; $startedProcess=$false; $pidValue=$null; $exitCode=$null; $stageError=$null; $cleanupError=$null; $forcedStop=$false
+    $jobInitialActiveProcesses=$null; $jobActiveBeforeClose=$null; $jobEmptyProven=$false; $jobHandleClosed=$false
     try {
         Write-Host "WHITE_TRAIN_STAGE_START stage=$Name"
-        if (-not $process.Start()) { throw "Unable to start Python stage: $Name" }
-        $startedProcess=$true; $pidValue=[int]$process.Id
-        Add-ObservedDescendantPids $pidValue $observedDescendantPids
-        $stdoutTask=$process.StandardOutput.ReadToEndAsync(); $stderrTask=$process.StandardError.ReadToEndAsync(); $lastReport=$started
+        $process=[WhiteTrainNativeJobProcessV1]::StartSuspendedAssigned($PythonExe,$commandLine,$RepoRoot,$stdoutPath,$stderrPath,$environmentEntries)
+        $startedProcess=$true; $pidValue=[int]$process.Id; $jobInitialActiveProcesses=[uint32]1; $lastReport=$started
         while (-not $process.WaitForExit(1000)) {
-            Add-ObservedDescendantPids $pidValue $observedDescendantPids
             $now=[DateTime]::UtcNow
             if (($now-$lastReport).TotalSeconds -ge 60) {
-                try { $process.Refresh(); Write-Host ("WHITE_TRAIN_STAGE_ALIVE stage={0} elapsed_s={1} pid={2} cpu_s={3:N1} ws_bytes={4}" -f $Name,[int]($now-$started).TotalSeconds,$pidValue,$process.TotalProcessorTime.TotalSeconds,$process.WorkingSet64) }
+                try { Write-Host ("WHITE_TRAIN_STAGE_ALIVE stage={0} elapsed_s={1} pid={2} cpu_s={3:N1} ws_bytes={4}" -f $Name,[int]($now-$started).TotalSeconds,$pidValue,$process.CpuSeconds,$process.WorkingSetBytes) }
                 catch { Write-Host "WHITE_TRAIN_STAGE_ALIVE stage=$Name elapsed_s=$([int]($now-$started).TotalSeconds) pid=$pidValue" }
                 $lastReport=$now
             }
@@ -362,51 +589,68 @@ function Invoke-PythonStage([string]$Name, [string[]]$Arguments, [hashtable]$Env
     finally {
         try {
             try {
-                if ($startedProcess) { Add-ObservedDescendantPids $pidValue $observedDescendantPids }
-                if ($startedProcess -and -not $process.HasExited) {
-                    $forcedStop=$true; Stop-ProcessTree $pidValue; Stop-ObservedProcessIds @($observedDescendantPids)
-                    if (-not $process.WaitForExit(30000)) { throw 'Python process tree remained alive after forced stop and bounded wait' }
-                }
-                if ($startedProcess -and $process.HasExited) { $process.WaitForExit(); $exitCode=[int]$process.ExitCode }
-                [int[]]$observedIds=@($observedDescendantPids | Sort-Object)
-                $descendantAbsenceProven=Wait-ProcessIdsAbsent $observedIds 30000
-                if (-not $descendantAbsenceProven) {
-                    $forcedStop=$true; Stop-ObservedProcessIds $observedIds
-                    if (-not (Wait-ProcessIdsAbsent $observedIds 30000)) { throw "Observed descendant PIDs remained alive after bounded cleanup: $($observedIds -join ',')" }
-                    throw "Python stage retained descendant PIDs and required forced cleanup: $($observedIds -join ',')"
+                if ($startedProcess) {
+                    if (-not $process.HasExited) {
+                        $forcedStop=$true; $process.Terminate([uint32]254)
+                        if (-not $process.WaitForExit(30000)) { throw 'Python Job Object root remained alive after forced termination and bounded wait' }
+                    }
+                    if ($process.HasExited) { $process.WaitForExit(); $exitCode=[int]$process.ExitCode }
+                    $jobActiveBeforeClose=[uint32]$process.ActiveProcessCount
+                    if (-not $process.WaitForJobEmpty(30000)) {
+                        $forcedStop=$true; $process.Terminate([uint32]253)
+                        if (-not $process.WaitForJobEmpty(30000)) { throw 'Python Job Object retained active processes after forced termination and bounded wait' }
+                        throw 'Python stage retained Job Object descendants and required forced cleanup'
+                    }
+                    $jobEmptyProven=$true
                 }
             }
             catch { $cleanupError=$_ }
-            try { Assert-BindingUnchanged $NvidiaSmiBinding "fixed nvidia-smi in finalizer after Python stage $Name" }
-            catch { if ($null -eq $cleanupError) { $cleanupError=$_ } }
-            try {
-                foreach ($streamTask in @($stdoutTask,$stderrTask)) {
-                    if ($null -ne $streamTask -and -not $streamTask.IsCompleted -and -not $streamTask.Wait(30000)) { throw 'Python redirected stream did not close within the bounded wait' }
-                }
-                $stdout=if ($null -ne $stdoutTask -and $stdoutTask.IsCompleted) { [string]$stdoutTask.Result } else { '' }
-                $stderr=if ($null -ne $stderrTask -and $stderrTask.IsCompleted) { [string]$stderrTask.Result } else { '' }
-                [IO.File]::WriteAllText($stdoutPath,$stdout,$Utf8NoBom); [IO.File]::WriteAllText($stderrPath,$stderr,$Utf8NoBom)
-                if ($null -ne $exitCode) { Write-RcNew $rcPath ([int]$exitCode) }
-                $stderrNonEmpty=([Text.Encoding]::UTF8.GetByteCount($stderr) -ne 0)
-                if ($null -ne $stageError -or $null -ne $cleanupError -or $null -eq $exitCode -or [int]$exitCode -ne 0 -or $stderrNonEmpty) {
-                    Write-JsonNew (Join-Path $stageRoot 'stage.failure.json') ([ordered]@{
-                        schema_version=1; kind='otherimages_white_train_windows_stage_failure_v1'; status='failed'; stage=$Name; pid=$pidValue
-                        process_started=$startedProcess; forced_process_tree_stop=$forcedStop; exit_code=$exitCode; stderr_nonempty=$stderrNonEmpty
-                        observed_descendant_pids=@($observedDescendantPids | Sort-Object); descendant_absence_proven=$descendantAbsenceProven
-                        stage_error=$(if ($null -eq $stageError) {$null} else {$stageError.Exception.Message}); cleanup_error=$(if ($null -eq $cleanupError) {$null} else {$cleanupError.Exception.Message})
-                        stdout=Get-Binding $stdoutPath; stderr=Get-Binding $stderrPath; rc_file=$(if (Test-Path -LiteralPath $rcPath) {Get-Binding $rcPath} else {$null}); utc=[DateTime]::UtcNow.ToString('o')
-                    })
+            finally {
+                if ($null -ne $process) {
+                    if (-not $jobEmptyProven) {
+                        try {
+                            $forcedStop=$true; $process.Terminate([uint32]252)
+                            if (-not $process.WaitForJobEmpty(30000)) { throw 'Python Job Object did not become empty during final containment' }
+                            $jobEmptyProven=$true
+                        }
+                        catch { if ($null -eq $cleanupError) { $cleanupError=$_ } }
+                    }
+                    try { $process.CloseJob(); $jobHandleClosed=$true }
+                    catch { if ($null -eq $cleanupError) { $cleanupError=$_ } }
+                    try {
+                        if (-not $process.WaitForExit(30000)) { throw 'Python root remained alive after KILL_ON_JOB_CLOSE and bounded wait' }
+                        $process.WaitForExit(); $exitCode=[int]$process.ExitCode
+                    }
+                    catch { if ($null -eq $cleanupError) { $cleanupError=$_ } }
                 }
             }
+            try {
+                Assert-BindingUnchanged $NvidiaSmiBinding "fixed nvidia-smi in finalizer after Python stage $Name"
+                Assert-BindingUnchanged $NvidiaSmiBinding "fixed nvidia-smi immediately after Python stage $Name"
+            }
             catch { if ($null -eq $cleanupError) { $cleanupError=$_ } }
+            $stdout=''; $stderr=''; $stderrNonEmpty=$false; $evidenceError=$null
+            try {
+                $stdout=if (Test-Path -LiteralPath $stdoutPath -PathType Leaf) { [IO.File]::ReadAllText($stdoutPath,$Utf8NoBom) } else { '' }
+                $stderr=if (Test-Path -LiteralPath $stderrPath -PathType Leaf) { [IO.File]::ReadAllText($stderrPath,$Utf8NoBom) } else { '' }
+                $stderrNonEmpty=([Text.Encoding]::UTF8.GetByteCount($stderr) -ne 0)
+            }
+            catch { $evidenceError=$_; if ($null -eq $cleanupError) { $cleanupError=$_ } }
+            try { if ($null -ne $exitCode) { Write-RcNew $rcPath ([int]$exitCode) } }
+            catch { if ($null -eq $evidenceError) {$evidenceError=$_}; if ($null -eq $cleanupError) {$cleanupError=$_} }
+            if ($null -ne $stageError -or $null -ne $cleanupError -or $null -ne $evidenceError -or $null -eq $exitCode -or [int]$exitCode -ne 0 -or $stderrNonEmpty) {
+                try {
+                    Write-StageFailureEvidenceBestEffort $stageRoot $Name $pidValue $startedProcess $forcedStop $exitCode $stderrNonEmpty $jobInitialActiveProcesses $jobActiveBeforeClose $jobEmptyProven $jobHandleClosed $stageError $cleanupError $evidenceError $stdoutPath $stderrPath $rcPath
+                }
+                catch { if ($null -eq $cleanupError) { $cleanupError=$_ } }
+            }
         }
-        finally { $process.Dispose() }
+        finally { if ($null -ne $process) { $process.Dispose() } }
     }
     if ($null -ne $stageError) { throw $stageError }; if ($null -ne $cleanupError) { throw $cleanupError }
     if ($null -eq $exitCode -or [int]$exitCode -ne 0) { throw "Python stage failed: stage=$Name rc=$exitCode evidence=$stageRoot" }
     Assert-ZeroRc $rcPath
-    Assert-BindingUnchanged $NvidiaSmiBinding "fixed nvidia-smi immediately after Python stage $Name"
-    $result=[pscustomobject][ordered]@{ name=$Name; pid=$pidValue; rc=[int]$exitCode; started_utc=$started.ToString('o'); completed_utc=[DateTime]::UtcNow.ToString('o'); elapsed_seconds=([DateTime]::UtcNow-$started).TotalSeconds; observed_descendant_pids=@($observedDescendantPids | Sort-Object); descendant_absence_proven=$descendantAbsenceProven; stdout=Get-Binding $stdoutPath; stderr=Get-Binding $stderrPath; rc_file=Get-Binding $rcPath }
+    $result=[pscustomobject][ordered]@{ name=$Name; pid=$pidValue; rc=[int]$exitCode; started_utc=$started.ToString('o'); completed_utc=[DateTime]::UtcNow.ToString('o'); elapsed_seconds=([DateTime]::UtcNow-$started).TotalSeconds; job=[ordered]@{creation='CreateJobObjectW';limit='JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE';launch='CREATE_SUSPENDED_ASSIGN_RESUME';initial_active_processes=$jobInitialActiveProcesses;active_processes_before_close=$jobActiveBeforeClose;empty_proven=$jobEmptyProven;handle_closed=$jobHandleClosed}; stdout=Get-Binding $stdoutPath; stderr=Get-Binding $stderrPath; rc_file=Get-Binding $rcPath }
     if ([int64]$result.stderr.size_bytes -ne 0) { throw "Python stage emitted stderr: stage=$Name evidence=$stderrPath" }
     Write-Host "WHITE_TRAIN_STAGE_EXIT stage=$Name rc=0 elapsed_s=$([int]$result.elapsed_seconds)"
     return $result
@@ -414,7 +658,7 @@ function Invoke-PythonStage([string]$Name, [string[]]$Arguments, [hashtable]$Env
 
 function Complete-Stage([object]$Stage, [object]$Validation) {
     $path=Join-Path (Join-Path $LogsRoot ([string]$Stage.name)) 'stage.receipt.json'
-    Write-JsonNew $path ([ordered]@{ schema_version=1; kind='otherimages_white_train_windows_stage_receipt_v1'; status='complete'; stage=$Stage.name; process=[ordered]@{pid=$Stage.pid;rc=$Stage.rc;started_utc=$Stage.started_utc;completed_utc=$Stage.completed_utc;elapsed_seconds=$Stage.elapsed_seconds;observed_descendant_pids=$Stage.observed_descendant_pids;descendant_absence_proven=$Stage.descendant_absence_proven}; stdout=$Stage.stdout;stderr=$Stage.stderr;rc_file=$Stage.rc_file;validation=$Validation })
+    Write-JsonNew $path ([ordered]@{ schema_version=1; kind='otherimages_white_train_windows_stage_receipt_v1'; status='complete'; stage=$Stage.name; process=[ordered]@{pid=$Stage.pid;rc=$Stage.rc;started_utc=$Stage.started_utc;completed_utc=$Stage.completed_utc;elapsed_seconds=$Stage.elapsed_seconds;job=$Stage.job}; stdout=$Stage.stdout;stderr=$Stage.stderr;rc_file=$Stage.rc_file;validation=$Validation })
     return Get-Binding $path
 }
 
@@ -506,7 +750,7 @@ print(json.dumps({"schema_version":1,"kind":"otherimages_white_train_import_atte
 try {
     foreach ($path in @($RepoRoot,$TeacherRoot,$PythonExe,$GitExe,$NvidiaSmiExe,$PSCommandPath)) { if (-not (Test-Path -LiteralPath $path)) { throw "Missing fixed authority path: $path" }; Assert-NoReparseChain $path 'white train authority' }
     if (Test-Path -LiteralPath $RunRoot) { throw "RunRoot must be brand-new and is never resumed: $RunRoot" }
-    Initialize-NativeDirectoryType
+    Initialize-NativeDirectoryType; Initialize-NativeJobType
     $runParent=Split-Path -Parent $RunRoot; Assert-NoReparseChain $runParent 'white train output parent'; $parentIdentity=Get-DirectoryIdentity $runParent 'white train output parent'
     $gitBefore=Get-Binding $GitExe; $NvidiaSmiBinding=Get-Binding $NvidiaSmiExe
     Assert-GitAuthority $gitBefore; $codeBefore=Get-CodeBindings; $wrapperBefore=Get-Binding $PSCommandPath; $pythonBefore=Get-Binding $PythonExe
@@ -587,7 +831,7 @@ try {
         student_bundle=[ordered]@{root=$StudentBundle;bindings=[ordered]@{model=$onnxBinding;charset=$charsetBinding;contract=$studentContractBinding}}
         bindings=[ordered]@{model=$onnxBinding;charset=$charsetBinding;contract=$studentContractBinding;student_model=$onnxBinding;student_charset=$charsetBinding;student_contract=$studentContractBinding}
         semantics=[ordered]@{analysis_candidate_only=$true;teacher_parity_only=$true;independent_business_accuracy_proven=$false;cpu_publication_performed=$false;cpu_delivery_gate_passed=$false;test_inference_performed=$false}
-        validation=[ordered]@{fresh_no_resume_no_clobber=$true;teacher_sealed_train_val_test=$true;line_dataset_authorized_and_sealed=$true;generic_text_line_only=$true;generic_test_oov_fail_closed_by_source=$true;test_split_oov_zero=$true;test_split_used_for_training=$false;train_val_test_closed=$true;onnx_export_complete=$true;fixed_clone_import_attested=$true;gpu_idle_and_exact8_absent_before_train=$true;every_stage_rc_zero=$true;every_stage_stderr_zero_bytes=$true;every_stage_descendant_absence_proven=$true;process_tree_cleanup_on_failure=$true;git_and_nvidia_smi_bound_before_first_query_and_stable=$true;source_teacher_and_executables_stable=$true;onnx_sha_bound=$true}
+        validation=[ordered]@{fresh_no_resume_no_clobber=$true;teacher_sealed_train_val_test=$true;line_dataset_authorized_and_sealed=$true;generic_text_line_only=$true;generic_test_oov_fail_closed_by_source=$true;test_split_oov_zero=$true;test_split_used_for_training=$false;train_val_test_closed=$true;onnx_export_complete=$true;fixed_clone_import_attested=$true;gpu_idle_and_exact8_absent_before_train=$true;every_stage_rc_zero=$true;every_stage_stderr_zero_bytes=$true;every_stage_job_empty_proven=$true;kernel_job_cleanup_on_failure=$true;create_suspended_assign_before_resume=$true;git_and_nvidia_smi_bound_before_first_query_and_stable=$true;source_teacher_and_executables_stable=$true;onnx_sha_bound=$true}
         started_utc=$PipelineStartedUtc.ToString('o');completed_utc=[DateTime]::UtcNow.ToString('o')
     })
     $readback=Read-Json $pipelinePath

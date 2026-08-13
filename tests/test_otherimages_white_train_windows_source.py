@@ -105,30 +105,103 @@ def test_gpu_and_exact8_concurrency_are_fail_closed_before_training() -> None:
     assert "Assert-NoConflictingGpuWork 'immediately-before-student-train'" in source
 
 
-def test_fresh_no_resume_process_tree_cleanup_and_failure_evidence() -> None:
+def test_fresh_no_resume_kernel_job_cleanup_and_failure_evidence() -> None:
     source = _source()
     assert "CreateDirectoryW" in source
     assert "RunRoot must be brand-new and is never resumed" in source
-    assert "Stop-ProcessTree" in source
-    assert "ParentProcessId" in source
-    assert "finally" in source
-    assert "process tree remained alive after forced stop and bounded wait" in source
-    assert "redirected stream did not close within the bounded wait" in source
-    assert "forced_process_tree_stop" in source
-    assert "Add-ObservedDescendantPids" in source
-    assert "observed_descendant_pids" in source
-    assert "descendant_absence_proven" in source
-    assert "Wait-ProcessIdsAbsent" in source
-    assert "finally { $process.Dispose() }" in source
+    for symbol in (
+        "CreateJobObjectW",
+        "SetInformationJobObject",
+        "JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE",
+        "CreateProcessW",
+        "CREATE_SUSPENDED",
+        "STARTUPINFOEX",
+        "EXTENDED_STARTUPINFO_PRESENT",
+        "PROC_THREAD_ATTRIBUTE_HANDLE_LIST",
+        "InitializeProcThreadAttributeList",
+        "UpdateProcThreadAttribute",
+        "DeleteProcThreadAttributeList",
+        "AssignProcessToJobObject",
+        "ResumeThread",
+        "QueryInformationJobObject",
+        "TerminateJobObject",
+        "WaitForJobEmpty",
+    ):
+        assert symbol in source
+    assert "StartSuspendedAssigned" in source
+    assert "nested job constraints may forbid safe containment" in source
+    assert "forced_job_termination" in source
+    assert "finally { if ($null -ne $process) { $process.Dispose() } }" in source
     stage_helper = source[source.index("function Invoke-PythonStage") : source.index("function Complete-Stage")]
-    assert stage_helper.index("finally { $process.Dispose() }") > stage_helper.index("Write-JsonNew")
-    assert "Wait-ProcessIdsAbsent $observedIds 30000" in stage_helper
+    assert stage_helper.index("$process.CloseJob()") < stage_helper.index("[IO.File]::ReadAllText")
+    assert stage_helper.index("finally { if ($null -ne $process) { $process.Dispose() } }") > stage_helper.index(
+        "Write-StageFailureEvidenceBestEffort"
+    )
+    assert "$process.WaitForJobEmpty(30000)" in stage_helper
+    assert "$process.CloseJob(); $jobHandleClosed=$true" in stage_helper
     assert "stage.failure.json" in source
+    assert "stage.failure.fallback.txt" in source
     assert "pipeline.failure.json" in source
     assert "oom_detected" in source
     assert "resume_or_reuse_allowed=$false" in source
     for forbidden in ("Remove-Item", "Move-Item", "Copy-Item", "Start-Job"):
         assert forbidden not in source
+
+
+def test_suspended_root_is_assigned_before_resume_without_pid_based_kill_races() -> None:
+    source = _source()
+    native = source[source.index("public sealed class WhiteTrainNativeJobProcessV1") : source.index("function Get-DirectoryIdentity")]
+    launch = native[native.index("StartSuspendedAssigned") : native.index("private static long ToLong")]
+    assert launch.index("CreateProcessW(applicationName") < launch.index("AssignProcessToJobObject(job,processInfo.hProcess)")
+    assert launch.index("AssignProcessToJobObject(job,processInfo.hProcess)") < launch.index("accounting.ActiveProcesses!=1")
+    assert launch.index("accounting.ActiveProcesses!=1") < launch.index("ResumeThread(processInfo.hThread)")
+    assert "TerminateProcess(processInfo.hProcess,254)" in launch
+    assert "CREATE_SUSPENDED|CREATE_UNICODE_ENVIRONMENT|CREATE_NO_WINDOW" in launch
+    assert "|EXTENDED_STARTUPINFO_PRESENT" in launch
+    assert "Marshal.WriteIntPtr(handleList,0*IntPtr.Size,stdinHandle)" in launch
+    assert "Marshal.WriteIntPtr(handleList,1*IntPtr.Size,stdoutHandle)" in launch
+    assert "Marshal.WriteIntPtr(handleList,2*IntPtr.Size,stderrHandle)" in launch
+    assert "UpdateProcThreadAttribute(attributeList,0,PROC_THREAD_ATTRIBUTE_HANDLE_LIST" in launch
+    assert launch.index("UpdateProcThreadAttribute(attributeList") < launch.index("CreateProcessW(applicationName")
+    assert "if (attributeListInitialized) DeleteProcThreadAttributeList(attributeList)" in launch
+    stage = source[source.index("function Invoke-PythonStage") : source.index("function Complete-Stage")]
+    assert stage.index("StartSuspendedAssigned") < stage.index("while (-not $process.WaitForExit(1000))")
+    assert "foreach ($environmentName in" in stage
+    assert "foreach ($name in" not in stage
+    assert "$process.Start()" not in source
+    for forbidden in (
+        "Get-CimProcessIdentity",
+        "ParentProcessId",
+        "Stop-Process -Id",
+        "Stop-ProcessTree",
+        "Wait-ProcessIdsAbsent",
+        "observed_descendant_pids",
+    ):
+        assert forbidden not in source
+    assert "New-Object Collections.Generic.List" not in source
+    assert "New-Object 'Collections.Generic.List" not in source
+    assert "New-Object 'Collections.Generic.HashSet" not in source
+    assert "[Collections.Generic.List" not in source
+    assert "[Collections.Generic.HashSet" not in source
+    assert "Collections.ArrayList" not in source
+
+
+def test_stream_or_evidence_failure_still_has_create_new_fallback_failure_evidence() -> None:
+    source = _source()
+    helper = source[
+        source.index("function Write-StageFailureEvidenceBestEffort") : source.index("function Invoke-PythonStage")
+    ]
+    assert "Write-JsonNew $failurePath" in helper
+    assert "stage.failure.fallback.txt" in helper
+    assert "otherimages_white_train_windows_stage_failure_fallback_v1" in helper
+    assert "[IO.FileMode]::CreateNew" in helper
+    stage = source[source.index("function Invoke-PythonStage") : source.index("function Complete-Stage")]
+    assert "$evidenceError=$null" in stage
+    assert "catch { $evidenceError=$_" in stage
+    assert "-or $null -ne $evidenceError" in stage
+    assert "Write-StageFailureEvidenceBestEffort" in stage
+    assert stage.index("Write-StageFailureEvidenceBestEffort") > stage.index("$process.CloseJob()")
+    assert stage.index("Write-StageFailureEvidenceBestEffort") > stage.index("[IO.File]::ReadAllText")
 
 
 def test_rc_stderr_output_and_onnx_closure_are_strict() -> None:
@@ -138,9 +211,12 @@ def test_rc_stderr_output_and_onnx_closure_are_strict() -> None:
     assert "$bytes[1] -ne 0x0d" in source
     assert "$bytes[2] -ne 0x0a" in source
     assert "stderr.size_bytes -ne 0" in source
-    assert "stderr_nonempty=$stderrNonEmpty" in source
-    assert "-or $stderrNonEmpty" in source
-    assert source.index("-or $stderrNonEmpty") < source.index("stderr_nonempty=$stderrNonEmpty")
+    assert "stderr_nonempty=$StderrNonEmpty" in source
+    stage_helper = source[source.index("function Invoke-PythonStage") : source.index("function Complete-Stage")]
+    assert "-or $stderrNonEmpty" in stage_helper
+    assert stage_helper.index("-or $stderrNonEmpty") < stage_helper.index(
+        "Write-StageFailureEvidenceBestEffort"
+    )
     assert "WHITE_TRAIN_STAGE_ALIVE" in source
     assert "Student checkpoint output" in source
     assert "Student analysis candidate" in source
