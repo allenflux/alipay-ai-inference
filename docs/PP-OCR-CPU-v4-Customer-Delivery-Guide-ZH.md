@@ -1,12 +1,12 @@
-# PP-OCR CPU v4 客户交付、验收与迁移指南
+# PP-OCR CPU v4 r2 客户交付、验收与迁移指南
 
-> 适用版本：`receipt_full_page_ppocr_cpu_delivery_v4`  
+> 适用版本：`receipt_full_page_ppocr_cpu_delivery_v4`（规则修订版 r2）
 > 运行方式：Windows x64、纯 CPU、批量并行  
 > 发布状态：客户验收版；按本文完成远程验收并保存报告后转为正式交付
 
 ## 1. 交付概述
 
-PP-OCR CPU v4 是一套无需 GPU 的通用中文 OCR 交付包。蓝色凭证、白色凭证及其他支持格式的图片均走同一套全页识别流程，不需要先判断“蓝图/白图”。
+PP-OCR CPU v4 r2 是一套无需 GPU 的通用中文 OCR 交付包。蓝色凭证、白色凭证及其他支持格式的图片均走同一套全页识别流程，不需要先判断“蓝图/白图”。
 
 交付包配置以下 4 个 ONNX 模型；设备模型和文本检测模型按图片运行，方向分类与文本识别模型对检测出的文本区域运行：
 
@@ -18,7 +18,7 @@ PP-OCR CPU v4 是一套无需 GPU 的通用中文 OCR 交付包。蓝色凭证�
 正式交付目录建议统一命名为：
 
 ```text
-D:\alipay-ai-data\delivery\pp-final-v4
+D:\alipay-ai-data\delivery\pp-final-v4-r2
 ```
 
 交付包包含两个可用入口，其中批量脚本是唯一正式生产入口：
@@ -135,6 +135,18 @@ Microsoft.NETCore.App 8.x.x
 
 无法由当前映射规则形成值时，该字段输出 JSON `null`。非空值仍属于 review-only OCR/规则结果，可能发生误识别；客户应按自身业务风险要求进行抽查或复核。
 
+r2 在不改变上述 14 字段结构的前提下，补充了支付宝“账单详情”页面的严格固定映射：
+
+- `创建时间` → `transfer_time`；
+- `付款方式` → `payment_method`；
+- `转账备注` → `transfer_note`；
+- `订单号` / `交易订单号` → `voucher_number`；
+- `账单分类` 的受支持值 → `voucher_type`；
+- 页面顶部唯一、完整的负金额文本（例如 `-199.90`）→ `amount`；
+- 出账方向下，`对方账户` 中唯一的“姓名 + 脱敏邮箱”可拆分到 `recipient_name` 和 `recipient_account`。
+
+这些别名只有在页面同时出现 `账单分类 + 订单号 + 创建时间` 的完整账单详情画像时才启用。`支付奖励`、`账单管理`、`标签`、`计入收支`、普通 `备注`、`再转一笔` 等界面按钮或元数据不会作为交易字段值。存在方向冲突、多个候选、姓名账号不一致或格式不符合约束时，程序输出 `null`，不会猜测填值。
+
 示例：
 
 ```json
@@ -210,7 +222,7 @@ throughput.gate_passed = true   # 使用吞吐门时
 ### 7.1 设置交付包路径
 
 ```powershell
-$pkg = 'D:\alipay-ai-data\delivery\pp-final-v4'
+$pkg = 'D:\alipay-ai-data\delivery\pp-final-v4-r2'
 
 if (-not (Test-Path -LiteralPath $pkg -PathType Container)) {
     throw "找不到交付包：$pkg"
@@ -224,9 +236,9 @@ dotnet --list-runtimes
 ### 7.2 单图功能验收
 
 ```powershell
-$pkg = 'D:\alipay-ai-data\delivery\pp-final-v4'
+$pkg = 'D:\alipay-ai-data\delivery\pp-final-v4-r2'
 $img = 'D:\download2\BlueImages\s3_voucher_GWCZ2071987126068711424_20260701000133.jpg'
-$out = 'D:\alipay-ai-data\delivery-validation\pp-v4-single-' + (Get-Date -Format 'yyyyMMdd-HHmmss')
+$out = 'D:\alipay-ai-data\delivery-validation\pp-v4-r2-single-' + (Get-Date -Format 'yyyyMMdd-HHmmss')
 
 if (Test-Path -LiteralPath $out) {
     throw "输出目录必须是全新目录：$out"
@@ -260,7 +272,7 @@ if ($rc -ne 0) {
 ```powershell
 $blueRoot = 'D:\download2\BlueImages'
 $whiteRoot = 'D:\download2\OtherImages'
-$acceptInput = 'D:\alipay-ai-data\acceptance\pp-v4-200-input-a'
+$acceptInput = 'D:\alipay-ai-data\acceptance\pp-v4-r2-200-input-a'
 $extensions = @('.png', '.jpg', '.jpeg', '.bmp', '.webp')
 
 if (Test-Path -LiteralPath $acceptInput) {
@@ -316,9 +328,9 @@ if ($actual -ne 200) { throw "验收输入不是200张，实际=$actual" }
 ### 7.4 批量并行性能验收
 
 ```powershell
-$pkg = 'D:\alipay-ai-data\delivery\pp-final-v4'
-$acceptInput = 'D:\alipay-ai-data\acceptance\pp-v4-200-input-a'
-$acceptOutput = 'D:\alipay-ai-data\acceptance\pp-v4-200-output-' + (Get-Date -Format 'yyyyMMdd-HHmmss')
+$pkg = 'D:\alipay-ai-data\delivery\pp-final-v4-r2'
+$acceptInput = 'D:\alipay-ai-data\acceptance\pp-v4-r2-200-input-a'
+$acceptOutput = 'D:\alipay-ai-data\acceptance\pp-v4-r2-200-output-' + (Get-Date -Format 'yyyyMMdd-HHmmss')
 
 if (Test-Path -LiteralPath $acceptOutput) {
     throw "验收输出目录必须是全新目录：$acceptOutput"
@@ -401,7 +413,7 @@ Get-FileHash -LiteralPath $acceptEvidenceZip -Algorithm SHA256 | Format-List
 正式批量生产建议继续保留吞吐门：
 
 ```powershell
-$pkg = 'D:\alipay-ai-data\delivery\pp-final-v4'
+$pkg = 'D:\alipay-ai-data\delivery\pp-final-v4-r2'
 $input = 'D:\customer-data\receipt-input-20260818'
 $output = 'D:\customer-data\receipt-output-' + (Get-Date -Format 'yyyyMMdd-HHmmss')
 
@@ -431,8 +443,8 @@ if ($rc -ne 0) {
 迁移前确保没有 OCR 任务正在运行，然后执行：
 
 ```powershell
-$sourcePackage = 'D:\alipay-ai-data\delivery\pp-final-v4'
-$zip = 'D:\alipay-ai-data\delivery\pp-final-v4.zip'
+$sourcePackage = 'D:\alipay-ai-data\delivery\pp-final-v4-r2'
+$zip = 'D:\alipay-ai-data\delivery\pp-final-v4-r2.zip'
 
 if (-not (Test-Path -LiteralPath $sourcePackage -PathType Container)) {
     throw "找不到源交付包：$sourcePackage"
@@ -450,10 +462,10 @@ Get-FileHash -LiteralPath $zip -Algorithm SHA256 | Format-List
 ### 9.2 目标服务器恢复
 
 ```powershell
-$zip = 'D:\transfer\pp-final-v4.zip'
+$zip = 'D:\transfer\pp-final-v4-r2.zip'
 $expectedSha256 = '由交付方提供的64位SHA256'
 $deliveryParent = 'D:\alipay-ai-data\delivery'
-$targetPackage = Join-Path $deliveryParent 'pp-final-v4'
+$targetPackage = Join-Path $deliveryParent 'pp-final-v4-r2'
 
 if ($expectedSha256 -notmatch '^[0-9a-fA-F]{64}$') {
     throw 'expectedSha256 必须是交付方提供的64位十六进制SHA256'
@@ -527,8 +539,8 @@ dotnet --list-runtimes
 
 | 项目 | 记录值 |
 |---|---|
-| 交付版本 | PP-OCR CPU v4 |
-| 交付目录 | `D:\alipay-ai-data\delivery\pp-final-v4` |
+| 交付版本 | PP-OCR CPU v4 r2 |
+| 交付目录 | `D:\alipay-ai-data\delivery\pp-final-v4-r2` |
 | 迁移 ZIP SHA-256 | 由交付方与客户共同记录 |
 | 服务器 CPU | 从 `batch-report.json` 记录 |
 | 自动 worker/thread 方案 | 从 `batch-report.json` 记录 |
