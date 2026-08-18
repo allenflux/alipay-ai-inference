@@ -226,7 +226,7 @@ dotnet --list-runtimes
 ```powershell
 $pkg = 'D:\alipay-ai-data\delivery\pp-final-v4'
 $img = 'D:\download2\BlueImages\s3_voucher_GWCZ2071987126068711424_20260701000133.jpg'
-$out = 'D:\alipay-ai-data\delivery-validation\pp-v4-single-a'
+$out = 'D:\alipay-ai-data\delivery-validation\pp-v4-single-' + (Get-Date -Format 'yyyyMMdd-HHmmss')
 
 if (Test-Path -LiteralPath $out) {
     throw "输出目录必须是全新目录：$out"
@@ -237,9 +237,12 @@ powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
   -InputImage $img `
   -OutputDirectory $out
 
-if ($LASTEXITCODE -ne 0) {
-    throw "单图验收失败 rc=$LASTEXITCODE"
+$rc = $LASTEXITCODE
+if ($rc -ne 0) {
+    throw "单图验收失败 rc=$rc"
 }
+
+"单图验收成功，结果目录：$out"
 ```
 
 验收要求：
@@ -315,7 +318,7 @@ if ($actual -ne 200) { throw "验收输入不是200张，实际=$actual" }
 ```powershell
 $pkg = 'D:\alipay-ai-data\delivery\pp-final-v4'
 $acceptInput = 'D:\alipay-ai-data\acceptance\pp-v4-200-input-a'
-$acceptOutput = 'D:\alipay-ai-data\acceptance\pp-v4-200-output-a'
+$acceptOutput = 'D:\alipay-ai-data\acceptance\pp-v4-200-output-' + (Get-Date -Format 'yyyyMMdd-HHmmss')
 
 if (Test-Path -LiteralPath $acceptOutput) {
     throw "验收输出目录必须是全新目录：$acceptOutput"
@@ -364,6 +367,7 @@ if ([string]$summary.status -ne 'completed' `
 
 $summary | ConvertTo-Json -Depth 20
 'PP_V4_CUSTOMER_ACCEPTANCE_PASS'
+"批量验收结果目录：$acceptOutput"
 ```
 
 验收完成后必须保存整个 `$acceptOutput` 目录，不能只复制顶层报告。完整目录包含输入快照、worker 固定清单、逐图结果、worker 报告和原始日志，是复核报告的证据闭包。至少应确认以下内容存在：
@@ -381,8 +385,8 @@ workers\
 建议验收后将整个目录压缩并记录 SHA-256：
 
 ```powershell
-$acceptOutput = 'D:\alipay-ai-data\acceptance\pp-v4-200-output-a'
-$acceptEvidenceZip = 'D:\alipay-ai-data\acceptance\pp-v4-200-output-a.zip'
+# 紧接第 7.4 节在同一个 PowerShell 窗口执行，继续使用其 $acceptOutput。
+$acceptEvidenceZip = $acceptOutput + '.zip'
 
 if (Test-Path -LiteralPath $acceptEvidenceZip) {
     throw "验收证据压缩包已存在：$acceptEvidenceZip"
@@ -399,7 +403,7 @@ Get-FileHash -LiteralPath $acceptEvidenceZip -Algorithm SHA256 | Format-List
 ```powershell
 $pkg = 'D:\alipay-ai-data\delivery\pp-final-v4'
 $input = 'D:\customer-data\receipt-input-20260818'
-$output = 'D:\customer-data\receipt-output-20260818-a'
+$output = 'D:\customer-data\receipt-output-' + (Get-Date -Format 'yyyyMMdd-HHmmss')
 
 powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
   -File (Join-Path $pkg 'run-receipt-pp-batch-cpu.ps1') `
@@ -408,9 +412,12 @@ powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
   -Workers Auto `
   -MinimumThroughput 1.0
 
-if ($LASTEXITCODE -ne 0) {
-    throw "正式批处理失败 rc=$LASTEXITCODE"
+$rc = $LASTEXITCODE
+if ($rc -ne 0) {
+    throw "正式批处理失败 rc=$rc"
 }
+
+"正式批处理完成，结果目录：$output"
 ```
 
 `Workers Auto` 会读取当前服务器可用处理器数量，并自动分配最多 4 个 worker。迁移到不同 CPU 的服务器后，不应沿用旧服务器的固定线程数。
