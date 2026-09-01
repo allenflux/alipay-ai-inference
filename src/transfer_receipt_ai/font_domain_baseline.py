@@ -528,6 +528,7 @@ class FontDomainPublicationSafety:
         if self.leakage_metadata not in {
             "required_and_present",
             "incomplete_allowed",
+            "device_platform_weak_pseudo",
             "not_asserted",
         }:
             raise ValueError("invalid leakage_metadata publication status")

@@ -87,6 +87,27 @@ receipt-font-domain-consistency export-classifier \
 - `errors.jsonl`：成功运行时为空；输入或模型绑定失败时命令 fail closed；
 - `run.json`：模型/清单 SHA-256、数量、决定分布和输出哈希。
 
+## 现有裁图库零人工快跑
+
+如果已经有 `ocr_pseudolabels` 生成的 `pseudo_labels.jsonl`、字段裁图和对应推理结果 JSON，不需要重新截图、OCR、裁图或逐张标注。下面的命令会自动按原图聚合正文区域，从结果里的 `device.platform` 取得高置信 iOS/Android 弱标签，过滤 `uncertain`、低置信和设备先验冲突，使用上游 `group_id` 把同一回单的重复 capture 锁在同一个来源组和 split，再按规范文本内容做连通切分，并复制一个默认每域最多 500 张的独立 pilot 数据集：
+
+```powershell
+receipt-font-domain-consistency bootstrap-existing `
+  --records "D:\alipay-ai-data\receipt-lite-teacher-120k-v1\paddle-teacher-labels-5field-recipient95-v12-r3-4090-r1\pseudo_labels.jsonl" `
+  --output "D:\alipay-ai-data\font-domain-device-pseudo-v1"
+
+receipt-font-domain-consistency fit `
+  --records "D:\alipay-ai-data\font-domain-device-pseudo-v1\font_domain.auto.jsonl" `
+  --output "D:\alipay-ai-data\font-domain-device-pseudo-v1.model.json" `
+  --skip-near-duplicate-audit
+```
+
+正文只使用 `amount`、`recipient_field`、`transfer_status` 和 `payment_method_field`；现有数据里的 `time` 是状态栏时间，会自动排除，避免把系统状态栏字体和支付宝正文混为一类。输出清单与 `bootstrap.json` 会记录 `device_platform_weak_pseudo_v1` 标签来源；`fit` 检测到训练/校准集含该来源后，会在模型自哈希证据中写入 `leakage_metadata: "device_platform_weak_pseudo"`，使发布安全状态固定为未满足。分析时必须显式使用 `--allow-experimental-model`，结果仍强制人工复核且 `authenticity: "not_assessed"`。
+
+弱标签 pilot 中会跨回单反复出现“支付成功”“余额”等固定 UI 文案；即使来源与整图内容组已经隔离，这些相同的单区域裁图仍可能触发默认 region pHash 近重复启发式。因此上面的零人工快跑显式使用 `--skip-near-duplicate-audit`。这是为了让 pilot 能运行，不代表已经证明无泄漏；该状态会进入模型证据并保持不可发布。后续使用独立真值做正式验收时不得沿用这个跳过选项，仍需满足 exact/pHash 泄漏审计为零。
+
+这条快路只用于零人工判断“现有图片是否存在可分的 iOS/Android 渲染信号”。`fit` 对自动切分 `test` 的评估，会先移除同源的 `device_prior_domain`，再用裁图特征与区域角色预测，并和 `device.platform` 伪标签比较；它报告 classification coverage、selective/overall accuracy 和 PASS/REVIEW/UNKNOWN 分布，但仍然只回答弱标签是否可分。它不是独立人工真值，不是准确字体名称鉴定，也不能证明图片真实或被篡改。结果不能用于设定生产阈值或发布模型，也不能自动得到小米、OPPO、vivo、HarmonyOS 或支付宝字体版本真值。后续可以对每个平台内部做匿名聚类寻找候选子域，但不稳定的簇不得强行命名。
+
 ## 当前基线和后续模型
 
 v1 基线使用灰度/前景归一化后的 LBP、HOG、笔画宽度、形态学、连通域和边缘灰阶 64 维特征。它以训练集的稳健中位数/MAD 做缩放，学习通用域 prototype，并在角色样本足够时学习角色 prototype。calibration split 用于温度和域内距离校准；低质量、低支持、低 margin 或域外样本输出 `unknown`。

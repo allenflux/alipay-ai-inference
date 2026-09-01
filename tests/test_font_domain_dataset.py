@@ -192,6 +192,29 @@ def test_source_and_content_groups_cannot_leak_across_bindings(
         load_font_domain_dataset(manifest, require_labels=True)
 
 
+def test_repeated_capture_group_may_bind_multiple_source_image_hashes(
+    tmp_path: Path,
+) -> None:
+    records = [
+        _document("capture-one", source_group="same-receipt"),
+        _document("capture-two", source_group="same-receipt"),
+    ]
+    records[0]["source_image_sha256"] = "1" * 64
+    records[1]["source_image_sha256"] = "2" * 64
+    _prepare_images(tmp_path, records)
+
+    dataset = load_font_domain_dataset(
+        _write_manifest(tmp_path, records),
+        require_labels=True,
+        require_leakage_metadata=False,
+    )
+
+    assert len(dataset.documents) == 2
+    assert {document.source_group_id for document in dataset.documents} == {
+        "same-receipt"
+    }
+
+
 def test_exact_decoded_pixels_cannot_cross_splits_even_with_different_files(tmp_path: Path) -> None:
     pixels = np.arange(28 * 72 * 3, dtype=np.uint16).reshape(28, 72, 3).astype(np.uint8)
     records = [

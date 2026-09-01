@@ -9,6 +9,7 @@ import os
 import secrets
 import sys
 from collections import Counter
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -32,6 +33,7 @@ from .font_domain_dataset import (
 
 
 RUN_KIND = "receipt_font_domain_run_v1"
+DEVICE_PLATFORM_WEAK_LABEL_SOURCE = "device_platform_weak_pseudo_v1"
 
 
 def _json_bytes(value: object, *, pretty: bool = False) -> bytes:
@@ -129,6 +131,132 @@ def _load_training_dataset(args: argparse.Namespace) -> Any:
     return dataset, near_duplicate_audit
 
 
+def _classification_metrics(
+    labeled_predictions: list[tuple[str, str | None]],
+) -> dict[str, object]:
+    """Summarize selective classification without treating abstention as coverage."""
+
+    total = len(labeled_predictions)
+    covered = sum(prediction is not None for _, prediction in labeled_predictions)
+    correct = sum(
+        prediction is not None and prediction == reference
+        for reference, prediction in labeled_predictions
+    )
+    prediction_counts = Counter(
+        prediction if prediction is not None else "unknown"
+        for _, prediction in labeled_predictions
+    )
+    return {
+        "total": total,
+        "covered": covered,
+        "correct": correct,
+        "classification_coverage": round(covered / total, 6) if total else 0.0,
+        "selective_accuracy": round(correct / covered, 6) if covered else None,
+        "overall_accuracy": round(correct / total, 6) if total else 0.0,
+        "prediction_counts": {
+            prediction: int(prediction_counts[prediction])
+            for prediction in sorted(prediction_counts)
+        },
+    }
+
+
+def _metrics_with_domains(
+    labeled_predictions: list[tuple[str, str | None]],
+) -> dict[str, object]:
+    metrics = _classification_metrics(labeled_predictions)
+    metrics["per_domain"] = {
+        domain: _classification_metrics(
+            [
+                (reference, prediction)
+                for reference, prediction in labeled_predictions
+                if reference == domain
+            ]
+        )
+        for domain in sorted({reference for reference, _ in labeled_predictions})
+    }
+    return metrics
+
+
+def _evaluate_held_out(
+    model: Any,
+    dataset: Any,
+    *,
+    test_label_sources: list[str],
+) -> dict[str, object]:
+    """Evaluate the fitted model on labeled test documents only.
+
+    Coverage is reported separately from selective accuracy so UNKNOWN
+    abstentions cannot make the result look more accurate than it is. The
+    overall accuracy denominator includes abstentions.
+    """
+
+    test_documents = [
+        document
+        for document in dataset.documents
+        if document.split == "test" and document.font_domain is not None
+    ]
+    if not test_documents:
+        return {
+            "status": "not_available",
+            "authenticity": "not_assessed",
+            "device_prior_used": False,
+            "reference_label_used_for_prediction": False,
+            "reference_label_sources": test_label_sources,
+            "documents": _metrics_with_domains([]),
+            "regions": _metrics_with_domains([]),
+            "decision_counts": {decision: 0 for decision in ("PASS", "REVIEW", "UNKNOWN")},
+            "decision_rates": {decision: 0.0 for decision in ("PASS", "REVIEW", "UNKNOWN")},
+        }
+
+    document_predictions: list[tuple[str, str | None]] = []
+    region_predictions: list[tuple[str, str | None]] = []
+    decision_counts: Counter[str] = Counter()
+    for document in test_documents:
+        reference = document.font_domain
+        # The filter above establishes this for the type checker and keeps
+        # inference-only rows out of the held-out denominator.
+        if reference is None:  # pragma: no cover - defensive invariant
+            continue
+        # ``device_prior_domain`` is derived from the same device classifier as
+        # the weak reference label in bootstrap datasets.  Remove it here so
+        # held-out decisions and metrics are image-feature-only evidence.
+        result = predict_document(model, replace(document, device_prior_domain=None))
+        document_predictions.append((reference, result.dominant_domain))
+        decision_counts[result.decision] += 1
+        region_predictions.extend(
+            (reference, line.label if line.accepted else None)
+            for line in result.lines
+            if line.include_in_consistency
+        )
+
+    weak_test_labels = DEVICE_PLATFORM_WEAK_LABEL_SOURCE in test_label_sources
+    status = "test_split_labels_not_independently_assessed"
+    if weak_test_labels:
+        status = (
+            "weak_pseudo_test_split"
+            if test_label_sources == [DEVICE_PLATFORM_WEAK_LABEL_SOURCE]
+            else "mixed_including_weak_pseudo_test_split"
+        )
+    total_documents = len(document_predictions)
+    return {
+        "status": status,
+        "authenticity": "not_assessed",
+        "device_prior_used": False,
+        "reference_label_used_for_prediction": False,
+        "reference_label_sources": test_label_sources,
+        "documents": _metrics_with_domains(document_predictions),
+        "regions": _metrics_with_domains(region_predictions),
+        "decision_counts": {
+            decision: int(decision_counts[decision])
+            for decision in ("PASS", "REVIEW", "UNKNOWN")
+        },
+        "decision_rates": {
+            decision: round(decision_counts[decision] / total_documents, 6)
+            for decision in ("PASS", "REVIEW", "UNKNOWN")
+        },
+    }
+
+
 def _validate(args: argparse.Namespace) -> dict[str, object]:
     require_labels: bool | None
     if args.mode == "training":
@@ -160,22 +288,48 @@ def _validate(args: argparse.Namespace) -> dict[str, object]:
 
 def _fit(args: argparse.Namespace) -> dict[str, object]:
     dataset, near_duplicate_audit = _load_training_dataset(args)
+    label_sources = sorted(
+        {
+            document.label_source
+            for document in dataset.documents
+            if document.label_source is not None
+        }
+    )
+    training_label_sources = sorted(
+        {
+            document.label_source
+            for document in dataset.documents
+            if document.split in {"train", "calibration"}
+            and document.label_source is not None
+        }
+    )
+    test_label_sources = sorted(
+        {
+            document.label_source
+            for document in dataset.documents
+            if document.split == "test" and document.label_source is not None
+        }
+    )
+    weak_device_training_labels = (
+        DEVICE_PLATFORM_WEAK_LABEL_SOURCE in training_label_sources
+    )
+    # A device-platform pseudo label is useful for a zero-touch pilot, but it
+    # is not independent font-domain ground truth.  Persist that limitation in
+    # the self-hashed publication safety state so the resulting model can only
+    # run through the explicit experimental path.
+    leakage_metadata_status = "required_and_present"
+    if weak_device_training_labels:
+        leakage_metadata_status = "device_platform_weak_pseudo"
+    elif args.allow_incomplete_leakage_metadata:
+        leakage_metadata_status = "incomplete_allowed"
     if near_duplicate_audit is None:
         publication_safety = FontDomainPublicationSafety(
-            leakage_metadata=(
-                "incomplete_allowed"
-                if args.allow_incomplete_leakage_metadata
-                else "required_and_present"
-            ),
+            leakage_metadata=leakage_metadata_status,
             near_duplicate_audit="skipped",
         )
     else:
         publication_safety = FontDomainPublicationSafety(
-            leakage_metadata=(
-                "incomplete_allowed"
-                if args.allow_incomplete_leakage_metadata
-                else "required_and_present"
-            ),
+            leakage_metadata=leakage_metadata_status,
             near_duplicate_audit="passed",
             perceptual_hash_abi=str(near_duplicate_audit["perceptual_hash_abi"]),
             maximum_hamming_distance=int(near_duplicate_audit["maximum_hamming_distance"]),
@@ -215,6 +369,11 @@ def _fit(args: argparse.Namespace) -> dict[str, object]:
             + f" (required per domain: {model.minimum_calibration_groups_per_domain}). "
             "Use --allow-uncalibrated-model only for an UNKNOWN-by-default PoC model."
         )
+    held_out_evaluation = _evaluate_held_out(
+        model,
+        dataset,
+        test_label_sources=test_label_sources,
+    )
     publication = save_font_domain_model(model, args.output)
     return {
         "schema_version": SCHEMA_VERSION,
@@ -233,6 +392,15 @@ def _fit(args: argparse.Namespace) -> dict[str, object]:
         "calibration_prerequisites_met": not unready_domains,
         "ood_gate_effective": model.gates.fit_p_value > 0.0 and not unready_domains,
         "publication_safety": model.publication_safety.as_dict(),
+        "label_sources": label_sources,
+        "training_label_sources": training_label_sources,
+        "test_label_sources": test_label_sources,
+        "label_evidence_status": (
+            "device_platform_weak_pseudo"
+            if weak_device_training_labels
+            else "not_independently_assessed"
+        ),
+        "held_out_evaluation": held_out_evaluation,
         "publication_prerequisites_recorded": (
             not unready_domains
             and model.gates.fit_p_value > 0.0
@@ -254,6 +422,21 @@ def _export_classifier(args: argparse.Namespace) -> dict[str, object]:
         "dataset_root": dataset.root.as_posix(),
         "note": "The exported manifest stays beside the source manifest so image paths remain bound.",
     }
+
+
+def _bootstrap_existing(args: argparse.Namespace) -> dict[str, object]:
+    from .font_domain_bootstrap import bootstrap_existing_pseudolabels
+
+    return bootstrap_existing_pseudolabels(
+        args.records,
+        args.output,
+        minimum_device_confidence=args.minimum_device_confidence,
+        minimum_regions=args.minimum_regions,
+        maximum_documents_per_domain=args.maximum_documents_per_domain,
+        split_seed=args.split_seed,
+        train_ratio=args.train_ratio,
+        calibration_ratio=args.calibration_ratio,
+    )
 
 
 def _analyze(args: argparse.Namespace) -> dict[str, object]:
@@ -392,6 +575,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    bootstrap = subparsers.add_parser(
+        "bootstrap-existing",
+        help="Build a zero-touch iOS/Android weak-label pilot from existing OCR crops",
+    )
+    bootstrap.add_argument("--records", type=Path, required=True, help="Existing pseudo_labels.jsonl")
+    bootstrap.add_argument("--output", type=Path, required=True, help="New bootstrap dataset directory")
+    bootstrap.add_argument("--minimum-device-confidence", type=float, default=0.90)
+    bootstrap.add_argument("--minimum-regions", type=int, default=3)
+    bootstrap.add_argument("--maximum-documents-per-domain", type=int, default=500)
+    bootstrap.add_argument("--split-seed", default="font-domain-device-pseudo-v1")
+    bootstrap.add_argument("--train-ratio", type=float, default=0.60)
+    bootstrap.add_argument("--calibration-ratio", type=float, default=0.20)
+
     validate = subparsers.add_parser("validate", help="Validate a document-level manifest")
     validate.add_argument("--records", type=Path, required=True)
     validate.add_argument("--mode", choices=("training", "inference", "mixed"), default="training")
@@ -446,7 +642,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
-        if args.command == "validate":
+        if args.command == "bootstrap-existing":
+            result = _bootstrap_existing(args)
+        elif args.command == "validate":
             result = _validate(args)
         elif args.command == "fit":
             result = _fit(args)

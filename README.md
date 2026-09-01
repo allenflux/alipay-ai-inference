@@ -32,7 +32,7 @@ alipay-ai-inference/
 
 ## 字体域一致性独立实验
 
-本分支新增离线 `receipt-font-domain-consistency` sidecar，用文档级分组数据验证“一张回单正文应有一个主导手机/应用渲染域”。它不会修改 v4 OCR 或输出真假结论；低质量和未校准样本返回 `UNKNOWN`。数据契约、训练/分析命令和上线门禁见 [docs/font-domain-consistency-v1.md](docs/font-domain-consistency-v1.md)。
+本分支新增离线 `receipt-font-domain-consistency` sidecar，用文档级分组数据验证“一张回单正文应有一个主导手机/应用渲染域”。它不会修改 v4 OCR 或输出真假结论；低质量和未校准样本返回 `UNKNOWN`。已有 `pseudo_labels.jsonl`、字段裁图和设备结果时，`bootstrap-existing` 可零人工生成 iOS/Android 弱标签 pilot。这个快跑会显式跳过容易被“支付成功”“余额”等固定 UI 文案触发的 region pHash 近重复筛查；自动 test 指标只衡量模型与设备伪标签的可分性，不是独立真值、字体鉴定或真实性结论，产物不可发布。数据契约、命令和上线门禁见 [docs/font-domain-consistency-v1.md](docs/font-domain-consistency-v1.md)。
 
 ## Windows + CUDA 环境配置
 

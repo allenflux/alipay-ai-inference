@@ -3,10 +3,12 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 from PIL import Image, ImageDraw
 import pytest
 
+import transfer_receipt_ai.font_domain_cli as cli_module
 from transfer_receipt_ai.font_domain import RESULT_KIND
 from transfer_receipt_ai.font_domain_cli import RUN_KIND, main
 from transfer_receipt_ai.font_domain_dataset import DOCUMENT_KIND
@@ -87,6 +89,7 @@ def _training_manifest(
     root: Path,
     *,
     include_calibration: bool = True,
+    include_test: bool = False,
 ) -> Path:
     records: list[dict[str, object]] = []
     roles = ("amount", "recipient", "time")
@@ -129,6 +132,26 @@ def _training_manifest(
                     regions=regions,
                 )
             )
+    if include_test:
+        for domain in ("android_alipay", "ios_alipay"):
+            for document_index in range(2):
+                regions = []
+                document_id = f"test-{domain}-{document_index}"
+                for region_index, role in enumerate(roles):
+                    relative = (
+                        f"images/{document_id}-{region_index}.png"
+                    )
+                    _write_pattern(root / relative, domain, seed)
+                    seed += 1
+                    regions.append(_region(relative, f"{role}-{region_index}", role))
+                records.append(
+                    _document(
+                        document_id,
+                        split="test",
+                        domain=domain,
+                        regions=regions,
+                    )
+                )
     return _write_manifest(root, "training.jsonl", records)
 
 
@@ -202,6 +225,13 @@ def test_validate_fit_and_analyze_publish_bound_sidecar_without_clobber(
     assert fitted["authenticity"] == "not_assessed"
     assert fitted["publication_prerequisites_recorded"] is False
     assert fitted["model"]["path"] == str(model.resolve())
+    held_out = fitted["held_out_evaluation"]
+    assert held_out["status"] == "not_available"
+    assert held_out["authenticity"] == "not_assessed"
+    assert held_out["documents"]["total"] == 0
+    assert held_out["regions"]["total"] == 0
+    assert held_out["device_prior_used"] is False
+    assert held_out["decision_counts"] == {"PASS": 0, "REVIEW": 0, "UNKNOWN": 0}
     model_before = model.read_bytes()
 
     code, stdout, stderr = _invoke(capsys, *fit_arguments)
@@ -273,6 +303,174 @@ def test_validate_fit_and_analyze_publish_bound_sidecar_without_clobber(
     assert sidecar_path.read_bytes() == sidecar_bytes
     assert errors_path.read_bytes() == errors_bytes
     assert run_path.read_bytes() == run_bytes
+
+
+def test_device_platform_pseudo_labels_force_experimental_model_safety(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    training = _training_manifest(tmp_path / "weak-training", include_test=True)
+    rows = [
+        json.loads(line)
+        for line in training.read_text(encoding="utf-8").splitlines()
+    ]
+    for row in rows:
+        row["label_source"] = "device_platform_weak_pseudo_v1"
+        if row["split"] == "test":
+            # Match the real bootstrap contract.  The evaluator must remove
+            # this label-derived prior before asking for image predictions.
+            row["device_prior_domain"] = row["font_domain"]
+    training.write_text(
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+    def fake_predict_document(model: object, document: object) -> SimpleNamespace:
+        del model
+        assert getattr(document, "device_prior_domain") is None
+        reference = str(getattr(document, "font_domain"))
+        other = "ios_alipay" if reference == "android_alipay" else "android_alipay"
+        correct_document = str(getattr(document, "document_id")).endswith("-0")
+        if correct_document:
+            lines = (
+                SimpleNamespace(include_in_consistency=True, accepted=True, label=reference),
+                SimpleNamespace(include_in_consistency=True, accepted=True, label=reference),
+                SimpleNamespace(include_in_consistency=True, accepted=False, label="unknown"),
+            )
+            return SimpleNamespace(
+                dominant_domain=reference,
+                decision="PASS",
+                lines=lines,
+            )
+        lines = tuple(
+            SimpleNamespace(include_in_consistency=True, accepted=True, label=other)
+            for _ in range(3)
+        )
+        return SimpleNamespace(dominant_domain=other, decision="REVIEW", lines=lines)
+
+    monkeypatch.setattr(cli_module, "predict_document", fake_predict_document)
+
+    model = tmp_path / "weak-model.json"
+    code, stdout, stderr = _invoke(
+        capsys,
+        "fit",
+        "--records",
+        str(training),
+        "--output",
+        str(model),
+        "--skip-near-duplicate-audit",
+        "--confidence-threshold",
+        "0.5",
+        "--margin-threshold",
+        "0",
+        "--fit-p-threshold",
+        "0",
+    )
+
+    assert code == 0
+    assert stderr == ""
+    fitted = json.loads(stdout)
+    assert fitted["near_duplicate_audit"] is None
+    assert fitted["label_sources"] == ["device_platform_weak_pseudo_v1"]
+    assert fitted["training_label_sources"] == ["device_platform_weak_pseudo_v1"]
+    assert fitted["test_label_sources"] == ["device_platform_weak_pseudo_v1"]
+    assert fitted["label_evidence_status"] == "device_platform_weak_pseudo"
+    assert fitted["publication_safety"]["leakage_metadata"] == "device_platform_weak_pseudo"
+    assert fitted["publication_prerequisites_recorded"] is False
+    held_out = fitted["held_out_evaluation"]
+    assert held_out["status"] == "weak_pseudo_test_split"
+    assert held_out["authenticity"] == "not_assessed"
+    assert held_out["device_prior_used"] is False
+    assert held_out["reference_label_used_for_prediction"] is False
+    assert held_out["reference_label_sources"] == ["device_platform_weak_pseudo_v1"]
+    assert held_out["decision_counts"] == {"PASS": 2, "REVIEW": 2, "UNKNOWN": 0}
+    assert held_out["decision_rates"] == {"PASS": 0.5, "REVIEW": 0.5, "UNKNOWN": 0.0}
+    assert held_out["documents"] == {
+        "total": 4,
+        "covered": 4,
+        "correct": 2,
+        "classification_coverage": 1.0,
+        "selective_accuracy": 0.5,
+        "overall_accuracy": 0.5,
+        "prediction_counts": {"android_alipay": 2, "ios_alipay": 2},
+        "per_domain": {
+            domain: {
+                "total": 2,
+                "covered": 2,
+                "correct": 1,
+                "classification_coverage": 1.0,
+                "selective_accuracy": 0.5,
+                "overall_accuracy": 0.5,
+                "prediction_counts": {"android_alipay": 1, "ios_alipay": 1},
+            }
+            for domain in ("android_alipay", "ios_alipay")
+        },
+    }
+    assert held_out["regions"]["total"] == 12
+    assert held_out["regions"]["covered"] == 10
+    assert held_out["regions"]["correct"] == 4
+    assert held_out["regions"]["classification_coverage"] == 0.833333
+    assert held_out["regions"]["selective_accuracy"] == 0.4
+    assert held_out["regions"]["overall_accuracy"] == 0.333333
+    for level in ("documents", "regions"):
+        metrics = held_out[level]
+        assert metrics["classification_coverage"] == round(
+            metrics["covered"] / metrics["total"], 6
+        )
+        assert metrics["overall_accuracy"] == round(
+            metrics["correct"] / metrics["total"], 6
+        )
+        if metrics["covered"]:
+            assert metrics["selective_accuracy"] == round(
+                metrics["correct"] / metrics["covered"], 6
+            )
+        else:
+            assert metrics["selective_accuracy"] is None
+        assert set(metrics["per_domain"]) == {
+            "android_alipay",
+            "ios_alipay",
+        }
+    model_payload = json.loads(model.read_text(encoding="utf-8"))
+    assert model_payload["publication_safety"]["leakage_metadata"] == (
+        "device_platform_weak_pseudo"
+    )
+
+
+def test_test_only_weak_labels_do_not_relabel_training_evidence(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    training = _training_manifest(tmp_path / "test-only-weak", include_test=True)
+    rows = [json.loads(line) for line in training.read_text(encoding="utf-8").splitlines()]
+    for row in rows:
+        if row["split"] == "test":
+            row["label_source"] = "device_platform_weak_pseudo_v1"
+            row["device_prior_domain"] = row["font_domain"]
+    training.write_text(
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+    code, stdout, stderr = _invoke(
+        capsys,
+        "fit",
+        "--records",
+        str(training),
+        "--output",
+        str(tmp_path / "test-only-weak.model.json"),
+        "--skip-near-duplicate-audit",
+    )
+
+    assert code == 0
+    assert stderr == ""
+    fitted = json.loads(stdout)
+    assert fitted["training_label_sources"] == ["synthetic_test_fixture"]
+    assert fitted["test_label_sources"] == ["device_platform_weak_pseudo_v1"]
+    assert fitted["label_evidence_status"] == "not_independently_assessed"
+    assert fitted["publication_safety"]["leakage_metadata"] == "required_and_present"
+    assert fitted["held_out_evaluation"]["status"] == "weak_pseudo_test_split"
+    assert fitted["held_out_evaluation"]["device_prior_used"] is False
 
 
 def test_training_cli_enforces_leakage_metadata_and_content_group_split(

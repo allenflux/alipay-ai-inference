@@ -4,6 +4,9 @@ One JSONL row represents one receipt image and owns all of its text-region
 crops.  This is intentionally different from ordinary crop classification:
 the source image, every crop-margin variant and every compression derivative
 must share one ``source_group_id`` and therefore one split.
+One group may contain multiple source-image hashes when they are repeated
+captures of the same underlying receipt; the split and font domain must still
+remain identical across the whole group.
 
 The manifest labels a *rendering domain* (for example ``ios_alipay``), not an
 exact font file.  ``unknown`` is forbidden as a training label; it is produced
@@ -394,7 +397,7 @@ def load_font_domain_dataset(
     documents: list[FontDomainDocument] = []
     document_ids: set[str] = set()
     image_paths: set[str] = set()
-    group_bindings: dict[str, tuple[str, str | None, str | None]] = {}
+    group_bindings: dict[str, tuple[str, str | None]] = {}
     content_splits: dict[str, str] = {}
     source_hash_bindings: dict[str, tuple[str, str, str | None]] = {}
     pixel_bindings: dict[str, tuple[str, str, str | None, str]] = {}
@@ -513,13 +516,10 @@ def load_font_domain_dataset(
                         "or font domain"
                     )
 
-            prior_group = group_bindings.setdefault(
-                source_group_id, (split, font_domain, source_image_sha256)
-            )
-            if prior_group != (split, font_domain, source_image_sha256):
+            prior_group = group_bindings.setdefault(source_group_id, (split, font_domain))
+            if prior_group != (split, font_domain):
                 raise ValueError(
-                    f"{location}: source_group_id {source_group_id!r} crosses split or font domain, "
-                    "or changes its source image binding"
+                    f"{location}: source_group_id {source_group_id!r} crosses split or font domain"
                 )
 
             raw_regions = raw.get("regions")
