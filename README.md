@@ -34,6 +34,8 @@ alipay-ai-inference/
 
 本分支新增离线 `receipt-font-domain-consistency` sidecar，用文档级分组数据验证“一张回单正文应有一个主导字体渲染域”。它不会修改 v4 OCR 或输出真假结论；低质量和未校准样本返回 `UNKNOWN`。已有 `pseudo_labels.jsonl`、字段裁图和设备结果时，`bootstrap-existing` 可零人工生成 iOS/Android 平台代理的字体渲染弱标签 pilot，并在 train/calibration/test 各自只保留两边都出现的同角色、同文字等量样本。设备信息只生成弱监督标签，不进入任何预测 API。自动 test 指标不是独立字体真值、具体字体文件鉴定或真实性结论，产物不可发布。数据契约、命令和上线门禁见 [docs/font-domain-consistency-v1.md](docs/font-domain-consistency-v1.md)。
 
+另有隔离的 `receipt-font-routed-ocr-pilot`，直接验证“按 iOS/Android 系统代理分开训练 OCR”是否改善 `time`、`payment_method_field`，并以 `amount` 为保护字段。它使用 resolution-only 主路由、同内容等量样本、wrong-route 与随机双专家对照；结论仍仅是 Paddle 教师一致性，不是人工准确率。方法与 Windows runner 见 [docs/font-routed-ocr-validation-v1.md](docs/font-routed-ocr-validation-v1.md)。
+
 ## Windows + CUDA 环境配置
 
 推荐 Python 3.10–3.12。先用 `nvidia-smi` 确认 NVIDIA 驱动，然后根据
