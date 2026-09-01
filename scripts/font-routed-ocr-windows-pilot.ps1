@@ -3,6 +3,7 @@ param(
     [Parameter(Mandatory = $true)][string]$RunId,
     [string]$Records = "D:\alipay-ai-data\receipt-lite-teacher-120k-v1\paddle-teacher-labels-5field-recipient95-v12-r3-4090-r1\pseudo_labels.jsonl",
     [string]$SharedRoot = "\\tsclient\alipay-ai-inference-temp",
+    [string]$PreparedInput = "",
     [int]$Epochs = 5
 )
 
@@ -11,7 +12,8 @@ $ProgressPreference = "SilentlyContinue"
 $Python = "D:\alipay-ai-data\alipay-ai-inference\.venv-cu126\Scripts\python.exe"
 $RunRoot = Join-Path "D:\alipay-ai-data\experiments\font-routed-ocr-validation-v1" $RunId
 $SourceRoot = Join-Path $RunRoot "source"
-$Prepared = Join-Path $RunRoot "prepared-resolution-primary"
+$GeneratedPrepared = Join-Path $RunRoot "prepared-resolution-primary"
+$Prepared = if ([string]::IsNullOrWhiteSpace($PreparedInput)) { $GeneratedPrepared } else { $PreparedInput }
 $Logs = Join-Path $RunRoot "logs"
 $ModelsRoot = Join-Path $RunRoot "models"
 $EvaluationsRoot = Join-Path $RunRoot "evaluations"
@@ -30,7 +32,15 @@ $Script:CanPublishStatus = $true
 function Write-Utf8NoBom {
     param([string]$Path, [string]$Text)
     $Encoding = New-Object System.Text.UTF8Encoding($false)
-    [System.IO.File]::WriteAllText($Path, $Text, $Encoding)
+    $Temporary = $Path + ".tmp-" + $PID + "-" + [Guid]::NewGuid().ToString("N")
+    try {
+        [System.IO.File]::WriteAllText($Temporary, $Text, $Encoding)
+        [System.IO.File]::Copy($Temporary, $Path, $true)
+    } finally {
+        if (Test-Path -LiteralPath $Temporary) {
+            [System.IO.File]::Delete($Temporary)
+        }
+    }
 }
 
 function Publish-Status {
@@ -53,6 +63,7 @@ function Publish-Status {
             records = $Records
             run_root = $RunRoot
             prepared = $Prepared
+            prepared_input = $PreparedInput
             summary = $Summary
             shared_summary = $SharedSummary
         }
@@ -70,13 +81,24 @@ function Invoke-PythonStep {
     Publish-Status -Succeeded $false
     $Stdout = Join-Path $Logs ($Name + ".stdout.txt")
     $Stderr = Join-Path $Logs ($Name + ".stderr.txt")
-    & $Python @Arguments 1> $Stdout 2> $Stderr
-    if ($LASTEXITCODE -ne 0) {
+    $PreviousErrorActionPreference = $ErrorActionPreference
+    $ExitCode = 1
+    try {
+        # Windows PowerShell 5.1 wraps native stderr as an ErrorRecord.  Training
+        # libraries legitimately emit warnings on stderr, so only the native
+        # exit code is authoritative for this step.
+        $ErrorActionPreference = "Continue"
+        & $Python @Arguments 1> $Stdout 2> $Stderr
+        $ExitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $PreviousErrorActionPreference
+    }
+    if ($ExitCode -ne 0) {
         $Tail = ""
         if (Test-Path -LiteralPath $Stderr) {
             $Tail = ((Get-Content -LiteralPath $Stderr -Tail 30) -join " | ")
         }
-        throw "$Name failed with exit code $LASTEXITCODE. $Tail"
+        throw "$Name failed with exit code $ExitCode. $Tail"
     }
     $Script:CompletedSteps.Add($Name)
     $Script:Detail = "completed"
@@ -127,20 +149,39 @@ try {
         "-c",
         "import json,sys,torch,onnx,onnxruntime,numpy,cv2,PIL; assert (3,10) <= sys.version_info[:2] <= (3,12); assert torch.cuda.is_available(); providers=onnxruntime.get_available_providers(); assert 'CUDAExecutionProvider' in providers, providers; print(json.dumps({'python':sys.version,'torch':torch.__version__,'cuda':torch.version.cuda,'gpu':torch.cuda.get_device_name(0),'onnxruntime':onnxruntime.__version__,'providers':providers},sort_keys=True))"
     )
-    Invoke-PythonStep -Name "prepare" -Arguments @(
-        "-m", "transfer_receipt_ai.font_routed_ocr_pilot", "prepare",
-        "--records", $Records,
-        "--output", $Prepared,
-        "--fields", "amount,time,payment_method_field",
-        "--minimum-device-confidence", "0.90",
-        "--allowed-device-sources", "resolution",
-        "--split-seed", "font-routed-ocr-pilot-v1",
-        "--maximum-train-per-platform-field", "6000",
-        "--maximum-validation-per-platform-field", "1000",
-        "--maximum-test-per-platform-field", "1500"
-    )
+    if ([string]::IsNullOrWhiteSpace($PreparedInput)) {
+        Invoke-PythonStep -Name "prepare" -Arguments @(
+            "-m", "transfer_receipt_ai.font_routed_ocr_pilot", "prepare",
+            "--records", $Records,
+            "--output", $Prepared,
+            "--fields", "amount,time,payment_method_field",
+            "--minimum-device-confidence", "0.90",
+            "--allowed-device-sources", "resolution",
+            "--split-seed", "font-routed-ocr-pilot-v1",
+            "--maximum-train-per-platform-field", "6000",
+            "--maximum-validation-per-platform-field", "1000",
+            "--maximum-test-per-platform-field", "1500"
+        )
+    } else {
+        $Script:Stage = "prepare-reused"
+        $Script:Detail = "validating existing resolution-only prepared manifests"
+        Publish-Status -Succeeded $false
+        if (-not (Test-Path -LiteralPath $Prepared -PathType Container)) {
+            throw "PreparedInput directory is missing: $Prepared"
+        }
+        $Script:CompletedSteps.Add("prepare-reused")
+        $Script:Detail = "completed"
+        Publish-Status -Succeeded $false
+    }
     $PrepareReportPath = Join-Path $Prepared "prepare.json"
     $PrepareReport = Get-Content -LiteralPath $PrepareReportPath -Raw | ConvertFrom-Json
+    if (-not [string]::IsNullOrWhiteSpace($PreparedInput)) {
+        $PreparedRecords = [System.IO.Path]::GetFullPath([string]$PrepareReport.input.records)
+        $CurrentRecords = [System.IO.Path]::GetFullPath($Records)
+        if ($PreparedRecords -ine $CurrentRecords) {
+            throw "PreparedInput belongs to a different records file: $PreparedRecords"
+        }
+    }
     if ($PrepareReport.completed -ne $true `
         -or $PrepareReport.route_independence.time_circularity_controlled -ne $true `
         -or ($PrepareReport.parameters.allowed_device_sources -join ",") -cne "resolution") {

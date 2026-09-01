@@ -80,6 +80,19 @@ D:\alipay-ai-data\experiments\font-routed-ocr-validation-v1\<RunId>
 
 Mac 共享目录只回收 `prepare.json`、最终 A/B summary 和状态 JSON，不回收图片或 checkpoint。
 
+如果训练阶段因 runner/环境问题中止，而上一个独立 RunId 已经完整生成
+`prepared-resolution-primary`，可在新 RunId 中用 `-PreparedInput` 复用该只读清单。runner
+仍会重新校验 resolution-only 契约、输入记录路径和每个平台/字段测试样本量，不覆盖旧目录：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File `
+  \\tsclient\alipay-ai-inference-temp\font-routed-ocr-windows-pilot.ps1 `
+  -SourceArchive \\tsclient\alipay-ai-inference-temp\<exact-commit>.zip `
+  -RunId font-routed-ocr-<new-timestamp>-<commit> `
+  -PreparedInput D:\alipay-ai-data\experiments\font-routed-ocr-validation-v1\<old-run>\prepared-resolution-primary `
+  -Epochs 5
+```
+
 ## 负号边界
 
 已有 Windows 实验证明，同一冻结 DET/CLS/REC 在 `det_db_unclip_ratio=1.5` 时读成 `99.83`，扩大到约 `2.4` 后恢复 `-99.83`。当前证据更支持检测框左边界裁掉负号，而不是字体识别失败。
