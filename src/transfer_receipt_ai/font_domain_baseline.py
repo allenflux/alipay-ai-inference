@@ -529,6 +529,7 @@ class FontDomainPublicationSafety:
             "required_and_present",
             "incomplete_allowed",
             "device_platform_weak_pseudo",
+            "font_rendering_platform_proxy_weak",
             "not_asserted",
         }:
             raise ValueError("invalid leakage_metadata publication status")
@@ -1496,7 +1497,13 @@ def predict_document(
     allow_uncalibrated: bool = False,
     **aggregation_options: object,
 ) -> FontDomainConsistencyResult:
-    """Predict every crop and apply the model-agnostic document gate."""
+    """Predict every crop and apply the font-only document gate.
+
+    ``FontDomainDocument.device_prior_domain`` remains loadable for legacy
+    manifests, but this visual baseline deliberately ignores it.  Callers that
+    need the generic prior-aware gate can use
+    :func:`aggregate_font_domain_predictions` directly.
+    """
 
     if not isinstance(allow_uncalibrated, bool):
         raise ValueError("allow_uncalibrated must be boolean")
@@ -1507,7 +1514,7 @@ def predict_document(
     return aggregate_font_domain_predictions(
         document_id=document.document_id,
         predictions=predictions,
-        device_prior_domain=document.device_prior_domain,
+        device_prior_domain=None,
         **aggregation_options,
     )
 

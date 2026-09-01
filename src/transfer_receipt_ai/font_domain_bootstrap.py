@@ -3,9 +3,10 @@
 This adapter is deliberately separate from the deployed OCR pipeline.  It
 turns a frozen ``pseudo_labels.jsonl`` plus its source/result provenance into
 the strict document manifest consumed by :mod:`font_domain_dataset`.  Device
-platform is only a weak pseudo label: uncertain, conflicting, and low
-confidence device decisions are recorded as rejections rather than promoted
-to a training class.
+platform is only a weak proxy for a font-rendering domain: uncertain,
+conflicting, and low-confidence device decisions are recorded as rejections
+rather than promoted to a training class.  Device metadata is never emitted
+as an inference prior for the resulting font-only pilot.
 """
 
 from __future__ import annotations
@@ -26,7 +27,7 @@ import tempfile
 import unicodedata
 from collections import Counter, defaultdict
 from collections.abc import Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final
 
@@ -39,8 +40,8 @@ from .font_domain_dataset import DOCUMENT_KIND, load_font_domain_dataset
 
 BOOTSTRAP_KIND: Final[str] = "receipt_font_domain_bootstrap_v1"
 REJECTION_KIND: Final[str] = "receipt_font_domain_bootstrap_rejection_v1"
-LABEL_PROVENANCE: Final[str] = "device_platform_weak_pseudo_v1"
-DEFAULT_SPLIT_SEED: Final[str] = "font-domain-bootstrap-v1"
+LABEL_PROVENANCE: Final[str] = "device_platform_proxy_font_rendering_weak_v1"
+DEFAULT_SPLIT_SEED: Final[str] = "font-rendering-platform-proxy-v1"
 
 _FIELD_TO_ROLE: Final[dict[str, str]] = {
     "amount": "amount",
@@ -50,9 +51,15 @@ _FIELD_TO_ROLE: Final[dict[str, str]] = {
 }
 _IGNORED_FIELDS: Final[frozenset[str]] = frozenset({"time", "status_bar"})
 _PLATFORM_TO_DOMAIN: Final[dict[str, str]] = {
-    "ios": "ios_alipay_device_pseudo_v1",
-    "android": "android_alipay_device_pseudo_v1",
+    "ios": "ios_alipay_font_rendering_proxy_v1",
+    "android": "android_alipay_font_rendering_proxy_v1",
 }
+_FONT_PAIR_ROLE_PRIORITY: Final[tuple[str, ...]] = (
+    "transfer_status",
+    "payment_method",
+    "amount",
+    "recipient",
+)
 _SAFE_SUFFIX = re.compile(r"^\.[A-Za-z0-9]{1,10}$")
 
 MAXIMUM_RECORDS_BYTES: Final[int] = 512 * 1024 * 1024
@@ -395,6 +402,12 @@ def _normalise_content_text(value: str) -> str:
     return " ".join(unicodedata.normalize("NFKC", value).casefold().split())
 
 
+def _font_text_key(value: str) -> str:
+    """Preserve every visible glyph identity used by the font control."""
+
+    return unicodedata.normalize("NFC", value)
+
+
 def _producer_group_id(value: object, *, location: str) -> str:
     if not isinstance(value, str):
         raise ValueError(f"{location}: group_id must be a string")
@@ -441,6 +454,7 @@ class _ResultBinding:
     result_sha256: str
     platform: str | None
     confidence: float | None
+    device_source: str | None
     device_rejection: str | None
 
 
@@ -455,11 +469,15 @@ class _Candidate:
     result_sha256: str
     platform: str
     confidence: float
+    device_source: str
     domain: str
     producer_group_id: str
     regions: dict[str, _InputRegion]
     expected_source_size: int
     expected_source_mtime_ns: int
+    font_evidence_roles: set[str] = field(default_factory=set)
+    split_pair_group_id: str | None = None
+    split_component_id: str | None = None
     split: str | None = None
 
 
@@ -483,27 +501,34 @@ def _device_rejection(
     payload: Mapping[str, Any],
     *,
     minimum_confidence: float,
-) -> tuple[str | None, float | None, str | None]:
+) -> tuple[str | None, float | None, str | None, str | None]:
     device = payload.get("device")
     if not isinstance(device, Mapping):
-        return None, None, "device_metadata_missing_or_invalid"
+        return None, None, None, "device_metadata_missing_or_invalid"
     platform = device.get("platform")
     confidence_value = device.get("confidence")
     conflict = device.get("device_prior_conflict")
-    if not isinstance(platform, str) or isinstance(conflict, bool) is False:
-        return None, None, "device_metadata_missing_or_invalid"
+    device_source_value = device.get("source")
+    if (
+        not isinstance(platform, str)
+        or isinstance(conflict, bool) is False
+        or not isinstance(device_source_value, str)
+        or not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", device_source_value)
+    ):
+        return None, None, None, "device_metadata_missing_or_invalid"
+    device_source = device_source_value.lower()
     try:
         confidence = _finite_probability(confidence_value, description="device confidence")
     except ValueError:
-        return platform, None, "device_metadata_missing_or_invalid"
+        return platform, None, device_source, "device_metadata_missing_or_invalid"
     platform = platform.strip().lower()
     if platform not in _PLATFORM_TO_DOMAIN:
-        return platform, confidence, "device_platform_unknown"
+        return platform, confidence, device_source, "device_platform_unknown"
     if conflict:
-        return platform, confidence, "device_prior_conflict"
+        return platform, confidence, device_source, "device_prior_conflict"
     if confidence < minimum_confidence:
-        return platform, confidence, "device_confidence_below_threshold"
-    return platform, confidence, None
+        return platform, confidence, device_source, "device_confidence_below_threshold"
+    return platform, confidence, device_source, None
 
 
 def _rejection(
@@ -514,6 +539,7 @@ def _rejection(
     detail: object | None = None,
     platform: str | None = None,
     confidence: float | None = None,
+    device_source: str | None = None,
     document_id: str | None = None,
 ) -> dict[str, object]:
     row: dict[str, object] = {
@@ -529,6 +555,8 @@ def _rejection(
         row["device_platform"] = platform
     if confidence is not None:
         row["device_confidence"] = confidence
+    if device_source is not None:
+        row["device_label_source"] = device_source
     if detail is not None:
         row["detail"] = detail
     return row
@@ -553,6 +581,276 @@ class _DisjointSet:
             self.parent[right_root] = left_root
         else:
             self.parent[left_root] = right_root
+
+
+def _assign_matched_text_evidence(
+    candidates: list[_Candidate],
+    *,
+    split_seed: str,
+    within_split: bool = False,
+) -> dict[str, object]:
+    """Select equal cross-domain samples for every role/text stratum.
+
+    The platform label remains weak, but text content cannot by itself explain
+    the selected evidence because each included normalized string contributes
+    the same number of regions to both proxy domains.
+    """
+
+    expected_domains = tuple(sorted(_PLATFORM_TO_DOMAIN.values()))
+    strata: dict[tuple[str, str, str], dict[str, list[_Candidate]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
+    for candidate in candidates:
+        candidate.font_evidence_roles.clear()
+        if within_split and candidate.split is None:
+            raise RuntimeError("split-scoped font evidence requires assigned splits")
+        split_scope = str(candidate.split) if within_split else "all"
+        for role, region in candidate.regions.items():
+            key = (split_scope, role, _font_text_key(region.text))
+            strata[key][candidate.domain].append(candidate)
+
+    matched_text_keys: set[tuple[str, str]] = set()
+    matched_split_strata = 0
+    included_by_domain: Counter[str] = Counter()
+    included_by_role: Counter[str] = Counter()
+    included_by_split: Counter[str] = Counter()
+    included_by_split_domain: dict[str, Counter[str]] = defaultdict(Counter)
+    for (split_scope, role, normalised_text), by_domain in sorted(strata.items()):
+        if any(not by_domain.get(domain) for domain in expected_domains):
+            continue
+        target = min(len(by_domain[domain]) for domain in expected_domains)
+        if target < 1:
+            continue
+        matched_text_keys.add((role, normalised_text))
+        matched_split_strata += 1
+        stratum_id = _stable_id("font-text-stratum", role, normalised_text)
+        for domain in expected_domains:
+            ordered = sorted(
+                by_domain[domain],
+                key=lambda candidate: (
+                    _stable_id(
+                        "font-text-sample",
+                        split_seed,
+                        stratum_id,
+                        domain,
+                        candidate.document_id,
+                    ),
+                    candidate.document_id,
+                ),
+            )
+            for candidate in ordered[:target]:
+                candidate.font_evidence_roles.add(role)
+                included_by_domain[domain] += 1
+                included_by_role[role] += 1
+                if within_split:
+                    included_by_split[split_scope] += 1
+                    included_by_split_domain[split_scope][domain] += 1
+
+    documents_with_evidence = sum(
+        bool(candidate.font_evidence_roles) for candidate in candidates
+    )
+    return {
+        "strategy": (
+            "cross_domain_role_text_exact_match_balanced_within_split_v1"
+            if within_split
+            else "cross_domain_role_text_exact_match_balanced_global_prefilter_v1"
+        ),
+        "scope": "within_split" if within_split else "global_prefilter",
+        "candidate_strata": len({(role, text) for _, role, text in strata}),
+        "candidate_split_strata": len(strata),
+        "matched_strata": len(matched_text_keys),
+        "matched_split_strata": matched_split_strata,
+        "documents_with_evidence": documents_with_evidence,
+        "documents_without_evidence": len(candidates) - documents_with_evidence,
+        "included_regions": sum(included_by_domain.values()),
+        "included_regions_by_domain": dict(sorted(included_by_domain.items())),
+        "included_regions_by_role": dict(sorted(included_by_role.items())),
+        "included_regions_by_split": dict(sorted(included_by_split.items())),
+        "included_regions_by_split_and_domain": {
+            split: dict(sorted(counts.items()))
+            for split, counts in sorted(included_by_split_domain.items())
+        },
+        "text_values_disclosed": False,
+    }
+
+
+def _source_content_components(
+    candidates: list[_Candidate],
+) -> dict[str, tuple[_Candidate, ...]]:
+    """Return the components that already must remain in one split."""
+
+    by_id = {candidate.document_id: candidate for candidate in candidates}
+    disjoint = _DisjointSet(sorted(by_id))
+    first_by_source: dict[str, str] = {}
+    first_by_content: dict[str, str] = {}
+    for candidate in sorted(candidates, key=lambda value: value.document_id):
+        for mapping, group_id in (
+            (first_by_source, candidate.source_group_id),
+            (first_by_content, candidate.content_group_id),
+        ):
+            previous = mapping.setdefault(group_id, candidate.document_id)
+            disjoint.union(previous, candidate.document_id)
+    members_by_root: dict[str, list[_Candidate]] = defaultdict(list)
+    for document_id in sorted(by_id):
+        members_by_root[disjoint.find(document_id)].append(by_id[document_id])
+    return {
+        _stable_id(
+            "source-content-component",
+            *(candidate.document_id for candidate in members),
+        ): tuple(members)
+        for members in sorted(
+            members_by_root.values(),
+            key=lambda values: tuple(candidate.document_id for candidate in values),
+        )
+    }
+
+
+def _assign_font_split_pairs(
+    candidates: list[_Candidate],
+    *,
+    split_seed: str,
+) -> dict[str, object]:
+    """Pair pre-existing source/content components across proxy domains.
+
+    A component participates at most once.  Common UI strings therefore cannot
+    form a transitive chain through multiple documents in one source/content
+    component and collapse the entire corpus into a single split component.
+    """
+
+    expected_domains = tuple(sorted(_PLATFORM_TO_DOMAIN.values()))
+    for candidate in candidates:
+        candidate.split_pair_group_id = None
+    components = _source_content_components(candidates)
+    unpaired = dict(components)
+    pair_counts: Counter[str] = Counter()
+    internally_controlled: Counter[str] = Counter()
+    for role in _FONT_PAIR_ROLE_PRIORITY:
+        texts = sorted(
+            {
+                _font_text_key(candidate.regions[role].text)
+                for members in unpaired.values()
+                for candidate in members
+                if role in candidate.font_evidence_roles
+            }
+        )
+        for normalised_text in texts:
+            eligible_domains: dict[str, set[str]] = defaultdict(set)
+            for component_id, members in unpaired.items():
+                for candidate in members:
+                    region = candidate.regions.get(role)
+                    if (
+                        role in candidate.font_evidence_roles
+                        and region is not None
+                        and _font_text_key(region.text) == normalised_text
+                    ):
+                        eligible_domains[component_id].add(candidate.domain)
+
+            # A source/content component that already contains both domains
+            # needs no additional edge. Its final within-split sampler will
+            # select equal rows and discard any surplus.
+            internal_ids = sorted(
+                component_id
+                for component_id, domains in eligible_domains.items()
+                if all(domain in domains for domain in expected_domains)
+            )
+            for component_id in internal_ids:
+                unpaired.pop(component_id, None)
+                internally_controlled[role] += 1
+
+            by_domain: dict[str, list[str]] = defaultdict(list)
+            for component_id, domains in eligible_domains.items():
+                if component_id not in unpaired:
+                    continue
+                for domain in expected_domains:
+                    if domain in domains:
+                        by_domain[domain].append(component_id)
+            if any(not by_domain.get(domain) for domain in expected_domains):
+                continue
+
+            def pair_order(component_id: str, domain: str) -> tuple[str, str]:
+                return (
+                    _stable_id(
+                        "font-split-pair-sample",
+                        split_seed,
+                        role,
+                        normalised_text,
+                        domain,
+                        component_id,
+                    ),
+                    component_id,
+                )
+
+            ordered = {
+                domain: sorted(
+                    by_domain[domain],
+                    key=lambda component_id, current_domain=domain: pair_order(
+                        component_id,
+                        current_domain,
+                    ),
+                )
+                for domain in expected_domains
+            }
+            target = min(len(ordered[domain]) for domain in expected_domains)
+            for index in range(target):
+                component_ids = tuple(
+                    ordered[domain][index] for domain in expected_domains
+                )
+                pair_id = _stable_id(
+                    "font-split-pair",
+                    split_seed,
+                    role,
+                    normalised_text,
+                    *component_ids,
+                )
+                for component_id in component_ids:
+                    for candidate in components[component_id]:
+                        candidate.split_pair_group_id = pair_id
+                    unpaired.pop(component_id, None)
+                pair_counts[role] += 1
+    paired_component_ids = set(components) - set(unpaired)
+    return {
+        "strategy": "disjoint_source_content_component_font_pair_v1",
+        "source_content_components": len(components),
+        "controlled_components": len(paired_component_ids),
+        "uncontrolled_components": len(unpaired),
+        "controlled_documents": sum(
+            len(components[component_id]) for component_id in paired_component_ids
+        ),
+        "uncontrolled_documents": sum(len(members) for members in unpaired.values()),
+        "internally_controlled_components_by_role": dict(
+            sorted(internally_controlled.items())
+        ),
+        "pairs_by_role": dict(sorted(pair_counts.items())),
+        "text_values_disclosed": False,
+    }
+
+
+def _validate_split_matched_text_evidence(candidates: list[_Candidate]) -> None:
+    """Fail closed unless every included split/text stratum is domain-balanced."""
+
+    expected_domains = tuple(sorted(_PLATFORM_TO_DOMAIN.values()))
+    counts: dict[tuple[str, str, str], Counter[str]] = defaultdict(Counter)
+    for candidate in candidates:
+        if candidate.split is None:
+            raise RuntimeError("font evidence document has no split")
+        if not candidate.font_evidence_roles:
+            raise RuntimeError("font evidence document has no included matched role")
+        for role in candidate.font_evidence_roles:
+            region = candidate.regions[role]
+            key = (
+                candidate.split,
+                role,
+                _font_text_key(region.text),
+            )
+            counts[key][candidate.domain] += 1
+    for key, by_domain in counts.items():
+        values = [by_domain[domain] for domain in expected_domains]
+        if any(value < 1 for value in values) or len(set(values)) != 1:
+            split, role, _ = key
+            raise RuntimeError(
+                "split-scoped font evidence is not domain-balanced: "
+                f"split={split}, role={role}"
+            )
 
 
 def _assign_source_components(candidates: list[_Candidate]) -> int:
@@ -590,6 +888,7 @@ def _assign_component_splits(
     disjoint = _DisjointSet(sorted(by_id))
     first_by_source: dict[str, str] = {}
     first_by_content: dict[str, str] = {}
+    first_by_font_pair: dict[str, str] = {}
     for candidate in sorted(candidates, key=lambda value: value.document_id):
         for mapping, group_id in (
             (first_by_source, candidate.source_group_id),
@@ -597,12 +896,19 @@ def _assign_component_splits(
         ):
             previous = mapping.setdefault(group_id, candidate.document_id)
             disjoint.union(previous, candidate.document_id)
+        if candidate.split_pair_group_id is not None:
+            previous = first_by_font_pair.setdefault(
+                candidate.split_pair_group_id,
+                candidate.document_id,
+            )
+            disjoint.union(previous, candidate.document_id)
     components: dict[str, list[str]] = defaultdict(list)
     for document_id in sorted(by_id):
         components[disjoint.find(document_id)].append(document_id)
     component_counts: Counter[str] = Counter()
     for members in sorted(components.values(), key=lambda value: tuple(value)):
         identity = "\0".join(members)
+        component_id = _stable_id("split-component", identity)
         bucket = int.from_bytes(
             hashlib.sha256(f"{split_seed}\0split\0{identity}".encode("utf-8")).digest()[:8],
             "big",
@@ -616,7 +922,19 @@ def _assign_component_splits(
         component_counts[split] += 1
         for document_id in members:
             by_id[document_id].split = split
+            by_id[document_id].split_component_id = component_id
     return dict(sorted(component_counts.items()))
+
+
+def _selected_split_component_counts(candidates: list[_Candidate]) -> dict[str, int]:
+    components: dict[str, str] = {}
+    for candidate in candidates:
+        if candidate.split is None or candidate.split_component_id is None:
+            raise RuntimeError("selected document lacks a split component")
+        previous = components.setdefault(candidate.split_component_id, candidate.split)
+        if previous != candidate.split:
+            raise RuntimeError("one split component spans multiple splits")
+    return dict(sorted(Counter(components.values()).items()))
 
 
 def _write_new_file(path: Path, data: bytes) -> None:
@@ -796,7 +1114,7 @@ def bootstrap_existing_pseudolabels(
             result_payload = _decode_utf8_json(
                 result_bytes, location=result_json.as_posix()
             )
-            platform, confidence, device_reason = _device_rejection(
+            platform, confidence, device_source, device_reason = _device_rejection(
                 result_payload,
                 minimum_confidence=minimum_device_confidence,
             )
@@ -805,6 +1123,7 @@ def bootstrap_existing_pseudolabels(
                 result_sha256=_sha256(result_bytes),
                 platform=platform,
                 confidence=confidence,
+                device_source=device_source,
                 device_rejection=device_reason,
             )
         result_binding = result_binding_cache[result_json]
@@ -907,6 +1226,7 @@ def bootstrap_existing_pseudolabels(
         result_binding = result_binding_cache[result_json]
         platform = result_binding.platform
         confidence = result_binding.confidence
+        device_source = result_binding.device_source
         device_reason = result_binding.device_rejection
         result_sha = result_binding.result_sha256
         document_id = _stable_id(
@@ -923,11 +1243,12 @@ def bootstrap_existing_pseudolabels(
                     reason=device_reason,
                     platform=platform,
                     confidence=confidence,
+                    device_source=device_source,
                     document_id=document_id,
                 )
             )
             continue
-        assert platform is not None and confidence is not None
+        assert platform is not None and confidence is not None and device_source is not None
         best_by_role = group.regions
         if len(best_by_role) < minimum_regions:
             rejections.append(
@@ -938,6 +1259,7 @@ def bootstrap_existing_pseudolabels(
                     detail={"found": len(best_by_role), "required": minimum_regions},
                     platform=platform,
                     confidence=confidence,
+                    device_source=device_source,
                     document_id=document_id,
                 )
             )
@@ -967,6 +1289,7 @@ def bootstrap_existing_pseudolabels(
                 result_sha256=result_sha,
                 platform=platform,
                 confidence=confidence,
+                device_source=device_source,
                 domain=_PLATFORM_TO_DOMAIN[platform],
                 producer_group_id=group.producer_group_id,
                 regions=best_by_role,
@@ -1012,6 +1335,7 @@ def bootstrap_existing_pseudolabels(
                     },
                     platform=candidate.platform,
                     confidence=candidate.confidence,
+                    device_source=candidate.device_source,
                     document_id=candidate.document_id,
                 )
             )
@@ -1038,6 +1362,7 @@ def bootstrap_existing_pseudolabels(
                     detail={"domains": sorted(domains_by_source[source_key])},
                     platform=candidate.platform,
                     confidence=candidate.confidence,
+                    device_source=candidate.device_source,
                     document_id=candidate.document_id,
                 )
             )
@@ -1069,6 +1394,7 @@ def bootstrap_existing_pseudolabels(
                     detail={"balanced_target": balanced_target, "domain": domain},
                     platform=candidate.platform,
                     confidence=candidate.confidence,
+                    device_source=candidate.device_source,
                     document_id=candidate.document_id,
                 )
             )
@@ -1081,6 +1407,28 @@ def bootstrap_existing_pseudolabels(
         conflicted_producer_groups,
         ordered,
     )
+    _assign_matched_text_evidence(
+        selected,
+        split_seed=split_seed,
+    )
+    retained_font_evidence: list[_Candidate] = []
+    for candidate in selected:
+        if candidate.font_evidence_roles:
+            retained_font_evidence.append(candidate)
+            continue
+        rejections.append(
+            _rejection(
+                source=candidate.source,
+                result_json=candidate.result_json,
+                reason="no_cross_platform_matched_text_font_evidence",
+                detail={"available_roles": sorted(candidate.regions)},
+                platform=candidate.platform,
+                confidence=candidate.confidence,
+                device_source=candidate.device_source,
+                document_id=candidate.document_id,
+            )
+        )
+    selected = retained_font_evidence
     # Expensive source-byte hashing and image decoding happen only after the
     # deterministic per-domain cap.  On the existing 117k-result corpus this
     # keeps a 1,000-document pilot from decoding the entire source archive.
@@ -1148,19 +1496,80 @@ def bootstrap_existing_pseudolabels(
                     },
                     platform=candidate.platform,
                     confidence=candidate.confidence,
+                    device_source=candidate.device_source,
                     document_id=candidate.document_id,
                 )
             )
         selected = retained_selected
 
+    # Source-byte conflict removal can invalidate a previously balanced
+    # stratum. Recompute the final font-evidence set before assigning splits.
+    global_matched_text_prefilter = _assign_matched_text_evidence(
+        selected,
+        split_seed=split_seed,
+    )
+    final_matched_selection: list[_Candidate] = []
+    for candidate in selected:
+        if candidate.font_evidence_roles:
+            final_matched_selection.append(candidate)
+            continue
+        rejections.append(
+            _rejection(
+                source=candidate.source,
+                result_json=candidate.result_json,
+                reason="no_cross_platform_matched_text_font_evidence_after_source_audit",
+                detail={"available_roles": sorted(candidate.regions)},
+                platform=candidate.platform,
+                confidence=candidate.confidence,
+                device_source=candidate.device_source,
+                document_id=candidate.document_id,
+            )
+        )
+    selected = final_matched_selection
+
     selected.sort(key=lambda value: value.document_id)
-    selected_source_components = _assign_source_components(selected)
-    component_counts = _assign_component_splits(
+    _assign_source_components(selected)
+    font_split_pairing = _assign_font_split_pairs(
+        selected,
+        split_seed=split_seed,
+    )
+    _assign_component_splits(
         selected,
         split_seed=split_seed,
         train_ratio=train_ratio,
         calibration_ratio=calibration_ratio,
     )
+    matched_text_evidence = _assign_matched_text_evidence(
+        selected,
+        split_seed=split_seed,
+        within_split=True,
+    )
+    split_matched_selection: list[_Candidate] = []
+    for candidate in selected:
+        if candidate.font_evidence_roles:
+            split_matched_selection.append(candidate)
+            continue
+        rejections.append(
+            _rejection(
+                source=candidate.source,
+                result_json=candidate.result_json,
+                reason="no_split_scoped_matched_text_font_evidence",
+                detail={
+                    "available_roles": sorted(candidate.regions),
+                    "split": candidate.split,
+                },
+                platform=candidate.platform,
+                confidence=candidate.confidence,
+                device_source=candidate.device_source,
+                document_id=candidate.document_id,
+            )
+        )
+    selected = split_matched_selection
+    _validate_split_matched_text_evidence(selected)
+    selected_source_components = len(
+        {candidate.source_group_id for candidate in selected}
+    )
+    component_counts = _selected_split_component_counts(selected)
 
     staging = Path(
         tempfile.mkdtemp(
@@ -1216,7 +1625,7 @@ def bootstrap_existing_pseudolabels(
                         "id": _stable_id("region", candidate.document_id, role, raw_sha),
                         "role": role,
                         "image": relative_output,
-                        "include_in_consistency": True,
+                        "include_in_consistency": role in candidate.font_evidence_roles,
                         "text": region.text,
                         "raw_sha256": raw_sha,
                         "pixel_sha256": pixel_sha,
@@ -1231,8 +1640,7 @@ def bootstrap_existing_pseudolabels(
                     "content_group_id": candidate.content_group_id,
                     "split": candidate.split,
                     "font_domain": candidate.domain,
-                    "label_source": LABEL_PROVENANCE,
-                    "device_prior_domain": candidate.domain,
+                    "label_source": f"{LABEL_PROVENANCE}.{candidate.device_source}",
                     "source_image_sha256": candidate.source_sha256,
                     "regions": region_rows,
                 }
@@ -1248,6 +1656,8 @@ def bootstrap_existing_pseudolabels(
                     "source_group_id": candidate.source_group_id,
                     "device_platform": candidate.platform,
                     "device_confidence": candidate.confidence,
+                    "device_label_source": candidate.device_source,
+                    "font_evidence_roles": sorted(candidate.font_evidence_roles),
                 }
             )
 
@@ -1273,6 +1683,17 @@ def bootstrap_existing_pseudolabels(
             )
         selected_domain_counts = Counter(candidate.domain for candidate in selected)
         selected_split_counts = Counter(candidate.split for candidate in selected)
+        selected_device_source_counts = Counter(
+            candidate.device_source for candidate in selected
+        )
+        selected_device_sources_by_split_domain: dict[
+            str, dict[str, Counter[str]]
+        ] = defaultdict(lambda: defaultdict(Counter))
+        for candidate in selected:
+            assert candidate.split is not None
+            selected_device_sources_by_split_domain[candidate.split][
+                candidate.domain
+            ][candidate.device_source] += 1
         calibration_by_domain = Counter(
             candidate.domain for candidate in selected if candidate.split == "calibration"
         )
@@ -1293,11 +1714,28 @@ def bootstrap_existing_pseudolabels(
             for domain in sorted(_PLATFORM_TO_DOMAIN.values())
             if calibration_source_groups[domain] < 20
         ]
+        matched_splits = set(
+            matched_text_evidence["included_regions_by_split"]
+        )
+        missing_matched_text_splits = [
+            split
+            for split in ("train", "calibration", "test")
+            if split not in matched_splits
+        ]
         report: dict[str, object] = {
             "schema_version": SCHEMA_VERSION,
             "kind": BOOTSTRAP_KIND,
             "completed": True,
+            "classification_target": "font_rendering_domain",
             "label_provenance": LABEL_PROVENANCE,
+            "label_semantics": "device_platform_is_a_weak_proxy_not_an_exact_font_family",
+            "prediction_inputs": ["crop_pixels", "region_role"],
+            "device_prior_used": False,
+            "exact_font_identity": "not_assessed",
+            "font_signal_validation": (
+                "matched_text_balanced_within_split_before_information_gate"
+            ),
+            "post_information_gate_matched_balance": "not_assessed",
             "publication_prerequisites_recorded": False,
             "publication": False,
             "evaluation_status": "not_assessed",
@@ -1339,6 +1777,21 @@ def bootstrap_existing_pseudolabels(
                 "selected_by_split": dict(sorted((str(k), v) for k, v in selected_split_counts.items())),
                 "selected_source_components": selected_source_components,
                 "split_components": component_counts,
+                "matched_text_font_evidence": matched_text_evidence,
+                "global_matched_text_prefilter": global_matched_text_prefilter,
+                "font_split_pairing": font_split_pairing,
+                "selected_by_device_label_source": dict(
+                    sorted(selected_device_source_counts.items())
+                ),
+                "selected_by_split_domain_device_label_source": {
+                    split: {
+                        domain: dict(sorted(counts.items()))
+                        for domain, counts in sorted(by_domain.items())
+                    }
+                    for split, by_domain in sorted(
+                        selected_device_sources_by_split_domain.items()
+                    )
+                },
                 "duplicate_role_rows_discarded": duplicate_role_rows,
                 "ignored_fields": dict(sorted(ignored_fields.items())),
             },
@@ -1353,8 +1806,16 @@ def bootstrap_existing_pseudolabels(
                 "calibration_documents_by_domain": dict(sorted(calibration_by_domain.items())),
                 "calibration_source_groups_by_domain": calibration_source_groups,
                 "insufficient_calibration_domains": insufficient_calibration_domains,
-                "count_prerequisites_met": not missing_domains and not insufficient_calibration_domains,
-                "note": "Weak device labels require held-out evaluation before any publication use.",
+                "missing_matched_text_splits": missing_matched_text_splits,
+                "count_prerequisites_met": (
+                    not missing_domains
+                    and not insufficient_calibration_domains
+                    and not missing_matched_text_splits
+                ),
+                "note": (
+                    "Platform-proxy font-rendering labels require held-out evaluation "
+                    "before any publication use."
+                ),
             },
             "validation": {
                 "passed": dataset is not None,

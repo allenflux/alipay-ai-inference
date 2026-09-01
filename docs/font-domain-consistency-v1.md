@@ -2,7 +2,7 @@
 
 ## 目标和边界
 
-本实验回答的是：一张回单里参与检查的多个文本区域，是否来自同一个已知的“渲染域”。渲染域应按业务可验证的组合定义，例如 `ios_alipay`、`android_alipay` 或更细的 `ios_18_alipay_10`；它不等同于某个 TTF/OTF 文件名。
+本实验回答的是：一张回单里参与检查的多个文本区域，是否来自同一个已知的“字体渲染域”。正式域应优先按可验证的字体与渲染配置定义，而不是直接把操作系统当字体。零人工 pilot 使用 `ios_alipay_font_rendering_proxy_v1` 和 `android_alipay_font_rendering_proxy_v1`，含义只是“由 iOS/Android 平台标签代理得到的支付宝正文字体渲染类”；它们不等同于 PingFang、Roboto、Noto 或任何具体 TTF/OTF 文件。
 
 `PASS` 只表示区域间字体域证据一致，不表示图片真实；任意一个已经通过逐区域门禁的异域结果都会使整图进入 `REVIEW`，高质量冲突另带强冲突原因；`UNKNOWN` 表示信息量、覆盖率或模型支持不足。所有输出固定包含 `authenticity: "not_assessed"`。
 
@@ -16,14 +16,14 @@
 - 至少三个有效区域、至少两个角色才允许整图通过。
 - 任意一个已经通过逐区域门禁的异域区域都会触发 `REVIEW`；高质量冲突会额外标记强冲突原因。
 - `status_bar` 默认不参与一致性，因为它是弱设备先验，不是正文真值。
-- 设备/系统信息只能作为可选先验；与正文冲突时送审，不能覆盖视觉证据。
+- 设备/系统信息只能用于生成零人工弱监督标签，不进入字体预测或整图聚合。
 
 ## 数据集契约
 
 数据根目录里放一个 JSONL 清单和区域图片。每行描述一张原始回单；同一原图、裁边变体、压缩变体和修图变体必须共用 `source_group_id`，并且只能出现在一个 split。
 
 ```json
-{"schema_version":1,"kind":"receipt_font_domain_document_v1","id":"doc-0001","source_group_id":"source-0001","content_group_id":"content-0001","source_image_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","split":"train","font_domain":"ios_alipay","label_source":"device-capture-log","device_prior_domain":"ios_alipay","regions":[{"id":"amount","role":"amount","image":"regions/doc-0001-amount.png","text":"-99.83"},{"id":"recipient","role":"recipient","image":"regions/doc-0001-recipient.png"},{"id":"time","role":"time","image":"regions/doc-0001-time.png"},{"id":"status","role":"status_bar","image":"regions/doc-0001-status.png","include_in_consistency":false}]}
+{"schema_version":1,"kind":"receipt_font_domain_document_v1","id":"doc-0001","source_group_id":"source-0001","content_group_id":"content-0001","source_image_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","split":"train","font_domain":"ios_alipay_font_rendering_proxy_v1","label_source":"device_platform_proxy_font_rendering_weak_v1.cnn","regions":[{"id":"amount","role":"amount","image":"regions/doc-0001-amount.png","text":"-99.83","include_in_consistency":false},{"id":"status","role":"transfer_status","image":"regions/doc-0001-status.png","text":"支付成功","include_in_consistency":true}]}
 ```
 
 示例中的 `source_image_sha256` 必须替换成原始整图的真实 SHA-256。训练清单使用 `train`、`calibration`、`test`；待分析清单使用 `inference` 且不带 `font_domain`/`label_source`。路径只能是清单目录内的 POSIX 相对路径。加载器会绑定同一份字节快照的原始字节 SHA-256、解码像素 SHA-256 和 pHash，并拒绝：
@@ -89,24 +89,26 @@ receipt-font-domain-consistency export-classifier \
 
 ## 现有裁图库零人工快跑
 
-如果已经有 `ocr_pseudolabels` 生成的 `pseudo_labels.jsonl`、字段裁图和对应推理结果 JSON，不需要重新截图、OCR、裁图或逐张标注。下面的命令会自动按原图聚合正文区域，从结果里的 `device.platform` 取得高置信 iOS/Android 弱标签，过滤 `uncertain`、低置信和设备先验冲突，使用上游 `group_id` 把同一回单的重复 capture 锁在同一个来源组和 split，再按规范文本内容做连通切分，并复制一个默认每域最多 500 张的独立 pilot 数据集：
+如果已经有 `ocr_pseudolabels` 生成的 `pseudo_labels.jsonl`、字段裁图和对应推理结果 JSON，不需要重新截图、OCR、裁图或逐张标注。下面的命令会自动按原图聚合正文区域，从结果里的 `device.platform` 取得高置信平台代理标签，过滤 `uncertain`、低置信和设备冲突，使用上游 `group_id` 把同一回单的重复 capture 锁在同一个来源组和 split，再生成默认每个字体渲染代理域最多 500 张的 pilot：
 
 ```powershell
 receipt-font-domain-consistency bootstrap-existing `
   --records "D:\alipay-ai-data\receipt-lite-teacher-120k-v1\paddle-teacher-labels-5field-recipient95-v12-r3-4090-r1\pseudo_labels.jsonl" `
-  --output "D:\alipay-ai-data\font-domain-device-pseudo-v1"
+  --output "D:\alipay-ai-data\font-rendering-platform-proxy-v1"
 
 receipt-font-domain-consistency fit `
-  --records "D:\alipay-ai-data\font-domain-device-pseudo-v1\font_domain.auto.jsonl" `
-  --output "D:\alipay-ai-data\font-domain-device-pseudo-v1.model.json" `
+  --records "D:\alipay-ai-data\font-rendering-platform-proxy-v1\font_domain.auto.jsonl" `
+  --output "D:\alipay-ai-data\font-rendering-platform-proxy-v1.model.json" `
   --skip-near-duplicate-audit
 ```
 
-正文只使用 `amount`、`recipient_field`、`transfer_status` 和 `payment_method_field`；现有数据里的 `time` 是状态栏时间，会自动排除，避免把系统状态栏字体和支付宝正文混为一类。输出清单与 `bootstrap.json` 会记录 `device_platform_weak_pseudo_v1` 标签来源；`fit` 检测到训练/校准集含该来源后，会在模型自哈希证据中写入 `leakage_metadata: "device_platform_weak_pseudo"`，使发布安全状态固定为未满足。分析时必须显式使用 `--allow-experimental-model`，结果仍强制人工复核且 `authenticity: "not_assessed"`。
+正文候选来自 `amount`、`recipient_field`、`transfer_status` 和 `payment_method_field`；`time` 是状态栏时间，会自动排除。程序先按 `(区域角色, NFC 后逐字符严格相等的可见文字)` 做跨域预筛，再以既有 source/content 组件为原子、每个组件最多一次外连，把 iOS/Android 同文组件放进同一 split component，最后在 train、calibration、test 内分别做确定性等量选择；最终强校验要求每个 `(split, 区域角色, 严格文字)` 的两个代理域同时存在且数量相等，其他区域写成 `include_in_consistency: false`。`content_group_id` 仍使用 NFKC/casefold 的宽归一化来保守防泄漏，但字体配对不会把 `ABC/abc` 或全角 `－１`/ASCII `-1` 当成同一字形。因此常见的“支付成功”“余额”可以直接比较两边字形，而未配对的金额和姓名不会参与字体训练。输出标签来源为 `device_platform_proxy_font_rendering_weak_v1.<resolution|cnn>`，设备来源按 split/domain 保留用于审计，但清单不写 `device_prior_domain`，`fit`、`analyze` 和公共字体预测 API 都不使用旧清单里的设备先验。
+
+`fit` 检测到上述来源后，会在模型自哈希证据中写入 `leakage_metadata: "font_rendering_platform_proxy_weak"`，使发布安全状态固定为未满足。分析时必须显式使用 `--allow-experimental-model`，结果仍强制人工复核且 `authenticity: "not_assessed"`。`exact_font_identity` 始终为 `not_assessed`。
 
 弱标签 pilot 中会跨回单反复出现“支付成功”“余额”等固定 UI 文案；即使来源与整图内容组已经隔离，这些相同的单区域裁图仍可能触发默认 region pHash 近重复启发式。因此上面的零人工快跑显式使用 `--skip-near-duplicate-audit`。这是为了让 pilot 能运行，不代表已经证明无泄漏；该状态会进入模型证据并保持不可发布。后续使用独立真值做正式验收时不得沿用这个跳过选项，仍需满足 exact/pHash 泄漏审计为零。
 
-这条快路只用于零人工判断“现有图片是否存在可分的 iOS/Android 渲染信号”。`fit` 对自动切分 `test` 的评估，会先移除同源的 `device_prior_domain`，再用裁图特征与区域角色预测，并和 `device.platform` 伪标签比较；它报告 classification coverage、selective/overall accuracy 和 PASS/REVIEW/UNKNOWN 分布，但仍然只回答弱标签是否可分。它不是独立人工真值，不是准确字体名称鉴定，也不能证明图片真实或被篡改。结果不能用于设定生产阈值或发布模型，也不能自动得到小米、OPPO、vivo、HarmonyOS 或支付宝字体版本真值。后续可以对每个平台内部做匿名聚类寻找候选子域，但不稳定的簇不得强行命名。
+这条快路只用于零人工判断“同文控制后，现有图片是否存在可分的平台代理字体渲染信号”。`fit` 对自动切分 `test` 的评估使用裁图像素与区域角色，不使用设备先验，并和 `device.platform` 弱标签比较；它报告 classification coverage、selective/overall accuracy 和 PASS/REVIEW/UNKNOWN 分布。上述同文等量约束发生在训练信息门之前；若一侧裁图随后因质量不足被拒绝，门后平衡仍标记为 `not_assessed`，所以产物继续强制不可发布。它还可能包含抗锯齿、缩放、压缩和截图链差异，不是独立字体真值、准确字体名称鉴定，也不能证明图片真实或被篡改。结果不能用于设定生产阈值或发布模型，也不能自动得到小米、OPPO、vivo、HarmonyOS 或支付宝字体版本真值。后续可以对每个平台内部做匿名聚类寻找候选子域，但不稳定的簇不得强行命名。
 
 ## 当前基线和后续模型
 

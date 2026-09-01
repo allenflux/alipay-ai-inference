@@ -15,8 +15,8 @@ from transfer_receipt_ai.font_domain_cli import main
 from transfer_receipt_ai.font_domain_dataset import load_font_domain_dataset
 
 
-IOS_DOMAIN = "ios_alipay_device_pseudo_v1"
-ANDROID_DOMAIN = "android_alipay_device_pseudo_v1"
+IOS_DOMAIN = "ios_alipay_font_rendering_proxy_v1"
+ANDROID_DOMAIN = "android_alipay_font_rendering_proxy_v1"
 BODY_FIELDS = ("amount", "recipient_field", "transfer_status")
 
 
@@ -68,6 +68,7 @@ def _add_document(
     platform: str = "ios",
     confidence: float = 0.99,
     conflict: bool = False,
+    device_source: str = "cnn",
     fields: tuple[str, ...] = BODY_FIELDS + ("time",),
     content_key: str | None = None,
     producer_group_id: str | None = None,
@@ -88,6 +89,7 @@ def _add_document(
                 "device": {
                     "platform": platform,
                     "confidence": confidence,
+                    "source": device_source,
                     "device_prior_conflict": conflict,
                 },
             },
@@ -206,9 +208,9 @@ def test_bootstrap_creates_deterministic_loadable_weak_labels_and_excludes_time(
         ANDROID_DOMAIN,
     }
     assert {document.label_source for document in dataset.documents} == {
-        "device_platform_weak_pseudo_v1"
+        "device_platform_proxy_font_rendering_weak_v1.cnn"
     }
-    assert all(document.device_prior_domain == document.font_domain for document in dataset.documents)
+    assert all(document.device_prior_domain is None for document in dataset.documents)
     assert all(len(document.regions) == 3 for document in dataset.documents)
     assert all(
         {region.role for region in document.regions} == {
@@ -221,6 +223,31 @@ def test_bootstrap_creates_deterministic_loadable_weak_labels_and_excludes_time(
     assert all(region.include_in_consistency for document in dataset.documents for region in document.regions)
     assert all(region.role not in {"time", "status_bar"} for document in dataset.documents for region in document.regions)
     assert report_one["ignored_fields"] == {"time": 16}
+    assert report_one["classification_target"] == "font_rendering_domain"
+    assert report_one["device_prior_used"] is False
+    assert report_one["exact_font_identity"] == "not_assessed"
+    assert report_one["font_signal_validation"] == (
+        "matched_text_balanced_within_split_before_information_gate"
+    )
+    assert report_one["post_information_gate_matched_balance"] == "not_assessed"
+    matched = report_one["selection"]["matched_text_font_evidence"]
+    assert matched["strategy"] == (
+        "cross_domain_role_text_exact_match_balanced_within_split_v1"
+    )
+    assert matched["scope"] == "within_split"
+    assert matched["matched_strata"] == 17
+    assert matched["included_regions"] == 48
+    assert matched["included_regions_by_domain"] == {
+        ANDROID_DOMAIN: 24,
+        IOS_DOMAIN: 24,
+    }
+    assert report_one["selection"]["selected_by_device_label_source"] == {
+        "cnn": 16
+    }
+    assert all(
+        len(set(by_domain.values())) == 1
+        for by_domain in matched["included_regions_by_split_and_domain"].values()
+    )
 
     source_splits: dict[str, set[str]] = {}
     content_splits: dict[str, set[str]] = {}
@@ -237,6 +264,162 @@ def test_bootstrap_creates_deterministic_loadable_weak_labels_and_excludes_time(
     assert report_one["publication"] is False
     assert report_one["evaluation"] == "not_assessed"
     assert report_one["authenticity"] == "not_assessed"
+
+
+def test_bootstrap_balances_same_text_within_each_split_when_other_text_differs(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "existing-pseudo"
+    records: list[dict[str, object]] = []
+    for index in range(18):
+        _add_document(
+            source_root,
+            records,
+            document=f"ios-unique-{index}",
+            platform="ios",
+        )
+        _add_document(
+            source_root,
+            records,
+            document=f"android-unique-{index}",
+            platform="android",
+        )
+    records_path = _write_jsonl(source_root / "pseudo_labels.jsonl", records)
+    output = tmp_path / "bootstrap"
+
+    report = bootstrap_existing_pseudolabels(
+        records_path,
+        output,
+        split_seed="split-scoped-matched-text-regression",
+    )
+    dataset = load_font_domain_dataset(
+        output / "font_domain.auto.jsonl",
+        require_labels=True,
+        minimum_regions=3,
+        require_leakage_metadata=True,
+    )
+
+    assert len(dataset.documents) == 36
+    assert all(
+        {region.role for region in document.included_regions} == {"transfer_status"}
+        for document in dataset.documents
+    )
+    matched = report["selection"]["matched_text_font_evidence"]
+    assert set(matched["included_regions_by_split"]) == {
+        "train",
+        "calibration",
+        "test",
+    }
+    assert all(
+        by_domain[IOS_DOMAIN] == by_domain[ANDROID_DOMAIN]
+        for by_domain in matched["included_regions_by_split_and_domain"].values()
+    )
+    strict_counts: dict[tuple[str, str, str], dict[str, int]] = {}
+    for document in dataset.documents:
+        assert document.font_domain is not None
+        for region in document.included_regions:
+            assert region.text is not None
+            key = (document.split, region.role, region.text)
+            by_domain = strict_counts.setdefault(key, {})
+            by_domain[document.font_domain] = by_domain.get(document.font_domain, 0) + 1
+    assert all(
+        set(by_domain) == {IOS_DOMAIN, ANDROID_DOMAIN}
+        and by_domain[IOS_DOMAIN] == by_domain[ANDROID_DOMAIN]
+        for by_domain in strict_counts.values()
+    )
+    assert report["readiness"]["missing_matched_text_splits"] == []
+
+
+def test_font_matching_preserves_case_and_fullwidth_glyph_identity(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "existing-pseudo"
+    records: list[dict[str, object]] = []
+    fields = BODY_FIELDS + ("payment_method_field",)
+    _add_document(
+        source_root,
+        records,
+        document="ios-glyphs",
+        platform="ios",
+        fields=fields,
+    )
+    _add_document(
+        source_root,
+        records,
+        document="android-glyphs",
+        platform="android",
+        fields=fields,
+    )
+    for row in records:
+        ios = row["group_id"] == "source-ios-glyphs"
+        if row["field"] == "amount":
+            row["text"] = "-1" if ios else "－１"
+        elif row["field"] == "transfer_status":
+            row["text"] = "PAY" if ios else "pay"
+        elif row["field"] == "payment_method_field":
+            row["text"] = "余额"
+    records_path = _write_jsonl(source_root / "pseudo_labels.jsonl", records)
+    output = tmp_path / "bootstrap"
+
+    bootstrap_existing_pseudolabels(records_path, output)
+    dataset = load_font_domain_dataset(
+        output / "font_domain.auto.jsonl",
+        require_labels=True,
+        minimum_regions=3,
+        require_leakage_metadata=True,
+    )
+
+    assert len(dataset.documents) == 2
+    assert all(
+        {region.role for region in document.included_regions} == {"payment_method"}
+        for document in dataset.documents
+    )
+
+
+def test_font_pairing_never_fans_out_one_source_content_component(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "existing-pseudo"
+    records: list[dict[str, object]] = []
+    for index in range(10):
+        _add_document(
+            source_root,
+            records,
+            document=f"ios-shared-{index}",
+            platform="ios",
+            content_key="shared-content",
+        )
+    _add_document(
+        source_root,
+        records,
+        document="android-shared",
+        platform="android",
+        content_key="shared-content",
+    )
+    for index in range(9):
+        _add_document(
+            source_root,
+            records,
+            document=f"android-unique-{index}",
+            platform="android",
+        )
+    records_path = _write_jsonl(source_root / "pseudo_labels.jsonl", records)
+    output = tmp_path / "bootstrap"
+
+    report = bootstrap_existing_pseudolabels(
+        records_path,
+        output,
+        split_seed="component-fanout-regression",
+    )
+
+    pairing = report["selection"]["font_split_pairing"]
+    assert pairing["strategy"] == (
+        "disjoint_source_content_component_font_pair_v1"
+    )
+    assert pairing["source_content_components"] == 10
+    assert pairing["controlled_components"] == 1
+    assert pairing["uncontrolled_components"] == 9
+    assert pairing["pairs_by_role"] == {}
 
 
 def test_bootstrap_keeps_repeated_capture_group_in_one_source_group_and_split(
@@ -474,6 +657,12 @@ def test_bootstrap_fails_closed_before_output_on_unbound_input_paths(
         records[0]["image"] = "../escaped.png"
     elif failure == "missing_selected_crop":
         (source_root / str(records[0]["image"])).unlink()
+        _add_document(
+            source_root,
+            records,
+            document="matched-android",
+            platform="android",
+        )
     else:
         other_source = (source_root / "sources" / "other.png").resolve()
         _write_rgb(other_source, 1001, width=180, height=96)
@@ -663,6 +852,20 @@ def test_bootstrap_existing_cli_publishes_the_zero_touch_dataset(
     assert captured.err == ""
     result = json.loads(captured.out)
     assert result["counts"]["accepted_documents"] == 2
-    assert result["label_provenance"] == "device_platform_weak_pseudo_v1"
+    assert result["classification_target"] == "font_rendering_domain"
+    assert result["label_provenance"] == (
+        "device_platform_proxy_font_rendering_weak_v1"
+    )
     assert (output / "font_domain.auto.jsonl").is_file()
     assert (output / "bootstrap.json").is_file()
+    dataset = load_font_domain_dataset(
+        output / "font_domain.auto.jsonl",
+        require_labels=True,
+        minimum_regions=3,
+        require_leakage_metadata=True,
+    )
+    assert all(
+        {region.role for region in document.included_regions} == {"transfer_status"}
+        for document in dataset.documents
+    )
+    assert result["selection"]["matched_text_font_evidence"]["included_regions"] == 2

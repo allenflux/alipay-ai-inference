@@ -33,7 +33,21 @@ from .font_domain_dataset import (
 
 
 RUN_KIND = "receipt_font_domain_run_v1"
-DEVICE_PLATFORM_WEAK_LABEL_SOURCE = "device_platform_weak_pseudo_v1"
+PLATFORM_PROXY_FONT_LABEL_SOURCE = "device_platform_proxy_font_rendering_weak_v1"
+LEGACY_DEVICE_PLATFORM_WEAK_LABEL_SOURCE = "device_platform_weak_pseudo_v1"
+PLATFORM_PROXY_FONT_LABEL_SOURCES = frozenset(
+    {
+        PLATFORM_PROXY_FONT_LABEL_SOURCE,
+        LEGACY_DEVICE_PLATFORM_WEAK_LABEL_SOURCE,
+    }
+)
+
+
+def _is_platform_proxy_font_label_source(value: str) -> bool:
+    return (
+        value in PLATFORM_PROXY_FONT_LABEL_SOURCES
+        or value.startswith(PLATFORM_PROXY_FONT_LABEL_SOURCE + ".")
+    )
 
 
 def _json_bytes(value: object, *, pretty: bool = False) -> bytes:
@@ -177,6 +191,30 @@ def _metrics_with_domains(
     return metrics
 
 
+def _held_out_slice(
+    document_predictions: list[tuple[str, str | None]],
+    region_predictions: list[tuple[str, str | None]],
+    decision_counts: Counter[str],
+) -> dict[str, object]:
+    total_documents = len(document_predictions)
+    return {
+        "documents": _metrics_with_domains(document_predictions),
+        "regions": _metrics_with_domains(region_predictions),
+        "decision_counts": {
+            decision: int(decision_counts[decision])
+            for decision in ("PASS", "REVIEW", "UNKNOWN")
+        },
+        "decision_rates": {
+            decision: (
+                round(decision_counts[decision] / total_documents, 6)
+                if total_documents
+                else 0.0
+            )
+            for decision in ("PASS", "REVIEW", "UNKNOWN")
+        },
+    }
+
+
 def _evaluate_held_out(
     model: Any,
     dataset: Any,
@@ -202,6 +240,8 @@ def _evaluate_held_out(
             "device_prior_used": False,
             "reference_label_used_for_prediction": False,
             "reference_label_sources": test_label_sources,
+            "aggregation_mode": "not_available",
+            "evidence_groups": {},
             "documents": _metrics_with_domains([]),
             "regions": _metrics_with_domains([]),
             "decision_counts": {decision: 0 for decision in ("PASS", "REVIEW", "UNKNOWN")},
@@ -211,6 +251,23 @@ def _evaluate_held_out(
     document_predictions: list[tuple[str, str | None]] = []
     region_predictions: list[tuple[str, str | None]] = []
     decision_counts: Counter[str] = Counter()
+    grouped_document_predictions: dict[
+        str, list[tuple[str, str | None]]
+    ] = {"platform_proxy_font_rendering": [], "other_labels": []}
+    grouped_region_predictions: dict[
+        str, list[tuple[str, str | None]]
+    ] = {"platform_proxy_font_rendering": [], "other_labels": []}
+    grouped_decision_counts: dict[str, Counter[str]] = {
+        "platform_proxy_font_rendering": Counter(),
+        "other_labels": Counter(),
+    }
+    grouped_label_sources: dict[str, set[str]] = {
+        "platform_proxy_font_rendering": set(),
+        "other_labels": set(),
+    }
+    weak_test_sources = {
+        source for source in test_label_sources if _is_platform_proxy_font_label_source(source)
+    }
     for document in test_documents:
         reference = document.font_domain
         # The filter above establishes this for the type checker and keeps
@@ -220,40 +277,85 @@ def _evaluate_held_out(
         # ``device_prior_domain`` is derived from the same device classifier as
         # the weak reference label in bootstrap datasets.  Remove it here so
         # held-out decisions and metrics are image-feature-only evidence.
-        result = predict_document(model, replace(document, device_prior_domain=None))
+        label_source = document.label_source or "missing"
+        document_uses_proxy_label = _is_platform_proxy_font_label_source(label_source)
+        evidence_group = (
+            "platform_proxy_font_rendering"
+            if document_uses_proxy_label
+            else "other_labels"
+        )
+        aggregation_options: dict[str, object] = {}
+        if document_uses_proxy_label:
+            # Matched-text proxy pilots may have only one controlled text
+            # stratum per receipt. This is a classification diagnostic, not a
+            # production multi-region consistency pass.
+            aggregation_options = {"minimum_regions": 1, "minimum_roles": 1}
+        result = predict_document(
+            model,
+            replace(document, device_prior_domain=None),
+            **aggregation_options,
+        )
         document_predictions.append((reference, result.dominant_domain))
+        grouped_document_predictions[evidence_group].append(
+            (reference, result.dominant_domain)
+        )
         decision_counts[result.decision] += 1
-        region_predictions.extend(
+        grouped_decision_counts[evidence_group][result.decision] += 1
+        grouped_label_sources[evidence_group].add(label_source)
+        document_region_predictions = [
             (reference, line.label if line.accepted else None)
             for line in result.lines
             if line.include_in_consistency
+        ]
+        region_predictions.extend(document_region_predictions)
+        grouped_region_predictions[evidence_group].extend(
+            document_region_predictions
         )
 
-    weak_test_labels = DEVICE_PLATFORM_WEAK_LABEL_SOURCE in test_label_sources
     status = "test_split_labels_not_independently_assessed"
-    if weak_test_labels:
+    if weak_test_sources:
         status = (
-            "weak_pseudo_test_split"
-            if test_label_sources == [DEVICE_PLATFORM_WEAK_LABEL_SOURCE]
-            else "mixed_including_weak_pseudo_test_split"
+            "platform_proxy_font_rendering_test_split"
+            if len(weak_test_sources) == len(test_label_sources)
+            else "mixed_including_platform_proxy_font_rendering_test_split"
         )
-    total_documents = len(document_predictions)
+    if weak_test_sources and len(weak_test_sources) == len(test_label_sources):
+        aggregation_mode = "matched_text_single_region_diagnostic"
+    elif weak_test_sources:
+        aggregation_mode = "per_document_label_source"
+    else:
+        aggregation_mode = "default_document_consistency"
+    combined = _held_out_slice(
+        document_predictions,
+        region_predictions,
+        decision_counts,
+    )
+    evidence_groups = {
+        group: {
+            "label_sources": sorted(grouped_label_sources[group]),
+            "aggregation_mode": (
+                "matched_text_single_region_diagnostic"
+                if group == "platform_proxy_font_rendering"
+                else "default_document_consistency"
+            ),
+            **_held_out_slice(
+                grouped_document_predictions[group],
+                grouped_region_predictions[group],
+                grouped_decision_counts[group],
+            ),
+        }
+        for group in ("platform_proxy_font_rendering", "other_labels")
+        if grouped_document_predictions[group]
+    }
     return {
         "status": status,
         "authenticity": "not_assessed",
         "device_prior_used": False,
         "reference_label_used_for_prediction": False,
         "reference_label_sources": test_label_sources,
-        "documents": _metrics_with_domains(document_predictions),
-        "regions": _metrics_with_domains(region_predictions),
-        "decision_counts": {
-            decision: int(decision_counts[decision])
-            for decision in ("PASS", "REVIEW", "UNKNOWN")
-        },
-        "decision_rates": {
-            decision: round(decision_counts[decision] / total_documents, 6)
-            for decision in ("PASS", "REVIEW", "UNKNOWN")
-        },
+        "aggregation_mode": aggregation_mode,
+        "evidence_groups": evidence_groups,
+        **combined,
     }
 
 
@@ -310,16 +412,16 @@ def _fit(args: argparse.Namespace) -> dict[str, object]:
             if document.split == "test" and document.label_source is not None
         }
     )
-    weak_device_training_labels = (
-        DEVICE_PLATFORM_WEAK_LABEL_SOURCE in training_label_sources
+    weak_font_proxy_training_labels = any(
+        _is_platform_proxy_font_label_source(source)
+        for source in training_label_sources
     )
-    # A device-platform pseudo label is useful for a zero-touch pilot, but it
-    # is not independent font-domain ground truth.  Persist that limitation in
-    # the self-hashed publication safety state so the resulting model can only
-    # run through the explicit experimental path.
+    # Device platform is useful as a zero-touch proxy for a font-rendering
+    # class, but it is not independent font-family ground truth. Persist that
+    # limitation in the self-hashed model so it remains experimental.
     leakage_metadata_status = "required_and_present"
-    if weak_device_training_labels:
-        leakage_metadata_status = "device_platform_weak_pseudo"
+    if weak_font_proxy_training_labels:
+        leakage_metadata_status = "font_rendering_platform_proxy_weak"
     elif args.allow_incomplete_leakage_metadata:
         leakage_metadata_status = "incomplete_allowed"
     if near_duplicate_audit is None:
@@ -392,12 +494,15 @@ def _fit(args: argparse.Namespace) -> dict[str, object]:
         "calibration_prerequisites_met": not unready_domains,
         "ood_gate_effective": model.gates.fit_p_value > 0.0 and not unready_domains,
         "publication_safety": model.publication_safety.as_dict(),
+        "prediction_inputs": ["crop_pixels", "region_role"],
+        "device_prior_used": False,
+        "exact_font_identity": "not_assessed",
         "label_sources": label_sources,
         "training_label_sources": training_label_sources,
         "test_label_sources": test_label_sources,
         "label_evidence_status": (
-            "device_platform_weak_pseudo"
-            if weak_device_training_labels
+            "font_rendering_platform_proxy_weak"
+            if weak_font_proxy_training_labels
             else "not_independently_assessed"
         ),
         "held_out_evaluation": held_out_evaluation,
@@ -466,7 +571,7 @@ def _analyze(args: argparse.Namespace) -> dict[str, object]:
     results = [
         predict_document(
             model,
-            document,
+            replace(document, device_prior_domain=None),
             minimum_regions=args.minimum_regions,
             minimum_roles=args.minimum_roles,
             minimum_known_coverage=args.minimum_known_coverage,
@@ -482,6 +587,9 @@ def _analyze(args: argparse.Namespace) -> dict[str, object]:
             "feature_abi": FEATURE_ABI,
             "publication_prerequisites_recorded": publication_prerequisites_recorded,
             "evaluation_status": "not_assessed",
+            "prediction_inputs": ["crop_pixels", "region_role"],
+            "device_prior_used": False,
+            "exact_font_identity": "not_assessed",
         }
         if not publication_prerequisites_recorded:
             row["requires_manual_review"] = True
@@ -505,6 +613,9 @@ def _analyze(args: argparse.Namespace) -> dict[str, object]:
             "publication_safety": model.publication_safety.as_dict(),
             "publication_prerequisites_recorded": publication_prerequisites_recorded,
             "evaluation_status": "not_assessed",
+            "prediction_inputs": ["crop_pixels", "region_role"],
+            "device_prior_used": False,
+            "exact_font_identity": "not_assessed",
         },
         "input": dataset.summary(),
         "aggregation": {
@@ -512,6 +623,7 @@ def _analyze(args: argparse.Namespace) -> dict[str, object]:
             "minimum_roles": args.minimum_roles,
             "minimum_known_coverage": args.minimum_known_coverage,
             "pass_support_ratio": args.pass_support_ratio,
+            "device_prior_used": False,
         },
         "documents": len(results),
         "decisions": {
@@ -577,14 +689,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     bootstrap = subparsers.add_parser(
         "bootstrap-existing",
-        help="Build a zero-touch iOS/Android weak-label pilot from existing OCR crops",
+        help=(
+            "Build a zero-touch iOS/Android font-rendering proxy pilot "
+            "from existing OCR crops"
+        ),
     )
     bootstrap.add_argument("--records", type=Path, required=True, help="Existing pseudo_labels.jsonl")
     bootstrap.add_argument("--output", type=Path, required=True, help="New bootstrap dataset directory")
     bootstrap.add_argument("--minimum-device-confidence", type=float, default=0.90)
     bootstrap.add_argument("--minimum-regions", type=int, default=3)
     bootstrap.add_argument("--maximum-documents-per-domain", type=int, default=500)
-    bootstrap.add_argument("--split-seed", default="font-domain-device-pseudo-v1")
+    bootstrap.add_argument("--split-seed", default="font-rendering-platform-proxy-v1")
     bootstrap.add_argument("--train-ratio", type=float, default=0.60)
     bootstrap.add_argument("--calibration-ratio", type=float, default=0.20)
 

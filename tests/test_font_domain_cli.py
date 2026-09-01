@@ -168,6 +168,8 @@ def _inference_manifest(root: Path) -> Path:
         regions=regions,
         strict_metadata=False,
     )
+    # A contrary device prior must not affect font-only analysis.
+    record["device_prior_domain"] = "android_alipay"
     return _write_manifest(root, "inference.jsonl", [record])
 
 
@@ -278,6 +280,11 @@ def test_validate_fit_and_analyze_publish_bound_sidecar_without_clobber(
     assert sidecar_rows[0]["decision"] == "PASS"
     assert sidecar_rows[0]["requires_manual_review"] is True
     assert sidecar_rows[0]["model_evidence"]["evaluation_status"] == "not_assessed"
+    assert sidecar_rows[0]["model_evidence"]["device_prior_used"] is False
+    assert sidecar_rows[0]["model_evidence"]["prediction_inputs"] == [
+        "crop_pixels",
+        "region_role",
+    ]
 
     run = json.loads(run_bytes)
     assert run["kind"] == RUN_KIND
@@ -285,6 +292,7 @@ def test_validate_fit_and_analyze_publish_bound_sidecar_without_clobber(
     assert sum(run["decisions"].values()) == 1
     assert run["failures"] == 0
     assert run["authenticity"] == "not_assessed"
+    assert run["aggregation"]["device_prior_used"] is False
     assert run["outputs"]["font_domain.sidecar.jsonl"] == {
         "records": 1,
         "sha256": hashlib.sha256(sidecar_bytes).hexdigest(),
@@ -305,7 +313,7 @@ def test_validate_fit_and_analyze_publish_bound_sidecar_without_clobber(
     assert run_path.read_bytes() == run_bytes
 
 
-def test_device_platform_pseudo_labels_force_experimental_model_safety(
+def test_platform_proxy_font_labels_force_experimental_model_safety(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
@@ -316,19 +324,24 @@ def test_device_platform_pseudo_labels_force_experimental_model_safety(
         for line in training.read_text(encoding="utf-8").splitlines()
     ]
     for row in rows:
-        row["label_source"] = "device_platform_weak_pseudo_v1"
+        row["label_source"] = "device_platform_proxy_font_rendering_weak_v1"
         if row["split"] == "test":
-            # Match the real bootstrap contract.  The evaluator must remove
-            # this label-derived prior before asking for image predictions.
+            # Simulate a legacy manifest carrying the label-derived prior.
+            # The evaluator must remove it before asking for predictions.
             row["device_prior_domain"] = row["font_domain"]
     training.write_text(
         "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
         encoding="utf-8",
     )
 
-    def fake_predict_document(model: object, document: object) -> SimpleNamespace:
+    def fake_predict_document(
+        model: object,
+        document: object,
+        **aggregation_options: object,
+    ) -> SimpleNamespace:
         del model
         assert getattr(document, "device_prior_domain") is None
+        assert aggregation_options == {"minimum_regions": 1, "minimum_roles": 1}
         reference = str(getattr(document, "font_domain"))
         other = "ios_alipay" if reference == "android_alipay" else "android_alipay"
         correct_document = str(getattr(document, "document_id")).endswith("-0")
@@ -372,18 +385,28 @@ def test_device_platform_pseudo_labels_force_experimental_model_safety(
     assert stderr == ""
     fitted = json.loads(stdout)
     assert fitted["near_duplicate_audit"] is None
-    assert fitted["label_sources"] == ["device_platform_weak_pseudo_v1"]
-    assert fitted["training_label_sources"] == ["device_platform_weak_pseudo_v1"]
-    assert fitted["test_label_sources"] == ["device_platform_weak_pseudo_v1"]
-    assert fitted["label_evidence_status"] == "device_platform_weak_pseudo"
-    assert fitted["publication_safety"]["leakage_metadata"] == "device_platform_weak_pseudo"
+    assert fitted["label_sources"] == [
+        "device_platform_proxy_font_rendering_weak_v1"
+    ]
+    assert fitted["training_label_sources"] == [
+        "device_platform_proxy_font_rendering_weak_v1"
+    ]
+    assert fitted["test_label_sources"] == [
+        "device_platform_proxy_font_rendering_weak_v1"
+    ]
+    assert fitted["label_evidence_status"] == "font_rendering_platform_proxy_weak"
+    assert fitted["publication_safety"]["leakage_metadata"] == (
+        "font_rendering_platform_proxy_weak"
+    )
     assert fitted["publication_prerequisites_recorded"] is False
     held_out = fitted["held_out_evaluation"]
-    assert held_out["status"] == "weak_pseudo_test_split"
+    assert held_out["status"] == "platform_proxy_font_rendering_test_split"
     assert held_out["authenticity"] == "not_assessed"
     assert held_out["device_prior_used"] is False
     assert held_out["reference_label_used_for_prediction"] is False
-    assert held_out["reference_label_sources"] == ["device_platform_weak_pseudo_v1"]
+    assert held_out["reference_label_sources"] == [
+        "device_platform_proxy_font_rendering_weak_v1"
+    ]
     assert held_out["decision_counts"] == {"PASS": 2, "REVIEW": 2, "UNKNOWN": 0}
     assert held_out["decision_rates"] == {"PASS": 0.5, "REVIEW": 0.5, "UNKNOWN": 0.0}
     assert held_out["documents"] == {
@@ -433,7 +456,7 @@ def test_device_platform_pseudo_labels_force_experimental_model_safety(
         }
     model_payload = json.loads(model.read_text(encoding="utf-8"))
     assert model_payload["publication_safety"]["leakage_metadata"] == (
-        "device_platform_weak_pseudo"
+        "font_rendering_platform_proxy_weak"
     )
 
 
@@ -445,7 +468,7 @@ def test_test_only_weak_labels_do_not_relabel_training_evidence(
     rows = [json.loads(line) for line in training.read_text(encoding="utf-8").splitlines()]
     for row in rows:
         if row["split"] == "test":
-            row["label_source"] = "device_platform_weak_pseudo_v1"
+            row["label_source"] = "device_platform_proxy_font_rendering_weak_v1"
             row["device_prior_domain"] = row["font_domain"]
     training.write_text(
         "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
@@ -466,11 +489,126 @@ def test_test_only_weak_labels_do_not_relabel_training_evidence(
     assert stderr == ""
     fitted = json.loads(stdout)
     assert fitted["training_label_sources"] == ["synthetic_test_fixture"]
-    assert fitted["test_label_sources"] == ["device_platform_weak_pseudo_v1"]
+    assert fitted["test_label_sources"] == [
+        "device_platform_proxy_font_rendering_weak_v1"
+    ]
     assert fitted["label_evidence_status"] == "not_independently_assessed"
     assert fitted["publication_safety"]["leakage_metadata"] == "required_and_present"
-    assert fitted["held_out_evaluation"]["status"] == "weak_pseudo_test_split"
+    assert fitted["held_out_evaluation"]["status"] == (
+        "platform_proxy_font_rendering_test_split"
+    )
     assert fitted["held_out_evaluation"]["device_prior_used"] is False
+
+
+def test_mixed_test_labels_apply_single_region_mode_only_to_proxy_documents(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    training = _training_manifest(tmp_path / "mixed-test-labels", include_test=True)
+    rows = [json.loads(line) for line in training.read_text(encoding="utf-8").splitlines()]
+    weak_document_id = next(
+        str(row["id"])
+        for row in rows
+        if row["split"] == "test"
+    )
+    for row in rows:
+        if row["id"] == weak_document_id:
+            row["label_source"] = "device_platform_weak_pseudo_v1"
+            row["device_prior_domain"] = row["font_domain"]
+    training.write_text(
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+    options_by_document: dict[str, dict[str, object]] = {}
+
+    def fake_predict_document(
+        model: object,
+        document: object,
+        **aggregation_options: object,
+    ) -> SimpleNamespace:
+        del model
+        document_id = str(getattr(document, "document_id"))
+        options_by_document[document_id] = dict(aggregation_options)
+        reference = str(getattr(document, "font_domain"))
+        return SimpleNamespace(
+            dominant_domain=reference,
+            decision="PASS",
+            lines=tuple(
+                SimpleNamespace(
+                    include_in_consistency=True,
+                    accepted=True,
+                    label=reference,
+                )
+                for _ in range(3)
+            ),
+        )
+
+    monkeypatch.setattr(cli_module, "predict_document", fake_predict_document)
+    code, stdout, stderr = _invoke(
+        capsys,
+        "fit",
+        "--records",
+        str(training),
+        "--output",
+        str(tmp_path / "mixed-test-labels.model.json"),
+        "--skip-near-duplicate-audit",
+    )
+
+    assert code == 0
+    assert stderr == ""
+    assert options_by_document[weak_document_id] == {
+        "minimum_regions": 1,
+        "minimum_roles": 1,
+    }
+    assert all(
+        options == {}
+        for document_id, options in options_by_document.items()
+        if document_id != weak_document_id
+    )
+    held_out = json.loads(stdout)["held_out_evaluation"]
+    assert held_out["status"] == (
+        "mixed_including_platform_proxy_font_rendering_test_split"
+    )
+    assert held_out["aggregation_mode"] == "per_document_label_source"
+    assert held_out["evidence_groups"]["platform_proxy_font_rendering"][
+        "documents"
+    ]["total"] == 1
+    assert held_out["evidence_groups"]["other_labels"]["documents"]["total"] == 3
+
+
+def test_legacy_device_proxy_labels_remain_fail_closed(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    training = _training_manifest(tmp_path / "legacy-proxy")
+    rows = [json.loads(line) for line in training.read_text(encoding="utf-8").splitlines()]
+    for row in rows:
+        row["label_source"] = "device_platform_weak_pseudo_v1"
+    training.write_text(
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+    code, stdout, stderr = _invoke(
+        capsys,
+        "fit",
+        "--records",
+        str(training),
+        "--output",
+        str(tmp_path / "legacy-proxy.model.json"),
+        "--skip-near-duplicate-audit",
+    )
+
+    assert code == 0
+    assert stderr == ""
+    fitted = json.loads(stdout)
+    assert fitted["label_evidence_status"] == "font_rendering_platform_proxy_weak"
+    assert fitted["publication_safety"]["leakage_metadata"] == (
+        "font_rendering_platform_proxy_weak"
+    )
+    assert fitted["publication_prerequisites_recorded"] is False
 
 
 def test_training_cli_enforces_leakage_metadata_and_content_group_split(

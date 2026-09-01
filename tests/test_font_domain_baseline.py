@@ -14,11 +14,13 @@ from transfer_receipt_ai.font_domain_baseline import (
     FEATURE_ABI,
     FEATURE_DIMENSION,
     FontDomainGates,
+    FontDomainPublicationSafety,
     FontDomainPrototypeModel,
     extract_font_domain_features,
     fit_font_domain_model,
     load_font_domain_model,
     minimum_conformal_calibration_count,
+    predict_document,
     predict_region,
     save_font_domain_model,
 )
@@ -156,6 +158,55 @@ def calibrated_corpus(tmp_path_factory: pytest.TempPathFactory) -> _CalibratedCo
 
 def _document(dataset: FontDomainDataset, document_id: str):
     return next(document for document in dataset.documents if document.document_id == document_id)
+
+
+def test_document_prediction_ignores_legacy_device_prior(
+    calibrated_corpus: _CalibratedCorpus,
+) -> None:
+    document = _document(
+        calibrated_corpus.dataset,
+        f"{_DOMAINS[0]}-calibration-0",
+    )
+    options = {"minimum_regions": 1, "minimum_roles": 1}
+
+    without_prior = predict_document(
+        calibrated_corpus.model,
+        replace(document, device_prior_domain=None),
+        **options,
+    )
+    with_contrary_prior = predict_document(
+        calibrated_corpus.model,
+        replace(document, device_prior_domain=_DOMAINS[1]),
+        **options,
+    )
+
+    assert with_contrary_prior == without_prior
+    assert with_contrary_prior.device_prior_domain is None
+    assert "DEVICE_PRIOR_DOMAIN_CONFLICT" not in with_contrary_prior.reasons
+
+
+def test_legacy_device_proxy_publication_state_still_loads_fail_closed(
+    calibrated_corpus: _CalibratedCorpus,
+    tmp_path: Path,
+) -> None:
+    legacy_model = fit_font_domain_model(
+        calibrated_corpus.dataset,
+        gates=_PERMISSIVE_POC_GATES,
+        minimum_train_regions_per_domain=3,
+        minimum_role_regions_per_domain=3,
+        minimum_calibration_groups_per_domain=1,
+        publication_safety=FontDomainPublicationSafety(
+            leakage_metadata="device_platform_weak_pseudo",
+            near_duplicate_audit="skipped",
+        ),
+    )
+    destination = tmp_path / "legacy-device-proxy.model.json"
+    save_font_domain_model(legacy_model, destination)
+
+    loaded = load_font_domain_model(destination)
+
+    assert loaded.publication_safety.leakage_metadata == "device_platform_weak_pseudo"
+    assert loaded.publication_safety.required_checks_recorded is False
 
 
 def test_classical_feature_is_deterministic_finite_and_exactly_64_dimensional() -> None:
