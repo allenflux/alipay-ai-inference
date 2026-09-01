@@ -22,7 +22,7 @@ from time import perf_counter
 from typing import Any
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
 
 from .onnx_runtime import _preload_cuda_dlls, onnx_providers
 
@@ -71,6 +71,38 @@ def _sha256(path: Path) -> str:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _decoded_pixel_sha256(path: Path) -> str:
+    try:
+        with Image.open(path) as opened:
+            rgb = np.asarray(ImageOps.exif_transpose(opened).convert("RGB"), dtype=np.uint8)
+    except (OSError, ValueError) as error:
+        raise ValueError(f"unable to decode bound classifier image {path}: {error}") from error
+    pixels = np.ascontiguousarray(rgb, dtype=np.uint8)
+    digest = hashlib.sha256()
+    digest.update(str(tuple(int(item) for item in pixels.shape)).encode("ascii"))
+    digest.update(b"\0uint8\0RGB\0")
+    digest.update(pixels.tobytes(order="C"))
+    return digest.hexdigest()
+
+
+def _verify_optional_image_bindings(record: Mapping[str, object]) -> None:
+    image_path = Path(record["image_path"])
+    for key in ("raw_sha256", "pixel_sha256"):
+        value = record.get(key)
+        if value is not None and (
+            not isinstance(value, str)
+            or len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+        ):
+            raise ValueError(f"{key} must be a lowercase SHA-256 when supplied")
+    expected_raw = record.get("raw_sha256")
+    if expected_raw is not None and _sha256(image_path) != expected_raw:
+        raise ValueError(f"raw_sha256 differs from classifier image bytes: {image_path}")
+    expected_pixels = record.get("pixel_sha256")
+    if expected_pixels is not None and _decoded_pixel_sha256(image_path) != expected_pixels:
+        raise ValueError(f"pixel_sha256 differs from decoded classifier RGB: {image_path}")
 
 
 def _require_torch() -> tuple[Any, Any]:
@@ -240,24 +272,26 @@ def load_records(records_path: Path, *, dataset_root: Path | None = None) -> lis
                 raise ValueError(
                     f"{records_path}:{line_number}: group_id {group_id!r} appears in both {prior_split} and {split} splits"
                 )
+            bound_record: dict[str, object] = {
+                "id": record_id,
+                "image_path": image_path,
+                "image": image,
+                "field": field,
+                "class_name": class_name,
+                "split": split,
+                "group_id": group_id,
+                "source": value.get("source"),
+                "result_json": value.get("result_json"),
+                "crop_sha256": value.get("crop_sha256"),
+                "raw_sha256": value.get("raw_sha256"),
+                "pixel_sha256": value.get("pixel_sha256"),
+                "label_source": value.get("label_source") if isinstance(value.get("label_source"), str) else "unspecified",
+            }
+            _verify_optional_image_bindings(bound_record)
             ids.add(record_id)
             images.add(image_key)
             fields.add(field)
-            records.append(
-                {
-                    "id": record_id,
-                    "image_path": image_path,
-                    "image": image,
-                    "field": field,
-                    "class_name": class_name,
-                    "split": split,
-                    "group_id": group_id,
-                    "source": value.get("source"),
-                    "result_json": value.get("result_json"),
-                    "crop_sha256": value.get("crop_sha256"),
-                    "label_source": value.get("label_source") if isinstance(value.get("label_source"), str) else "unspecified",
-                }
-            )
+            records.append(bound_record)
     if not records:
         raise ValueError(f"No classification records in {records_path}")
     if len(fields) != 1:
@@ -277,6 +311,7 @@ def _make_dataset(records: Sequence[Mapping[str, object]], *, class_to_index: Ma
 
         def __getitem__(self, index: int) -> tuple[Any, int, str, str]:
             record = records[index]
+            _verify_optional_image_bindings(record)
             return (
                 _tensor_image(Path(record["image_path"]), config=config, torch=torch),
                 class_to_index[str(record["class_name"])],
@@ -721,6 +756,7 @@ def evaluate_onnx(
     accepted_predictions: list[int] = []
     latencies: list[float] = []
     for record in evaluation_records:
+        _verify_optional_image_bindings(record)
         started = perf_counter()
         logits = session.run([output_name], {input_name: preprocess_image(Path(record["image_path"]), config=config)})[0]
         latency_ms = (perf_counter() - started) * 1000.0

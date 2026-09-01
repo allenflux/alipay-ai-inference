@@ -31,6 +31,7 @@ receipt-ocr-train = "transfer_receipt_ai.ocr_train:train_main"
 receipt-ocr-export-onnx = "transfer_receipt_ai.ocr_train:export_main"
 receipt-ocr-evaluate = "transfer_receipt_ai.ocr_evaluate:main"
 receipt-paddle-ocr-bundle = "transfer_receipt_ai.paddle_ocr_bundle:main"
+receipt-font-domain-consistency = "transfer_receipt_ai.font_domain_cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

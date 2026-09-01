@@ -30,6 +30,10 @@ alipay-ai-inference/
   requirements-dev.txt
 ```
 
+## 字体域一致性独立实验
+
+本分支新增离线 `receipt-font-domain-consistency` sidecar，用文档级分组数据验证“一张回单正文应有一个主导手机/应用渲染域”。它不会修改 v4 OCR 或输出真假结论；低质量和未校准样本返回 `UNKNOWN`。数据契约、训练/分析命令和上线门禁见 [docs/font-domain-consistency-v1.md](docs/font-domain-consistency-v1.md)。
+
 ## Windows + CUDA 环境配置
 
 推荐 Python 3.10–3.12。先用 `nvidia-smi` 确认 NVIDIA 驱动，然后根据
