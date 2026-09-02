@@ -24,6 +24,7 @@ from uuid import uuid4
 SCHEMA_VERSION: Final[int] = 1
 PREPARE_KIND: Final[str] = "receipt_font_routed_ocr_pilot_dataset_v1"
 SUMMARY_KIND: Final[str] = "receipt_font_routed_ocr_pilot_ab_v1"
+RUNTIME_EVIDENCE_KIND: Final[str] = "receipt_font_routed_ocr_runtime_evidence_v1"
 DEFAULT_FIELDS: Final[tuple[str, ...]] = (
     "amount",
     "time",
@@ -31,6 +32,18 @@ DEFAULT_FIELDS: Final[tuple[str, ...]] = (
 )
 PLATFORMS: Final[tuple[str, ...]] = ("ios", "android")
 RANDOM_ROUTES: Final[tuple[str, ...]] = ("random_a", "random_b")
+DEFAULT_EVALUATIONS: Final[tuple[str, ...]] = (
+    "generic_ios",
+    "routed_ios",
+    "wrong_ios",
+    "generic_android",
+    "routed_android",
+    "wrong_android",
+    "generic_random_a",
+    "routed_random_a",
+    "generic_random_b",
+    "routed_random_b",
+)
 
 
 class RoutedOcrPilotError(ValueError):
@@ -655,6 +668,146 @@ def merge_comparisons(inputs: Sequence[Path], output: Path) -> dict[str, Any]:
     }
 
 
+def collect_runtime_evidence(
+    summaries: Sequence[Path],
+    output: Path,
+    *,
+    expected_fields: Sequence[str] = DEFAULT_FIELDS,
+    expected_evaluations: Sequence[str] = DEFAULT_EVALUATIONS,
+    required_provider: str = "CPUExecutionProvider",
+) -> dict[str, Any]:
+    """Bind every evaluator's provider, model, manifest, and comparisons artifact."""
+
+    output = Path(os.path.abspath(os.fspath(output.expanduser())))
+    if os.path.lexists(output):
+        raise FileExistsError(f"refusing to overwrite runtime evidence: {output}")
+    fields = tuple(dict.fromkeys(expected_fields))
+    evaluations = tuple(dict.fromkeys(expected_evaluations))
+    if not fields or not evaluations:
+        raise RoutedOcrPilotError("runtime evidence requires fields and evaluation names")
+    expected = {f"{field}/{evaluation}" for field in fields for evaluation in evaluations}
+    entries: dict[str, dict[str, Any]] = {}
+    for source in summaries:
+        source = source.resolve(strict=True)
+        if source.name != "summary.json" or len(source.parents) < 2:
+            raise RoutedOcrPilotError(f"evaluation summary path has unsupported layout: {source}")
+        field = source.parent.parent.name
+        evaluation = source.parent.name
+        key = f"{field}/{evaluation}"
+        if key not in expected or key in entries:
+            raise RoutedOcrPilotError(f"runtime evidence has unexpected or duplicate evaluation: {key}")
+        summary = _read_json(source, description=f"evaluation summary {key}")
+        if summary.get("providers") != [required_provider]:
+            raise RoutedOcrPilotError(
+                f"evaluation {key} did not use only {required_provider}: {summary.get('providers')!r}"
+            )
+        if summary.get("fields") != [field] or summary.get("evaluation_split") != "test":
+            raise RoutedOcrPilotError(f"evaluation {key} has wrong field or split")
+        if summary.get("kind") != "receipt_ocr_ctc_pseudo_label_evaluation_v1":
+            raise RoutedOcrPilotError(f"evaluation {key} does not preserve pseudo-label semantics")
+        model_value = summary.get("model")
+        records_value = summary.get("records")
+        model_sha256 = summary.get("model_sha256")
+        if not isinstance(model_value, str) or not isinstance(records_value, str):
+            raise RoutedOcrPilotError(f"evaluation {key} has invalid model or records path")
+        model = Path(model_value).resolve(strict=True)
+        records = Path(records_value).resolve(strict=True)
+        if not isinstance(model_sha256, str) or model_sha256 != _sha256(model):
+            raise RoutedOcrPilotError(f"evaluation {key} model hash is invalid")
+        comparisons = (source.parent / "comparisons.jsonl").resolve(strict=True)
+        entries[key] = {
+            "field": field,
+            "evaluation": evaluation,
+            "providers": [required_provider],
+            "model": model.as_posix(),
+            "model_sha256": model_sha256,
+            "records": records.as_posix(),
+            "records_sha256": _sha256(records),
+            "summary": source.as_posix(),
+            "summary_sha256": _sha256(source),
+            "comparisons": comparisons.as_posix(),
+            "comparisons_sha256": _sha256(comparisons),
+        }
+    missing = sorted(expected - set(entries))
+    if missing or set(entries) != expected:
+        raise RoutedOcrPilotError(
+            f"runtime evidence coverage is incomplete; first missing={missing[0] if missing else 'unexpected'}"
+        )
+    evidence = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": RUNTIME_EVIDENCE_KIND,
+        "completed": True,
+        "required_provider": required_provider,
+        "fields": list(fields),
+        "evaluations": list(evaluations),
+        "entries": {key: entries[key] for key in sorted(entries)},
+    }
+    output.parent.mkdir(parents=True, exist_ok=True)
+    _write_json(output, evidence)
+    return evidence
+
+
+def _validate_runtime_evidence(path: Path, *, fields: Sequence[str]) -> Mapping[str, Any]:
+    path = path.resolve(strict=True)
+    evidence = _read_json(path, description="runtime evidence")
+    if (
+        evidence.get("kind") != RUNTIME_EVIDENCE_KIND
+        or evidence.get("completed") is not True
+        or evidence.get("required_provider") != "CPUExecutionProvider"
+        or evidence.get("fields") != list(fields)
+        or evidence.get("evaluations") != list(DEFAULT_EVALUATIONS)
+    ):
+        raise RoutedOcrPilotError("runtime evidence contract is incomplete or unsupported")
+    raw_entries = evidence.get("entries")
+    expected = {f"{field}/{evaluation}" for field in fields for evaluation in DEFAULT_EVALUATIONS}
+    if not isinstance(raw_entries, Mapping) or set(raw_entries) != expected:
+        raise RoutedOcrPilotError("runtime evidence evaluation coverage differs from the A/B plan")
+    verified_hashes: dict[tuple[str, str], str] = {}
+    for key in sorted(expected):
+        entry = raw_entries.get(key)
+        field, evaluation = key.split("/", 1)
+        if (
+            not isinstance(entry, Mapping)
+            or entry.get("field") != field
+            or entry.get("evaluation") != evaluation
+            or entry.get("providers") != ["CPUExecutionProvider"]
+        ):
+            raise RoutedOcrPilotError(f"runtime evidence entry is invalid: {key}")
+        artifact_paths: dict[str, Path] = {}
+        for artifact in ("model", "records", "summary", "comparisons"):
+            raw_path = entry.get(artifact)
+            raw_sha256 = entry.get(f"{artifact}_sha256")
+            if not isinstance(raw_path, str) or not isinstance(raw_sha256, str):
+                raise RoutedOcrPilotError(f"runtime evidence {key}/{artifact} binding is invalid")
+            artifact_path = Path(raw_path).resolve(strict=True)
+            artifact_paths[artifact] = artifact_path
+            cache_key = (artifact, artifact_path.as_posix())
+            actual_sha256 = verified_hashes.get(cache_key)
+            if actual_sha256 is None:
+                actual_sha256 = _sha256(artifact_path)
+                verified_hashes[cache_key] = actual_sha256
+            if not re.fullmatch(r"[0-9a-f]{64}", raw_sha256) or raw_sha256 != actual_sha256:
+                raise RoutedOcrPilotError(f"runtime evidence {key}/{artifact} hash differs")
+        summary = _read_json(artifact_paths["summary"], description=f"evaluation summary {key}")
+        try:
+            summary_model = Path(str(summary.get("model"))).resolve(strict=True)
+            summary_records = Path(str(summary.get("records"))).resolve(strict=True)
+        except OSError as error:
+            raise RoutedOcrPilotError(f"runtime evidence {key} summary path is invalid: {error}") from error
+        if (
+            summary.get("kind") != "receipt_ocr_ctc_pseudo_label_evaluation_v1"
+            or summary.get("providers") != ["CPUExecutionProvider"]
+            or summary.get("fields") != [field]
+            or summary.get("evaluation_split") != "test"
+            or summary.get("model_sha256") != entry.get("model_sha256")
+            or summary_model != artifact_paths["model"]
+            or summary_records != artifact_paths["records"]
+            or artifact_paths["comparisons"] != artifact_paths["summary"].parent / "comparisons.jsonl"
+        ):
+            raise RoutedOcrPilotError(f"runtime evidence {key} summary binding differs")
+    return evidence
+
+
 def _mcnemar_p_value(wins: int, losses: int) -> float:
     discordant = wins + losses
     if discordant == 0:
@@ -822,6 +975,7 @@ def _difference_of_paired_improvements(
 def summarize_routed_ab(
     *,
     prepare_report: Path,
+    runtime_evidence: Path,
     generic_ios: Path,
     routed_ios: Path,
     generic_android: Path,
@@ -846,6 +1000,7 @@ def summarize_routed_ab(
     if not isinstance(fields_value, list) or not all(isinstance(field, str) for field in fields_value):
         raise RoutedOcrPilotError("prepare report fields are invalid")
     fields = tuple(fields_value)
+    runtime = _validate_runtime_evidence(runtime_evidence, fields=fields)
 
     paths = {
         "generic_ios": generic_ios,
@@ -862,6 +1017,17 @@ def summarize_routed_ab(
     indexes = {
         name: _comparison_index(path, description=name) for name, path in paths.items()
     }
+    runtime_entries = runtime["entries"]
+    for name in paths:
+        source_indexes = [
+            _comparison_index(
+                Path(str(runtime_entries[f"{field}/{name}"]["comparisons"])),
+                description=f"runtime {field}/{name}",
+            )
+            for field in fields
+        ]
+        if _combine_indexes(source_indexes) != indexes[name]:
+            raise RoutedOcrPilotError(f"merged comparisons differ from runtime evidence for {name}")
     actual_baseline = _combine_indexes([indexes["generic_ios"], indexes["generic_android"]])
     actual_candidate = _combine_indexes([indexes["routed_ios"], indexes["routed_android"]])
     random_baseline = _combine_indexes([indexes["generic_random_a"], indexes["generic_random_b"]])
@@ -983,6 +1149,11 @@ def summarize_routed_ab(
                 name: {"path": path.resolve().as_posix(), "sha256": _sha256(path.resolve())}
                 for name, path in paths.items()
             },
+            "runtime_evidence": {
+                "path": runtime_evidence.resolve().as_posix(),
+                "sha256": _sha256(runtime_evidence.resolve()),
+                "required_provider": "CPUExecutionProvider",
+            },
         },
         "routing_label_semantics": "device_platform_weak_proxy_not_exact_font_identity",
         "truth_semantics": "paddle_teacher_parity_not_independent_human_truth",
@@ -1028,8 +1199,16 @@ def build_parser() -> argparse.ArgumentParser:
     merge.add_argument("--inputs", type=Path, nargs="+", required=True)
     merge.add_argument("--output", type=Path, required=True)
 
+    runtime = subparsers.add_parser("collect-runtime-evidence")
+    runtime.add_argument("--summaries", type=Path, nargs="+", required=True)
+    runtime.add_argument("--expected-fields", type=_parse_csv, default=DEFAULT_FIELDS)
+    runtime.add_argument("--expected-evaluations", type=_parse_csv, default=DEFAULT_EVALUATIONS)
+    runtime.add_argument("--required-provider", default="CPUExecutionProvider")
+    runtime.add_argument("--output", type=Path, required=True)
+
     summarize = subparsers.add_parser("summarize")
     summarize.add_argument("--prepare-report", type=Path, required=True)
+    summarize.add_argument("--runtime-evidence", type=Path, required=True)
     for name in (
         "generic-ios", "routed-ios", "generic-android", "routed-android",
         "wrong-ios", "wrong-android",
@@ -1059,9 +1238,18 @@ def main(argv: list[str] | None = None) -> None:
             )
         elif args.command == "merge-comparisons":
             result = merge_comparisons(args.inputs, args.output)
+        elif args.command == "collect-runtime-evidence":
+            result = collect_runtime_evidence(
+                args.summaries,
+                args.output,
+                expected_fields=args.expected_fields,
+                expected_evaluations=args.expected_evaluations,
+                required_provider=args.required_provider,
+            )
         else:
             result = summarize_routed_ab(
                 prepare_report=args.prepare_report,
+                runtime_evidence=args.runtime_evidence,
                 generic_ios=args.generic_ios,
                 routed_ios=args.routed_ios,
                 generic_android=args.generic_android,

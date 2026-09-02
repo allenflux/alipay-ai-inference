@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
 import pytest
 
 from transfer_receipt_ai.font_routed_ocr_pilot import (
+    DEFAULT_EVALUATIONS,
     PREPARE_KIND,
+    RUNTIME_EVIDENCE_KIND,
+    collect_runtime_evidence,
     merge_comparisons,
     prepare_routed_pilot,
     summarize_routed_ab,
@@ -29,6 +33,65 @@ def _write_jsonl(path: Path, rows: list[dict[str, object]]) -> Path:
         encoding="utf-8",
     )
     return path
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _build_runtime_evidence(root: Path, comparison_paths: dict[str, Path]) -> Path:
+    entries: dict[str, dict[str, object]] = {}
+    for field in FIELDS:
+        for evaluation in DEFAULT_EVALUATIONS:
+            directory = root / "evaluations" / field / evaluation
+            model = directory / "model.onnx"
+            records = directory / "records.jsonl"
+            merged_rows = [json.loads(line) for line in comparison_paths[evaluation].read_text().splitlines()]
+            comparisons = _write_jsonl(
+                directory / "comparisons.jsonl",
+                [row for row in merged_rows if row.get("field") == field],
+            )
+            model.parent.mkdir(parents=True, exist_ok=True)
+            model.write_bytes(f"model:{field}:{evaluation}".encode())
+            records.write_text("{}\n", encoding="utf-8")
+            summary = _write_json(
+                directory / "summary.json",
+                {
+                    "kind": "receipt_ocr_ctc_pseudo_label_evaluation_v1",
+                    "providers": ["CPUExecutionProvider"],
+                    "fields": [field],
+                    "evaluation_split": "test",
+                    "model": model.resolve().as_posix(),
+                    "model_sha256": _sha256(model),
+                    "records": records.resolve().as_posix(),
+                },
+            )
+            key = f"{field}/{evaluation}"
+            entries[key] = {
+                "field": field,
+                "evaluation": evaluation,
+                "providers": ["CPUExecutionProvider"],
+                "model": model.resolve().as_posix(),
+                "model_sha256": _sha256(model),
+                "records": records.resolve().as_posix(),
+                "records_sha256": _sha256(records),
+                "summary": summary.resolve().as_posix(),
+                "summary_sha256": _sha256(summary),
+                "comparisons": comparisons.resolve().as_posix(),
+                "comparisons_sha256": _sha256(comparisons),
+            }
+    return _write_json(
+        root / "runtime-evidence.json",
+        {
+            "schema_version": 1,
+            "kind": RUNTIME_EVIDENCE_KIND,
+            "completed": True,
+            "required_provider": "CPUExecutionProvider",
+            "fields": list(FIELDS),
+            "evaluations": list(DEFAULT_EVALUATIONS),
+            "entries": entries,
+        },
+    )
 
 
 def _build_source_records(root: Path, *, groups_per_platform: int = 200) -> Path:
@@ -199,8 +262,10 @@ def test_summary_requires_platform_gain_beyond_random_and_wrong_route(tmp_path: 
         paths[name] = _write_jsonl(tmp_path / f"{name}.jsonl", rows)
 
     output = tmp_path / "summary.json"
+    runtime_evidence = _build_runtime_evidence(tmp_path / "runtime", paths)
     result = summarize_routed_ab(
         prepare_report=prepare,
+        runtime_evidence=runtime_evidence,
         output=output,
         **paths,
     )
@@ -211,6 +276,36 @@ def test_summary_requires_platform_gain_beyond_random_and_wrong_route(tmp_path: 
     assert result["metrics"]["time"]["semantic_exact"]["platform_excess_delta_over_random"] == pytest.approx(0.2)
     assert result["publication"] is False
     assert result["business_accuracy"] == "not_assessed"
+    assert result["evidence"]["runtime_evidence"]["required_provider"] == "CPUExecutionProvider"
+
+
+def test_collect_runtime_evidence_rejects_non_cpu_provider(tmp_path: Path) -> None:
+    directory = tmp_path / "evaluations" / "amount" / "generic_ios"
+    model = directory / "model.onnx"
+    records = directory / "records.jsonl"
+    model.parent.mkdir(parents=True, exist_ok=True)
+    model.write_bytes(b"model")
+    records.write_text("{}\n", encoding="utf-8")
+    _write_jsonl(directory / "comparisons.jsonl", [{"id": "one"}])
+    summary = _write_json(
+        directory / "summary.json",
+        {
+            "kind": "receipt_ocr_ctc_pseudo_label_evaluation_v1",
+            "providers": ["CUDAExecutionProvider", "CPUExecutionProvider"],
+            "fields": ["amount"],
+            "evaluation_split": "test",
+            "model": model.resolve().as_posix(),
+            "model_sha256": _sha256(model),
+            "records": records.resolve().as_posix(),
+        },
+    )
+    with pytest.raises(ValueError, match="did not use only CPUExecutionProvider"):
+        collect_runtime_evidence(
+            (summary,),
+            tmp_path / "runtime.json",
+            expected_fields=("amount",),
+            expected_evaluations=("generic_ios",),
+        )
 
 
 def test_merge_comparisons_rejects_duplicate_ids(tmp_path: Path) -> None:

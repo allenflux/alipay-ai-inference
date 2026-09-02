@@ -19,9 +19,11 @@ $ModelsRoot = Join-Path $RunRoot "models"
 $EvaluationsRoot = Join-Path $RunRoot "evaluations"
 $MergedRoot = Join-Path $RunRoot "merged"
 $Summary = Join-Path $RunRoot "routed-ab-summary.json"
+$RuntimeEvidence = Join-Path $RunRoot "runtime-evidence.json"
 $Status = Join-Path $SharedRoot ($RunId + ".status.json")
 $SharedSummary = Join-Path $SharedRoot ($RunId + ".routed-ab-summary.json")
 $SharedPrepare = Join-Path $SharedRoot ($RunId + ".prepare.json")
+$SharedRuntimeEvidence = Join-Path $SharedRoot ($RunId + ".runtime-evidence.json")
 $Script:Stage = "starting"
 $Script:Detail = ""
 $Script:CompletedSteps = New-Object System.Collections.Generic.List[string]
@@ -66,6 +68,8 @@ function Publish-Status {
             prepared_input = $PreparedInput
             summary = $Summary
             shared_summary = $SharedSummary
+            runtime_evidence = $RuntimeEvidence
+            shared_runtime_evidence = $SharedRuntimeEvidence
         }
     }
     Write-Utf8NoBom -Path $Status -Text ($Payload | ConvertTo-Json -Depth 12)
@@ -124,7 +128,7 @@ try {
         $Script:CanPublishStatus = $false
         throw "Refusing to overwrite an existing shared output: $Status"
     }
-    foreach ($SharedOutput in @($SharedSummary, $SharedPrepare)) {
+    foreach ($SharedOutput in @($SharedSummary, $SharedPrepare, $SharedRuntimeEvidence)) {
         if (Test-Path -LiteralPath $SharedOutput) {
             throw "Refusing to overwrite an existing shared output: $SharedOutput"
         }
@@ -147,7 +151,7 @@ try {
     $env:PYTHONPATH = Join-Path $SourceRoot "src"
     Invoke-PythonStep -Name "preflight" -Arguments @(
         "-c",
-        "import json,sys,torch,onnx,onnxruntime,numpy,cv2,PIL; assert (3,10) <= sys.version_info[:2] <= (3,12); assert torch.cuda.is_available(); providers=onnxruntime.get_available_providers(); assert 'CUDAExecutionProvider' in providers, providers; print(json.dumps({'python':sys.version,'torch':torch.__version__,'cuda':torch.version.cuda,'gpu':torch.cuda.get_device_name(0),'onnxruntime':onnxruntime.__version__,'providers':providers},sort_keys=True))"
+        "import json,sys,torch,onnx,onnxruntime,numpy,cv2,PIL; assert (3,10) <= sys.version_info[:2] <= (3,12); assert torch.cuda.is_available(); providers=onnxruntime.get_available_providers(); assert 'CPUExecutionProvider' in providers, providers; print(json.dumps({'python':sys.version,'torch':torch.__version__,'cuda':torch.version.cuda,'gpu':torch.cuda.get_device_name(0),'onnxruntime':onnxruntime.__version__,'providers':providers,'evaluation_provider':'CPUExecutionProvider'},sort_keys=True))"
     )
     if ([string]::IsNullOrWhiteSpace($PreparedInput)) {
         Invoke-PythonStep -Name "prepare" -Arguments @(
@@ -229,9 +233,9 @@ try {
                 "--onnx-output", $Onnx
             )
             if (-not $Script:OrtSmokeCompleted) {
-                Invoke-PythonStep -Name "onnxruntime-cuda-smoke" -Arguments @(
+                Invoke-PythonStep -Name "onnxruntime-cpu-smoke" -Arguments @(
                     "-c",
-                    "import json,sys,onnxruntime as ort; s=ort.InferenceSession(sys.argv[1],providers=['CUDAExecutionProvider','CPUExecutionProvider']); assert s.get_providers()[0]=='CUDAExecutionProvider',s.get_providers(); print(json.dumps({'active_providers':s.get_providers()},sort_keys=True))",
+                    "import json,sys,onnxruntime as ort; s=ort.InferenceSession(sys.argv[1],providers=['CPUExecutionProvider']); assert s.get_providers()==['CPUExecutionProvider'],s.get_providers(); print(json.dumps({'active_providers':s.get_providers()},sort_keys=True))",
                     $Onnx
                 )
                 $Script:OrtSmokeCompleted = $true
@@ -251,6 +255,7 @@ try {
         [ordered]@{ Name = "generic_random_b"; Model = "global"; Manifest = "random_b" },
         [ordered]@{ Name = "routed_random_b"; Model = "random_b"; Manifest = "random_b" }
     )
+    $RuntimeSummaries = @()
     foreach ($Field in $Fields) {
         foreach ($Item in $EvaluationPlan) {
             $Model = Join-Path (Join-Path (Join-Path $ModelsRoot $Field) $Item.Model) ($Item.Model + ".onnx")
@@ -265,10 +270,21 @@ try {
                 "--split", "test",
                 "--fields", $Field,
                 "--training-splits", "train,val",
-                "--device", "cuda:0"
+                "--device", "cpu"
             )
+            $RuntimeSummaries += Join-Path $Output "summary.json"
         }
     }
+
+    Invoke-PythonStep -Name "collect-runtime-evidence" -Arguments (@(
+        "-m", "transfer_receipt_ai.font_routed_ocr_pilot", "collect-runtime-evidence",
+        "--summaries"
+    ) + $RuntimeSummaries + @(
+        "--expected-fields", ($Fields -join ","),
+        "--expected-evaluations", (($EvaluationPlan | ForEach-Object { $_.Name }) -join ","),
+        "--required-provider", "CPUExecutionProvider",
+        "--output", $RuntimeEvidence
+    ))
 
     foreach ($Item in $EvaluationPlan) {
         $Inputs = @()
@@ -284,6 +300,7 @@ try {
     Invoke-PythonStep -Name "summarize" -Arguments @(
         "-m", "transfer_receipt_ai.font_routed_ocr_pilot", "summarize",
         "--prepare-report", $PrepareReportPath,
+        "--runtime-evidence", $RuntimeEvidence,
         "--generic-ios", (Join-Path $MergedRoot "generic_ios.jsonl"),
         "--routed-ios", (Join-Path $MergedRoot "routed_ios.jsonl"),
         "--wrong-ios", (Join-Path $MergedRoot "wrong_ios.jsonl"),
@@ -298,6 +315,7 @@ try {
     )
     Copy-Item -LiteralPath $Summary -Destination $SharedSummary
     Copy-Item -LiteralPath $PrepareReportPath -Destination $SharedPrepare
+    Copy-Item -LiteralPath $RuntimeEvidence -Destination $SharedRuntimeEvidence
     $Script:Stage = "completed"
     $Script:Detail = "Resolution-only platform experts, wrong-route controls, and random two-expert controls completed."
     Publish-Status -Succeeded $true

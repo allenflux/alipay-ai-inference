@@ -78,7 +78,13 @@ D:\alipay-ai-data\receipt-lite-teacher-120k-v1\paddle-teacher-labels-5field-reci
 D:\alipay-ai-data\experiments\font-routed-ocr-validation-v1\<RunId>
 ```
 
-Mac 共享目录只回收 `prepare.json`、最终 A/B summary 和状态 JSON，不回收图片或 checkpoint。
+Mac 共享目录只回收 `prepare.json`、`runtime-evidence.json`、最终 A/B summary 和状态 JSON，
+不回收图片或 checkpoint。
+
+PyTorch 使用 CUDA 训练；ONNX A/B 评估明确使用 CPU provider。评估正确性不依赖 ONNX Runtime
+CUDA DLL，避免把环境加速问题混入本轮字体方向判断。runner 会验证全部 30 个字段/对照评估
+都只激活 `CPUExecutionProvider`，并把每个模型、输入清单、evaluation summary 和 comparisons 的
+SHA-256 写入随最终结果一起发布的 `runtime-evidence.json`；最终 A/B summary 再绑定该证据文件。
 
 如果训练阶段因 runner/环境问题中止，而上一个独立 RunId 已经完整生成
 `prepared-resolution-primary`，可在新 RunId 中用 `-PreparedInput` 复用该只读清单。runner
@@ -92,6 +98,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File `
   -PreparedInput D:\alipay-ai-data\experiments\font-routed-ocr-validation-v1\<old-run>\prepared-resolution-primary `
   -Epochs 5
 ```
+
+模型产物不会跨 RunId 复用：现有 checkpoint 没有绑定训练 manifest 的哈希，直接复制会削弱
+A/B 实验的可审计性。续跑只复用经过契约校验的准备清单，所有模型仍按相同参数重新训练。
 
 ## 负号边界
 
