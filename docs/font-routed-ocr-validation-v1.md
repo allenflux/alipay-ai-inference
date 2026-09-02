@@ -102,6 +102,35 @@ powershell -NoProfile -ExecutionPolicy Bypass -File `
 模型产物不会跨 RunId 复用：现有 checkpoint 没有绑定训练 manifest 的哈希，直接复制会削弱
 A/B 实验的可审计性。续跑只复用经过契约校验的准备清单，所有模型仍按相同参数重新训练。
 
+## 2026-09-02 Windows 实测结果
+
+独立运行 `font-routed-ocr-20260902-020425-55a05690-r3` 已完整成功，源提交为 `55a05690`。
+最终门禁是 `not_supported_in_pilot`，`supported_fields` 为空，金额护栏未通过。下表是
+semantic exact 的配对结果；百分点变化均为平台代理专家相对同字段 global 模型：
+
+| 字段 | 每平台测试数 | global | 正确路由专家 | 变化 | 95% group-bootstrap | 随机双专家变化 | 平台超额收益 | 正确路由相对错路由 | 支持 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| `amount` | 549 | 4.83% | 0.00% | -4.83 pp | [-6.19, -3.64] pp | -4.83 pp | 0.00 pp | 0.00 pp | 否 |
+| `time` | 436 | 0.00% | 0.00% | 0.00 pp | [0.00, 0.00] pp | 0.00 pp | 0.00 pp | 0.00 pp | 否 |
+| `payment_method_field` | 1,500 | 94.90% | 2.40% | -92.50 pp | [-93.47, -91.50] pp | -49.70 pp | -42.80 pp | 0.00 pp | 否 |
+
+证据审计同时通过：共 31,346 条选中记录、27,653 个 source group；时间路由只用
+`device.source=resolution`，没有读取时间字形像素；15 个模型和 30 个评估全部完成；30/30
+evaluation summary 都只激活 `CPUExecutionProvider`。最终 summary 绑定的 runtime evidence
+SHA-256 为 `4e7e39bb4b2a1a163103d0a62f80dc57d6bf64b98f1547efcdcdced3cfe7e5ed`。
+共享副本是哈希收据而不是可离线重算的完整 bundle：ONNX、逐评估 summary/comparisons 和 merged
+JSONL 仍保留在该 RunId 的 Windows D 盘目录；离开该目录只能核对收据，不能重算全部指标。
+
+这次结果否定的是“把当前 CTC 按平台各自从头训练 5 epochs 就能受益”，不是证明 iOS 与 Android
+字体相同。`payment_method_field` 的 global 已有较强教师一致性，但平台代理专家严重退化；正确
+路由与错路由又完全无差异，说明当前专家没有学到可用的平台特异信号。`amount` 和 `time` 的
+global 基线本身过低，无法承担字体效应验证。这些退化值也可能包含训练配方、decoder 或评估
+适配问题，不能外推成“平台路由天然有害”。不得据此拆分生产 OCR。
+
+如果继续验证，下一次应先保住可用 global 基线，再从同一 global checkpoint 对 iOS/Android
+做低学习率域微调，并保留本轮随机专家、错路由和金额护栏；在该门槛通过前不值得人工标大量
+字体标签。即便后续教师一致性通过，生产准确率仍需要冻结的人工真值测试集。
+
 ## 负号边界
 
 已有 Windows 实验证明，同一冻结 DET/CLS/REC 在 `det_db_unclip_ratio=1.5` 时读成 `99.83`，扩大到约 `2.4` 后恢复 `-99.83`。当前证据更支持检测框左边界裁掉负号，而不是字体识别失败。
